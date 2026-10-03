@@ -3671,6 +3671,7 @@ function ComposerImpl(
             state={composerGit.githubState}
             prCount={composerGit.prCount}
             prNumber={composerGit.prNumber}
+            prNumberPrefix={composerGit.prNumberPrefix}
             onOpen={openComposerGithubTab}
           />
           <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
