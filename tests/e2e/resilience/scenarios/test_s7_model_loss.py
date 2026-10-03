@@ -14,8 +14,8 @@ from collections.abc import Callable
 
 import pytest
 
-from tests.e2e.resilience.lab.driver import ClaudeDriver, Turn
-from tests.e2e.resilience.lab.lab import Lab
+from tests.e2e.resilience.lab.driver import SessionDriver, Turn
+from tests.e2e.resilience.lab.lab import Harness, Lab
 from tests.e2e.resilience.lab.observe import SessionWatcher
 from tests.e2e.resilience.lab.report import ScenarioReport
 from tests.e2e.resilience.scenarios import _contract as contract
@@ -27,18 +27,22 @@ _RETRYABLE = frozenset(
 )
 _PHASES = ["turn_start", "mid_stream"]
 #: Rows whose failure is known not to be retryable today.
-_KNOWN_GAPS = {("mid_stream", 180): "R7"}
+_KNOWN_GAPS = {("claude", "mid_stream", 180): "R7"}
 
 
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize(
-    ("phase", "outage_s"), contract.cases(_PHASES, contract.outages([10], [60, 180]))
+    ("harness", "phase", "outage_s"), contract.cases(_PHASES, contract.outages([10], [60, 180]))
 )
-def test_s7_model_loss(lab_factory: Callable[..., Lab], phase: str, outage_s: int) -> None:
+def test_s7_model_loss(
+    lab_factory: Callable[..., Lab], harness: Harness, phase: str, outage_s: int
+) -> None:
     lab = lab_factory()
-    session_id = lab.create_claude_session()
-    driver = ClaudeDriver(lab, session_id)
-    report = ScenarioReport("S7 model loss", {"phase": phase, "outage_s": outage_s})
+    driver = SessionDriver.create(lab, harness)
+    session_id = driver.session_id
+    report = ScenarioReport(
+        "S7 model loss", {"harness": harness, "phase": phase, "outage_s": outage_s}
+    )
     model = lab.proxies.model
     with SessionWatcher(lab.server_url, session_id) as watcher:
         driver.round_trip()
@@ -66,7 +70,7 @@ def test_s7_model_loss(lab_factory: Callable[..., Lab], phase: str, outage_s: in
             replies = driver.count_text(turn.reply, role="assistant")
             report.check("final_reply_committed_once", replies == 1, f"{replies} copies")
         code = (lab.snapshot(session_id).get("labels") or {}).get("omnigent.last_task_error_code")
-        gap = _KNOWN_GAPS.get((phase, outage_s))
+        gap = _KNOWN_GAPS.get((harness, phase, outage_s))
         if outcome == "failed" or gap is not None:
             # On the pinned row a completed turn also counts as passing, so the
             # marker goes stale once the gap stops reproducing.
@@ -90,7 +94,7 @@ def test_s7_model_loss(lab_factory: Callable[..., Lab], phase: str, outage_s: in
     report.require()
 
 
-def _wait_outcome(lab: Lab, driver: ClaudeDriver, turn: Turn) -> str | None:
+def _wait_outcome(lab: Lab, driver: SessionDriver, turn: Turn) -> str | None:
     """``completed``, ``failed``, or ``None`` if the turn neither finished nor failed."""
 
     def _outcome() -> str | None:

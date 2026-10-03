@@ -16,8 +16,8 @@ from dataclasses import dataclass
 import pytest
 
 from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
-from tests.e2e.resilience.lab.driver import ClaudeDriver, Turn
-from tests.e2e.resilience.lab.lab import Lab, wait_for
+from tests.e2e.resilience.lab.driver import SessionDriver, Turn
+from tests.e2e.resilience.lab.lab import Harness, Lab, wait_for
 from tests.e2e.resilience.lab.observe import SessionWatcher
 from tests.e2e.resilience.lab.report import ScenarioReport
 
@@ -33,6 +33,8 @@ IDLE = "idle"
 TOOL_RUNNING = "tool_running"
 TOOL_ENDS_DURING_OUTAGE = "tool_ends_during_outage"
 APPROVAL_PENDING = "approval_pending"
+#: Native harnesses every scenario runs against.
+HARNESSES: tuple[Harness, ...] = ("claude", "codex")
 
 
 def outages(short: Iterable[int], full: Iterable[int]) -> list[int]:
@@ -43,25 +45,43 @@ def outages(short: Iterable[int], full: Iterable[int]) -> list[int]:
 def cases(
     phases: Iterable[str],
     outage_s: Iterable[int],
-    known_gaps: Mapping[tuple[str, int], str] | None = None,
+    known_gaps: Mapping[tuple[str, str, int], str] | None = None,
+    *,
+    harnesses: Iterable[Harness] = HARNESSES,
 ) -> list[object]:
-    """Parametrize ``(phase, outage_s)``; known gaps become strict xfails.
+    """Parametrize ``(harness, phase, outage_s)``; known gaps become strict xfails.
 
     :param phases: Phase names, e.g. ``[IDLE, APPROVAL_PENDING]``.
     :param outage_s: Outage lengths in seconds.
-    :param known_gaps: ``(phase, outage) -> finding`` for rows that fail today.
-    :returns: ``pytest.param`` entries with ids like ``approval_pending-60s``.
+    :param known_gaps: ``(harness, phase, outage) -> finding`` for rows that fail today.
+    :param harnesses: Harnesses to run.
+    :returns: ``pytest.param`` entries with ids like ``codex-approval_pending-60s``.
     """
     params = []
-    for phase in phases:
-        for seconds in outage_s:
-            gap = (known_gaps or {}).get((phase, seconds))
-            # Only a broken contract check is the documented gap; a crash is not.
-            marks = (
-                [pytest.mark.xfail(strict=True, reason=gap, raises=AssertionError)] if gap else []
-            )
-            params.append(pytest.param(phase, seconds, marks=marks, id=f"{phase}-{seconds}s"))
+    outage_list = list(outage_s)
+    for harness in harnesses:
+        for phase in phases:
+            for seconds in outage_list:
+                gap = (known_gaps or {}).get((harness, phase, seconds))
+                # Only a broken contract check is the documented gap; a crash is not.
+                marks = (
+                    [pytest.mark.xfail(strict=True, reason=gap, raises=AssertionError)]
+                    if gap
+                    else []
+                )
+                params.append(
+                    pytest.param(
+                        harness, phase, seconds, marks=marks, id=f"{harness}-{phase}-{seconds}s"
+                    )
+                )
     return params
+
+
+def gaps(
+    finding: str, rows: Iterable[tuple[str, int]], harnesses: Iterable[Harness] = ("claude",)
+) -> dict[tuple[str, str, int], str]:
+    """Known-gap entries for *finding* on each ``(phase, outage)`` row of *harnesses*."""
+    return {(harness, phase, s): finding for harness in harnesses for phase, s in rows}
 
 
 @dataclass
@@ -78,7 +98,7 @@ class Phase:
     approval_id: str | None = None
 
 
-def enter(driver: ClaudeDriver, phase: str, *, outage_s: float) -> Phase:
+def enter(driver: SessionDriver, phase: str, *, outage_s: float) -> Phase:
     """Complete one turn, then start the work *phase* names.
 
     A running tool outlasts the outage by 20 s; one that ends during the outage
@@ -105,7 +125,7 @@ def enter(driver: ClaudeDriver, phase: str, *, outage_s: float) -> Phase:
 def finish(
     report: ScenarioReport,
     lab: Lab,
-    driver: ClaudeDriver,
+    driver: SessionDriver,
     watcher: SessionWatcher,
     phase: Phase,
     *,
@@ -113,6 +133,7 @@ def finish(
     fault_end: float,
     outage_s: float,
     grace_applies: bool = True,
+    racy_gaps: Mapping[str, str] | None = None,
 ) -> None:
     """Record every contract check once the fault has cleared.
 
@@ -125,6 +146,8 @@ def finish(
     :param fault_end: Wall-clock end of the fault.
     :param outage_s: Planned outage, compared against the reconnect grace.
     :param grace_applies: Whether "no failure within the grace" is expected.
+    :param racy_gaps: Check name to finding id for intermittent known gaps,
+        e.g. ``{"status_settles_idle": "R8"}``.
     """
     turn = phase.turn
     if turn is not None and phase.approval_id is not None:
@@ -148,16 +171,19 @@ def finish(
         next_turn is not None,
         "" if next_turn else "a new message after recovery got no reply",
     )
-    check_settled_idle(report, lab, driver.session_id)
+    check_settled_idle(
+        report, lab, driver.session_id, gap=(racy_gaps or {}).get("status_settles_idle")
+    )
     if grace_applies and outage_s < GRACE_S:
         # Observe through settlement so a late failure flash still counts.
         check_no_failure(report, watcher, fault_start, max(time.time(), fault_end + SETTLE_S))
 
 
-def check_turn_completes(report: ScenarioReport, driver: ClaudeDriver, turn: Turn) -> None:
+def check_turn_completes(report: ScenarioReport, driver: SessionDriver, turn: Turn) -> None:
     """The interrupted turn finishes, with every item and side effect exactly once."""
     try:
-        driver.wait_done(turn, timeout=RECOVERY_S)
+        # A chained tool (Codex) may still have most of its steps to run.
+        driver.wait_done(turn, timeout=RECOVERY_S + turn.tool_s)
         finished = True
     except TimeoutError:
         finished = False
@@ -167,14 +193,24 @@ def check_turn_completes(report: ScenarioReport, driver: ClaudeDriver, turn: Tur
     replies = driver.count_text(turn.reply, role="assistant")
     report.check("final_reply_committed_once", replies == 1, f"{replies} copies")
     if turn.done is not None:
-        outputs = driver.count_tool_outputs(turn)
-        report.check("tool_result_committed_once", outputs == 1, f"{outputs} copies")
+        counts = driver.tool_output_counts(turn)
+        wrong = {call: n for call, n in counts.items() if n != 1}
+        report.check(
+            "tool_result_committed_once",
+            not wrong,
+            ", ".join(f"{call}: {n} copies" for call, n in wrong.items()),
+        )
         ran = turn.done.exists()
         report.check("tool_side_effect_happened", ran, "" if ran else f"{turn.done.name} missing")
 
 
-def check_settled_idle(report: ScenarioReport, lab: Lab, session_id: str) -> None:
-    """The session settles to ``idle`` once its work is done."""
+def check_settled_idle(
+    report: ScenarioReport, lab: Lab, session_id: str, *, gap: str | None = None
+) -> None:
+    """The session settles to ``idle`` once its work is done.
+
+    :param gap: Intermittent finding id this check is known to hit, if any.
+    """
     status = eventually(
         lambda: "idle" if lab.snapshot(session_id).get("status") == "idle" else None,
         timeout=SETTLE_S,
@@ -183,6 +219,8 @@ def check_settled_idle(report: ScenarioReport, lab: Lab, session_id: str) -> Non
         "status_settles_idle",
         status == "idle",
         "" if status else f"status={lab.snapshot(session_id).get('status')}",
+        known_gap=gap,
+        intermittent=gap is not None,
     )
 
 
@@ -208,7 +246,7 @@ def eventually(predicate: Callable[[], object | None], *, timeout: float) -> obj
         return None
 
 
-def eventually_round_trip(driver: ClaudeDriver) -> Turn | None:
+def eventually_round_trip(driver: SessionDriver) -> Turn | None:
     """Run a fresh turn; ``None`` when it does not complete in time."""
     try:
         return driver.round_trip(timeout=RECOVERY_S)
