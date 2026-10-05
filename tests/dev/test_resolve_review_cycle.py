@@ -86,7 +86,7 @@ class Github:
         }
         self.polly_run = {**self.run, "workflow_id": 21}
         self.calls = []
-        self.active_runs = []
+        self.active_runs = {"polly-review.yml": [], "open-code-review.yml": []}
         self.permissions = {}
 
     @staticmethod
@@ -118,7 +118,7 @@ class Github:
         if "/actions/artifacts?" in path:
             return {"artifacts": copy.deepcopy(self.artifacts)}
         if "/runs?per_page=100" in path:
-            return {"workflow_runs": self.active_runs}
+            return {"workflow_runs": self.active_runs[path.split("/")[-2]]}
         if "/actions/workflows/open-code-review.yml" in path:
             return {"id": 20}
         if "/actions/workflows/polly-review.yml" in path:
@@ -791,19 +791,95 @@ def test_automatic_polly_review_does_not_cover_a_later_push():
 
 
 @pytest.mark.parametrize("status", ["queued", "in_progress", "waiting"])
-def test_request_waits_for_automatic_review_of_current_head(status):
+@pytest.mark.parametrize("both", [False, True])
+def test_request_waits_for_automatic_review_of_current_head(status, both):
     api = Github()
     api.artifacts = []
-    api.active_runs = [
+    run = {
+        "event": "pull_request_target",
+        "status": status,
+        "pull_requests": [{"number": 7, "head": {"sha": "a" * 40}}],
+    }
+    api.active_runs["polly-review.yml"] = [run]
+    if both:
+        api.active_runs["open-code-review.yml"] = [run]
+    cycle.request_reviews("o/r", 7, cycle.snapshot("o/r", 7, api), api)
+    posts = [call for call in api.calls if "POST" in call]
+    assert [call[3] for call in posts] == (
+        [] if both else ["repos/o/r/actions/workflows/open-code-review.yml/dispatches"]
+    )
+    api.calls.clear()
+    api.pull["head"]["sha"] = "b" * 40
+    # Unpinned reviews can collect a newer head; wait until they end.
+    run["status"] = "completed"
+    cycle.request_reviews("o/r", 7, cycle.snapshot("o/r", 7, api), api)
+    assert len([call for call in api.calls if "POST" in call]) == 2
+
+
+@pytest.mark.parametrize(
+    "branch,status,head,waits",
+    [
+        ("main", "in_progress", "a" * 40, True),
+        ("untrusted", "in_progress", "a" * 40, False),
+        ("main", "completed", "a" * 40, False),
+        ("main", "in_progress", "b" * 40, False),
+    ],
+)
+def test_dispatch_waits_only_for_matching_trusted_current_head(branch, status, head, waits):
+    api = Github()
+    api.artifacts = []
+    api.active_runs["polly-review.yml"] = [
         {
-            "event": "pull_request_target",
+            "event": "workflow_dispatch",
+            "head_branch": branch,
             "status": status,
-            "display_title": f"Polly #7 @{'a' * 40}",
-            "pull_requests": [{"number": 7, "head": {"sha": "a" * 40}}],
+            "conclusion": "failure" if status == "completed" else None,
+            "display_title": f"Polly #7 @{head}",
+            "pull_requests": [],
         }
     ]
     cycle.request_reviews("o/r", 7, cycle.snapshot("o/r", 7, api), api)
-    assert not any("POST" in call for call in api.calls)
-    api.pull["head"]["sha"] = "b" * 40
-    cycle.request_reviews("o/r", 7, cycle.snapshot("o/r", 7, api), api)
-    assert len([call for call in api.calls if "POST" in call]) == 2
+    posts = [call[3] for call in api.calls if "POST" in call]
+    assert ("repos/o/r/actions/workflows/polly-review.yml/dispatches" not in posts) == waits
+    assert "repos/o/r/actions/workflows/open-code-review.yml/dispatches" in posts
+
+
+@pytest.mark.parametrize("event", ["issue_comment", "workflow_dispatch", "pull_request_target"])
+def test_unpinned_active_review_waits_without_claiming_completed_evidence(event):
+    api = Github()
+    run = {
+        "event": event,
+        "head_branch": "main",
+        "status": "in_progress",
+        "display_title": "Polly #7 @current",
+        "pull_requests": [],
+    }
+    api.active_runs["polly-review.yml"] = [run]
+    assert cycle.active_review_runs("o/r", 7, "a" * 40, "polly", api) == [run]
+    run["status"] = "completed"
+    assert cycle.review_attempts("o/r", 7, "a" * 40, "polly", api) == []
+
+
+def test_active_review_beyond_recent_hundred_runs_is_still_found():
+    api = Github()
+    old = {
+        "event": "workflow_dispatch",
+        "head_branch": "main",
+        "status": "waiting",
+        "display_title": f"Polly #7 @{'a' * 40}",
+    }
+    api.active_runs["polly-review.yml"] = [{"status": "completed"}] * 100
+
+    def request(args):
+        if "/runs?status=" in args[1]:
+            # Simulate two full pages of unrelated waiting reviews before ours.
+            if "status=waiting" in args[1]:
+                return {
+                    "workflow_runs": [old]
+                    if "&page=3" in args[1]
+                    else [{"status": "waiting"}] * 100
+                }
+            return {"workflow_runs": []}
+        return api(args)
+
+    assert cycle.active_review_runs("o/r", 7, "a" * 40, "polly", request) == [old]

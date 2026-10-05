@@ -107,7 +107,7 @@ def test_force_review_bypasses_duplicate_check(
     assert ("duplicate=true" in output.read_text()) is skipped
 
 
-def test_automatic_review_uses_base_workflow_and_retains_fork_approval():
+def test_automatic_review_runs_base_workflow_and_excludes_fork_prs():
     workflow = yaml.safe_load(_WORKFLOW.read_text())
     triggers = workflow.get("on", workflow.get(True))
     assert "pull_request" not in triggers
@@ -131,13 +131,22 @@ def test_automatic_review_uses_base_workflow_and_retains_fork_approval():
     assert not any("pull_request.head" in s.get("with", {}).get("ref", "") for s in steps)
 
 
-def test_requested_head_cannot_change_before_polly_reads_the_diff(tmp_path):
+@pytest.mark.parametrize(
+    "expected_head,passes", [("old-head", False), ("new-head", True), ("", True)]
+)
+def test_requested_head_cannot_change_before_polly_reads_the_diff(tmp_path, expected_head, passes):
     workflow = yaml.safe_load(_WORKFLOW.read_text())
     step = next(s for s in workflow["jobs"]["review"]["steps"] if s.get("id") == "ctx")
     script = step["run"]
-    script = script[: script.index('gh api "repos/${REPO}/compare/')].replace(
-        "/tmp/", str(tmp_path) + "/"
+    marker = 'gh api "repos/${REPO}/compare/'
+    assert marker in script, "diff-fetch command not found in ctx step"
+    script = script[: script.index(marker)].replace("/tmp/", str(tmp_path) + "/")
+    assert step["env"]["EXPECTED_HEAD"] == "${{ inputs.expected_head }}"
+    jq = tmp_path / "jq"
+    jq.write_text(
+        '#!/bin/sh\ncase "$2" in .baseRefOid) echo base;; .headRefOid) echo new-head;; esac\n'
     )
+    jq.chmod(0o755)
     gh = tmp_path / "gh"
     gh.write_text('#!/bin/sh\necho \'{"baseRefOid":"base","headRefOid":"new-head"}\'\n')
     gh.chmod(0o755)
@@ -146,7 +155,7 @@ def test_requested_head_cannot_change_before_polly_reads_the_diff(tmp_path):
         env={
             **os.environ,
             "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
-            "EXPECTED_HEAD": "old-head",
+            "EXPECTED_HEAD": expected_head,
             "PR_NUMBER": "7",
             "REPO": "o/r",
         },
@@ -154,4 +163,5 @@ def test_requested_head_cannot_change_before_polly_reads_the_diff(tmp_path):
         text=True,
         timeout=10,
     )
-    assert result.returncode != 0 and "PR moved" in result.stdout
+    assert (result.returncode == 0) is passes
+    assert ("PR moved" in result.stdout) is not passes

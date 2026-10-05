@@ -49,10 +49,11 @@ Completion requires these independent proofs, not just green checks:
 - **Polly:** a trusted bot comment starting with exact `<!-- polly-review-bot -->`,
   `<!-- polly-reviewed-sha: <full current head SHA> -->`, and matching
   `polly-review-run` lines, plus an unexpired `polly-completed-<pr>-<head SHA>`
-  artifact from a completed, successful `polly-review.yml` run on the default
-  branch via `workflow_dispatch` or `issue_comment`. Marker text quoted inside
-  another bot's review cannot establish completion. Automatic `pull_request`
-  runs do not establish trusted workflow provenance; dispatch through the helper.
+  artifact from a completed, successful `polly-review.yml` run via trusted
+  `pull_request_target`, or via `workflow_dispatch`/`issue_comment` on the default
+  branch. Marker text quoted inside another bot's review cannot establish
+  completion. Legacy `pull_request` runs remain untrusted; request a fresh review
+  through the helper when only that older evidence exists.
   Repositories must deploy the receipt-producing Polly workflow before this gate
   can pass. Do not fall back to bare markers on older workflow versions.
 - **OCR:** an unexpired `ocr-completed-<pr>-<full current head SHA>` artifact

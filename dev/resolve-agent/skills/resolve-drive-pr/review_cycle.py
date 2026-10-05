@@ -109,30 +109,46 @@ def completed_review_runs(repository, number, head, default_branch, reviewer, re
 
 
 def review_attempts(repository, number, head, reviewer, request):
-    """Find review attempts whose trusted trigger identifies this PR revision."""
+    """Find trusted attempts and active, unpinned review requests for this PR."""
     repo = api_object(f"repos/{repository}", request)
     runs = api_object(
         f"repos/{repository}/actions/workflows/{REVIEWERS[reviewer]}/runs?per_page=100",
         request,
     )["workflow_runs"]
-    label = "Polly" if reviewer == "polly" else "OCR"
+    # Scan all active runs when recent history is full: a long-queued review
+    # can be older than the first page. Completed history remains bounded.
+    if len(runs) == 100:
+        for status in ("queued", "in_progress", "waiting", "pending", "requested"):
+            runs.extend(
+                pages(
+                    f"repos/{repository}/actions/workflows/{REVIEWERS[reviewer]}/runs?status={status}",
+                    request,
+                    "workflow_runs",
+                )
+            )
+    label = {"polly": "Polly", "ocr": "OCR"}[reviewer]
     return [
         run
         for run in runs
         if (
             run.get("event") == "pull_request_target"
             or (
-                run.get("event") == "workflow_dispatch"
+                run.get("event") in {"workflow_dispatch", "issue_comment"}
                 and run.get("head_branch") == repo["default_branch"]
             )
         )
         and (
             run.get("display_title") == f"{label} #{number} @{head}"
             or (
-                run.get("event") == "pull_request_target"
-                and any(
-                    pull.get("number") == number and pull.get("head", {}).get("sha") == head
-                    for pull in run.get("pull_requests", [])
+                run.get("status") != "completed"
+                and (
+                    run.get("display_title") == f"{label} #{number} @current"
+                    or (
+                        run.get("event") == "pull_request_target"
+                        and any(
+                            pull.get("number") == number for pull in run.get("pull_requests", [])
+                        )
+                    )
                 )
             )
         )

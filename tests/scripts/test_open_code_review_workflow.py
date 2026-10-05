@@ -311,14 +311,24 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
                 self.assertEqual(result["outputs"], expected)
 
     def test_requested_head_cannot_silently_change_while_queued(self):
-        result = self.run_script(
-            self.comment(),
-            script=RESOLVE,
-            pr={"state": "open", "draft": False, "head": {"sha": "new-head"}},
-            extra_env={"EXPECTED_HEAD": "old-head"},
-        )
-        self.assertEqual(result["outputs"], {})
-        self.assertIn("PR moved", result["error"])
+        for expected_head in ("old-head", "new-head", ""):
+            with self.subTest(expected_head=expected_head):
+                result = self.run_script(
+                    self.comment(),
+                    script=RESOLVE,
+                    pr={
+                        "state": "open",
+                        "draft": False,
+                        "base": {"ref": "main"},
+                        "head": {"sha": "new-head"},
+                    },
+                    extra_env={"EXPECTED_HEAD": expected_head},
+                )
+                if expected_head == "old-head":
+                    self.assertEqual(result["outputs"], {})
+                    self.assertIn("PR moved", result["error"])
+                else:
+                    self.assertEqual(result["outputs"], {"base": "main", "head": "new-head"})
 
     def completed_comment(self, marker=None, *, login="github-actions[bot]", user_type="Bot"):
         return {
