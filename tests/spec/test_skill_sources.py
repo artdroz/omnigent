@@ -1218,45 +1218,61 @@ def test_plugin_command_marked_not_user_invocable_is_hidden(
     assert "knowledge-base:kb-internal" not in names
 
 
-def test_plugin_commands_namespace_nested_entries_and_skip_non_md(
+def test_plugin_commands_namespace_nested_entries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Nested files are ``<plugin>:<dir>:<name>``; a ``<dir>/skill.md`` is ``<plugin>:<dir>``."""
+    """Nested files are ``<plugin>:<dir>:<name>``; hidden paths and any-case ``.md`` count."""
     home, install = _claude_home_with_plugin_command(tmp_path / "home")
     (install / "commands" / "notes.txt").write_text("not a command")
     _write_plugin_command(
         install / "commands" / "group", "inner", "---\ndescription: nested\n---\nbody\n"
     )
     _write_plugin_command(install / "commands" / "group" / "deep", "leaf", "Deep command.\n")
-    (install / "commands" / "legacy").mkdir()
-    (install / "commands" / "legacy" / "skill.md").write_text("Directory-named command.\n")
-    _write_plugin_command(install / "commands" / "legacy", "sibling", "Ignored next to skill.md\n")
-    deepest = install / "commands" / Path(*(f"d{index}" for index in range(31)))
-    _write_plugin_command(deepest, "ok", "Thirty-one directories deep.\n")
-    _write_plugin_command(deepest / "d31", "too-deep", "Beyond Claude Code's depth bound.\n")
     _write_plugin_command(install / "commands" / ".drafts", "wip", "Hidden paths count.\n")
     (install / "commands" / "SHOUT.MD").write_text("Only a lowercase .md is stripped.\n")
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
 
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
+    assert "knowledge-base:kb-review" in names
+    assert "knowledge-base:group:inner" in names
+    assert "knowledge-base:group:deep:leaf" in names
+    assert "knowledge-base:.drafts:wip" in names
+    assert "knowledge-base:SHOUT.MD" in names
+    for absent in ("knowledge-base:notes", "knowledge-base:inner", "knowledge-base:group"):
+        assert absent not in names
+
+
+def test_plugin_command_directory_with_skill_md_is_one_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``<dir>/skill.md`` is the command ``<plugin>:<dir>``; its siblings are ignored."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    (install / "commands" / "legacy").mkdir()
+    (install / "commands" / "legacy" / "skill.md").write_text("Directory-named command.\n")
+    _write_plugin_command(install / "commands" / "legacy", "sibling", "Ignored next to skill.md\n")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
     out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")
     by_name = {s.name: s for s in out}
-    assert "knowledge-base:kb-review" in by_name
-    assert "knowledge-base:group:inner" in by_name
-    assert "knowledge-base:group:deep:leaf" in by_name
     assert by_name["knowledge-base:legacy"].description == "Directory-named command."
+    assert "knowledge-base:legacy:skill" not in by_name
+    assert "knowledge-base:legacy:sibling" not in by_name
+
+
+def test_plugin_commands_stop_at_claude_code_depth_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Commands 31 directories deep are offered; the 32nd level is beyond Claude Code's bound."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    deepest = install / "commands" / Path(*(f"d{index}" for index in range(31)))
+    _write_plugin_command(deepest, "ok", "Thirty-one directories deep.\n")
+    _write_plugin_command(deepest / "d31", "too-deep", "Beyond Claude Code's depth bound.\n")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
     deep_prefix = "knowledge-base:" + ":".join(f"d{index}" for index in range(31))
-    assert f"{deep_prefix}:ok" in by_name
-    assert "knowledge-base:.drafts:wip" in by_name
-    assert "knowledge-base:SHOUT.MD" in by_name
-    for absent in (
-        "knowledge-base:notes",
-        "knowledge-base:inner",
-        "knowledge-base:group",
-        "knowledge-base:legacy:skill",
-        "knowledge-base:legacy:sibling",
-        f"{deep_prefix}:d31:too-deep",
-    ):
-        assert absent not in by_name
+    assert f"{deep_prefix}:ok" in names
+    assert f"{deep_prefix}:d31:too-deep" not in names
 
 
 def test_plugin_commands_do_not_follow_symlinks(

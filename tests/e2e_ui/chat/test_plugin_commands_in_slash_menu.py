@@ -257,5 +257,6 @@ def test_plugin_commands_listed_in_slash_menu(
     command_row = page.get_by_test_id(f"slash-menu-item-{_PLUGIN}:{_COMMAND}")
     expect(command_row).to_be_visible(timeout=10_000)
     expect(command_row).to_contain_text("Review a knowledge-base PR")
-    # Hold the populated menu so a recording of this journey ends on it.
-    page.wait_for_timeout(2_000)
+    if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
+        # Hold the populated menu so the recorded journey ends on it.
+        page.wait_for_timeout(2_000)
