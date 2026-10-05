@@ -276,21 +276,43 @@ function lastLine(text) {
  * @returns {{ state: string | null, shutdownAt: number | null, rawShutdownTime: string | null } | null}
  */
 function parseArcaStatus(stdout) {
-  const first = stdout.indexOf("{");
-  const last = stdout.lastIndexOf("}");
-  if (first < 0 || last <= first) return null;
-  let status;
-  try {
-    status = JSON.parse(stdout.slice(first, last + 1));
-  } catch {
-    return null;
+  const parseObject = (text) => {
+    try {
+      const value = JSON.parse(text);
+      return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+    } catch {
+      return null;
+    }
+  };
+  let status = parseObject(stdout.trim());
+  if (!status) {
+    for (
+      let start = stdout.indexOf("{");
+      start !== -1 && !status;
+      start = stdout.indexOf("{", start + 1)
+    ) {
+      for (
+        let end = stdout.indexOf("}", start + 1);
+        end !== -1;
+        end = stdout.indexOf("}", end + 1)
+      ) {
+        const candidate = parseObject(stdout.slice(start, end + 1));
+        if (
+          candidate &&
+          (typeof candidate.status === "string" || Object.hasOwn(candidate, "instance"))
+        ) {
+          status = candidate;
+          break;
+        }
+      }
+    }
   }
-  if (!status || typeof status !== "object" || Array.isArray(status)) return null;
+  if (!status) return null;
   const raw = status.instance == null ? status.shutdown_time : status.instance.shutdown_time;
   const rawShutdownTime = typeof raw === "string" ? raw : null;
   const shutdownAt =
-    rawShutdownTime && /(?:Z|[+-]\d{2}:\d{2})$/i.test(rawShutdownTime)
-      ? Date.parse(rawShutdownTime)
+    rawShutdownTime && /(?:Z|[+-]\d{2}:?\d{2})$/i.test(rawShutdownTime)
+      ? Date.parse(rawShutdownTime.replace(/([+-]\d{2})(\d{2})$/, "$1:$2"))
       : NaN;
   return {
     state: typeof status.status === "string" ? status.status : null,
@@ -318,13 +340,21 @@ function runArca(arcaPath, args, options) {
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let exited = false;
+    let exitCode = null;
+    let exitGraceTimer;
     const settle = (result) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(exitGraceTimer);
       resolve({ code: result.code, stdout, stderr, ...result });
     };
     const timer = setTimeout(() => {
+      if (exited) {
+        settle({ code: exitCode });
+        return;
+      }
       try {
         child.kill();
       } catch {
@@ -340,11 +370,19 @@ function runArca(arcaPath, args, options) {
       stderr += String(chunk);
     });
     child.on("error", (error) => settle({ code: null, spawnError: error }));
-    child.on("close", (code) => settle({ code }));
+    child.on("exit", (code) => {
+      if (settled) return;
+      exited = true;
+      exitCode = code;
+      exitGraceTimer = setTimeout(() => settle({ code }), 500);
+      if (typeof exitGraceTimer.unref === "function") exitGraceTimer.unref();
+    });
+    child.on("close", (code) => settle({ code: exited ? exitCode : code }));
   });
 }
 
 /**
+ * Turn a failed status or extend run into an actionable result.
  * @param {{ code: number | null, stdout: string, stderr: string, timedOut?: boolean }} run
  * @param {"status" | "extend"} action
  * @returns {{ ok: false, errorKind: ArcaErrorKind, error: string }}
@@ -403,6 +441,7 @@ function describeArcaCliFailure(run, action) {
 }
 
 /**
+ * Read this machine's Arca instance state and shutdown time.
  * @param {{ resolveArcaPath?: () => string | null, spawn?: typeof spawn, timeoutMs?: number }} [deps]
  * @returns {Promise<{ ok: true, state: string | null, shutdownAt: number | null, rawShutdownTime: string | null } | { ok: false, errorKind: ArcaErrorKind, error: string }>}
  */
@@ -441,6 +480,7 @@ async function readArcaStatus(deps = {}) {
 }
 
 /**
+ * Extend this machine's Arca instance using an approved mode.
  * @param {string} mode
  * @param {{ resolveArcaPath?: () => string | null, spawn?: typeof spawn, timeoutMs?: number }} [deps]
  * @returns {Promise<{ ok: true, message: string } | { ok: false, errorKind: ArcaErrorKind, error: string }>}

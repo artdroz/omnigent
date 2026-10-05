@@ -59,6 +59,12 @@ describe("arca status output", () => {
     });
     status.instance.shutdown_time = "2026-10-05T01:00:00+00:00";
     assert.equal(parseArcaStatus(JSON.stringify(status)).shutdownAt, Date.UTC(2026, 9, 5, 1));
+    status.instance.shutdown_time = "2026-10-05T01:00:00+0000";
+    assert.deepEqual(parseArcaStatus(JSON.stringify(status)), {
+      state: "running",
+      shutdownAt: Date.UTC(2026, 9, 5, 1),
+      rawShutdownTime: "2026-10-05T01:00:00+0000",
+    });
   });
 
   it("handles null instance, null time, and the minimal top-level shape", () => {
@@ -89,6 +95,13 @@ describe("arca status output", () => {
     assert.equal(parseArcaStatus('{"instance":{"shutdown_time":"badZ"}}').shutdownAt, null);
     assert.equal(parseArcaStatus("garbage"), null);
     assert.equal(parseArcaStatus("{broken}"), null);
+  });
+
+  it("finds status JSON around notices containing braces", () => {
+    const json = '{"status":"running","instance":{"shutdown_time":"2026-10-05T01:00:00Z"}}';
+    for (const stdout of [`Notice: run {arca upgrade}\n${json}`, `${json}\nTip: see {docs}`]) {
+      assert.equal(parseArcaStatus(stdout).shutdownAt, Date.UTC(2026, 9, 5, 1));
+    }
   });
 });
 
@@ -129,6 +142,33 @@ describe("arca status command", () => {
       shutdownAt: Date.UTC(2026, 9, 5, 1),
       rawShutdownTime: "2026-10-05T01:00:00Z",
     });
+  });
+
+  it("uses captured output after exit when close never arrives", async () => {
+    const deps = fakeCliSpawn((child) =>
+      queueMicrotask(() => {
+        child.stdout.emit("data", '{"status":"running","instance":null}');
+        child.emit("exit", 0);
+      }),
+    );
+    assert.deepEqual(await readArcaStatus({ ...deps, timeoutMs: 1_000 }), {
+      ok: true,
+      state: "running",
+      shutdownAt: null,
+      rawShutdownTime: null,
+    });
+    assert.equal(deps.calls[0].child.killed, false);
+  });
+
+  it("uses the exit code at the overall timeout when close never arrives", async () => {
+    const deps = fakeCliSpawn((child) =>
+      queueMicrotask(() => {
+        child.stdout.emit("data", '{"status":"running","instance":null}');
+        child.emit("exit", 0);
+      }),
+    );
+    assert.equal((await readArcaStatus({ ...deps, timeoutMs: 20 })).ok, true);
+    assert.equal(deps.calls[0].child.killed, false);
   });
 
   it("maps non-zero exit, timeout, spawn errors, and malformed success", async () => {
