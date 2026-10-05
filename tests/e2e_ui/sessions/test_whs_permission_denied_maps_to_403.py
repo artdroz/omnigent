@@ -201,28 +201,39 @@ def whs_403_server(built_spa: None, tmp_path: Path) -> Iterator[str]:
 
 
 def test_whs_permission_denied_is_handled_not_500(
-    page: Page,
+    request: pytest.FixtureRequest,
     whs_403_server: str,
 ) -> None:
     """A WHS gRPC ``PERMISSION_DENIED`` must surface as a handled 403, not a 500.
 
     Drives the real SPA to render the user-visible failure (the sidebar's
-    "Failed to load" state), then pins the fix target on the HTTP contract:
-    ``GET /v1/sessions`` must answer ``403 forbidden`` instead of the unhandled
-    ``500 internal_error`` the bug produces.
+    "Failed to load" state), checks that the failure names the denied resource
+    and a remedy, then pins the fix target on the HTTP contract:
+    ``GET /v1/sessions`` must answer ``403 upstream_permission_denied`` instead
+    of the unhandled ``500 internal_error`` the bug produces.
 
-    :param page: Playwright page fixture (fresh context per test; filmed via
-        ``--video`` for the reproduction clip).
+    :param request: Opens the Playwright ``page`` fixture only once the server
+        is up, so a recording starts at the user's first navigation instead of
+        on a blank page while the server boots.
     :param whs_403_server: Base URL of the app whose session listing hits the
         WHS 403 stand-in.
     """
+    page: Page = request.getfixturevalue("page")
+
     # 1. Drive the real user journey: open the app; the sidebar issues its
     #    session-list query on load, which hits the WHS 403.
     page.goto(f"{whs_403_server}/", wait_until="domcontentloaded")
 
     # The sidebar surfaces a load failure once the query settles. This renders
     # for the reproduction footage regardless of the eventual status code.
-    expect(page.get_by_text("Failed to load", exact=False).first).to_be_visible(timeout=30_000)
+    failure = page.get_by_text("Failed to load", exact=False).first
+    expect(failure).to_be_visible(timeout=30_000)
+    # The user must see what was denied and what to do about it, not the
+    # generic "An internal error occurred." the unhandled 500 produced.
+    expect(failure).to_contain_text("/v1/sessions")
+    expect(failure).to_contain_text("denied by a backing service")
+    # Hold the failed state on screen so the recording shows what the user sees.
+    page.wait_for_timeout(1_500)
 
     # 2. Pin the fix target on the server contract. Today the gRPC
     #    PERMISSION_DENIED escapes to _handle_unhandled_exception and the
