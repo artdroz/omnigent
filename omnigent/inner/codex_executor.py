@@ -720,33 +720,37 @@ def codex_skill_sources(
     codex_home: Path | None = None,
 ) -> list[Path]:
     """
-    Build the ordered Codex skill-source list: bundle skills, then host skills.
+    Build the ordered Codex skill-source list: bundle, Codex home, then shared skills.
 
     The single source of truth for *where* Codex skills come from, shared
     by :func:`populate_codex_skills_from_bundle` (which symlinks them into
     ``$CODEX_HOME/skills/``) and the slash-command menu's ``codex_host_skills``
     provider — so the linked set and the menu cannot drift on which roots
-    are scanned. Priority order: the agent's own ``<bundle>/skills/`` before
-    the host-installed skills dir (a bundled skill shadows a host skill of
+    are scanned. Priority order: the agent's own ``<bundle>/skills/``, then
+    the host-installed Codex skills dir, then the vendor-neutral shared user
+    dir ``<home>/.agents/skills`` (an earlier source shadows a later skill of
     the same name). Only existing directories are returned.
 
     :param bundle_dir: Materialized agent-bundle root, or ``None``.
     :param home: The user home directory (``Path.home()``); injected so
         tests and the menu provider can pin it. The host skills dir defaults
-        to ``<home>/.codex/skills``.
+        to ``<home>/.codex/skills``; the shared dir is ``<home>/.agents/skills``.
     :param codex_home: When set, the resolved Codex home whose ``skills/`` is
         the host source instead of ``<home>/.codex/skills``. Codex honors
         ``$CODEX_HOME`` for its config, so the native launch passes the
         resolved home here to keep the seeded skills and the menu in step with
-        the CLI's own ``$CODEX_HOME``.
+        the CLI's own ``$CODEX_HOME``. The shared dir lives under *home*, not
+        the Codex home, so this override leaves it in place.
     :returns: Existing skill-dir roots in priority order.
     """
     sources: list[Path] = []
     if bundle_dir is not None and (bundle_dir / "skills").is_dir():
         sources.append(bundle_dir / "skills")
     host = (codex_home if codex_home is not None else home / ".codex") / "skills"
-    if host.is_dir():
-        sources.append(host)
+    shared = home / ".agents" / "skills"
+    for candidate in (host, shared):
+        if candidate.is_dir():
+            sources.append(candidate)
     return sources
 
 
@@ -929,8 +933,9 @@ def populate_codex_skills_from_bundle(
 
     Shared by the wrapped ``codex`` executor and the ``codex-native``
     launch path so both expose the same skill surface. Builds the source
-    list in priority order — the agent's own ``<bundle>/skills/`` before
-    the host skills dir (so a bundled skill shadows a host skill of the same
+    list in priority order via :func:`codex_skill_sources` — the agent's own
+    ``<bundle>/skills/``, then the host Codex skills dir, then the shared
+    ``~/.agents/skills`` (an earlier source shadows a later skill of the same
     name) — and delegates to :func:`_populate_codex_skills`, which honours
     ``skills_filter`` (``"all"`` / ``"none"`` / list of names).
 

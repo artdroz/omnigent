@@ -3573,6 +3573,28 @@ def test_populate_codex_skills_from_bundle_sources_from_codex_home(tmp_path: Pat
     assert (linked / "SKILL.md").is_file()
 
 
+def test_populate_codex_skills_from_bundle_links_shared_agents_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``~/.agents/skills`` skill is linked into ``<codex_home>/skills`` like a host skill.
+
+    The shared user dir is part of the same source list the menu reads, so a
+    skill the menu lists from there is also seeded for the Codex session.
+    """
+    from omnigent.inner.codex_executor import populate_codex_skills_from_bundle
+
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    _make_skill_dir(home / ".agents" / "skills", "shared-skill")
+    codex_home = tmp_path / "codex_home"
+
+    populate_codex_skills_from_bundle(codex_home, None, "all")
+
+    linked = codex_home / "skills" / "shared-skill"
+    assert linked.is_symlink() or linked.is_dir()
+    assert (linked / "SKILL.md").is_file()
+
+
 def test_populate_codex_skills_from_bundle_none_leaves_no_dir(tmp_path: Path) -> None:
     """
     ``skills_filter="none"`` produces no ``skills/`` dir even when the
@@ -4891,6 +4913,39 @@ def test_codex_skill_sources_omits_absent_dirs(tmp_path: Path) -> None:
     (home / ".codex" / "skills").mkdir(parents=True)
     assert codex_skill_sources(None, home) == [home / ".codex" / "skills"]
     assert codex_skill_sources(tmp_path / "no-bundle", home) == [home / ".codex" / "skills"]
+
+
+def test_codex_skill_sources_appends_shared_agents_dir(tmp_path: Path) -> None:
+    """``<home>/.agents/skills`` follows the Codex skills dir under either Codex home.
+
+    The shared user dir lives under the user home, not the Codex home, so a
+    custom ``codex_home`` swaps only the middle source. An earlier source still
+    wins a name collision, so a Codex-dir skill shadows a shared one.
+    """
+    from omnigent.inner.codex_executor import codex_skill_sources, select_codex_skill_dirs
+
+    bundle = tmp_path / "bundle"
+    (bundle / "skills").mkdir(parents=True)
+    home = tmp_path / "home"
+    _mk_codex_skill(home / ".codex" / "skills", "shared-name")
+    _mk_codex_skill(home / ".agents" / "skills", "shared-name")
+    _mk_codex_skill(home / ".agents" / "skills", "agents-only")
+    custom = tmp_path / "custom-codex-home"
+    (custom / "skills").mkdir(parents=True)
+
+    assert codex_skill_sources(bundle, home) == [
+        bundle / "skills",
+        home / ".codex" / "skills",
+        home / ".agents" / "skills",
+    ]
+    assert codex_skill_sources(bundle, home, codex_home=custom) == [
+        bundle / "skills",
+        custom / "skills",
+        home / ".agents" / "skills",
+    ]
+    selected = select_codex_skill_dirs("all", codex_skill_sources(None, home))
+    assert selected["shared-name"] == home / ".codex" / "skills" / "shared-name"
+    assert selected["agents-only"] == home / ".agents" / "skills" / "agents-only"
 
 
 def test_clean_codex_env_honors_extra_allow(monkeypatch):

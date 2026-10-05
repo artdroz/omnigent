@@ -233,24 +233,51 @@ def test_claude_sdk_keeps_generic_walk_native_matches_terminal(
 def test_codex_native_and_sdk_agree_without_a_configured_codex_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Without a configured ``$CODEX_HOME`` both codex harnesses read ``~/.codex``.
+    """Without a configured ``$CODEX_HOME`` both codex harnesses read the same dirs.
 
-    The Codex provider never scans ``.agents`` and, absent a resolved
-    ``$CODEX_HOME`` (``ctx.codex_home is None``), the native provider falls back
-    to the same ``~/.codex/skills`` the SDK path uses — so the two agree until a
-    custom codex home is in play (see the divergence test below).
+    Both providers list ``~/.codex/skills`` plus the shared ``~/.agents/skills``
+    and, absent a resolved ``$CODEX_HOME`` (``ctx.codex_home is None``), the
+    native provider falls back to the same ``~/.codex/skills`` the SDK path uses
+    — so the two agree until a custom codex home is in play (see the divergence
+    test below).
     """
     home = tmp_path / "home"
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     _write_skill(home / ".codex" / "skills", "codex-host-skill")
-    _write_skill(home / ".agents" / "skills", "agents-only-skill")
+    _write_skill(home / ".agents" / "skills", "agents-shared-skill")
     workspace = tmp_path / "ws"
     workspace.mkdir()
     ctx = _ctx(workspace, home)
 
     native = {s.name for s in resolve_harness_skills(ctx, "codex-native")}
     sdk = {s.name for s in resolve_harness_skills(ctx, "codex")}
-    assert native == sdk == {"codex-host-skill"}
+    assert native == sdk == {"codex-host-skill", "agents-shared-skill"}
+
+
+def test_codex_provider_surfaces_shared_agents_skills_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex surfaces skills from the shared ``~/.agents/skills`` user dir.
+
+    A skill saved under ``~/.agents/skills`` must appear for both codex harnesses
+    alongside the ``~/.codex/skills`` user-dir skills. Because the Codex source
+    list is shared with the executor that symlinks those roots into
+    ``$CODEX_HOME/skills/``, the shared dir would be runnable in the terminal too.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    _write_skill(home / ".codex" / "skills", "codex-host-skill")
+    _write_skill(home / ".agents" / "skills", "agents-shared-skill")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    ctx = _ctx(workspace, home)
+
+    native = {s.name for s in resolve_harness_skills(ctx, "codex-native")}
+    sdk = {s.name for s in resolve_harness_skills(ctx, "codex")}
+    assert "agents-shared-skill" in native
+    assert "agents-shared-skill" in sdk
+    assert "codex-host-skill" in native
+    assert "codex-host-skill" in sdk
 
 
 def test_codex_native_honors_codex_home_sdk_keeps_home_codex(
@@ -262,11 +289,13 @@ def test_codex_native_honors_codex_home_sdk_keeps_home_codex(
     ``$CODEX_HOME`` (its launch seeds the per-bridge home from that resolved
     home), so the menu must read it too. The in-process ``codex`` (SDK) harness
     has no such terminal, so it stays on ``~/.codex`` — the same seeded tree
-    must diverge by harness.
+    must diverge by harness. The shared ``~/.agents/skills`` dir lives under the
+    user home rather than the Codex home, so both harnesses keep listing it.
     """
     home = tmp_path / "home"
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     _write_skill(home / ".codex" / "skills", "default-codex-skill")
+    _write_skill(home / ".agents" / "skills", "agents-shared-skill")
     custom = tmp_path / "custom-codex-home"
     _write_skill(custom / "skills", "custom-codex-skill")
     workspace = tmp_path / "ws"
@@ -276,8 +305,8 @@ def test_codex_native_honors_codex_home_sdk_keeps_home_codex(
     native = {s.name for s in resolve_harness_skills(ctx, "codex-native")}
     sdk = {s.name for s in resolve_harness_skills(ctx, "codex")}
     # Native reads $CODEX_HOME's skills; SDK ignores codex_home and reads ~/.codex.
-    assert native == {"custom-codex-skill"}
-    assert sdk == {"default-codex-skill"}
+    assert native == {"custom-codex-skill", "agents-shared-skill"}
+    assert sdk == {"default-codex-skill", "agents-shared-skill"}
 
 
 def test_claude_provider_defaults_user_tier_to_home_claude(
