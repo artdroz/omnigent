@@ -1186,12 +1186,54 @@ async def _tmux_window_width(sock: Path, target: str) -> int:
     return int(out.decode().strip())
 
 
+async def _tmux_client_widths(sock: Path) -> list[int]:
+    tmux = shutil.which("tmux")
+    assert tmux
+    proc = await asyncio.create_subprocess_exec(
+        tmux,
+        "-S",
+        str(sock),
+        "list-clients",
+        "-F",
+        "#{client_width}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await proc.communicate()
+    return [int(w) for w in out.decode().split() if w.strip().isdigit()]
+
+
+async def _wait_for_client_width(sock: Path, width: int) -> None:
+    """Wait until an attached client reports ``width`` columns.
+
+    A client's size reaches tmux only once the bridge forwards its resize, so a
+    client reaching ``width`` signals that tmux has run its window-size policy
+    for that client -- more reliable than a fixed sleep on a loaded machine.
+    """
+    for _ in range(100):
+        if width in await _tmux_client_widths(sock):
+            return
+        await asyncio.sleep(0.1)
+    raise AssertionError(
+        f"no client reached {width} columns; saw {await _tmux_client_widths(sock)}"
+    )
+
+
+async def _wait_for_client_count(sock: Path, count: int) -> None:
+    for _ in range(100):
+        if len(await _tmux_client_widths(sock)) == count:
+            return
+        await asyncio.sleep(0.1)
+    raise AssertionError(
+        f"expected {count} attached client(s); saw {await _tmux_client_widths(sock)}"
+    )
+
+
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
 async def test_second_interactive_client_does_not_shrink_first_clients_pane() -> None:
     """A second owner tab (a phone) attaching narrower leaves the desktop pane wide."""
     sock, target = await _new_private_tmux("cat")
-    await asyncio.sleep(0.3)
 
     desktop = _FakeWebSocket(
         inbound=[{"type": "websocket.receive", "text": '{"type":"resize","cols":160,"rows":40}'}]
@@ -1208,17 +1250,21 @@ async def test_second_interactive_client_does_not_shrink_first_clients_pane() ->
     desktop_task = asyncio.create_task(_attach(desktop))
     phone_task: asyncio.Task[None] | None = None
     try:
-        await asyncio.sleep(0.8)
+        # Wait for the desktop's 160-col resize to reach tmux before sampling.
+        await _wait_for_client_width(sock, 160)
         assert await _tmux_window_width(sock, target) == 160
 
+        # Attach the phone and wait for its 45-col resize to land, so tmux has
+        # run its window-size policy for both clients before we read the width.
         phone_task = asyncio.create_task(_attach(phone))
-        await asyncio.sleep(0.8)
+        await _wait_for_client_width(sock, 45)
         width_with_phone = await _tmux_window_width(sock, target)
 
+        # Detach the phone and wait for tmux to drop it.
         phone._recv_gate.set()
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(phone_task, timeout=5)
-        await asyncio.sleep(0.5)
+        await _wait_for_client_count(sock, 1)
         width_after_phone_left = await _tmux_window_width(sock, target)
 
         assert width_with_phone == 160, (
