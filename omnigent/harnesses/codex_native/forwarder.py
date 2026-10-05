@@ -2966,14 +2966,26 @@ def _omnigent_status_from_resume_turn(turn: _JsonObject) -> str | None:
     # A ``turn.error`` forces ``failed`` regardless of the recorded status.
     if _terminal_error_from_turn({"turn": turn}) is not None:
         return "failed"
-    status = turn.get("status")
-    if isinstance(status, dict):
-        status = status.get("type") or status.get("status")
+    status = _raw_turn_status(turn)
     if status in {"completed", "interrupted", "cancelled", "canceled"}:
         return "idle"
     if status in {"failed", "errored"}:
         return "failed"
     return None
+
+
+def _raw_turn_status(turn: _JsonObject) -> object:
+    """
+    Return a Codex turn's status literal, unwrapping the object form.
+
+    :param turn: Codex turn object, e.g. ``{"id": "turn_123", "status":
+        "completed"}`` or with ``{"status": {"type": "completed"}}``.
+    :returns: The status value, e.g. ``"completed"``, or ``None`` when absent.
+    """
+    status = turn.get("status")
+    if isinstance(status, dict):
+        return status.get("type") or status.get("status")
+    return status
 
 
 def _latest_resume_turn_status(response: CodexMessage) -> str | None:
@@ -2995,10 +3007,7 @@ def _latest_resume_turn_status(response: CodexMessage) -> str | None:
     status = _omnigent_status_from_resume_turn(turn)
     if status is not None:
         return status
-    raw_status = turn.get("status")
-    if isinstance(raw_status, dict):
-        raw_status = raw_status.get("type") or raw_status.get("status")
-    return "running" if raw_status in _CODEX_ACTIVE_TURN_STATUSES else None
+    return "running" if _raw_turn_status(turn) in _CODEX_ACTIVE_TURN_STATUSES else None
 
 
 async def _handle_event(

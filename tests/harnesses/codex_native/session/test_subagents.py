@@ -1017,7 +1017,12 @@ class _SuspendingResumeClient(_PerThreadFakeCodexClient):
 
 
 def _child_resume_response_with_turns(statuses: list[str]) -> dict[str, Any]:
-    """Build a child ``thread/resume`` response whose turns carry ``statuses`` in order."""
+    """
+    Build a child ``thread/resume`` response whose turns carry ``statuses`` in order.
+
+    :param statuses: Non-empty list of Codex turn statuses, oldest first.
+    :returns: JSON-RPC ``thread/resume`` response.
+    """
     response = _child_resume_response(turn_status=statuses[0])
     turns = response["result"]["thread"]["turns"]
     for index, status in enumerate(statuses[1:], start=2):
