@@ -359,6 +359,37 @@ describe("Arca shutdown watch", () => {
     assert.equal(h.prompts[1].shutdownAt, 5 * HOUR);
   });
 
+  it("confirms the new deadline after opt-out without scheduling more reads", async () => {
+    let enabled = true;
+    let extendCalls = 0;
+    const results = [];
+    const h = makeWatch({
+      statuses: [running(2 * HOUR), running(11 * HOUR)],
+      enabled: () => enabled,
+      prompt: () => {
+        enabled = false;
+        return { mode: "overnight" };
+      },
+      extend: async () => {
+        extendCalls++;
+        return { ok: true, message: "extended" };
+      },
+      onExtendResult: (result) => results.push(result),
+    });
+    h.watch.start();
+    await flush();
+    assert.equal(extendCalls, 1);
+    assert.equal(h.reads, 2);
+    assert.deepEqual(results, [{ ok: true, mode: "overnight", shutdownAt: 18 * HOUR }]);
+    assert.equal(h.watch.getState().phase, "idle");
+    assert.equal(h.watch.getState().nextCheckAt, null);
+    await h.clock.advanceTo(DAY);
+    h.watch.onResume();
+    await flush();
+    assert.equal(h.reads, 2);
+    assert.equal(h.clock.timers.size, 0);
+  });
+
   it("reports extension failure without repeating the same prompt key", async () => {
     const results = [];
     const h = makeWatch({

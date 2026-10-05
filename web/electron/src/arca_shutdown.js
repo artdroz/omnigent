@@ -212,8 +212,8 @@ function createArcaShutdownWatch({
     }
   }
 
-  async function readAndCache() {
-    if (!enabled()) {
+  async function readAndCache({ confirmExtend = false } = {}) {
+    if (!confirmExtend && !enabled()) {
       clearScheduled();
       shutdownAt = null;
       effectiveAt = null;
@@ -233,7 +233,7 @@ function createArcaShutdownWatch({
       shutdownAt = null;
       effectiveAt = null;
       safeLog(`arca shutdown: status failed (${status?.errorKind ?? "unknown"}): ${status?.error}`);
-      armRetry();
+      if (!confirmExtend || enabled()) armRetry();
       return false;
     }
     failedReads = 0;
@@ -342,12 +342,12 @@ function createArcaShutdownWatch({
       return;
     }
     clearScheduled();
-    const active = await readAndCache();
+    const active = await readAndCache({ confirmExtend: true });
     if (disposed) return;
     phase = "extending";
     await notifyExtend({ ok: true, mode, shutdownAt: active ? effectiveAt : null });
     if (disposed) return;
-    if (active && !pendingFresh) await planCached(false);
+    if (active && !pendingFresh && enabled()) await planCached(false);
   }
 
   async function evaluate(launch) {
