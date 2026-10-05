@@ -154,6 +154,12 @@ readiness; name pending publication/review steps in `remaining_work`.
   the governing-definition citation and real configured-path observation requested
   by `resolve-investigate`, or the specific missing evidence; do not defer a
   feasible check merely to finish.
+  Before finalizing `test_audit`, verify an actual defining-source read and the
+  file, symbol and value for each governing shared definition. If none exists,
+  record the bounded search; a filename or caller reference alone is insufficient.
+  Execute missing feasible reads and keep unresolved definition gaps explicit.
+  Distinguish observed effects from expected downstream behavior: unexercised
+  reconnect or recovery paths remain unverified in every summary field.
 - `review_body` — the PR-facing review text from Step 2A. Fill it in for
   `reviewed_existing_pr`, including workflow-owned publication; use `""` in
   other modes. State the verdict and reason first, then separate the proof and
