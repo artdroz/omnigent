@@ -3126,6 +3126,9 @@ def create_app(
             # files a session into a project (owner-private membership).
             project_store=project_store,
             background_title_coordinator=background_title_coordinator,
+            register_runner_ingest=lambda handler: setattr(
+                app.state, "runner_event_ingest", handler
+            ),
         ),
         prefix="/v1",
         tags=["sessions"],
@@ -3320,38 +3323,65 @@ def create_app(
         if pending is not None and not pending.done():
             pending.cancel()
 
-    async def _mark_disconnected_runner_failed(runner_id: str) -> None:
-        """Reconcile a dropped runner's sessions once the grace expires.
+    async def _mark_disconnected_runner_failed(
+        runner_id: str, reference_stamp: int | None
+    ) -> None:
+        """Reconcile a dropped runner's sessions once the liveness lease expires.
 
-        A runner that re-registered inside the grace makes this a no-op
-        via the live-tunnel re-check (the same newest-wins rule the
-        immediate path used); one still gone hands its bound sessions to
+        Waits for the runner to re-register on this replica, event-driven,
+        for the whole liveness lease (:data:`RUNNER_DISCONNECT_GRACE_S`,
+        sized to :data:`RUNNER_LIVENESS_TTL_S`). A reconnect resolves the
+        wait at once and makes this a no-op, so a Wi-Fi roam, VPN stall,
+        ingress recycle, or sleep/resume that comes back within the lease
+        never flaps its sessions to failed. A runner still absent when the
+        lease expires hands its bound sessions to
         :func:`_mark_runner_sessions_offline`, which fails only the
         interrupted turns and stamps the disconnect cause.
+
+        This is the transport-drop path only. A runner that actually
+        crashed is reported by its daemon on the host tunnel and handled by
+        :func:`_on_runner_exited`, which fails fast and cancels this timer,
+        so waiting out the lease here costs nothing on real death.
 
         A server that is itself shutting down skips the marking too: it
         closed the tunnel, and the runner cannot re-register with a
         process that stopped listening — the replacement server re-adopts
         it on reconnect (:mod:`omnigent.server.shutdown_state`).
 
+        A runner confirmed live on another replica (via
+        :func:`_runner_live_on_another_replica_from_conversations`) skips it too: that
+        replica's tunnel is authoritative now, and this one's registry
+        only ever knew about its own connections.
+
         :param runner_id: The disconnected runner's id.
+        :param reference_stamp: This replica's own last liveness stamp for
+            *runner_id*, captured in :func:`_on_runner_disconnect` before
+            the clear — the reference the cross-replica check compares
+            against.
         """
         from omnigent.server.routes.sessions import (
             RUNNER_DISCONNECT_GRACE_S,
             _mark_runner_sessions_offline,
+            _relinquish_session_live_state,
+            _runner_live_on_another_replica_from_conversations,
         )
         from omnigent.server.schemas import ErrorDetail
 
-        await asyncio.sleep(RUNNER_DISCONNECT_GRACE_S)
+        # Event-driven: `register` resolves the wait the instant the runner
+        # reconnects here. A non-positive grace collapses to an immediate
+        # registry check, matching the sleep(0) behavior tests pin.
+        reconnected = await tunnel_registry.wait_for_runner(
+            runner_id, timeout_s=RUNNER_DISCONNECT_GRACE_S
+        )
         if shutdown_state.server_shutting_down():
             _logger.info(
                 "Runner %s dropped because this server is shutting down; skipping offline-marking",
                 runner_id,
             )
             return
-        if tunnel_registry.get(runner_id) is not None:
+        if reconnected is not None:
             _logger.info(
-                "Runner %s reconnected within the disconnect grace; skipping offline-marking",
+                "Runner %s reconnected within the liveness lease; skipping offline-marking",
                 runner_id,
             )
             return
@@ -3365,6 +3395,16 @@ def create_app(
         affected = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
+        if _runner_live_on_another_replica_from_conversations(
+            affected, runner_id, reference_stamp
+        ):
+            for conv in affected:
+                _relinquish_session_live_state(conv.id)
+            _logger.info(
+                "Runner %s is live on another replica; skipping offline-marking",
+                runner_id,
+            )
+            return
         _logger.warning(
             "Runner %s disconnected; reconciling %d bound session(s)",
             runner_id,
@@ -3424,6 +3464,10 @@ def create_app(
             extra=debug_event("runner_disconnected", runner_id=runner_id),
         )
         runner_session_initializer.invalidate_runner(runner_id)
+        # Capture this replica's own last stamp before clearing, so the grace
+        # timer can tell a fresher stamp another replica writes later from
+        # one we wrote ourselves (the clear itself never erases this record).
+        reference_stamp = session_live_state.last_liveness_stamp(runner_id)
         # Graceful disconnect: clear the persisted liveness stamp so other replicas
         # flip offline at once. Not on our own shutdown: the runner is alive and
         # re-tunnels to the replacement, which must not settle its turns to idle.
@@ -3436,7 +3480,7 @@ def create_app(
         # each outage a full grace window.
         _cancel_disconnect_grace(runner_id)
         task = asyncio.create_task(
-            _mark_disconnected_runner_failed(runner_id),
+            _mark_disconnected_runner_failed(runner_id, reference_stamp),
             name=f"runner-disconnect-grace-{runner_id}",
         )
         _disconnect_grace_tasks[runner_id] = task
@@ -3447,7 +3491,7 @@ def create_app(
 
         task.add_done_callback(_clear_grace_slot)
 
-    async def _on_runner_exited(runner_id: str, error: str) -> None:
+    async def _on_runner_exited(host_id: str, runner_id: str, error: str) -> None:
         """Mark a crashed runner's session(s) failed and push the cause.
 
         Fired by the host tunnel when a daemon reports
@@ -3461,10 +3505,12 @@ def create_app(
         sub-agent is not, since its work finished on a runner that was
         already live.
 
+        :param host_id: The reporting host's id.
         :param runner_id: The crashed runner's id.
         :param error: Human-readable cause from the daemon (exit code +
             log tail), e.g. ``"runner process exited with code 1 ..."``.
         """
+        from omnigent.server.routes.host_tunnel import log_runner_exited
         from omnigent.server.routes.sessions import _mark_runner_sessions_offline
         from omnigent.server.schemas import ErrorDetail
 
@@ -3472,15 +3518,18 @@ def create_app(
         # cancel any pending disconnect-grace timer so it can't re-run the
         # disconnect reconciliation on top of it.
         _cancel_disconnect_grace(runner_id)
-        affected = await asyncio.to_thread(
-            conversation_store.list_conversations_by_runner_id, runner_id
-        )
-        _logger.warning(
-            "Runner %s reported crashed; reconciling %d bound session(s): %s",
-            runner_id,
-            len(affected),
-            error,
-        )
+        try:
+            affected = await asyncio.to_thread(
+                conversation_store.list_conversations_by_runner_id, runner_id
+            )
+        except Exception:
+            # Never lose the crash event to a failed session lookup.
+            log_runner_exited(host_id, runner_id, error)
+            raise
+        # One row per bound session so every crash is attributable; a runner
+        # with no bound session still gets a session-less row.
+        for session_id in [conv.id for conv in affected] or [None]:
+            log_runner_exited(host_id, runner_id, error, session_id=session_id)
         await _mark_runner_sessions_offline(
             affected,
             ErrorDetail(code="runner_failed_to_start", message=error),
@@ -3685,8 +3734,12 @@ def create_app(
     # except (a hidden failure). No host_store = host support is simply
     # not enabled (host connects get 404), rather than silently broken.
     if host_store is not None:
+        from omnigent.server.routes.harness_startup import create_harness_startup_router
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
         from omnigent.server.routes.hosts import create_hosts_router
+        from omnigent.server.routes.mcp_servers import create_mcp_servers_router
+        from omnigent.server.routes.plugins import create_plugins_router
+        from omnigent.server.routes.skill_content import create_skill_content_router
         from omnigent.server.routes.skills import create_skills_router
 
         async def _on_hosts_changed(_host_id: str, owner: str | None) -> None:
@@ -3732,6 +3785,26 @@ def create_app(
             ),
             prefix="/v1",
             tags=["skills"],
+        )
+        app.include_router(
+            create_harness_startup_router(host_registry, host_store, auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+        app.include_router(
+            create_plugins_router(host_registry, host_store, auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+        app.include_router(
+            create_skill_content_router(host_registry, host_store, auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+        app.include_router(
+            create_mcp_servers_router(host_registry, host_store, auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["hosts"],
         )
         # Host-facing credential vending: a sandbox fetches its owner's
         # per-provider credential over the launch-token-authenticated channel

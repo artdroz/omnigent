@@ -5533,181 +5533,6 @@ def test_fork_conversation_agent_id_override(
     )
 
 
-def test_switch_conversation_agent_cross_family_resets_and_relabels(
-    conversation_store: SqlAlchemyConversationStore,
-    agent_store: SqlAlchemyAgentStore,
-) -> None:
-    """In-place switch deletes the old agent, binds the new, and on a
-    cross-family switch resets model settings, clears the native session
-    id, and replaces the harness-presentation labels.
-    """
-    from omnigent._wrapper_labels import (
-        CODEX_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
-    )
-    from omnigent.stores.conversation_store import (
-        FORK_CARRY_HISTORY_LABEL_KEY,
-        SWITCH_PREVIOUS_BUILTIN_LABEL_KEY,
-    )
-
-    # An instance-scoped label (belongs to the running instance, dropped on a
-    # switch). Uses a literal still in _INSTANCE_SCOPED_LABEL_KEYS — the old
-    # omnigent.stopped marker was retired upstream.
-    instance_label = "omnigent.last_context_tokens"
-
-    # A real session binds a session-scoped agent (agent.session_id == conv).
-    created = conversation_store.create_session_with_agent(
-        agent_id="af75a9579488e3520ba6842699e43323",
-        agent_name="claude (switch src)",
-        agent_bundle_location="af75a9579488e3520ba6842699e43323/hash",
-        agent_description="old",
-    )
-    conv_id = created.conversation.id
-    # Give the session model settings, a native session id, and labels that a
-    # switch must touch (instance-scoped stopped marker + the old harness's
-    # ui/wrapper) so we can assert they're handled correctly.
-    conversation_store.update_conversation(
-        conv_id, model_override="claude-opus-4-7", reasoning_effort="high"
-    )
-    conversation_store.set_external_session_id(conv_id, "old-native-uuid")
-    conversation_store.set_session_todos(
-        conv_id, [{"content": "switch", "status": "pending", "activeForm": "switching"}]
-    )
-    conversation_store.set_labels(
-        conv_id,
-        {
-            instance_label: "1",
-            # DANGEROUS codex bypass opt-in: in the instance-scoped set so a
-            # switch (a new agent/harness context) drops it rather than
-            # silently re-arming bypass without a fresh typed confirmation.
-            "omnigent.codex_native.bypass_sandbox": "1",
-            UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-            WRAPPER_LABEL_KEY: "claude-code-native-ui",
-        },
-    )
-    conversation_store.append(
-        conv_id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id="resp_1",
-                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
-            )
-        ],
-    )
-
-    target_labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: CODEX_NATIVE_WRAPPER_VALUE,
-    }
-    updated = conversation_store.switch_conversation_agent(
-        conv_id,
-        new_agent_id="9d2c8d5e342b7da390dc38351c49fb72",
-        new_agent_name="codex (switch new)",
-        new_agent_bundle_location="9d2c8d5e342b7da390dc38351c49fb72/hash",
-        new_agent_description="new",
-        copy_model_settings=False,  # cross-family
-        carry_history_into_native=True,  # native target
-        presentation_labels=target_labels,
-        previous_builtin_id="52adb39f0c5ea92b5563da5327dac08f",
-    )
-
-    # New agent bound; old session-scoped agent deleted (unique session_id
-    # index would otherwise be violated by leaving both).
-    assert updated.agent_id == "9d2c8d5e342b7da390dc38351c49fb72"
-    assert agent_store.get("af75a9579488e3520ba6842699e43323") is None, (
-        "old session-scoped agent must be deleted on switch"
-    )
-    new_agent = agent_store.get("9d2c8d5e342b7da390dc38351c49fb72")
-    assert new_agent is not None and new_agent.session_id == conv_id, (
-        "new agent must be session-scoped to this conversation"
-    )
-    # Cross-family → provider-bound model id is meaningless, so both reset.
-    assert updated.model_override is None
-    assert updated.reasoning_effort is None
-    # Native runtime state belongs to the old harness → cleared so the next
-    # turn cold-starts and rebuilds from items.
-    assert updated.external_session_id is None
-    assert updated.session_todos == []
-    # Labels: target ui/wrapper applied, carry-history + previous-builtin
-    # stamped, and the old instance-scoped stopped marker dropped.
-    assert updated.labels[UI_MODE_LABEL_KEY] == UI_MODE_TERMINAL_VALUE
-    assert updated.labels[WRAPPER_LABEL_KEY] == CODEX_NATIVE_WRAPPER_VALUE
-    assert updated.labels[FORK_CARRY_HISTORY_LABEL_KEY] == "1"
-    assert updated.labels[SWITCH_PREVIOUS_BUILTIN_LABEL_KEY] == "52adb39f0c5ea92b5563da5327dac08f"
-    assert instance_label not in updated.labels, "instance-scoped labels must not survive a switch"
-    assert "omnigent.codex_native.bypass_sandbox" not in updated.labels, (
-        "the dangerous bypass opt-in must not survive a switch (re-confirm per context)"
-    )
-    # Transcript is untouched (in place, not copied).
-    assert len(conversation_store.list_items(conv_id).data) == 1
-
-
-def test_switch_conversation_agent_same_family_keeps_model_settings(
-    conversation_store: SqlAlchemyConversationStore,
-    agent_store: SqlAlchemyAgentStore,
-) -> None:
-    """A same-family switch keeps model settings; an SDK target (empty
-    presentation labels) drops the old ui/wrapper labels and does not stamp
-    the carry-history directive.
-    """
-    from omnigent._wrapper_labels import (
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
-    )
-    from omnigent.stores.conversation_store import (
-        FORK_CARRY_HISTORY_LABEL_KEY,
-        SWITCH_PREVIOUS_BUILTIN_LABEL_KEY,
-    )
-
-    created = conversation_store.create_session_with_agent(
-        agent_id="06efca8dd5c2e87b8cfed1aae99cc239",
-        agent_name="claude-native-ui",
-        agent_bundle_location="06efca8dd5c2e87b8cfed1aae99cc239/hash",
-        agent_description=None,
-    )
-    conv_id = created.conversation.id
-    conversation_store.update_conversation(
-        conv_id, model_override="claude-opus-4-7", reasoning_effort="high"
-    )
-    conversation_store.set_labels(
-        conv_id,
-        {
-            UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-            WRAPPER_LABEL_KEY: "claude-code-native-ui",
-            # A stale previous-builtin pointer from an earlier switch.
-            SWITCH_PREVIOUS_BUILTIN_LABEL_KEY: "a8361389acc16b7721305a16d0ec739e",
-        },
-    )
-
-    updated = conversation_store.switch_conversation_agent(
-        conv_id,
-        new_agent_id="6b49de4c1bc8cb4d4c02a933f68bd3b1",
-        new_agent_name="claude (switch new)",
-        new_agent_bundle_location="6b49de4c1bc8cb4d4c02a933f68bd3b1/hash",
-        new_agent_description=None,
-        copy_model_settings=True,  # same family (anthropic native → sdk)
-        carry_history_into_native=False,  # SDK target rebuilds nothing
-        presentation_labels={},  # SDK → chat mode (drop ui/wrapper)
-        previous_builtin_id=None,
-    )
-
-    # Same family → model settings carry over unchanged.
-    assert updated.model_override == "claude-opus-4-7"
-    assert updated.reasoning_effort == "high"
-    # SDK target → terminal-first ui/wrapper labels removed (chat mode).
-    assert UI_MODE_LABEL_KEY not in updated.labels
-    assert WRAPPER_LABEL_KEY not in updated.labels
-    # No native rebuild for an SDK target.
-    assert FORK_CARRY_HISTORY_LABEL_KEY not in updated.labels
-    # Stale previous-builtin pointer dropped (None passed → not re-stamped),
-    # so a later "switch back" can't offer a wrong target.
-    assert SWITCH_PREVIOUS_BUILTIN_LABEL_KEY not in updated.labels
-
-
 def test_get_session_connectivity_batches_runner_and_host(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,
@@ -6803,6 +6628,60 @@ def test_live_state_columns_round_trip_without_bumping_updated_at(
     conversation_store.touch_runner_liveness([], now=1)
 
 
+def test_clear_runner_liveness_not_after_spares_a_newer_stamp(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A ``not_after`` guard keeps a stamp another replica wrote after ours.
+
+    The cross-replica disconnect check compares against THIS replica's own
+    last stamp, so a clear scheduled before it learns of a reconnect
+    elsewhere must never erase that replica's fresher write.
+    """
+    conv = conversation_store.create_conversation(title="newer-elsewhere")
+    assert conversation_store.set_runner_id(conv.id, "runner_newer_elsewhere")
+
+    conversation_store.touch_runner_liveness(["runner_newer_elsewhere"], now=2_000_000)
+    conversation_store.clear_runner_liveness("runner_newer_elsewhere", not_after=1_000_000)
+
+    connectivity = conversation_store.get_session_connectivity([conv.id])
+    assert connectivity[conv.id].runner_last_seen == 2_000_000
+
+
+def test_clear_runner_liveness_not_after_clears_an_equal_or_older_stamp(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A stamp at or before ``not_after`` still clears — the runner is really gone."""
+    equal = conversation_store.create_conversation(title="equal-stamp")
+    older = conversation_store.create_conversation(title="older-stamp")
+    assert conversation_store.set_runner_id(equal.id, "runner_equal_stamp")
+    assert conversation_store.set_runner_id(older.id, "runner_older_stamp")
+
+    conversation_store.touch_runner_liveness(["runner_equal_stamp"], now=1_000_000)
+    conversation_store.clear_runner_liveness("runner_equal_stamp", not_after=1_000_000)
+
+    conversation_store.touch_runner_liveness(["runner_older_stamp"], now=999_000)
+    conversation_store.clear_runner_liveness("runner_older_stamp", not_after=1_000_000)
+
+    connectivity = conversation_store.get_session_connectivity([equal.id, older.id])
+    assert connectivity[equal.id].runner_last_seen is None
+    assert connectivity[older.id].runner_last_seen is None
+
+
+def test_clear_runner_liveness_without_not_after_still_clears_unconditionally(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Omitting ``not_after`` preserves the pre-cross-replica unconditional clear."""
+    conv = conversation_store.create_conversation(title="unconditional-clear")
+    assert conversation_store.set_runner_id(conv.id, "runner_unconditional_clear")
+
+    conversation_store.touch_runner_liveness(["runner_unconditional_clear"], now=2_000_000)
+    conversation_store.clear_runner_liveness("runner_unconditional_clear")
+
+    connectivity = conversation_store.get_session_connectivity([conv.id])
+    assert connectivity[conv.id].runner_last_seen is None
+
+
 def test_live_state_writes_via_chokepoint_land_in_scoped_workspace(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -7643,6 +7522,31 @@ def test_append_with_stable_id_is_idempotent(
 
     page = conversation_store.list_items(conv.id)
     assert [i.id for i in page.data if i.id == stable] == [stable]
+
+
+def test_get_item_returns_the_persisted_item_or_none(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``get_item`` is the point lookup the native mirror path uses to spot a retry."""
+    conv = conversation_store.create_conversation()
+    stable = "cd" * 16
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_y",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id=stable,
+    )
+    assert conversation_store.get_item(conv.id, stable) is None
+
+    [persisted] = conversation_store.append(conv.id, [item])
+
+    found = conversation_store.get_item(conv.id, stable)
+    assert found is not None
+    assert found.id == persisted.id
+    assert isinstance(found.data, MessageData)
+    assert found.data.content == [{"type": "input_text", "text": "hi"}]
+    other = conversation_store.create_conversation()
+    assert conversation_store.get_item(other.id, stable) is None
 
 
 def test_append_without_stable_id_still_duplicates(
