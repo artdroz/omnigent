@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import threading
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
 import httpx
@@ -59,10 +60,9 @@ _WS_HANDSHAKE_ONLY = frozenset(
 )
 _AUTH_HEADERS = ("authorization", "cookie")
 _UNAUTHORIZED_BODY = {"error": "Invalid Token"}
-# The designed-unauthenticated bootstrap surface: a browser must reach these to
-# render the login UI (just as a real SSO front door redirects to its own login
-# before the app loads), so the edge passes them through un-credentialed. The
-# runner never calls them — it hits /token and /tunnel, which stay gated.
+# The unauthenticated bootstrap surface a browser needs to render the login UI,
+# passed through like a real SSO front door's own login page. The runner never
+# calls these; it hits the gated /token and /tunnel.
 _UNGATED_V1 = frozenset({"/v1/me", "/v1/info"})
 
 
@@ -110,6 +110,14 @@ class AuthEdgeProxy:
 
     def start(self) -> str:
         """Start serving in a background thread and return the edge URL."""
+
+        @contextlib.asynccontextmanager
+        async def lifespan(_app: Starlette) -> AsyncIterator[None]:
+            try:
+                yield
+            finally:
+                await self._aclose_client()
+
         app = Starlette(
             routes=[
                 Route(
@@ -118,7 +126,8 @@ class AuthEdgeProxy:
                     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
                 ),
                 WebSocketRoute("/{path:path}", self._relay_websocket),
-            ]
+            ],
+            lifespan=lifespan,
         )
         config = uvicorn.Config(
             app, host="127.0.0.1", port=self._port, log_level="warning", ws="websockets"
@@ -138,6 +147,12 @@ class AuthEdgeProxy:
             self._server.should_exit = True
         if self._thread is not None:
             self._thread.join(timeout=10)
+
+    async def _aclose_client(self) -> None:
+        """Close the upstream probe/relay client on the server's own loop."""
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
     def _http(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -185,7 +200,13 @@ class AuthEdgeProxy:
         upstream_req = self._http().build_request(
             request.method, target, headers=headers, content=request.stream()
         )
-        upstream = await self._http().send(upstream_req, stream=True)
+        try:
+            upstream = await self._http().send(upstream_req, stream=True)
+        except httpx.HTTPError as exc:
+            # Upstream unreachable or dropped mid-request; record it and fail
+            # cleanly so rejection/summary assertions point at the real cause.
+            self._record(request.method, path, 502, authorized)
+            return JSONResponse({"error": f"edge upstream failure: {exc}"}, status_code=502)
         self._record(request.method, path, upstream.status_code, authorized)
         response_headers = {
             k: v for k, v in upstream.headers.items() if k.lower() not in _HOP_BY_HOP
@@ -223,6 +244,14 @@ class AuthEdgeProxy:
             self._record("WS", path, status, authorized)
             await websocket.send_denial_response(
                 Response(exc.response.body or b"", status_code=status)
+            )
+            return
+        except (OSError, TimeoutError, websockets.exceptions.WebSocketException) as exc:
+            # Upstream never completed the handshake (refused, timed out, or a
+            # protocol error); fail the upgrade instead of crashing the edge.
+            self._record("WS", path, 502, authorized)
+            await websocket.send_denial_response(
+                Response(f"edge upstream connect failed: {exc}".encode(), status_code=502)
             )
             return
         self._record("WS", path, 101, authorized)
@@ -266,6 +295,8 @@ class AuthEdgeProxy:
         finally:
             for task in pumps:
                 task.cancel()
+            with contextlib.suppress(Exception):
+                await asyncio.gather(*pumps, return_exceptions=True)
             with contextlib.suppress(Exception):
                 await upstream.close()
 

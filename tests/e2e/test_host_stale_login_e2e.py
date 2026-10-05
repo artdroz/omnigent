@@ -67,8 +67,9 @@ executor:
 _SERVER_HEALTH_TIMEOUT_S = 90.0
 _HOST_ONLINE_TIMEOUT_S = 120.0
 _RUNNER_TIMEOUT_S = 60.0
-# Short stand-in for the multi-hour login lifetime that lapsed on the reporter's host.
-_LOGIN_TTL_S = 60.0
+# Short stand-in for a multi-hour login lifetime that lapses mid-session; long
+# enough for the baseline runner to settle before the token expires.
+_LOGIN_TTL_S = 90.0
 # Host liveness TTL is 90 s; a host that reacted to the rejection would leave "online" inside it.
 _HOST_REACTION_WINDOW_S = 60.0
 
@@ -421,21 +422,6 @@ def stale_login_rig(tmp_path: Path, mock_llm_server_url: str) -> Iterator[StaleL
         rig.shutdown()
 
 
-@pytest.mark.timeout(400)
-def test_valid_login_launches_a_runner_through_the_edge(stale_login_rig: StaleLoginRig) -> None:
-    """Healthy baseline: with a live login the host connects and its runner comes online."""
-    rig = stale_login_rig
-    rig.store_host_login(ttl_s=3600)
-    rig.start_host()
-    with rig.client() as client:
-        rig.wait_host_online(client)
-        _, launch = rig.launch_session(client)
-        assert launch.status_code == 200, launch.text
-        status = rig.wait_runner_settled(client, launch.json()["runner_id"])
-    assert status.get("online") is True, f"{status}\n{rig.edge_summary()}\n{rig.host_log_tail()}"
-    assert not rig.edge.rejections("/tunnel"), rig.edge_summary()
-
-
 @pytest.mark.timeout(900)
 def test_host_stops_reporting_online_once_runner_login_is_rejected(
     stale_login_rig: StaleLoginRig,
@@ -452,6 +438,11 @@ def test_host_stops_reporting_online_once_runner_login_is_rejected(
         assert baseline_status.get("online") is True, (
             f"baseline runner never connected: {baseline_status}\n{rig.host_log_tail()}"
         )
+        # A live login connects cleanly: no tunnel upgrade was rejected yet.
+        assert not rig.edge.rejections("/tunnel"), rig.edge_summary()
+        assert time.time() < expires_at, (
+            "login expired before the baseline runner settled; raise _LOGIN_TTL_S"
+        )
 
         _sleep_until(expires_at + 3.0)
         assert rig.host_alive(), rig.host_log_tail()
@@ -462,9 +453,12 @@ def test_host_stops_reporting_online_once_runner_login_is_rejected(
 
         _, launch = rig.launch_session(client)
         if launch.status_code != 200:
-            # A launch refused up front with a re-login hint is acceptable behaviour.
-            assert launch.status_code in (401, 403, 409, 503), launch.text
-            assert "login" in launch.text.lower() or "auth" in launch.text.lower(), launch.text
+            # Once the stored login lapsed the server refuses the launch up
+            # front with an actionable re-login error, not a doomed runner.
+            assert launch.status_code == 503, launch.text
+            error = launch.json().get("error", {})
+            assert error.get("code") == "host_login_expired", launch.text
+            assert "login" in (error.get("message") or "").lower(), launch.text
             return
         runner_id = launch.json()["runner_id"]
         failed = rig.wait_runner_settled(client, runner_id)

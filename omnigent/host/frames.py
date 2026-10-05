@@ -90,6 +90,25 @@ def workspace_missing_message(workspace: str | PathLike[str] | None) -> str:
     return f"workspace path does not exist: {workspace}"
 
 
+def host_login_expired_message() -> str:
+    """Build the canonical client-facing text of a stored-login-expired refusal.
+
+    Authored on the server side so the dedicated-launch and relaunch paths
+    surface identical re-login guidance and never echo the host's own text
+    (which can carry a runner log tail).
+
+    :returns: The refusal reason naming the re-login command, e.g.
+        ``"The host's stored login has expired; run `omnigent login` ..."``.
+    """
+    from omnigent.cli_invocation import cli_invocation
+
+    return (
+        "The host's stored login has expired; run "
+        f"`{cli_invocation()} login` on the host machine to launch sessions "
+        "on it again."
+    )
+
+
 def classify_launch_refusal(
     error_code: str | None,
     error: str | None,
@@ -106,13 +125,16 @@ def classify_launch_refusal(
     :param error: The host's human-readable failure text.
     :param workspace: The server's authorized workspace for the session.
     :returns: :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE`,
-        :data:`WORKSPACE_MISSING_ERROR_CODE`, or ``None`` when the failure
+        :data:`WORKSPACE_MISSING_ERROR_CODE`,
+        :data:`HOST_LOGIN_EXPIRED_ERROR_CODE`, or ``None`` when the failure
         is not a safe categorical refusal.
     """
     if error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE:
         return HARNESS_NOT_CONFIGURED_ERROR_CODE
     if error_code == WORKSPACE_MISSING_ERROR_CODE:
         return WORKSPACE_MISSING_ERROR_CODE
+    if error_code == HOST_LOGIN_EXPIRED_ERROR_CODE:
+        return HOST_LOGIN_EXPIRED_ERROR_CODE
     # Rolling upgrade: an older host sends this exact categorical reason
     # with no error_code.
     if error_code is None and error == workspace_missing_message(workspace):

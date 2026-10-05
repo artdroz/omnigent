@@ -125,7 +125,11 @@ from omnigent.host.git_worktree import (
     list_worktrees,
     remove_worktree,
 )
-from omnigent.host.identity import HostIdentity, load_or_create_host_identity
+from omnigent.host.identity import (
+    HOST_TOKEN_ENV_VAR,
+    HostIdentity,
+    load_or_create_host_identity,
+)
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.inner import _proc
@@ -1856,12 +1860,10 @@ class HostProcess:
             self._current_auth_token,
             initialize=False,
         )
-        if initial_auth_token is None:
-            # The control tunnel authenticated once and its heartbeat keeps the
-            # host reporting online even after the stored login lapses, so a
-            # runner spawned now would be rejected (HTTP 401) and exit. Refuse an
-            # expired login up front; "absent" (managed/never-logged-in) reads are
-            # left alone, as is the connected-host 401/403 tunnel retry.
+        if initial_auth_token is None and not os.environ.get(HOST_TOKEN_ENV_VAR):
+            # The tunnel outlives its login, so a runner spawned after it lapses
+            # is rejected (HTTP 401) and exits. Managed hosts read None here yet
+            # launch via delegated auth, so only an expired stored login refuses.
             from omnigent.cli_auth import stored_token_status
 
             if await asyncio.to_thread(stored_token_status, self._server_url) == "expired":

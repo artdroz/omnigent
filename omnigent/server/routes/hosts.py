@@ -48,6 +48,7 @@ from omnigent.host.frames import (
     HostStoreSecretFrame,
     classify_launch_refusal,
     encode_host_frame,
+    host_login_expired_message,
     optional_str_bool_map,
     workspace_missing_message,
 )
@@ -1090,23 +1091,20 @@ def create_hosts_router(
 
         if result.get("status") == "failed":
             await _rollback_failed_launch()
-            if result.get("error_code") == HOST_LOGIN_EXPIRED_ERROR_CODE:
-                # Map the host's refusal to an actionable 503 (re-login on the
-                # host) rather than the generic 502. The message is authored here,
-                # not echoed from the host, so host log text cannot leak.
-                from omnigent.cli_invocation import cli_invocation
-
-                raise OmnigentError(
-                    "The host's stored login has expired; run "
-                    f"`{cli_invocation()} login` on the host machine to "
-                    "launch sessions on it again.",
-                    code=ErrorCode.HOST_LOGIN_EXPIRED,
-                )
             refusal_code = classify_launch_refusal(
                 result.get("error_code"),
                 result.get("error"),
                 workspace,
             )
+            if refusal_code == HOST_LOGIN_EXPIRED_ERROR_CODE:
+                # Map the refusal to an actionable 503 (re-login on the host)
+                # rather than the generic 502. The message is authored
+                # server-side, not echoed from the host, so host log text
+                # cannot leak.
+                raise OmnigentError(
+                    host_login_expired_message(),
+                    code=ErrorCode.HOST_LOGIN_EXPIRED,
+                )
             if refusal_code == HARNESS_NOT_CONFIGURED_ERROR_CODE:
                 # Categorical refusal: the harness isn't configured on
                 # the host, so a retry can't succeed without user action

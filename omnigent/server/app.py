@@ -2218,19 +2218,16 @@ def create_app(
             # A session/host state, not a server fault (machine asleep, host
             # disconnected, or host login lapsed); clients render it as a
             # reconnect / re-login affordance. Logging it at 5xx buried real 500s.
+            _login_expired = exc.code == ErrorCode.HOST_LOGIN_EXPIRED
             _logger.warning(
                 "%s: %s",
-                (
-                    "Runner unavailable"
-                    if exc.code == ErrorCode.RUNNER_UNAVAILABLE
-                    else "Host login expired"
-                ),
+                "Host login expired" if _login_expired else "Runner unavailable",
                 exc.message,
                 extra=_error_audit_extra(
                     request,
-                    phase="unavailable",
+                    phase="login_expired" if _login_expired else "unavailable",
                     code=str(exc.code),
-                    http_status="503",
+                    http_status=str(exc.http_status),
                     error_category=exc.category.value,
                     error_impact=exc.impact.value,
                     error_phase=exc.phase.value,

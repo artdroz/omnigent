@@ -77,7 +77,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
-from omnigent.host.identity import HostIdentity
+from omnigent.host.identity import HOST_TOKEN_ENV_VAR, HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteUnavailable
 from omnigent.runner.identity import (
@@ -1046,6 +1046,65 @@ async def test_handle_launch_refuses_when_host_login_expired(
     assert result.runner_id is None
     # No runner subprocess may exist after a refusal.
     assert host._runners == {}
+
+
+@pytest.mark.parametrize(
+    ("bearer", "stored_status", "managed"),
+    [
+        # A warm bearer still works even if the on-disk login reads expired.
+        ("warm-bearer", "expired", False),
+        # No stored login at all (managed pointer / never logged in).
+        (None, "absent", False),
+        # A healthy stored login.
+        (None, "ok", False),
+        # Managed host: it launches via its delegated token, so `_current_auth_token`
+        # reads None by design and a stale local login entry must be ignored.
+        (None, "expired", True),
+    ],
+)
+async def test_handle_launch_proceeds_when_login_is_not_expired(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bearer: str | None,
+    stored_status: str,
+    managed: bool,
+) -> None:
+    """Only a non-managed host with no warm bearer AND an expired stored login refuses.
+
+    Every other combination must get past the stored-login-expired guard to the
+    spawn (forced here to a benign OSError) instead of tripping the refusal: a
+    warm bearer, an ``absent``/``ok`` stored login, or a managed host whose
+    delegated launch token makes ``_current_auth_token`` read None by design.
+    """
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    if managed:
+        monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "managed-launch-token")
+    monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: bearer)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.stored_token_status",
+        lambda server_url: stored_status,
+    )
+
+    def _spawn_blocked(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
+        raise OSError(errno.EACCES, "spawn blocked for test")
+
+    monkeypatch.setattr(host, "_spawn_runner_proc", _spawn_blocked)
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_not_expired",
+        binding_token="token_live",
+        workspace=str(workspace),
+        harness=None,
+    )
+    result = await host._handle_launch(frame)
+
+    assert isinstance(result, HostLaunchRunnerResultFrame)
+    assert result.status == "failed"
+    # Reached the spawn (our injected OSError surfaces), not the login refusal.
+    assert "spawn blocked for test" in (result.error or "")
+    assert result.error_code != HOST_LOGIN_EXPIRED_ERROR_CODE
 
 
 async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
