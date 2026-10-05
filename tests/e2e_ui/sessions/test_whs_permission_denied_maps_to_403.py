@@ -35,6 +35,7 @@ from playwright.sync_api import Page, expect
 # Without grpcio there is no real permission-denied RPC to raise.
 grpc = pytest.importorskip("grpc", reason="grpcio is required to raise the permission-denied RPC")
 
+from omnigent.runtime import _globals  # noqa: E402
 from omnigent.runtime import init as init_runtime  # noqa: E402
 from omnigent.runtime.agent_cache import AgentCache  # noqa: E402
 from omnigent.server import app as app_module  # noqa: E402
@@ -48,6 +49,22 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore  # n
 # The details a proxied HTTP 403 surfaces with on the gRPC channel, and the WHS listing RPC.
 _WHS_403_DETAILS = "Received http2 header with status: 403"
 _WHS_METHOD = "/whs.WorkspaceHierarchyService/ListTreeNodeChildren"
+# Process-wide runtime state that init_runtime rebinds; restored after the test so
+# later in-process tests do not inherit the deny-all store.
+_RUNTIME_GLOBALS = (
+    "_conversation_store",
+    "_agent_store",
+    "_agent_cache",
+    "_file_store",
+    "_artifact_store",
+    "_comment_store",
+    "_policy_store",
+    "_caps",
+    "_terminal_registry",
+)
+
+# The handled 403 is new server behaviour; older pinned servers answer 500.
+pytestmark = pytest.mark.min_server_version("0.17.0")
 
 
 class _DenyAllHandler(grpc.GenericRpcHandler):
@@ -83,7 +100,7 @@ def _start_deny_all_grpc() -> tuple[grpc.Server, grpc.Channel]:
 def _wait_until_serving(base_url: str, timeout: float = 30.0) -> None:
     """Block until the app answers, so the SPA has something to load.
 
-    ``/healthz`` (or any always-served route) proves uvicorn is up without
+    Probing ``/`` (an always-served route) proves uvicorn is up without
     tripping the faulted listing funnel.
 
     :param base_url: Server root, e.g. ``http://127.0.0.1:12345``.
@@ -113,6 +130,7 @@ def whs_403_server(built_spa: None, tmp_path: Path) -> Iterator[str]:
     :param tmp_path: Per-test scratch dir for the sqlite DB / artifacts.
     :yields: The base URL of the running server.
     """
+    saved_globals = {name: getattr(_globals, name) for name in _RUNTIME_GLOBALS}
     grpc_server, channel = _start_deny_all_grpc()
     server: uvicorn.Server | None = None
     thread: threading.Thread | None = None
@@ -176,6 +194,8 @@ def whs_403_server(built_spa: None, tmp_path: Path) -> Iterator[str]:
             thread.join(timeout=10.0)
         channel.close()
         grpc_server.stop(grace=None)
+        for name, value in saved_globals.items():
+            setattr(_globals, name, value)
 
 
 def test_whs_permission_denied_is_handled_not_500(

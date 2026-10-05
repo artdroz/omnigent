@@ -14,7 +14,7 @@ other gRPC status keeps the unhandled-500 contract.
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
 import httpx
 import pytest
@@ -23,6 +23,7 @@ from fastapi import FastAPI
 # grpcio is not a base dependency; without it there is no backend RpcError to raise.
 grpc = pytest.importorskip("grpc", reason="grpcio is required to build the backend RpcError")
 
+from omnigent.errors import ErrorCategory  # noqa: E402
 from omnigent.stores.conversation_store.sqlalchemy_store import (  # noqa: E402
     SqlAlchemyConversationStore,
 )
@@ -108,20 +109,40 @@ def _fail_listing_with(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
     monkeypatch.setattr(SqlAlchemyConversationStore, "list_conversations", _raise)
 
 
+def _app_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """
+    :param caplog: The capture fixture.
+    :returns: The records the server's app logger emitted during the request.
+    """
+    return [r for r in caplog.records if r.name == "omnigent.server.app"]
+
+
+@pytest.mark.parametrize(
+    "make_error",
+    [
+        pytest.param(
+            lambda: _BackendRpcError(grpc.StatusCode.PERMISSION_DENIED, _DENIAL_DETAILS),
+            id="grpcio",
+        ),
+        pytest.param(_make_vendored_rpc_error, id="vendored"),
+    ],
+)
 async def test_grpc_permission_denied_maps_to_403(
     catchall_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    make_error: Callable[[], Exception],
 ) -> None:
     """A backend ``PERMISSION_DENIED`` answers a handled 403, not a raw 500.
 
-    The denial is an expected upstream access outcome: it must answer the
-    coded 403 naming the resource, logged as a WARNING rather than an
-    ERROR-level ``Unhandled exception`` traceback per client retry.
+    The denial is an expected upstream access outcome: it answers the coded
+    403 naming the resource and is logged exactly once at WARNING, with the
+    traceback and audit attributes, instead of an ERROR-level ``Unhandled
+    exception`` per client retry. The vendored shape must match as well: an
+    isinstance check against pypi grpcio's ``grpc.RpcError`` would never fire
+    for the vendored copy the deployed build ships.
     """
-    _fail_listing_with(
-        monkeypatch, _BackendRpcError(grpc.StatusCode.PERMISSION_DENIED, _DENIAL_DETAILS)
-    )
+    _fail_listing_with(monkeypatch, make_error())
     with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
         resp = await catchall_client.get("/v1/sessions", params={"limit": 30})
     assert resp.status_code == 403
@@ -129,56 +150,48 @@ async def test_grpc_permission_denied_maps_to_403(
     assert error["code"] == "upstream_permission_denied"
     # The message names the denied resource so the user has something to act on.
     assert "/v1/sessions" in error["message"]
-    records = [r for r in caplog.records if r.name == "omnigent.server.app"]
-    assert records, "expected the denial to be logged"
-    assert all(r.levelno == logging.WARNING for r in records)
-    assert not any(r.getMessage().startswith("Unhandled exception:") for r in records)
+    records = _app_records(caplog)
+    assert len(records) == 1, [r.getMessage() for r in records]
+    (record,) = records
+    assert record.levelno == logging.WARNING
+    assert record.getMessage().startswith("Upstream call denied by a backing service:")
+    assert record.exc_info is not None
+    assert record.attributes["code"] == "upstream_permission_denied"
+    assert record.attributes["http_status"] == "403"
+    assert record.attributes["error_category"] == ErrorCategory.UPSTREAM.value
 
 
-async def test_vendored_grpc_permission_denied_maps_to_403(
-    catchall_client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A vendored grpc's ``PERMISSION_DENIED`` maps by shape, not class identity.
-
-    An isinstance check against pypi grpcio's ``grpc.RpcError`` would never
-    fire for the vendored copy the deployed build ships, silently keeping the
-    unhandled 500 exactly where the bug was reported.
-    """
-    _fail_listing_with(monkeypatch, _make_vendored_rpc_error())
-    resp = await catchall_client.get("/v1/sessions", params={"limit": 30})
-    assert resp.status_code == 403
-    assert resp.json()["error"]["code"] == "upstream_permission_denied"
-
-
+@pytest.mark.parametrize(
+    ("status", "details"),
+    [
+        pytest.param(grpc.StatusCode.UNAVAILABLE, "connection refused", id="unavailable"),
+        pytest.param(grpc.StatusCode.UNAUTHENTICATED, "bad credentials", id="unauthenticated"),
+    ],
+)
 async def test_other_grpc_errors_keep_the_500_contract(
     catchall_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    status: grpc.StatusCode,
+    details: str,
 ) -> None:
     """A non-denial gRPC failure still surfaces as the standard 500 shape.
 
     Only ``PERMISSION_DENIED`` (and, elsewhere, ``CANCELLED``) are expected
-    upstream outcomes; anything else stays an unhandled fault so real breakage
-    keeps its ERROR-level signal.
+    upstream outcomes. ``UNAUTHENTICATED`` is deliberately not mapped: broken
+    backend credentials would 401 every user, which is an operational fault,
+    not a caller access outcome. Both keep the ERROR-level unhandled signal
+    with its traceback.
     """
-    _fail_listing_with(
-        monkeypatch, _BackendRpcError(grpc.StatusCode.UNAVAILABLE, "connection refused")
-    )
-    resp = await catchall_client.get("/v1/sessions", params={"limit": 30})
+    _fail_listing_with(monkeypatch, _BackendRpcError(status, details))
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
+        resp = await catchall_client.get("/v1/sessions", params={"limit": 30})
     assert resp.status_code == 500
     assert resp.json()["error"]["code"] == "internal_error"
-
-
-async def test_grpc_unauthenticated_keeps_the_500_contract(
-    catchall_client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``UNAUTHENTICATED`` is not mapped: a backend credential failure is an
-    operational fault (broken service credentials would 401 every user), not a
-    caller access outcome, so it keeps the unhandled-500 signal."""
-    _fail_listing_with(
-        monkeypatch, _BackendRpcError(grpc.StatusCode.UNAUTHENTICATED, "bad credentials")
-    )
-    resp = await catchall_client.get("/v1/sessions", params={"limit": 30})
-    assert resp.status_code == 500
-    assert resp.json()["error"]["code"] == "internal_error"
+    records = _app_records(caplog)
+    assert len(records) == 1, [r.getMessage() for r in records]
+    (record,) = records
+    assert record.levelno == logging.ERROR
+    assert record.getMessage().startswith("Unhandled exception:")
+    assert record.exc_info is not None
+    assert record.attributes["http_status"] == "500"

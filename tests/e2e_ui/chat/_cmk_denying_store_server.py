@@ -74,7 +74,10 @@ def main() -> None:
     import omnigent.stores.conversation_store.sqlalchemy_store as store_module
     from omnigent.cli import cli
 
-    cmk_service, target = _start_cmk_service(Path(os.environ[DENY_FLAG_ENV]))
+    deny_flag = os.environ.get(DENY_FLAG_ENV)
+    if not deny_flag:
+        raise SystemExit(f"{DENY_FLAG_ENV} must point at the deny-flag file")
+    cmk_service, target = _start_cmk_service(Path(deny_flag))
     channel = grpc.insecure_channel(target)
 
     def _stub(method: str) -> grpc.UnaryUnaryMultiCallable:

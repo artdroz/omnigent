@@ -33,6 +33,7 @@ Run::
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import secrets
@@ -64,6 +65,10 @@ from tests.e2e_ui.conftest import (
     _find_free_port,
     configure_mock_llm,
 )
+
+# The handled 403 is new server behaviour; the stand-in server below always runs the
+# current checkout, so older pinned servers must be skipped rather than substituted.
+pytestmark = pytest.mark.min_server_version("0.17.0")
 
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _HEALTHY_PROMPT = "hello before the burst"
@@ -239,7 +244,9 @@ def cmk_session(cmk_server: CmkServer) -> Iterator[str]:
         yield session_id
     finally:
         cmk_server.deny_flag.unlink(missing_ok=True)
-        httpx.delete(f"{cmk_server.base_url}/v1/sessions/{session_id}", timeout=10.0)
+        # A server that died mid-test must not mask that test's own failure here.
+        with contextlib.suppress(httpx.HTTPError):
+            httpx.delete(f"{cmk_server.base_url}/v1/sessions/{session_id}", timeout=10.0)
 
 
 def _json_body(response: Response) -> dict[str, Any]:

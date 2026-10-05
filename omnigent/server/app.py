@@ -2446,7 +2446,7 @@ def create_app(
             denied = OmnigentError(
                 f"Access to {request.url.path} was denied by a backing "
                 "service. Verify you still have access to the underlying "
-                "workspace resource, or ask a workspace admin to grant it.",
+                "resource, or ask an administrator to grant it.",
                 code=ErrorCode.UPSTREAM_PERMISSION_DENIED,
             )
             _logger.warning(
