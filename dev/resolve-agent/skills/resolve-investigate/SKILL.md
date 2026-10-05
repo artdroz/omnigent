@@ -49,6 +49,9 @@ check cannot run, name the concrete blocker and keep the cause unresolved.
    refreshes or recovers before proposing a cache reset. Mocking that object or
    its factory cannot satisfy this check. Retain the controlled boundaries and
    remaining incident uncertainty.
+   If you change this path, rerun the same configured control and discriminator
+   on the candidate. A new mock-only regression test cannot verify recovery
+   through the implementation you diagnosed; limit the fix claim accordingly.
 3. **Find the design intent.** Read nearby tests and documentation, targeted
    `git log -S`/`git blame`, and relevant commit/PR discussion. Cite the source
    and revision; distinguish documented rationale from inference and note
