@@ -39,7 +39,7 @@ from __future__ import annotations
 import re
 import time
 
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 from tests.e2e_ui.conftest import open_right_rail
 
@@ -108,14 +108,15 @@ def _wait_for_sent_bytes(page: Page, sent: list[bytes], needle: bytes, timeout_s
 
 def _wait_for_sent_quiescence(
     page: Page, sent: list[bytes], quiet_ms: int = 500, timeout_s: float = 3
-) -> None:
-    """Wait until no frame has been sent for *quiet_ms*, giving up after *timeout_s*."""
+) -> bool:
+    """Wait until no frame has been sent for *quiet_ms*; ``False`` if *timeout_s* elapses first."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         count = len(sent)
         page.wait_for_timeout(quiet_ms)
         if len(sent) == count:
-            return
+            return True
+    return False
 
 
 def _begin_composition(textarea, text: str) -> None:
@@ -304,17 +305,43 @@ def _fullwidth_latin(text: str) -> list[str]:
     return [c for c in text if 0xFF01 <= ord(c) <= 0xFF5E]
 
 
+def _focused_shell_input(
+    page: Page, terminal_session: tuple[str, str]
+) -> tuple[list[bytes], Locator]:
+    """Open a shell, focus xterm's helper textarea and prove the capture is live.
+
+    Returns the captured sent frames and the focused textarea once a plain
+    keystroke has shown up on the attach WebSocket, so the assertions that
+    follow cannot fail for capture reasons.
+    """
+    base_url, session_id = terminal_session
+    sent, _received = _capture_attach_frames(page)
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_new_shell(page)
+    terminal_view = _connected_terminal(page)
+    textarea = terminal_view.locator("textarea.xterm-helper-textarea")
+    textarea.focus()
+    page.keyboard.type("q")
+    assert _wait_for_sent_bytes(page, sent, b"q", timeout_s=10), (
+        f"attach WebSocket frame capture saw no keystroke frame; sent so far: {b''.join(sent)!r}"
+    )
+    return sent, textarea
+
+
 def _drive_composition(
-    textarea, preedits: list[str], codes: list[str], *, shift_ascii_first: bool
+    textarea: Locator, preedits: list[str], codes: list[str], *, shift_ascii_first: bool
 ) -> bool:
     """Replay an IME composition at ``term.textarea`` without a real IME.
 
     A ``compositionstart`` opens the preedit. With *shift_ascii_first*, the
     first preedit is a Shift-typed ASCII letter whose keydown carries the real
-    keyCode (65) and ``isComposing`` — the mid-composition gesture under test.
-    Every other keystroke is a keyCode-229 keydown with the preedit growing, and
-    a ``compositionend`` commits. No fresh ``compositionstart`` fires after the
-    Shift+letter, mirroring a native IME.
+    keyCode and ``isComposing`` — the mid-composition gesture under test. Every
+    other keystroke is a keyCode-229 keydown with the preedit growing, and a
+    ``compositionend`` commits. The order is a constructed regression sequence
+    rather than a byte-exact native replay: the first preedit is written before
+    the Shift+letter keydown so a premature finalization has a nonempty prefix
+    to send, and no fresh ``compositionstart`` follows it, matching the
+    reporter's trusted-CDP trace.
 
     :returns: Whether every keydown stayed uncanceled (``dispatchEvent`` returned
         ``true``). The IME must keep receiving the keys it owns, so the terminal
@@ -386,20 +413,7 @@ def test_shift_ascii_run_mid_composition_does_not_resend_preedit(
     away from the IME. The bug re-sent the committed prefix plus the growing
     preedit on every update (``AｄAでｙAでよ…``).
     """
-    base_url, session_id = terminal_session
-
-    sent, _received = _capture_attach_frames(page)
-    page.goto(f"{base_url}/c/{session_id}")
-    _open_new_shell(page)
-    terminal_view = _connected_terminal(page)
-
-    textarea = terminal_view.locator("textarea.xterm-helper-textarea")
-    textarea.focus()
-
-    page.keyboard.type("q")
-    assert _wait_for_sent_bytes(page, sent, b"q", timeout_s=10), (
-        f"attach WebSocket frame capture saw no keystroke frame; sent so far: {b''.join(sent)!r}"
-    )
+    sent, textarea = _focused_shell_input(page, terminal_session)
 
     baseline = len(sent)
     uncanceled = _drive_composition(
@@ -410,7 +424,9 @@ def test_shift_ascii_run_mid_composition_does_not_resend_preedit(
         f"the converted kana never reached the PTY; sent: {b''.join(sent[baseline:])!r}"
     )
     # Let any erroneous re-sends that trail the commit land before asserting.
-    _wait_for_sent_quiescence(page, sent)
+    assert _wait_for_sent_quiescence(page, sent), (
+        f"the terminal kept sending frames after the commit: {b''.join(sent[baseline:])!r}"
+    )
 
     decoded = b"".join(sent[baseline:]).decode("utf-8", "replace")
     assert decoded.count(_COMMITTED_TAIL) == 1, (
@@ -436,20 +452,7 @@ def test_kana_conversion_without_shift_ascii_sends_once(
     fullwidth leak, so the failing scenario above cannot be blamed on IME
     composition itself.
     """
-    base_url, session_id = terminal_session
-
-    sent, _received = _capture_attach_frames(page)
-    page.goto(f"{base_url}/c/{session_id}")
-    _open_new_shell(page)
-    terminal_view = _connected_terminal(page)
-
-    textarea = terminal_view.locator("textarea.xterm-helper-textarea")
-    textarea.focus()
-
-    page.keyboard.type("q")
-    assert _wait_for_sent_bytes(page, sent, b"q", timeout_s=10), (
-        f"attach WebSocket frame capture saw no keystroke frame; sent so far: {b''.join(sent)!r}"
-    )
+    sent, textarea = _focused_shell_input(page, terminal_session)
 
     baseline = len(sent)
     preedits = ["で", "でよ", "でよい", "でよいで", "でよいです"]
@@ -460,7 +463,9 @@ def test_kana_conversion_without_shift_ascii_sends_once(
     assert _wait_for_sent_bytes(page, sent, _COMMITTED_TAIL.encode("utf-8"), timeout_s=10), (
         f"the converted kana never reached the PTY; sent: {b''.join(sent[baseline:])!r}"
     )
-    _wait_for_sent_quiescence(page, sent)
+    assert _wait_for_sent_quiescence(page, sent), (
+        f"the terminal kept sending frames after the commit: {b''.join(sent[baseline:])!r}"
+    )
 
     decoded = b"".join(sent[baseline:]).decode("utf-8", "replace")
     assert decoded.count(_COMMITTED_TAIL) == 1, (
