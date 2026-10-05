@@ -82,6 +82,7 @@ from omnigent.tools.builtins.os_env import (
     SysOsReadTool,
     SysOsShellTool,
     SysOsWriteTool,
+    unknown_shell_argument_error,
 )
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
@@ -7190,6 +7191,9 @@ async def _execute_os_env_tool(
             if filesystem_registry is not None and conversation_id is not None:
                 filesystem_registry.record_change(_path, "modified", conversation_id)
         elif tool_name == SysOsShellTool.name():
+            rejected = unknown_shell_argument_error(args)
+            if rejected is not None:
+                return json.dumps(rejected)
             result = await os_env.shell(
                 command=cast("str", args.get("command", "")),
                 timeout=cast("int | None", args.get("timeout")),

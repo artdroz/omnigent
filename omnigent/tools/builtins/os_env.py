@@ -131,7 +131,35 @@ _OS_SHELL_SCHEMA: dict[str, Any] = {
         },
     },
     "required": ["command"],
+    "additionalProperties": False,
 }
+
+
+def unknown_shell_argument_error(args: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    Reject a ``sys_os_shell`` call that names arguments the tool
+    does not accept.
+
+    A misnamed optional argument (``timeout_seconds`` for
+    ``timeout``) would otherwise be dropped silently and the
+    120-second default applied.
+
+    :param args: Parsed tool-call arguments, e.g.
+        ``{"command": "ls", "timeout_seconds": 5}``.
+    :returns: An ``{"error": ...}`` result naming the unknown and
+        the accepted argument names, or ``None`` when every name
+        is accepted.
+    """
+    accepted = _OS_SHELL_SCHEMA["properties"]
+    unknown = sorted(name for name in args if name not in accepted)
+    if not unknown:
+        return None
+    return {
+        "error": (
+            f"unknown argument(s) for sys_os_shell: {', '.join(unknown)}; "
+            f"accepted arguments: {', '.join(accepted)}"
+        )
+    }
 
 
 class _OSEnvBackedTool(Tool):
@@ -369,8 +397,12 @@ class SysOsShellTool(_OSEnvBackedTool):
         Forward to :meth:`OSEnvironment.shell`.
 
         :param kwargs: Parsed args; ``command`` is required.
-        :returns: OpResult from the OSEnvironment.
+        :returns: OpResult from the OSEnvironment, or the
+            unknown-argument error.
         """
+        rejected = unknown_shell_argument_error(kwargs)
+        if rejected is not None:
+            return rejected
         return dict(
             await self._os_env.shell(
                 command=kwargs["command"],

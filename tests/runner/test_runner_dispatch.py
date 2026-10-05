@@ -2511,6 +2511,45 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runner_os_env_shell_rejects_unknown_argument_names() -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+    from omnigent.spec.types import AgentSpec
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        spec = AgentSpec(
+            spec_version=1,
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=str(root),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            ),
+        )
+
+        rejected = await _execute_os_env_tool(
+            "sys_os_shell",
+            {"command": "touch ran.txt", "timeout_seconds": 5},
+            agent_spec=spec,
+            conversation_id="conv_runner_os_env_test",
+        )
+        rejected_result = json.loads(rejected)
+        assert "error" in rejected_result, rejected_result
+        assert "timeout_seconds" in rejected_result["error"]
+        assert "command, timeout" in rejected_result["error"]
+        assert not root.joinpath("ran.txt").exists()
+
+        accepted = await _execute_os_env_tool(
+            "sys_os_shell",
+            {"command": "touch ran.txt", "timeout": 5},
+            agent_spec=spec,
+            conversation_id="conv_runner_os_env_test",
+        )
+        assert json.loads(accepted)["exit_code"] == 0
+        assert root.joinpath("ran.txt").exists()
+
+
+@pytest.mark.asyncio
 async def test_runner_os_env_placeholder_cwd_uses_cli_workspace(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
