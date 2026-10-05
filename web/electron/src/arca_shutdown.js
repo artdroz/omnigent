@@ -1,5 +1,11 @@
 "use strict";
 
+/**
+ * Schedule launch and final warnings for an Arca instance. Its box may shut
+ * down after 60 idle minutes once the shutdown time has passed, outside
+ * weekday business hours. Electron-free: all I/O and timing are injected.
+ */
+
 const DEFAULT_OPTIONS = Object.freeze({
   finalLeadMs: 60 * 60e3,
   launchMaxLeadMs: 8 * 60 * 60e3,
@@ -214,7 +220,7 @@ function createArcaShutdownWatch({
       safeLog(`arca shutdown: instance state is ${status.state}`);
       return false;
     }
-    if (status.shutdownAt === null) {
+    if (!Number.isFinite(status.shutdownAt)) {
       shutdownAt = null;
       effectiveAt = null;
       clearScheduled();
@@ -330,7 +336,7 @@ function createArcaShutdownWatch({
       if (!disposed && pendingFresh) {
         pendingFresh = false;
         clearScheduled();
-        void evaluate(false);
+        void evaluate(launchPending);
       } else {
         phase = timer !== null ? "scheduled" : "idle";
       }
@@ -352,7 +358,7 @@ function createArcaShutdownWatch({
   function onResume() {
     if (!started || disposed) return;
     clearScheduled();
-    requestFresh();
+    requestFresh(launchPending);
   }
 
   function dispose() {

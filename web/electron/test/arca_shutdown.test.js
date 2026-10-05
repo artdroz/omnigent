@@ -325,11 +325,28 @@ describe("Arca shutdown watch", () => {
     );
   });
 
+  it("preserves launch eligibility when resume replaces a failed read's retry", async () => {
+    const h = makeWatch({
+      statuses: [{ ok: false, errorKind: "network", error: "offline" }, running(2 * HOUR)],
+    });
+    h.watch.start();
+    await flush();
+    assert.equal(h.watch.getState().nextCheckAt, 15 * MINUTE);
+    h.watch.onResume();
+    await flush();
+    assert.equal(h.reads, 2);
+    assert.deepEqual(
+      h.prompts.map((request) => request.kind),
+      ["launch"],
+    );
+  });
+
   it("stays idle for a stopped instance or missing shutdown time", async () => {
     await Promise.all(
       [
         { ok: true, state: "stopped", shutdownAt: 2 * HOUR },
         { ok: true, state: "running", shutdownAt: null, rawShutdownTime: "unknown" },
+        { ok: true, state: "running", rawShutdownTime: "unparseable" },
       ].map(async (status) => {
         const messages = [];
         const h = makeWatch({ statuses: [status], log: (message) => messages.push(message) });
