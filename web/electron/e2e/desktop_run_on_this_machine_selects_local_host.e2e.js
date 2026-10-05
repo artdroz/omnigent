@@ -47,6 +47,10 @@ function sleep(ms) {
   });
 }
 
+function shellQuote(value) {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 function writeCliShim(dir) {
   const shim = path.join(dir, "omnigent");
   const pythonPath = [
@@ -57,8 +61,8 @@ function writeCliShim(dir) {
   fs.writeFileSync(
     shim,
     "#!/usr/bin/env bash\n" +
-      `export PYTHONPATH="${pythonPath}\${PYTHONPATH:+:$PYTHONPATH}"\n` +
-      `exec "${PYTHON}" -c "from omnigent.cli import main; main()" "$@"\n`,
+      `export PYTHONPATH=${shellQuote(pythonPath)}\${PYTHONPATH:+:$PYTHONPATH}\n` +
+      `exec ${shellQuote(PYTHON)} -c "from omnigent.cli import main; main()" "$@"\n`,
     { mode: 0o755 },
   );
   return shim;
@@ -118,7 +122,10 @@ function startHostDaemon(cliShim, serverUrl, logPath) {
     if (!out.writableEnded) out.end();
   };
   return new Promise((resolve) => {
+    let done = false;
     const finish = (connected) => {
+      if (done) return;
+      done = true;
       clearTimeout(timer);
       resolve({ child, connected, log });
     };
