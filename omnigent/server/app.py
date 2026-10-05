@@ -2440,12 +2440,9 @@ def create_app(
             )
             return await _handle_omnigent_error(request, cancelled)
         if is_permission_denied_rpc_error(exc):
-            # A backing service refused the call (e.g. a workspace-hierarchy
-            # 403 surfacing as gRPC PERMISSION_DENIED through a channel
-            # proxy): an access outcome, not a fault. Answer the coded 403
-            # naming the resource instead of an unhandled 500 whose traceback
-            # repeats on every client retry. Matched structurally, like the
-            # cancellation above, because the deployed build vendors grpc.
+            # An upstream PERMISSION_DENIED (e.g. a proxied workspace-hierarchy
+            # 403) is an access outcome, not a fault: answer the coded 403 naming
+            # the resource instead of an unhandled 500 on every client retry.
             denied = OmnigentError(
                 f"Access to {request.url.path} was denied by a backing "
                 "service. Verify you still have access to the underlying "

@@ -16,12 +16,14 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator
 
-import grpc
 import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent.stores.conversation_store.sqlalchemy_store import (
+# grpcio is not a base dependency; without it there is no backend RpcError to raise.
+grpc = pytest.importorskip("grpc", reason="grpcio is required to build the backend RpcError")
+
+from omnigent.stores.conversation_store.sqlalchemy_store import (  # noqa: E402
     SqlAlchemyConversationStore,
 )
 

@@ -27,25 +27,26 @@ from collections.abc import Iterator
 from concurrent import futures
 from pathlib import Path
 
-import grpc
 import httpx
 import pytest
 import uvicorn
 from playwright.sync_api import Page, expect
 
-from omnigent.runtime import init as init_runtime
-from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server import app as app_module
-from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-from omnigent.stores.artifact_store.local import LocalArtifactStore
-from omnigent.stores.conversation_store.sqlalchemy_store import (
+# Without grpcio there is no real permission-denied RPC to raise.
+grpc = pytest.importorskip("grpc", reason="grpcio is required to raise the permission-denied RPC")
+
+from omnigent.runtime import init as init_runtime  # noqa: E402
+from omnigent.runtime.agent_cache import AgentCache  # noqa: E402
+from omnigent.server import app as app_module  # noqa: E402
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore  # noqa: E402
+from omnigent.stores.artifact_store.local import LocalArtifactStore  # noqa: E402
+from omnigent.stores.conversation_store.sqlalchemy_store import (  # noqa: E402
     SqlAlchemyConversationStore,
 )
-from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore  # noqa: E402
 
-# The exact gRPC status + details string from the ticket's log.
+# The details a proxied HTTP 403 surfaces with on the gRPC channel, and the WHS listing RPC.
 _WHS_403_DETAILS = "Received http2 header with status: 403"
-# gRPC service/method matching the WHS listing RPC named in the ticket.
 _WHS_METHOD = "/whs.WorkspaceHierarchyService/ListTreeNodeChildren"
 
 
@@ -54,7 +55,7 @@ class _DenyAllHandler(grpc.GenericRpcHandler):
 
     Stands in for the workspace hierarchy service behind Barnacle answering a
     request with HTTP 403, which the gRPC layer surfaces as
-    ``StatusCode.PERMISSION_DENIED`` with the ticket's details string.
+    ``StatusCode.PERMISSION_DENIED`` with that details string.
     """
 
     def service(self, handler_call_details: object) -> object:
@@ -113,52 +114,54 @@ def whs_403_server(built_spa: None, tmp_path: Path) -> Iterator[str]:
     :yields: The base URL of the running server.
     """
     grpc_server, channel = _start_deny_all_grpc()
-    list_children = channel.unary_unary(
-        _WHS_METHOD,
-        request_serializer=lambda payload: payload,
-        response_deserializer=lambda payload: payload,
-    )
-
-    class _WhsBackedConversationStore(SqlAlchemyConversationStore):
-        """Conversation store whose listing funnel goes through the WHS."""
-
-        def list_conversations(self, *args: object, **kwargs: object) -> object:
-            # Raises grpc._channel._InactiveRpcError(PERMISSION_DENIED, ...),
-            # the same shape whs_client.list_children raises in production.
-            list_children(b"")
-            raise AssertionError("unreachable")  # the RPC always raises
-
-    db_uri = f"sqlite:///{tmp_path / 'whs403.db'}"
-    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
-    agent_store = SqlAlchemyAgentStore(db_uri)
-    file_store = SqlAlchemyFileStore(db_uri)
-    conversation_store = _WhsBackedConversationStore(db_uri)
-    agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache")
-    init_runtime(
-        conversation_store=conversation_store,
-        agent_store=agent_store,
-        agent_cache=agent_cache,
-        file_store=file_store,
-        artifact_store=artifact_store,
-    )
-    app = app_module.create_app(
-        agent_store=agent_store,
-        file_store=file_store,
-        conversation_store=conversation_store,
-        artifact_store=artifact_store,
-        agent_cache=agent_cache,
-    )
-
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
-    server = uvicorn.Server(config)
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
-
-    base_url = f"http://127.0.0.1:{port}"
+    server: uvicorn.Server | None = None
+    thread: threading.Thread | None = None
     try:
+        list_children = channel.unary_unary(
+            _WHS_METHOD,
+            request_serializer=lambda payload: payload,
+            response_deserializer=lambda payload: payload,
+        )
+
+        class _WhsBackedConversationStore(SqlAlchemyConversationStore):
+            """Conversation store whose listing funnel goes through the WHS."""
+
+            def list_conversations(self, *args: object, **kwargs: object) -> object:
+                # Raises grpc._channel._InactiveRpcError(PERMISSION_DENIED, ...),
+                # the same shape whs_client.list_children raises in production.
+                list_children(b"")
+                raise AssertionError("unreachable")  # the RPC always raises
+
+        db_uri = f"sqlite:///{tmp_path / 'whs403.db'}"
+        artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+        agent_store = SqlAlchemyAgentStore(db_uri)
+        file_store = SqlAlchemyFileStore(db_uri)
+        conversation_store = _WhsBackedConversationStore(db_uri)
+        agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache")
+        init_runtime(
+            conversation_store=conversation_store,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+            file_store=file_store,
+            artifact_store=artifact_store,
+        )
+        app = app_module.create_app(
+            agent_store=agent_store,
+            file_store=file_store,
+            conversation_store=conversation_store,
+            artifact_store=artifact_store,
+            agent_cache=agent_cache,
+        )
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+
+        base_url = f"http://127.0.0.1:{port}"
         deadline = time.time() + 30.0
         while not server.started:
             if time.time() > deadline:
@@ -167,8 +170,10 @@ def whs_403_server(built_spa: None, tmp_path: Path) -> Iterator[str]:
         _wait_until_serving(base_url)
         yield base_url
     finally:
-        server.should_exit = True
-        thread.join(timeout=10.0)
+        if server is not None:
+            server.should_exit = True
+        if thread is not None:
+            thread.join(timeout=10.0)
         channel.close()
         grpc_server.stop(grace=None)
 
@@ -205,10 +210,8 @@ def test_whs_permission_denied_is_handled_not_500(
     # Hold the failed state on screen so the recording shows what the user sees.
     page.wait_for_timeout(1_500)
 
-    # 2. Pin the fix target on the server contract. Today the gRPC
-    #    PERMISSION_DENIED escapes to _handle_unhandled_exception and the
-    #    endpoint answers 500 internal_error; once mapped to a handled error it
-    #    must answer a coded 403 naming the resource, never a raw 500.
+    # 2. Server contract: the gRPC PERMISSION_DENIED maps to a coded 403 naming
+    #    the resource, never a raw 500 internal_error.
     resp = httpx.get(
         f"{whs_403_server}/v1/sessions", params={"limit": 30, "visibility": "all"}, timeout=15.0
     )

@@ -49,6 +49,9 @@ import httpx
 import pytest
 from playwright.sync_api import Page, Response, expect
 
+# The stand-in CMK service and the store hooks it serves need grpcio.
+pytest.importorskip("grpc", reason="grpcio is required for the stand-in CMK RPC service")
+
 from omnigent.runner.identity import token_bound_runner_id
 from tests._helpers.compat import apply_server_env
 from tests.e2e_ui.chat._cmk_denying_store_server import DENY_FLAG_ENV
@@ -304,11 +307,10 @@ def test_cmk_permission_denied_on_persist_is_not_an_unhandled_internal_error(
     A denied CMK encrypt during a send must not be answered as an unhandled 500.
 
     Drives the reconstructed journey: a healthy turn completes, the CMK edge
-    flips into its denial burst, and the user sends again. The send may still
-    fail — the payload could not be encrypted — but the denial is an upstream
-    condition the server must recognise: the client must not receive the
-    generic ``500 internal_error`` and the server must not book the RPC error
-    as an unhandled exception.
+    flips into its denial burst, and the user sends again. The send fails —
+    the payload could not be encrypted — but as the handled
+    ``403 upstream_permission_denied``, not the generic ``500 internal_error``,
+    and the server must not book the RPC error as an unhandled exception.
 
     :param page: Playwright page driving the SPA.
     :param cmk_server: The stand-in server whose CMK edge the test flips.
@@ -339,9 +341,9 @@ def test_cmk_permission_denied_on_persist_is_not_an_unhandled_internal_error(
 
     body = _json_body(response)
     code = body.get("error", {}).get("code")
-    assert (response.status, code) != (500, "internal_error"), (
-        "CMK PERMISSION_DENIED on item persist escaped as an unhandled 500 internal_error; "
-        f"the SPA showed {headline!r}"
+    assert (response.status, code) == (403, "upstream_permission_denied"), (
+        "CMK PERMISSION_DENIED on item persist was not answered as a handled 403 "
+        f"upstream_permission_denied: got {response.status} {code!r}; the SPA showed {headline!r}"
     )
     unhandled = _unhandled_permission_denied(cmk_server.server_log, log_offset)
     assert unhandled is None, (
@@ -360,9 +362,10 @@ def test_cmk_permission_denied_on_read_is_not_an_unhandled_internal_error(
 
     Drives the read side of the journey: a healthy turn leaves encrypted items
     behind, the CMK edge flips into its denial burst, and the user reloads the
-    session. The transcript may fail to load — nothing can be decrypted — but
-    the client must not receive the generic ``500 internal_error`` and the
-    server must not book the RPC error as an unhandled exception.
+    session. The transcript cannot be decrypted, so the denied read must
+    surface as the handled ``403 upstream_permission_denied`` — never the
+    generic ``500 internal_error`` — and the server must not book the RPC
+    error as an unhandled exception.
 
     :param page: Playwright page driving the SPA.
     :param cmk_server: The stand-in server whose CMK edge the test flips.
@@ -375,15 +378,16 @@ def test_cmk_permission_denied_on_read_is_not_an_unhandled_internal_error(
     cmk_server.deny_flag.touch()
 
     session_prefix = f"/v1/sessions/{cmk_session}"
-    internal_errors: list[str] = []
+    # (path, status, error code) of every session response the reload triggers.
+    outcomes: list[tuple[str, int, str | None]] = []
 
-    def _record_internal_error(response: Response) -> None:
-        if response.status != 500 or not urlparse(response.url).path.startswith(session_prefix):
-            return
-        if _json_body(response).get("error", {}).get("code") == "internal_error":
-            internal_errors.append(urlparse(response.url).path)
+    def _record_outcome(response: Response) -> None:
+        path = urlparse(response.url).path
+        if path.startswith(session_prefix):
+            code = _json_body(response).get("error", {}).get("code")
+            outcomes.append((path, response.status, code))
 
-    page.on("response", _record_internal_error)
+    page.on("response", _record_outcome)
     page.reload()
     transcript_or_failure = page.locator(_ASSISTANT).first.or_(
         page.get_by_role("heading", name="Conversation not found")
@@ -393,9 +397,19 @@ def test_cmk_permission_denied_on_read_is_not_an_unhandled_internal_error(
     # Hold the loaded (or failed) state on screen so the recording shows what the user sees.
     page.wait_for_timeout(2_000)
 
+    internal_errors = [
+        p for p, status, code in outcomes if (status, code) == (500, "internal_error")
+    ]
     assert not internal_errors, (
         "CMK PERMISSION_DENIED on item decrypt escaped as an unhandled 500 internal_error on "
         f"{internal_errors[0]}; the SPA showed {shown[:160]!r}"
+    )
+    denied = [
+        p for p, status, code in outcomes if (status, code) == (403, "upstream_permission_denied")
+    ]
+    assert denied, (
+        "the denied CMK decrypt never surfaced as a handled 403 upstream_permission_denied; "
+        f"session responses: {outcomes!r}; the SPA showed {shown[:160]!r}"
     )
     unhandled = _unhandled_permission_denied(cmk_server.server_log, log_offset)
     assert unhandled is None, (

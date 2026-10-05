@@ -1,14 +1,11 @@
-"""Run the real server with item-payload encryption served by an in-process gRPC CMK stub.
+"""Run the real server with item-payload encode/decode served by an in-process gRPC CMK stub.
 
-Stands in for the Databricks agentbricks/mas deployment, where the MySQL/CMK
-conversation store encrypts every conversation-item payload through the
-mas-java sidecar's ``EncryptPayloads`` / ``DecryptPayloads`` RPCs behind the
-Barnacle forward-proxy. Here the RPC is served in-process and returns the
-payloads unchanged. While the file named by ``OMNIGENT_E2E_CMK_DENY_FLAG``
-exists, every call is rejected with ``PERMISSION_DENIED`` and the detail string
-``"Received http2 header with status: 403"`` — the exact rejection the ticket
-quotes — so the store raises the same ``_InactiveRpcError`` the deployment's
-``_cmk_rpc`` does.
+Stands in for a deployment whose conversation store encrypts item payloads
+through a CMK sidecar's ``EncryptPayloads`` / ``DecryptPayloads`` RPCs. The stub
+returns payloads unchanged; while the file named by ``OMNIGENT_E2E_CMK_DENY_FLAG``
+exists, every call is rejected with ``PERMISSION_DENIED`` /
+``"Received http2 header with status: 403"``, so the store raises the same
+``_InactiveRpcError`` the deployment's CMK client does.
 
 Usage::
 
@@ -101,12 +98,15 @@ def main() -> None:
         return _cmk_rpc(decrypt, stored)
 
     store_cls = store_module.SqlAlchemyConversationStore
-    with (
-        patch.object(store_cls, "_encode_item_data_batch", _encode_item_data_batch),
-        patch.object(store_cls, "_decode_item_data_batch", _decode_item_data_batch),
-    ):
-        cli(args=["server", *sys.argv[1:]], prog_name="cmk-store-test-server")
-    cmk_service.stop(grace=None)
+    try:
+        with (
+            patch.object(store_cls, "_encode_item_data_batch", _encode_item_data_batch),
+            patch.object(store_cls, "_decode_item_data_batch", _decode_item_data_batch),
+        ):
+            cli(args=["server", *sys.argv[1:]], prog_name="cmk-store-test-server")
+    finally:
+        channel.close()
+        cmk_service.stop(grace=None)
 
 
 if __name__ == "__main__":
