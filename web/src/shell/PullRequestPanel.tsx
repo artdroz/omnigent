@@ -1109,12 +1109,12 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
       {showTrackingControls && (linking || update.isError) && (
         <div className="shrink-0 border-b border-border p-2">{linkControls}</div>
       )}
-      {info.data?.warnings?.length ? (
+      {info.data?.warnings?.length || info.data?.discovery_warnings?.length ? (
         <p
           role="status"
           className="shrink-0 border-b border-border p-2 text-ui text-muted-foreground"
         >
-          {info.data.warnings.join(" ")}
+          {[...(info.data?.warnings ?? []), ...(info.data?.discovery_warnings ?? [])].join(" ")}
         </p>
       ) : null}
       <div className="min-h-0 flex-1">

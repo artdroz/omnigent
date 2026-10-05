@@ -167,6 +167,8 @@ export interface PullRequestInfo {
   provider?: string | null;
   provider_display?: GitProviderDisplay | null;
   warnings?: string[];
+  /** Failures on other remotes do not change the selected provider’s state. */
+  discovery_warnings?: string[];
   auth?: PullRequestAuth;
   capabilities?: PullRequestCapabilities;
   /** Whether the `gh` CLI is present on the host.

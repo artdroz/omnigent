@@ -371,6 +371,18 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByText(/No open PR for/)).not.toBeInTheDocument();
   });
 
+  it("keeps the no-PR state and linking available when another provider fails", () => {
+    state.info!.data!.pr = null;
+    state.info!.data!.tracking_available = true;
+    state.info!.data!.discovery_warnings = ["GitLab discovery failed. Refresh to retry."];
+    renderPanel();
+
+    expect(screen.getByText(/No open PR for/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Link a PR" })).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("GitLab discovery failed.");
+    expect(screen.queryByText("Pull requests aren’t available.")).not.toBeInTheDocument();
+  });
+
   it("reveals the stacked diff after switching to the Changes tab", async () => {
     renderPanel();
     expect(screen.queryByTestId("diff")).toBeNull();
