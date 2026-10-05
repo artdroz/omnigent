@@ -4,11 +4,18 @@ const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const {
+  ARCA_EXTEND_MODES,
+  EXTEND_TIMEOUT_MS,
+  STATUS_TIMEOUT_MS,
   buildConnectArgs,
   buildLoginArgs,
   connectArcaHost,
+  describeArcaCliFailure,
   describeConnectFailure,
+  parseArcaStatus,
+  readArcaStatus,
   resolveArcaPath,
+  runArcaExtend,
   startArcaConnect,
   startArcaLogin,
 } = require("../src/arca");
@@ -24,6 +31,230 @@ function fakeConnectChild() {
   };
   return child;
 }
+
+function fakeCliSpawn(onSpawn) {
+  const calls = [];
+  const spawn = (file, args, options) => {
+    const child = fakeConnectChild();
+    calls.push({ file, args, options, child });
+    onSpawn?.(child);
+    return child;
+  };
+  return { spawn, calls, resolveArcaPath: () => "/fake/arca" };
+}
+
+describe("arca status output", () => {
+  it("parses a pretty-printed status and explicit UTC offsets", () => {
+    const status = {
+      name: "dev",
+      status: "running",
+      region: "us-west-2",
+      volume: null,
+      instance: { launch_time: "2026-10-04T01:00:00Z", shutdown_time: "2026-10-05T01:00:00Z" },
+    };
+    assert.deepEqual(parseArcaStatus(JSON.stringify(status, null, 2)), {
+      state: "running",
+      shutdownAt: Date.UTC(2026, 9, 5, 1),
+      rawShutdownTime: "2026-10-05T01:00:00Z",
+    });
+    status.instance.shutdown_time = "2026-10-05T01:00:00+00:00";
+    assert.equal(parseArcaStatus(JSON.stringify(status)).shutdownAt, Date.UTC(2026, 9, 5, 1));
+  });
+
+  it("handles null instance, null time, and the minimal top-level shape", () => {
+    assert.deepEqual(parseArcaStatus('{"status":"terminated","instance":null}'), {
+      state: "terminated",
+      shutdownAt: null,
+      rawShutdownTime: null,
+    });
+    assert.deepEqual(parseArcaStatus('{"status":"running","instance":{"shutdown_time":null}}'), {
+      state: "running",
+      shutdownAt: null,
+      rawShutdownTime: null,
+    });
+    assert.equal(
+      parseArcaStatus('{"shutdown_time":"2026-10-05T01:00:00Z"}').shutdownAt,
+      Date.UTC(2026, 9, 5, 1),
+    );
+  });
+
+  it("ignores notices and keeps invalid or zone-less raw times", () => {
+    const stdout =
+      'Upgrade available\n{"status":"running","instance":{"shutdown_time":"2026-10-05T01:00:00"}}\nDone';
+    assert.deepEqual(parseArcaStatus(stdout), {
+      state: "running",
+      shutdownAt: null,
+      rawShutdownTime: "2026-10-05T01:00:00",
+    });
+    assert.equal(parseArcaStatus('{"instance":{"shutdown_time":"badZ"}}').shutdownAt, null);
+    assert.equal(parseArcaStatus("garbage"), null);
+    assert.equal(parseArcaStatus("{broken}"), null);
+  });
+});
+
+describe("arca status command", () => {
+  it("runs headlessly with exact argv and returns parsed status", async () => {
+    const deps = fakeCliSpawn((child) =>
+      queueMicrotask(() => {
+        child.stdout.emit(
+          "data",
+          'notice\n{"status":"running","instance":{"shutdown_time":"2026-10-05T01:00:00Z"}}\n',
+        );
+        child.emit("close", 0);
+      }),
+    );
+    assert.deepEqual(await readArcaStatus(deps), {
+      ok: true,
+      state: "running",
+      shutdownAt: Date.UTC(2026, 9, 5, 1),
+      rawShutdownTime: "2026-10-05T01:00:00Z",
+    });
+    assert.deepEqual(deps.calls[0].args, ["status", "--json"]);
+    assert.equal(deps.calls[0].options.stdio[0], "ignore");
+    assert.equal(STATUS_TIMEOUT_MS, 60_000);
+  });
+
+  it("waits for close when status output arrives after exit", async () => {
+    const deps = fakeCliSpawn((child) =>
+      queueMicrotask(() => {
+        child.stdout.emit("data", '{"status":"running","instance":{"shutdown_time":"2026-');
+        child.emit("exit", 0);
+        child.stdout.emit("data", '10-05T01:00:00Z"}}');
+        child.emit("close", 0);
+      }),
+    );
+    assert.deepEqual(await readArcaStatus(deps), {
+      ok: true,
+      state: "running",
+      shutdownAt: Date.UTC(2026, 9, 5, 1),
+      rawShutdownTime: "2026-10-05T01:00:00Z",
+    });
+  });
+
+  it("maps non-zero exit, timeout, spawn errors, and malformed success", async () => {
+    const fail = fakeCliSpawn((child) =>
+      queueMicrotask(() => {
+        child.stderr.emit("data", "No running arca instance found for 'dev'.");
+        child.emit("close", 1);
+      }),
+    );
+    assert.equal((await readArcaStatus(fail)).errorKind, "no-instance");
+    const timeout = fakeCliSpawn();
+    assert.equal((await readArcaStatus({ ...timeout, timeoutMs: 20 })).errorKind, "timeout");
+    assert.equal(timeout.calls[0].child.killed, true);
+    const spawnError = fakeCliSpawn((child) =>
+      queueMicrotask(() => child.emit("error", new Error("EACCES"))),
+    );
+    assert.deepEqual(await readArcaStatus(spawnError), {
+      ok: false,
+      errorKind: "unknown",
+      error: "Couldn't run arca: EACCES",
+    });
+    const garbage = fakeCliSpawn((child) =>
+      queueMicrotask(() => {
+        child.stdout.emit("data", "garbage");
+        child.emit("close", 0);
+      }),
+    );
+    assert.match((await readArcaStatus(garbage)).error, /unexpected arca status output/i);
+  });
+
+  it("does not spawn when arca is absent", async () => {
+    const result = await readArcaStatus({
+      resolveArcaPath: () => null,
+      spawn: () => {
+        throw new Error("must not spawn");
+      },
+    });
+    assert.equal(result.errorKind, "not-installed");
+  });
+});
+
+describe("arca extend command", () => {
+  it("validates modes and returns the last output line", async () => {
+    assert.deepEqual(ARCA_EXTEND_MODES, ["default", "overnight", "workweek"]);
+    assert.equal(Object.isFrozen(ARCA_EXTEND_MODES), true);
+    assert.equal(EXTEND_TIMEOUT_MS, 120_000);
+    const deps = fakeCliSpawn((child) =>
+      queueMicrotask(() => {
+        child.stdout.emit(
+          "data",
+          "Starting\nExtend succeeded. Instance will not be shutdown until October 06\n",
+        );
+        child.emit("close", 0);
+      }),
+    );
+    assert.deepEqual(await runArcaExtend("overnight", deps), {
+      ok: true,
+      message: "Extend succeeded. Instance will not be shutdown until October 06",
+    });
+    assert.deepEqual(deps.calls[0].args, ["extend", "overnight"]);
+    assert.equal(deps.calls[0].options.stdio[0], "ignore");
+    const invalidResults = await Promise.all(
+      ["reset", "overnight; rm -rf ~"].map((mode) => runArcaExtend(mode, deps)),
+    );
+    for (const result of invalidResults) {
+      assert.deepEqual(result, {
+        ok: false,
+        errorKind: "unknown",
+        error: "Unsupported arca extend mode.",
+      });
+    }
+    assert.equal(deps.calls.length, 1);
+  });
+
+  it("maps every documented failure kind", async () => {
+    const failures = [
+      ["No running arca instance found for 'dev'.", "no-instance"],
+      [
+        "Cannot set shutdown_after: reaches its one-week runtime limit at tomorrow",
+        "runtime-limit",
+      ],
+      ["Your dbcert login expired", "arca-auth"],
+      ["Error connecting to arca", "unreachable"],
+      ["noise\nopaque failure", "unknown"],
+    ];
+    const results = await Promise.all(
+      failures.map(([output]) => {
+        const deps = fakeCliSpawn((child) =>
+          queueMicrotask(() => {
+            child.stderr.emit("data", output);
+            child.emit("close", 1);
+          }),
+        );
+        return runArcaExtend("workweek", deps);
+      }),
+    );
+    results.forEach((result, index) => {
+      const kind = failures[index][1];
+      assert.equal(result.errorKind, kind);
+      if (kind === "unknown") assert.match(result.error, /opaque failure/);
+    });
+    const timeout = fakeCliSpawn();
+    assert.equal(
+      (await runArcaExtend("default", { ...timeout, timeoutMs: 20 })).errorKind,
+      "timeout",
+    );
+    assert.equal(timeout.calls[0].child.killed, true);
+    assert.equal(
+      (await runArcaExtend("default", { resolveArcaPath: () => null })).errorKind,
+      "not-installed",
+    );
+  });
+
+  it("uses timeout before text classification", () => {
+    assert.equal(
+      describeArcaCliFailure({ code: null, stdout: "dbcert", stderr: "", timedOut: true }, "status")
+        .errorKind,
+      "timeout",
+    );
+    assert.match(
+      describeArcaCliFailure({ code: null, stdout: "", stderr: "", timedOut: true }, "status")
+        .error,
+      /checking arca's status timed out/i,
+    );
+  });
+});
 
 describe("arca binary resolution", () => {
   it("prefers PATH, then falls back to well-known locations", () => {
