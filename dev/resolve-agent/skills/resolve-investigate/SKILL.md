@@ -10,6 +10,10 @@ investigation proportional to the reported problem; reuse evidence that still
 matches the checkout. Record concise findings in the existing `root_cause`,
 `fix_summary`, and `test_audit` fields, not a separate report.
 
+Before editing product code, complete the applicable checks below and record
+their commands and observations. A plan to check later is not evidence. When a
+check cannot run, name the concrete blocker and keep the cause unresolved.
+
 1. **Reconstruct the report.** Read the report and relevant discussion, including
    linked evidence. Separate reported facts, observations, and hypotheses. Pin
    the entry point, build, harness, authentication mode/profile, configuration,
@@ -34,6 +38,12 @@ matches the checkout. Record concise findings in the existing `root_cause`,
    to exercise the configured path. Keep application token resolution and the
    installed SDK intact; record the controlled external boundaries and remaining
    incident uncertainty. Put timeouts on discovery and subprocess calls.
+   Start with a working control: load an isolated version of the reported
+   profile through the real credential-selection code and SDK, obtain a token
+   from a controlled external service, and use it at the caller's transport
+   boundary. Keep the same application credential object while exercising
+   expiry or rejection. Record whether it refreshes or recovers before proposing
+   a cache reset. Mocking that object or its factory cannot satisfy this check.
 3. **Find the design intent.** Read nearby tests and documentation, targeted
    `git log -S`/`git blame`, and relevant commit/PR discussion. Cite the source
    and revision; distinguish documented rationale from inference and note
@@ -43,12 +53,22 @@ matches the checkout. Record concise findings in the existing `root_cause`,
    Follow the reported path to any shared registry, default, or policy definition
    that governs the behavior, then read its rationale, relevant callers, and
    tests. Do not infer the full contract from one local fallback.
+   Follow imported policy symbols to their defining files. Search for the
+   declaration and other consumers; a filename in search output or a symbol in
+   a caller is not a definition read. Record the controlling symbol/value,
+   definition path, historical rationale, and pinning test in `test_audit`.
+   If there is no shared definition, record the search that established that.
 4. **Choose and explain.** Preserve intended behavior when correcting the
    defect. For a necessary policy change, explain the old behavior, the proposed
    behavior, affected users/configurations, alternatives, and supporting
    evidence. Existing tests are evidence of intent, not unquestionable policy.
    Repair unsupported repro expectations with the original evidence preserved;
    label tests of a proposed policy as such, not proof the old policy was a bug.
+   Before adding a retry, trace the retried operation's state writes and external
+   effects. Test failure after an effect commits but before success reaches the
+   caller; retry counts alone do not show safety. Preserve existing behavior
+   when the proposed retry lacks that evidence, and record the unsupported
+   proposal as remaining work.
 
 ## PR review is the human decision boundary
 

@@ -230,6 +230,11 @@ rules out. A familiar error message alone does not establish its cause.
 Follow the reported path to any shared registry, default, or policy definition
 that governs the behavior, then read its rationale, relevant callers, and tests.
 Do not infer the full contract from one local fallback.
+Follow imported policy symbols to their defining files: search for the declaration
+and other consumers. Record the governing symbol/value, definition path, historical
+rationale, and pinning test in `evidence`. A filename in search output or a symbol
+in a caller is not a definition read. If no shared definition exists, record the
+search that established that before choosing the test's expected result.
 
 When reported authentication endpoints are unavailable or sanitized, use bounded
 local discovery, refresh, and transport services with fake credentials to exercise
@@ -238,6 +243,14 @@ intact; replacing the suspected component with canned results assumes the cause.
 Record the controlled external boundaries and remaining incident uncertainty.
 Put timeouts on discovery and subprocess calls. A controlled check does not by
 itself reproduce an unavailable production incident.
+Start with a working control: load an isolated version of the reported profile
+through the real credential-selection code and SDK, obtain a token from a
+controlled external service, and use it at the caller's transport boundary.
+Keep the same application credential object while exercising expiry or rejection.
+Record whether it refreshes or recovers; mocking that object or its factory cannot
+satisfy this check. Complete this before writing a test that assumes stale
+credentials are the cause. Preserve any concrete blocker and unsupported hypothesis
+in the handoff; a failing mock does not establish the reported reproduction.
 
 Keep this investigation bounded to the reported journey; a complete diagnosis
 is not required to hand off a valid reproduction. Preserve unresolved intent in
