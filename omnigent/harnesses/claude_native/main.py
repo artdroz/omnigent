@@ -3019,22 +3019,14 @@ def _profile_pinned_auth_command(
 
 
 def _mark_1m_context_models(config: ClaudeNativeUcodeConfig) -> ClaudeNativeUcodeConfig:
-    """Spell the config's Opus/Sonnet ids with the ``[1m]`` 1M-context marker.
-
-    Claude Code reports and compacts at the 1M window only for a model id
-    carrying ``[1m]``; a bare Opus/Sonnet id leaves the pane capped at 200K
-    even when the gateway serves 1M. Mark the alias pins, the custom-slot id,
-    the launch default, and the routable set so the launched model, the
-    ``/model`` picker, and routing all run at 1M. The canonical refusal-
-    fallback overrides stay bare: Claude Code emits the marker-less canonical
-    id, so their keys must keep matching it. Only the Anthropic-surface gateway
-    configs call this; Bedrock ids are not Anthropic ids and never carry it.
-    """
+    """Stamp ``[1m]`` onto the config's Opus/Sonnet ids so the pane runs at 1M."""
     pin_keys = {_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV, *ALIAS_MODEL_ENV_VARS.values()}
     env = {
         key: with_1m_context_marker(value) if key in pin_keys else value
         for key, value in config.env.items()
     }
+    # Leave model_overrides bare: Claude Code's refusal fallback emits the
+    # canonical, marker-less id, so override keys must keep matching it.
     return replace(
         config,
         env=env,

@@ -8547,14 +8547,7 @@ def test_bedrock_config_for_native_claude_static_key(monkeypatch: pytest.MonkeyP
 
 
 def test_mark_1m_context_models_marks_opus_and_sonnet_only() -> None:
-    """The 1M-context pass marks the Opus/Sonnet launch spellings, nothing else.
-
-    It stamps [1m] onto the launch model, the alias and custom-slot pins, and
-    the routable set for the 1M families, leaves the Haiku/Fable small tiers and
-    non-model env entries at the 200K default, and never rewrites the
-    refusal-fallback overrides, whose keys must match Claude Code's marker-less
-    canonical model refs.
-    """
+    """The 1M-context pass marks only the Opus/Sonnet launch spellings."""
     config = claude_native.ClaudeNativeUcodeConfig(
         env={
             "ANTHROPIC_BASE_URL": "https://gw.example/anthropic",

@@ -2837,8 +2837,7 @@ def native_claude_mock_session(
 
 
 # A 1M-context-capable Opus served under a Databricks gateway spelling. Claude
-# Code reports 1M only for ids carrying the ``[1m]`` marker, so this bare id
-# surfaces the 200K cap of OMNI-10374.
+# A bare id (no ``[1m]``) surfaces the 200K cap this suite guards against.
 _NATIVE_CLAUDE_OPUS_MODEL = "databricks-claude-opus-5"
 
 
@@ -2848,11 +2847,7 @@ def native_claude_opus_mock_session(
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[tuple[str, str]]:
-    """A real Claude CLI pinned to a 1M-capable Opus gateway id (no ``[1m]``).
-
-    Same wiring as :func:`native_claude_mock_session`, but the mock provider
-    defaults to an Opus model so the session exercises the Opus context window.
-    """
+    """A real Claude CLI pinned to a 1M-capable Opus gateway id (no ``[1m]``)."""
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     with _temp_omnigent_mock_config(

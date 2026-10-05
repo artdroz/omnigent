@@ -173,12 +173,7 @@ async def test_catalog_uses_cli_managed_picker_for_every_launch_config(
 async def test_catalog_coalesces_a_1m_pinned_default_onto_its_alias_row(
     monkeypatch: pytest.MonkeyPatch, picker_echo: str
 ) -> None:
-    """A 1M-pinned opus default is one row, whether or not the picker echoes [1m].
-
-    The gateway launch config pins the opus id with the ``[1m]`` marker, so the
-    appended default must fold onto the picker's own opus row instead of listing
-    the same model twice (once bare, once ``[1m]``) in ``/model``.
-    """
+    """A 1M-pinned opus default folds onto its picker row instead of listing twice."""
     _stub_picker(
         monkeypatch,
         [{"value": "opus", "resolvedModel": picker_echo, "displayName": "Opus 5"}],

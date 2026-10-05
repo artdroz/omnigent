@@ -288,28 +288,13 @@ _CONTEXT_1M_MARKER = "[1m]"
 
 
 def model_supports_1m_context(model: str) -> bool:
-    """Whether *model* names a Claude family that serves the 1M window.
-
-    Decided by family, not generation, so a newer Opus/Sonnet inherits the
-    window instead of capping at 200K until a hardcoded version list is
-    updated.
-
-    :param model: A served model id or alias.
-    :returns: ``True`` for an Opus or Sonnet id/alias, else ``False``.
-    """
+    """Whether *model* names a Claude family (Opus/Sonnet) that serves the 1M window."""
     base = claude_model_alias(model, env={})
     return base is not None and base.partition("[")[0] in CLAUDE_1M_CONTEXT_FAMILIES
 
 
 def with_1m_context_marker(model: str) -> str:
-    """Spell *model* with the ``[1m]`` marker when its family serves the 1M window.
-
-    Idempotent: a model that already carries the marker, whose family does not
-    serve the 1M window, or that spells no Claude model, is returned unchanged.
-
-    :param model: A served model id or alias.
-    :returns: The model id with ``[1m]`` appended when applicable.
-    """
+    """Append ``[1m]`` to *model* when its family serves 1M; idempotent, else unchanged."""
     if not isinstance(model, str) or not model.strip():
         return model
     spelled = model.strip()

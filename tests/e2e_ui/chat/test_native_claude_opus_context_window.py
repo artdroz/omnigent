@@ -1,12 +1,4 @@
-"""OMNI-10374: a native Claude Opus session must report Opus's 1M context window.
-
-A terminal-first ``claude-native`` session renders the composer context ring
-from the window Claude Code's statusLine reports for the active model. Claude
-Code grants a 1M window only to model ids carrying the ``[1m]`` marker, so a
-1M-capable Opus served under a bare gateway spelling (the Databricks Sandbox
-case) is capped at Claude Code's 200K default. This drives the real web journey
-and asserts the window the session reports, so a 200K cap fails here.
-"""
+"""A native Claude Opus session must report Opus's 1M context window, not a 200K cap."""
 
 from __future__ import annotations
 
