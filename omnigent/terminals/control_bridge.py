@@ -506,13 +506,14 @@ def _cursor_restore_escape(meta: _PaneMetadata | None) -> bytes:
 
 
 async def _set_shared_window_size_largest(tmux: str, socket_path: str, tmux_target: str) -> None:
-    """Size the shared tmux window to the widest attached client, not the latest.
+    """Keep the shared tmux window from shrinking to a narrower owner client.
 
-    Under the default ``window-size latest`` a second owner client that attaches
-    narrower (the same session opened on a phone) shrinks the shared window and
-    every other client's pane. ``largest`` keeps it at the widest client;
-    read-only viewers are already excluded via ``ignore-size``. Best-effort: a
-    tmux that rejects the option keeps the previous behavior.
+    The default ``window-size latest`` lets whichever owner attached last win, so
+    the same session opened on a phone shrinks every client's pane. ``largest``
+    instead maxes columns and rows independently across size-contributing clients,
+    keeping the desktop's width (a taller client can leave rows below the fold).
+    Read-only viewers are already excluded via ``ignore-size``; best-effort, since
+    a tmux that rejects the option keeps the previous behavior.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -584,8 +585,7 @@ async def bridge_tmux_control_to_websocket(
         with contextlib.suppress(RuntimeError, WebSocketDisconnect):
             await websocket.send_bytes(seed)
 
-    # Keep a second, narrower owner client (e.g. the same session opened on a
-    # phone) from shrinking an existing wider client's pane (see helper).
+    # Apply before attaching so already-running sessions get the policy too.
     await _set_shared_window_size_largest(tmux, socket_path, tmux_target)
 
     argv = [tmux, "-S", socket_path, "-f", "/dev/null", "-C", "attach"]

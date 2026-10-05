@@ -1179,9 +1179,10 @@ async def _tmux_window_width(sock: Path, target: str) -> int:
         target,
         "#{window_width}",
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
     )
-    out, _ = await proc.communicate()
+    out, err = await proc.communicate()
+    assert proc.returncode == 0, err.decode()
     return int(out.decode().strip())
 
 
@@ -1205,23 +1206,32 @@ async def test_second_interactive_client_does_not_shrink_first_clients_pane() ->
         )
 
     desktop_task = asyncio.create_task(_attach(desktop))
-    await asyncio.sleep(0.8)
-    assert await _tmux_window_width(sock, target) == 160
-
-    phone_task = asyncio.create_task(_attach(phone))
-    await asyncio.sleep(0.8)
-    width_with_phone = await _tmux_window_width(sock, target)
-
-    phone._recv_gate.set()
-    with contextlib.suppress(asyncio.TimeoutError):
-        await asyncio.wait_for(phone_task, timeout=5)
-    await asyncio.sleep(0.5)
-    width_after_phone_left = await _tmux_window_width(sock, target)
-
+    phone_task: asyncio.Task[None] | None = None
     try:
+        await asyncio.sleep(0.8)
+        assert await _tmux_window_width(sock, target) == 160
+
+        phone_task = asyncio.create_task(_attach(phone))
+        await asyncio.sleep(0.8)
+        width_with_phone = await _tmux_window_width(sock, target)
+
+        phone._recv_gate.set()
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(phone_task, timeout=5)
+        await asyncio.sleep(0.5)
+        width_after_phone_left = await _tmux_window_width(sock, target)
+
         assert width_with_phone == 160, (
-            f"desktop pane shrank to the phone's {width_with_phone} columns while the "
-            f"phone was attached (back to {width_after_phone_left} after it left)"
+            f"desktop pane shrank to the phone's {width_with_phone} columns "
+            "while the phone was attached"
+        )
+        assert width_after_phone_left == 160, (
+            f"desktop pane did not stay at 160 columns after the phone left "
+            f"(got {width_after_phone_left})"
         )
     finally:
+        if phone_task is not None:
+            phone_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await phone_task
         await _kill_and_join(sock, desktop_task)

@@ -114,14 +114,29 @@ def _wait_for_frame(observer: _AttachObserver, *, min_width: int, timeout_s: flo
 
 
 def _wait_for_frame_change(observer: _AttachObserver, *, previous: int, timeout_s: float) -> int:
+    """Wait for the drawn width to change and settle on two consecutive equal reads.
+
+    Bytes stream in continuously, so a single poll can land mid-redraw; requiring
+    the changed width to repeat avoids returning a transient, partially drawn frame.
+    """
     deadline = time.monotonic() + timeout_s
-    width = previous
+    last = previous
     while time.monotonic() < deadline:
         width = _drawn_frame_width(observer.screen_lines())
-        if width != previous:
+        if width != previous and width == last:
             return width
+        last = width
         time.sleep(0.5)
-    return width
+    return last
+
+
+def _wait_for_resize(observer: _AttachObserver, *, timeout_s: float) -> None:
+    """Wait until the tab has recorded its initial resize frame (sent async on WS open)."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if observer.resizes:
+            return
+        time.sleep(0.1)
 
 
 def _painted_extent_px(page: Page, path: Path) -> tuple[int, int]:
@@ -174,6 +189,9 @@ def _open_session_terminal(context: BrowserContext, url: str, observer: _AttachO
     expect(page.locator(_TERMINAL_VIEW).last).to_have_attribute(
         "data-state", "connected", timeout=_TERMINAL_READY_TIMEOUT_MS
     )
+    # The resize frame is delivered asynchronously over CDP, so wait for the
+    # observer to record it before callers read ``cols_rows``.
+    _wait_for_resize(observer, timeout_s=_SETTLE_TIMEOUT_S)
     return page
 
 
@@ -182,16 +200,12 @@ def _dump(path: Path, lines: list[str]) -> None:
 
 
 @pytest.mark.timeout(600)
-@pytest.mark.parametrize(
-    "close_phone", [False, True], ids=["phone_stays_attached", "phone_closes"]
-)
 def test_phone_attach_keeps_desktop_terminal_pane_width(
     browser: Browser,
     native_claude_mock_session: tuple[str, str],
     output_path: str,
-    close_phone: bool,
 ) -> None:
-    """The desktop TUI keeps its columns while (and after) a phone views the session."""
+    """The desktop TUI keeps its columns while a phone views the session, and recovers after."""
     base_url, session_id = native_claude_mock_session
     url = f"{base_url}/c/{session_id}"
     print(f"[shared-pane] session_id={session_id}")
@@ -237,30 +251,25 @@ def test_phone_attach_keeps_desktop_terminal_pane_width(
             f"[shared-pane] desktop while phone attached: drawn_frame_width={with_phone} "
             f"painted_px={with_phone_px}"
         )
-
-        after_close = with_phone
-        if close_phone:
-            phone.close()
-            phone = None
-            after_close = _wait_for_frame_change(
-                desktop_obs, previous=with_phone, timeout_s=_SETTLE_TIMEOUT_S
-            )
-            _dump(artifacts / "desktop-after-phone-closed.txt", desktop_obs.screen_lines())
-            after_px = _painted_extent_px(
-                desktop_page, artifacts / "desktop-after-phone-closed.png"
-            )
-            print(
-                f"[shared-pane] desktop after phone closed: drawn_frame_width={after_close} "
-                f"painted_px={after_px}"
-            )
-        else:
-            # Hold the shrunken pane on screen long enough to read in the clip.
-            desktop_page.wait_for_timeout(3_000)
-
         assert with_phone >= baseline * 0.9, (
             f"desktop pane shrank from {baseline} to {with_phone} columns while a "
             f"{phone_cols}-column phone was attached"
-            + (f"; back to {after_close} after the phone closed" if close_phone else "")
+        )
+
+        phone.close()
+        phone = None
+        after_close = _wait_for_frame_change(
+            desktop_obs, previous=with_phone, timeout_s=_SETTLE_TIMEOUT_S
+        )
+        _dump(artifacts / "desktop-after-phone-closed.txt", desktop_obs.screen_lines())
+        after_px = _painted_extent_px(desktop_page, artifacts / "desktop-after-phone-closed.png")
+        print(
+            f"[shared-pane] desktop after phone closed: drawn_frame_width={after_close} "
+            f"painted_px={after_px}"
+        )
+        assert after_close >= baseline * 0.9, (
+            f"desktop pane did not recover after the phone closed: "
+            f"{after_close} vs baseline {baseline}"
         )
     finally:
         desktop.close()
