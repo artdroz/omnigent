@@ -38,8 +38,11 @@ check cannot run, name the concrete blocker and keep the cause unresolved.
    auth services are unavailable or sanitized, substitute only boundaries this
    provider uses, with bounded local services and fake credentials. Static
    credentials need no invented issuance or refresh service. Keep application
-   token resolution and the installed SDK intact, and time out discovery and
-   subprocess calls. Get credential resolution working on its own before adding
+   token resolution and the installed SDK intact. Record which provider actually
+   returns the credential, including any fallback, using its runtime type or call
+   trace. Starting SDK configuration or discovery does not prove SDK-provider
+   success. Bound discovery and subprocess calls with timeouts. Get credential
+   resolution working on its own before adding
    the host/reconnect loop. If initialization hangs, inspect the blocking stack.
    If it identifies external configuration metadata/discovery calls, provide
    controlled responses and record whether the control reached them. Preserve
@@ -61,6 +64,9 @@ check cannot run, name the concrete blocker and keep the cause unresolved.
    Follow the reported path to any shared registry, default, or policy definition
    that governs the behavior, then read its rationale, relevant callers, and
    tests. Do not infer the full contract from one local fallback.
+   Even when the local fallback is explicit, follow the phase or operation type
+   to its declaration and inspect other consumers for a shared table or default
+   controlling error behavior. Cite that declaration, or a bounded search if absent.
    Follow imported policy symbols to their defining files. Search for the
    declaration and other consumers; a filename in search output or a symbol in
    a caller is not a definition read. Record the controlling symbol/value,
