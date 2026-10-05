@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -493,8 +494,10 @@ def test_probe_codex_home_bridges_provider_tables_and_credential(
     config = (home / "config.toml").read_text()
     assert "[model_providers.Databricks]" in config
     assert "https://ws.example/serving-endpoints" in config
-    # The credential the account's catalog is gated on, in either spelling.
-    assert (home / ".credentials.json").is_symlink()
+    # The credential the account's catalog is gated on, bridged as a regular
+    # file on the source inode so Codex's O_NOFOLLOW rewrite still succeeds.
+    assert not (home / ".credentials.json").is_symlink()
+    assert os.path.samefile(home / ".credentials.json", source / ".credentials.json")
     # Minimal: no MCPs to boot and no hooks to fire during a probe.
     assert "mcp_servers" not in config
     assert not (home / "hooks.json").exists()

@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import contextlib
+import errno
 import json
 import os
 import stat
@@ -3699,20 +3700,23 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
     assert (target / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
 
 
-def test_populate_codex_home_config_symlinks_remote_mcp_oauth(tmp_path: Path) -> None:
-    """``.credentials.json`` and its lock dir are symlinked, not left behind.
+def test_populate_codex_home_config_hard_links_remote_mcp_oauth_store(tmp_path: Path) -> None:
+    """The remote-MCP OAuth store survives Codex's ``O_NOFOLLOW`` rewrite.
 
     Codex keeps OAuth tokens for remote (``url =``) MCP servers in
-    ``.credentials.json``, guarded across processes by
-    ``mcp-oauth-locks/``. A private home missing them starts those servers
-    unauthenticated while ``command =`` (stdio) servers still work.
+    ``.credentials.json``, guarded across processes by ``mcp-oauth-locks/``,
+    and persists refreshed tokens through an ``O_NOFOLLOW`` open. A symlinked
+    store fails that open with ELOOP ("Symbolic link loop (os error 40)") and
+    the server never starts; the bridged store must be a regular file whose
+    refreshes still reach the real home.
     """
     from omnigent.inner.codex_executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
     (source / "config.toml").write_text('[mcp_servers.linear]\nurl = "https://x/mcp"')
-    (source / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    stored = {"linear|abc": {"access_token": "t", "refresh_token": "r", "expires_at": 1}}
+    (source / ".credentials.json").write_text(json.dumps(stored))
     (source / "mcp-oauth-locks").mkdir()
     (source / "mcp-oauth-locks" / "file-store.lock").write_text("")
     target = tmp_path / "temp_codex_home"
@@ -3720,11 +3724,51 @@ def test_populate_codex_home_config_symlinks_remote_mcp_oauth(tmp_path: Path) ->
 
     _populate_codex_home_config(target, source)
 
-    # Symlinked (not copied) so a refresh in either direction is shared.
-    assert (target / ".credentials.json").is_symlink()
-    assert (target / ".credentials.json").read_text() == '{"linear|abc": {"access_token": "t"}}'
+    bridged = target / ".credentials.json"
+    assert bridged.is_file()
+    assert not bridged.is_symlink()
+    assert json.loads(bridged.read_text()) == stored
+    # One inode with the real store, so a refresh in either place is shared.
+    assert os.path.samefile(bridged, source / ".credentials.json")
+    # The open Codex uses to persist a refreshed token.
+    refreshed = {"linear|abc": {"access_token": "t2", "refresh_token": "r2", "expires_at": 9}}
+    fd = os.open(bridged, os.O_WRONLY | os.O_NOFOLLOW)
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, json.dumps(refreshed).encode())
+    finally:
+        os.close(fd)
+    assert json.loads((source / ".credentials.json").read_text()) == refreshed
     assert (target / "mcp-oauth-locks").is_symlink()
     assert (target / "mcp-oauth-locks" / "file-store.lock").is_file()
+
+
+def test_populate_codex_home_config_copies_remote_mcp_oauth_store_across_filesystems(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store that cannot be hard-linked is still a private, writable regular file."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    def _cross_device_link(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(os, "link", _cross_device_link)
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    bridged = target / ".credentials.json"
+    assert bridged.is_file()
+    assert not bridged.is_symlink()
+    assert not os.path.samefile(bridged, source / ".credentials.json")
+    assert stat.S_IMODE(bridged.stat().st_mode) == 0o600
+    fd = os.open(bridged, os.O_WRONLY | os.O_NOFOLLOW)
+    os.close(fd)
+    assert bridged.read_text() == '{"linear|abc": {"access_token": "t"}}'
 
 
 def test_populate_codex_home_config_symlinks_memories(tmp_path: Path) -> None:
