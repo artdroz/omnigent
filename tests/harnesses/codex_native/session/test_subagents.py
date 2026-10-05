@@ -1001,6 +1001,21 @@ def _child_error_event(
     }
 
 
+class _SuspendingResumeClient(_PerThreadFakeCodexClient):
+    """Resume client that parks ``thread/resume`` until the test releases it."""
+
+    def __init__(self, thread_responses: dict[str, dict[str, Any]]) -> None:
+        super().__init__(thread_responses)
+        self.resume_started = asyncio.Event()
+        self.release_resume = asyncio.Event()
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method == "thread/resume":
+            self.resume_started.set()
+            await self.release_resume.wait()
+        return await super().request(method, params)
+
+
 def _child_resume_response_with_turns(statuses: list[str]) -> dict[str, Any]:
     """Build a child ``thread/resume`` response whose turns carry ``statuses`` in order."""
     response = _child_resume_response(turn_status=statuses[0])
@@ -1045,6 +1060,26 @@ def test_forwarder_collab_snapshot_does_not_revive_settled_child(
     )
 
     assert _status_posts(posted, "conv_child") == ["running", settled_status]
+
+
+def test_forwarder_collab_snapshot_posts_status_for_child_without_own_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A freshly registered child with no lifecycle of its own still takes the snapshot status.
+    """
+    posted: list[tuple[str, dict[str, Any]]] = []
+    state, bridge_dir = _snapshot_test_state(tmp_path, monkeypatch)
+
+    _deliver_parent_events(
+        state,
+        bridge_dir,
+        [_subagent_activity_started_event(), _running_snapshot_event()],
+        posted,
+    )
+
+    assert _status_posts(posted, "conv_child") == ["running"]
 
 
 def test_forwarder_collab_snapshot_marks_child_running_after_new_turn_starts(
@@ -1177,19 +1212,38 @@ def test_forwarder_backfilled_status_does_not_overwrite_live_child_turn(
     """
     A child's live turn edge wins over a stale terminal status in its backfill.
 
-    The resume payload was fetched before the child's new ``turn/started``
-    arrived, so its completed turn must not settle a child that is running.
+    The child starts a new turn while its ``thread/resume`` is still pending, so
+    the resumed completed turn must not settle a child that is running.
     """
     posted: list[tuple[str, dict[str, Any]]] = []
-    codex_client = _PerThreadFakeCodexClient(
-        thread_responses={"thread_child": _child_resume_response(turn_status="completed")}
+    codex_client = _SuspendingResumeClient(
+        {"thread_child": _child_resume_response(turn_status="completed")}
     )
     state, bridge_dir = _snapshot_test_state(tmp_path, monkeypatch, codex_client=codex_client)
-    state.note_child_thread("thread_child", "conv_child")
-    state.note_child_turn_status("thread_child", "running")
 
-    _deliver_parent_events(state, bridge_dir, [_running_snapshot_event()], posted)
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_make_omnigent_handler(posted)),
+        ) as client:
+
+            def handle(event: dict[str, Any]) -> Any:
+                return codex_native_forwarder._handle_event(
+                    client,
+                    **_forwarder_context(client, bridge_dir, session_id="conv_parent"),
+                    event=event,
+                    expected_thread_id="thread_parent",
+                    forwarder_state=state,
+                )
+
+            spawn = asyncio.create_task(handle(_running_snapshot_event()))
+            await asyncio.wait_for(codex_client.resume_started.wait(), timeout=5)
+            await handle(_child_turn_event("turn/started"))
+            codex_client.release_resume.set()
+            await asyncio.wait_for(spawn, timeout=5)
+
+    asyncio.run(run())
 
     assert len(_transcript_posts(posted, "conv_child")) == 1, "child backfill did not replay"
-    assert _status_posts(posted, "conv_child") == ["running"]
+    assert _status_posts(posted, "conv_child") == ["running", "running"]
     assert state.child_turn_status("thread_child") == "running"
