@@ -414,7 +414,9 @@ def test_ucode_config_for_profile_reads_allowlisted_claude_state(
             # tool search on (it rides on the advanced-tool-use beta).
         },
         api_key_helper="printf token",
-        model="databricks-claude-opus-test",
+        # Opus serves the 1M window, so its gateway spelling launches with the
+        # [1m] marker Claude Code reads to report and compact at 1M.
+        model="databricks-claude-opus-test[1m]",
     )
 
 
@@ -536,9 +538,11 @@ def test_ucode_config_for_profile_sets_model_tier_env_vars(
     config = claude_native._ucode_config_for_profile("test-profile", refresh_models=False)
 
     assert config is not None
+    # Opus and Sonnet serve the 1M window and launch with the [1m] marker;
+    # Fable and Haiku are the small tiers that stay at the 200K default.
     assert config.env["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "databricks-claude-fable-5"
-    assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-claude-opus-4-7"
-    assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-6"
+    assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-claude-opus-4-7[1m]"
+    assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-6[1m]"
     assert config.env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "databricks-claude-haiku-4-5"
 
 
@@ -576,7 +580,8 @@ def test_ucode_config_for_profile_sets_only_present_tier_env_vars(
     config = claude_native._ucode_config_for_profile("test-profile", refresh_models=False)
 
     assert config is not None
-    assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-6"
+    # Sonnet serves the 1M window, so it launches with the [1m] marker.
+    assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-6[1m]"
     assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in config.env
     assert "ANTHROPIC_DEFAULT_OPUS_MODEL" not in config.env
     assert "ANTHROPIC_DEFAULT_HAIKU_MODEL" not in config.env
@@ -620,8 +625,10 @@ def test_ucode_config_for_profile_sets_custom_model_option_for_second_sonnet(
     config = claude_native._ucode_config_for_profile("test-profile", refresh_models=False)
 
     assert config is not None
-    assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-6"
-    assert config.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-sonnet-5"
+    # Both Sonnet pins serve the 1M window and launch with the [1m] marker;
+    # the custom-slot display name stays human-readable.
+    assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-6[1m]"
+    assert config.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-sonnet-5[1m]"
     assert config.env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] == "Sonnet 5"
 
 
@@ -765,15 +772,19 @@ def test_ucode_config_refreshes_live_models_and_builds_picker_options(
 
     assert config is not None
     assert first_config is not None
-    assert first_config.model == "system.ai.claude-sonnet-5"
+    # Opus and Sonnet serve the 1M window, so the launch model, tier pins, and
+    # picker rows carry the [1m] marker; the display names stay unmarked.
+    assert first_config.model == "system.ai.claude-sonnet-5[1m]"
     assert calls == [
         ("https://example.databricks.com", "token"),
         ("https://example.databricks.com", "token"),
     ]
-    assert config.model == "system.ai.claude-sonnet-5"
-    assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-4-10"
-    assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "system.ai.claude-sonnet-5"
+    assert config.model == "system.ai.claude-sonnet-5[1m]"
+    assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-4-10[1m]"
+    assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "system.ai.claude-sonnet-5[1m]"
     assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in config.env
+    # Refusal-fallback overrides stay bare: their keys must match Claude Code's
+    # marker-less canonical model refs, so the marker never touches them.
     assert config.model_overrides == {
         "claude-opus-4-10": "system.ai.claude-opus-4-10",
         "claude-sonnet-5": "system.ai.claude-sonnet-5",
@@ -782,13 +793,13 @@ def test_ucode_config_refreshes_live_models_and_builds_picker_options(
     assert claude_native.claude_native_model_options(config) == [
         {
             "id": "opus",
-            "model": "system.ai.claude-opus-4-10",
+            "model": "system.ai.claude-opus-4-10[1m]",
             "displayName": "Opus 4.10",
             "isDefault": False,
         },
         {
             "id": "sonnet",
-            "model": "system.ai.claude-sonnet-5",
+            "model": "system.ai.claude-sonnet-5[1m]",
             "displayName": "Sonnet 5",
             "isDefault": True,
         },
@@ -1117,8 +1128,9 @@ def test_ucode_config_uses_cached_models_when_live_refresh_fails(
     config = claude_native._ucode_config_for_profile("test-profile")
 
     assert config is not None
-    assert config.model == "system.ai.claude-opus-4-8"
-    assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-4-8"
+    # The cached Opus mapping serves the 1M window, so it launches with [1m].
+    assert config.model == "system.ai.claude-opus-4-8[1m]"
+    assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-4-8[1m]"
 
 
 def _stage_cached_models_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -8328,15 +8340,17 @@ def test_provider_config_for_native_claude_key_injects_base_url_and_helper(
     # 400 on beta flags they don't implement; see _provider_config_for_native_claude)
     # plus the declared default pinning its own family alias, so /model and
     # the harness probe resolve ``sonnet`` to the entry's model.
+    # Sonnet serves the 1M window, so the pin, launch model, and routable set
+    # all carry the [1m] marker.
     assert cfg.env == {
         "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6[1m]",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
     }
     # Static key delivered via the apiKeyHelper, never the env (allowlist).
     assert cfg.api_key_helper == "printf %s sk-ant-test"
-    assert cfg.model == "claude-sonnet-4-6"
-    assert cfg.routable_models == ("claude-sonnet-4-6",)
+    assert cfg.model == "claude-sonnet-4-6[1m]"
+    assert cfg.routable_models == ("claude-sonnet-4-6[1m]",)
 
 
 def test_provider_config_for_native_claude_pins_declared_tier_models(
@@ -8377,17 +8391,19 @@ def test_provider_config_for_native_claude_pins_declared_tier_models(
     assert cfg is not None
     assert cfg.env == {
         "ANTHROPIC_BASE_URL": "https://gw.example/anthropic",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL": "system.ai.claude-sonnet-5",
+        # Sonnet serves the 1M window, so its pin gains the [1m] marker;
+        # Haiku is the small tier and stays at the 200K default.
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "system.ai.claude-sonnet-5[1m]",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": "system.ai.claude-haiku-4-5",
         # The default's own family (opus) had no explicit key, so the
-        # default pins it — bracket markers ride along verbatim.
+        # default pins it; its existing [1m] marker is left untouched.
         "ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8[1m]",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
     }
     assert cfg.model == "system.ai.claude-opus-4-8[1m]"
     assert set(cfg.routable_models) == {
         "system.ai.claude-opus-4-8[1m]",
-        "system.ai.claude-sonnet-5",
+        "system.ai.claude-sonnet-5[1m]",
         "system.ai.claude-haiku-4-5",
     }
 
@@ -8420,7 +8436,8 @@ def test_provider_config_for_native_claude_explicit_tier_key_beats_the_default(
 
     cfg = claude_native._provider_config_for_native_claude(entry)
     assert cfg is not None
-    assert cfg.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-5"
+    # Opus serves the 1M window, so the explicit opus pin launches with [1m].
+    assert cfg.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-5[1m]"
 
 
 def test_provider_config_for_native_claude_uses_auth_command_verbatim(
@@ -8524,7 +8541,57 @@ def test_bedrock_config_for_native_claude_static_key(monkeypatch: pytest.MonkeyP
     }
     # Bedrock ignores apiKeyHelper; the credential rides the env, not a helper.
     assert cfg.api_key_helper is None
+    # Bedrock inference-profile ids are not Claude Code gateway spellings, so the
+    # 1M-context pass skips this builder: the launch id stays bare, never [1m].
     assert cfg.model == "us.anthropic.claude-opus-4-5-20251101-v1:0"
+
+
+def test_mark_1m_context_models_marks_opus_and_sonnet_only() -> None:
+    """The 1M-context pass marks the Opus/Sonnet launch spellings, nothing else.
+
+    It stamps [1m] onto the launch model, the alias and custom-slot pins, and
+    the routable set for the 1M families, leaves the Haiku/Fable small tiers and
+    non-model env entries at the 200K default, and never rewrites the
+    refusal-fallback overrides, whose keys must match Claude Code's marker-less
+    canonical model refs.
+    """
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BASE_URL": "https://gw.example/anthropic",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-5",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "system.ai.claude-sonnet-4-6",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": "system.ai.claude-haiku-4-5",
+            "ANTHROPIC_DEFAULT_FABLE_MODEL": "system.ai.claude-fable-5",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION": "system.ai.claude-sonnet-5",
+        },
+        model="system.ai.claude-opus-5",
+        routable_models=(
+            "system.ai.claude-opus-5",
+            "system.ai.claude-sonnet-4-6",
+            "system.ai.claude-haiku-4-5",
+            "system.ai.claude-fable-5",
+        ),
+        model_overrides={"claude-opus-5": "system.ai.claude-opus-5"},
+    )
+
+    marked = claude_native._mark_1m_context_models(config)
+
+    assert marked.model == "system.ai.claude-opus-5[1m]"
+    assert marked.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-5[1m]"
+    assert marked.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "system.ai.claude-sonnet-4-6[1m]"
+    assert marked.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "system.ai.claude-sonnet-5[1m]"
+    assert marked.env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "system.ai.claude-haiku-4-5"
+    assert marked.env["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "system.ai.claude-fable-5"
+    assert marked.env["ANTHROPIC_BASE_URL"] == "https://gw.example/anthropic"
+    assert marked.routable_models == (
+        "system.ai.claude-opus-5[1m]",
+        "system.ai.claude-sonnet-4-6[1m]",
+        "system.ai.claude-haiku-4-5",
+        "system.ai.claude-fable-5",
+    )
+    assert marked.model_overrides == {"claude-opus-5": "system.ai.claude-opus-5"}
+    # Idempotent: marking the marked config again changes nothing.
+    assert claude_native._mark_1m_context_models(marked) == marked
 
 
 def test_bedrock_config_for_native_claude_resolves_auth_command() -> None:
@@ -11504,7 +11571,8 @@ def test_connect_fallback_prefers_ucode_state(
     assert config is not None
     # ucode's base URL + discovered model win over the hand-built defaults.
     assert config.env["ANTHROPIC_BASE_URL"] == "https://ws.example/serving-endpoints/anthropic"
-    assert config.model == "system.ai.claude-sonnet-4-6"
+    # Sonnet serves the 1M window, so the managed-connect launch model carries [1m].
+    assert config.model == "system.ai.claude-sonnet-4-6[1m]"
     # But the bearer is still our own broker command, not ucode's.
     assert config.api_key_helper is not None
     assert "omnigent.host.databricks_credential token" in config.api_key_helper
@@ -11570,8 +11638,9 @@ def test_connect_fallback_pins_deployment_gateway_model(
     config = claude_native.resolve_native_claude_config(spec=None, refresh_models=False)
 
     assert config is not None
-    # The deployment override wins over the (stubbed) catalog default.
-    assert config.model == "databricks-claude-sonnet-4-6"
+    # The deployment override wins over the (stubbed) catalog default; Sonnet
+    # serves the 1M window, so the launch model carries [1m].
+    assert config.model == "databricks-claude-sonnet-4-6[1m]"
 
 
 def test_resolve_native_claude_config_declines_without_broker_sidecar(

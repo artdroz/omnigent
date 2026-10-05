@@ -2836,6 +2836,45 @@ def native_claude_mock_session(
                     respawned.wait(timeout=5)
 
 
+# A 1M-context-capable Opus served under a Databricks gateway spelling. Claude
+# Code reports 1M only for ids carrying the ``[1m]`` marker, so this bare id
+# surfaces the 200K cap of OMNI-10374.
+_NATIVE_CLAUDE_OPUS_MODEL = "databricks-claude-opus-5"
+
+
+@pytest.fixture
+def native_claude_opus_mock_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A real Claude CLI pinned to a 1M-capable Opus gateway id (no ``[1m]``).
+
+    Same wiring as :func:`native_claude_mock_session`, but the mock provider
+    defaults to an Opus model so the session exercises the Opus context window.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    with _temp_omnigent_mock_config(
+        mock_llm_server_url,
+        "claude",
+        workflow_owned=bool(_server_state.get("workflow_owned")),
+        claude_model=_NATIVE_CLAUDE_OPUS_MODEL,
+    ):
+        session_id = _create_native_claude_session(live_server, runner_id)
+        try:
+            yield (live_server, session_id)
+        finally:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+            if respawned is not None:
+                respawned.terminate()
+                try:
+                    respawned.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    respawned.kill()
+                    respawned.wait(timeout=5)
+
+
 @pytest.fixture
 def native_codex_mock_session(
     live_server: str,

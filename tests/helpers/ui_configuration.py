@@ -82,7 +82,11 @@ def _validate_ui_base_url(base_url: str) -> None:
 
 @contextlib.contextmanager
 def temp_omnigent_mock_config(
-    mock_llm_server_url: str, harness: str, *, workflow_owned: bool = False
+    mock_llm_server_url: str,
+    harness: str,
+    *,
+    workflow_owned: bool = False,
+    claude_model: str | None = None,
 ) -> Generator[None, None, None]:
     """Temporarily write a mock provider config in the selected config home.
 
@@ -94,6 +98,9 @@ def temp_omnigent_mock_config(
         ``"http://127.0.0.1:51235"``.
     :param harness: ``"claude"`` or ``"codex"``.
     :param workflow_owned: Reuse the provider configuration prepared by the workflow.
+    :param claude_model: Default model id for the claude provider; the window a
+        native Claude session reports is a function of this id (an ``[1m]``
+        marker is what grants 1M), so tests pin it to exercise a specific model.
     """
     if workflow_owned:
         yield
@@ -114,6 +121,7 @@ def temp_omnigent_mock_config(
     original = config_path.read_bytes() if config_path.exists() else None
 
     if harness == "claude":
+        claude_default_model = claude_model or _CLAUDE_MOCK_MODEL
         mock_config = textwrap.dedent(f"""\
             providers:
               mock-claude:
@@ -123,7 +131,7 @@ def temp_omnigent_mock_config(
                   base_url: "{mock_llm_server_url}"
                   api_key: "mock-key"
                   models:
-                    default: {_CLAUDE_MOCK_MODEL}
+                    default: {claude_default_model}
             """)
     else:  # codex
         # The mock model is not in the pricing catalog; configured rates let

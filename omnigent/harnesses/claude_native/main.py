@@ -118,7 +118,9 @@ from omnigent.models.claude_model_vocabulary import (
     CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
     LEGACY_CUSTOM_SLOT_ROW_ID,
     claude_model_alias,
+    normalized_model_id,
     served_canonical_overrides,
+    with_1m_context_marker,
 )
 from omnigent.native._native_resume_hint import echo_native_resume_hint
 from omnigent.native.native_coding_agents import native_shell_terminal_spec
@@ -1351,13 +1353,22 @@ async def claude_model_catalog(
 
     configured_pin = claude_config.model if claude_config is not None else None
     default_model = configured_pin or probe.default_model
+    # A 1M-pinned default ("...opus-5[1m]") and the picker's unmarked echo of
+    # the same model are one model, so fold the marker and mechanical prefix
+    # when matching rather than appending the pin as a second opus/sonnet row.
+    default_identity = normalized_model_id(default_model) if default_model else None
     marked = False
     out: list[dict[str, object]] = []
     for row in rows:
+        row_model = str(row.get("model") or "")
         is_default = (
             bool(default_model)
             and not marked
-            and (row.get("model") == default_model or row.get("id") == default_model)
+            and (
+                row.get("model") == default_model
+                or row.get("id") == default_model
+                or (bool(row_model) and normalized_model_id(row_model) == default_identity)
+            )
         )
         if is_default:
             marked = True
@@ -2944,18 +2955,20 @@ def _ucode_config_for_profile(
     # When ucode caches no model and live discovery was unavailable, default it
     # so Claude Code doesn't fall back to a host-config Anthropic id the gateway
     # rejects.
-    return ClaudeNativeUcodeConfig(
-        env=env,
-        api_key_helper=_profile_pinned_auth_command(
-            agent_state.auth_command, workspace_url, profile
-        ),
-        model=default_model
-        or configured_default
-        or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
-        routable_models=routable_models,
-        # Databricks discovery reports ids that wrap the canonical Claude id.
-        # Keep that translation here; launch consumers treat ids as opaque.
-        model_overrides=served_canonical_overrides(routable_models),
+    return _mark_1m_context_models(
+        ClaudeNativeUcodeConfig(
+            env=env,
+            api_key_helper=_profile_pinned_auth_command(
+                agent_state.auth_command, workspace_url, profile
+            ),
+            model=default_model
+            or configured_default
+            or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
+            routable_models=routable_models,
+            # Databricks discovery reports ids that wrap the canonical Claude id.
+            # Keep that translation here; launch consumers treat ids as opaque.
+            model_overrides=served_canonical_overrides(routable_models),
+        )
     )
 
 
@@ -3003,6 +3016,31 @@ def _profile_pinned_auth_command(
         profile,
     )
     return databricks_bearer_token_command(workspace_url, profile, fallback_command=auth_command)
+
+
+def _mark_1m_context_models(config: ClaudeNativeUcodeConfig) -> ClaudeNativeUcodeConfig:
+    """Spell the config's Opus/Sonnet ids with the ``[1m]`` 1M-context marker.
+
+    Claude Code reports and compacts at the 1M window only for a model id
+    carrying ``[1m]``; a bare Opus/Sonnet id leaves the pane capped at 200K
+    even when the gateway serves 1M. Mark the alias pins, the custom-slot id,
+    the launch default, and the routable set so the launched model, the
+    ``/model`` picker, and routing all run at 1M. The canonical refusal-
+    fallback overrides stay bare: Claude Code emits the marker-less canonical
+    id, so their keys must keep matching it. Only the Anthropic-surface gateway
+    configs call this; Bedrock ids are not Anthropic ids and never carry it.
+    """
+    pin_keys = {_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV, *ALIAS_MODEL_ENV_VARS.values()}
+    env = {
+        key: with_1m_context_marker(value) if key in pin_keys else value
+        for key, value in config.env.items()
+    }
+    return replace(
+        config,
+        env=env,
+        model=with_1m_context_marker(config.model) if config.model else config.model,
+        routable_models=tuple(with_1m_context_marker(model) for model in config.routable_models),
+    )
 
 
 def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcodeConfig | None:
@@ -3071,29 +3109,31 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
         default_env_var = ALIAS_MODEL_ENV_VARS.get(base_alias)
         if default_env_var:
             pin_env.setdefault(default_env_var, family.default_model)
-    return ClaudeNativeUcodeConfig(
-        env={
-            _UCODE_CLAUDE_BASE_URL_ENV: family.base_url,
-            **pin_env,
-            # Disable beta flags gateways reject (400 "invalid beta flag");
-            # skip when CLAUDE_CODE_USE_GATEWAY=1 to keep tool search enabled.
-            **(
-                {_CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1"}
-                if os.environ.get("CLAUDE_CODE_USE_GATEWAY") != "1"
-                else {}
+    return _mark_1m_context_models(
+        ClaudeNativeUcodeConfig(
+            env={
+                _UCODE_CLAUDE_BASE_URL_ENV: family.base_url,
+                **pin_env,
+                # Disable beta flags gateways reject (400 "invalid beta flag");
+                # skip when CLAUDE_CODE_USE_GATEWAY=1 to keep tool search enabled.
+                **(
+                    {_CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1"}
+                    if os.environ.get("CLAUDE_CODE_USE_GATEWAY") != "1"
+                    else {}
+                ),
+            },
+            api_key_helper=api_key_helper,
+            model=family.default_model,
+            # The declared models are exactly what this entry can route.
+            routable_models=tuple(
+                dict.fromkeys(
+                    [
+                        *pin_env.values(),
+                        *([family.default_model] if family.default_model else []),
+                    ]
+                )
             ),
-        },
-        api_key_helper=api_key_helper,
-        model=family.default_model,
-        # The declared models are exactly what this entry can route.
-        routable_models=tuple(
-            dict.fromkeys(
-                [
-                    *pin_env.values(),
-                    *([family.default_model] if family.default_model else []),
-                ]
-            )
-        ),
+        )
     )
 
 
@@ -3377,7 +3417,9 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
             )
 
     env[_CLAUDE_CODE_API_KEY_HELPER_TTL_ENV] = str(_BROKER_APIKEY_HELPER_TTL_MS)
-    return ClaudeNativeUcodeConfig(env=env, api_key_helper=api_key_helper, model=model)
+    return _mark_1m_context_models(
+        ClaudeNativeUcodeConfig(env=env, api_key_helper=api_key_helper, model=model)
+    )
 
 
 def resolve_native_claude_config(

@@ -167,6 +167,38 @@ async def test_catalog_uses_cli_managed_picker_for_every_launch_config(
     ]
 
 
+@pytest.mark.parametrize(
+    "picker_echo", ["databricks-claude-opus-5", "databricks-claude-opus-5[1m]"]
+)
+async def test_catalog_coalesces_a_1m_pinned_default_onto_its_alias_row(
+    monkeypatch: pytest.MonkeyPatch, picker_echo: str
+) -> None:
+    """A 1M-pinned opus default is one row, whether or not the picker echoes [1m].
+
+    The gateway launch config pins the opus id with the ``[1m]`` marker, so the
+    appended default must fold onto the picker's own opus row instead of listing
+    the same model twice (once bare, once ``[1m]``) in ``/model``.
+    """
+    _stub_picker(
+        monkeypatch,
+        [{"value": "opus", "resolvedModel": picker_echo, "displayName": "Opus 5"}],
+        default=picker_echo,
+    )
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BASE_URL": "https://dbx.example/anthropic",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5[1m]",
+        },
+        model="databricks-claude-opus-5[1m]",
+        routable_models=("databricks-claude-opus-5[1m]",),
+    )
+    rows = await claude_native.claude_model_catalog(config)
+    assert len(rows) == 1, "the 1M-pinned default must not add a second opus row"
+    assert rows[0]["id"] == "opus"
+    assert rows[0]["model"] == picker_echo
+    assert rows[0]["isDefault"] is True
+
+
 @pytest.mark.parametrize("failure", [None, "unsupported", "exit", "timeout"])
 async def test_catalog_falls_back_for_older_claude(
     monkeypatch: pytest.MonkeyPatch, failure: str | None

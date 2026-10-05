@@ -5,6 +5,7 @@ import pytest
 from omnigent.models.claude_model_vocabulary import (
     claude_model_alias,
     claude_model_command_arg,
+    model_supports_1m_context,
     model_vocabulary_env,
     normalized_model_id,
     picker_command_values,
@@ -12,6 +13,7 @@ from omnigent.models.claude_model_vocabulary import (
     prefix_folded_model_id,
     served_alias_pins,
     served_canonical_overrides,
+    with_1m_context_marker,
 )
 
 # A ucode-style launch pinning: each family alias mapped to a gateway id,
@@ -366,3 +368,53 @@ def test_command_arg_prefers_the_picker_over_an_unrelated_pin() -> None:
 def test_command_arg_keeps_failing_loud_when_the_picker_is_unknown() -> None:
     """No picker rows recorded yet leaves today's pinning-only answer."""
     assert claude_model_command_arg("system.ai.glm-5-3", _PINNED_ENV, picker_values=()) is None
+
+
+@pytest.mark.parametrize(
+    ("model", "supports_1m"),
+    [
+        # Opus and Sonnet serve the 1M window, across generations and gateway
+        # spellings — the predicate keys off the family, not a version list.
+        ("opus", True),
+        ("sonnet", True),
+        ("databricks-claude-opus-5", True),
+        ("databricks-claude-sonnet-4-6", True),
+        ("system.ai.claude-opus-4-10", True),
+        ("claude-opus-4-8[1m]", True),
+        # Haiku and Fable are the small/fast tiers capped at the 200K default.
+        ("haiku", False),
+        ("fable", False),
+        ("databricks-claude-haiku-4-5", False),
+        ("databricks-claude-fable-5", False),
+        # Non-Claude ids and the catalog default name no 1M family.
+        ("system.ai.glm-5-3", False),
+        ("databricks-gpt-5-5", False),
+        ("catalog-databricks-claude-default", False),
+        ("", False),
+    ],
+)
+def test_model_supports_1m_context_decides_by_family(model: str, supports_1m: bool) -> None:
+    assert model_supports_1m_context(model) is supports_1m
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        # 1M families gain the marker Claude Code reads to report/compact at 1M.
+        ("opus", "opus[1m]"),
+        ("sonnet", "sonnet[1m]"),
+        ("databricks-claude-opus-5", "databricks-claude-opus-5[1m]"),
+        ("databricks-claude-sonnet-4-6", "databricks-claude-sonnet-4-6[1m]"),
+        # Idempotent: an already-marked id is returned unchanged.
+        ("databricks-claude-opus-5[1m]", "databricks-claude-opus-5[1m]"),
+        # Small tiers and non-Claude ids are left bare at the 200K default.
+        ("databricks-claude-haiku-4-5", "databricks-claude-haiku-4-5"),
+        ("databricks-claude-fable-5", "databricks-claude-fable-5"),
+        ("system.ai.glm-5-3", "system.ai.glm-5-3"),
+        # Nothing to spell: empty/blank input passes through verbatim.
+        ("", ""),
+        ("   ", "   "),
+    ],
+)
+def test_with_1m_context_marker_marks_only_1m_families(model: str, expected: str) -> None:
+    assert with_1m_context_marker(model) == expected

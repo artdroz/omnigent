@@ -276,6 +276,50 @@ def claude_model_alias(
     return None
 
 
+#: Claude families whose current generations serve the 1M-token context
+#: window. Opus and Sonnet carry it; Haiku and Fable are the small/fast
+#: tiers that do not.
+CLAUDE_1M_CONTEXT_FAMILIES: frozenset[str] = frozenset({"opus", "sonnet"})
+
+#: The marker Claude Code reads as "run this model with the 1M-token context
+#: beta". Appended to a model id it makes the pane report and compact at 1M and
+#: negotiate the context-1m beta on the wire; without it the pane caps at 200K.
+_CONTEXT_1M_MARKER = "[1m]"
+
+
+def model_supports_1m_context(model: str) -> bool:
+    """Whether *model* names a Claude family that serves the 1M window.
+
+    Decided by family, not generation, so a newer Opus/Sonnet inherits the
+    window instead of capping at 200K until a hardcoded version list is
+    updated.
+
+    :param model: A served model id or alias.
+    :returns: ``True`` for an Opus or Sonnet id/alias, else ``False``.
+    """
+    base = claude_model_alias(model, env={})
+    return base is not None and base.partition("[")[0] in CLAUDE_1M_CONTEXT_FAMILIES
+
+
+def with_1m_context_marker(model: str) -> str:
+    """Spell *model* with the ``[1m]`` marker when its family serves the 1M window.
+
+    Idempotent: a model that already carries the marker, whose family does not
+    serve the 1M window, or that spells no Claude model, is returned unchanged.
+
+    :param model: A served model id or alias.
+    :returns: The model id with ``[1m]`` appended when applicable.
+    """
+    if not isinstance(model, str) or not model.strip():
+        return model
+    spelled = model.strip()
+    if spelled.lower().endswith(_CONTEXT_1M_MARKER):
+        return spelled
+    if not model_supports_1m_context(spelled):
+        return spelled
+    return f"{spelled}{_CONTEXT_1M_MARKER}"
+
+
 def claude_model_command_arg(
     model: str,
     env: Mapping[str, str] | None = None,
