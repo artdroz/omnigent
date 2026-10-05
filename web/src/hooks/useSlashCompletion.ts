@@ -1,6 +1,22 @@
 import { useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { rankedSlashCommandNames } from "@/components/SlashCommandMenu";
 
+function commandContinuationLength(token: string | undefined, tokenSuffix: string, cmd: string) {
+  if (!tokenSuffix || !token) return 0;
+
+  const tokenBody = token.slice(1).toLowerCase();
+  const commandBody = cmd.slice(1).toLowerCase();
+  if (!commandBody.startsWith(tokenBody)) return 0;
+
+  const continuation = commandBody.slice(tokenBody.length);
+  if (!continuation) return 0;
+
+  const suffix = tokenSuffix.toLowerCase();
+  if (continuation.startsWith(suffix)) return tokenSuffix.length;
+  if (suffix.startsWith(continuation)) return continuation.length;
+  return 0;
+}
+
 /** The slice of a textarea keydown the menu reads. */
 export interface SlashCompletionKeyEvent {
   key: string;
@@ -51,6 +67,8 @@ export interface UseSlashCompletionOptions {
   allowOpen: boolean;
   /** Called with the ranked, prefixed name chosen via Tab/Enter. */
   onSelect: (cmd: string) => void;
+  /** Tab only fills the draft when selecting a command would execute it. */
+  onTabComplete?: (cmd: string) => void;
   /** Clears the composer draft (Escape semantics). */
   clearText: () => void;
 }
@@ -96,6 +114,7 @@ export function useSlashCompletion({
   escapeClearsOnlyWithContent,
   allowOpen,
   onSelect,
+  onTabComplete = onSelect,
   clearText,
 }: UseSlashCompletionOptions): UseSlashCompletionResult {
   const [selection, setSelection] = useState<{ text: string; start: number; end: number } | null>(
@@ -205,7 +224,7 @@ export function useSlashCompletion({
         index >= 0
       ) {
         e.preventDefault();
-        onSelect(matches[index]!);
+        (e.key === "Tab" ? onTabComplete : onSelect)(matches[index]!);
         return true;
       }
     }
@@ -249,7 +268,8 @@ export function useSlashCompletion({
     builtinNames,
     onSelectionChange,
     complete: (cmd) => {
-      const suffix = text.slice(end);
+      const consumedContinuation = commandContinuationLength(token, tokenSuffix, cmd);
+      const suffix = text.slice(caret + consumedContinuation);
       const separator = /^\s/.test(suffix) ? "" : " ";
       const completedText = text.slice(0, start) + cmd + separator + suffix;
       // Leave existing newlines and tabs after the caret.

@@ -10,6 +10,8 @@
 import { useEffect, useRef, useState } from "react";
 import { RotateCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import type { ConnectProgress } from "@/pages/onboarding/ServerSelectorV2";
+import { ConnectStatus } from "@/pages/onboarding/primitives";
 
 type Phase = "installing" | "running" | "ready" | "failed";
 
@@ -24,6 +26,9 @@ export function SetupTerminalStep({
   onSetupLog,
   onBack,
   runningLabel = "Starting Omnigent",
+  runningHint = "Starting the local server…",
+  connection = null,
+  onCancelConnect,
 }: {
   /** Install the CLI first (when missing). Absent → skip straight to onRun. */
   onInstallCli?: () => Promise<{ ok: boolean; error?: string }>;
@@ -36,6 +41,11 @@ export function SetupTerminalStep({
   onBack: () => void;
   /** Heading + verb for the run phase ("Starting Omnigent" / "Connecting…"). */
   runningLabel?: string;
+  /** Placeholder log line for the run phase until its first line streams. */
+  runningHint?: string;
+  /** Progress of the run phase's server connect (null when not connecting). */
+  connection?: ConnectProgress | null;
+  onCancelConnect?: () => void;
 }) {
   const [phase, setPhase] = useState<Phase>(onInstallCli ? "installing" : "running");
   const [error, setError] = useState<string | undefined>();
@@ -142,12 +152,18 @@ export function SetupTerminalStep({
           ? "Installing the Omnigent CLI"
           : runningLabel;
   const phaseLabel = inProgress ? `${baseLabel}${".".repeat(dots)}` : baseLabel;
-  const pendingHint = phase === "installing" ? "Installing the CLI…" : "Starting the local server…";
-  // Coarse progress: each step is a real detected milestone — warmup → install
-  // output starts → server starting → done. Holds within a step (streaming log +
-  // pulse show liveness) rather than fake an unmeasurable fraction.
+  const pendingHint = phase === "installing" ? "Installing the CLI…" : runningHint;
+  // Coarse progress over real milestones: warmup → install output → server
+  // starting → done; without an install, the run's first output and the server
+  // open fill those steps. Holds within a step (streaming log + pulse show liveness).
   const progress =
-    phase === "ready" || phase === "failed" ? 100 : phase === "running" ? 70 : streamed ? 35 : 10;
+    phase === "ready" || phase === "failed"
+      ? 100
+      : phase === "running" && (onInstallCli || connection !== null)
+        ? 70
+        : streamed
+          ? 35
+          : 10;
 
   return (
     <div className="flex h-full flex-col px-2 pb-1 pt-4">
@@ -186,6 +202,8 @@ export function SetupTerminalStep({
           </div>
         )}
       </div>
+
+      <ConnectStatus connection={connection} onCancel={onCancelConnect} />
 
       {phase === "failed" && (
         <div className="mt-3 flex gap-2">

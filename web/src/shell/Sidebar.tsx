@@ -227,6 +227,7 @@ import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
+import { ALT_KEY, ARIA_MOD_KEY, CompactShortcutKeys, MOD_KEY } from "@/components/KeyboardShortcut";
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
 // trailing icon edge in every viewport: on desktop it fades on hover so the pin
@@ -262,6 +263,7 @@ const SIDEBAR_ACTIVE_HIGHLIGHT =
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 
 const SCROLLBAR_HIDE_DELAY_MS = 700;
+const NEW_SESSION_KEYS = [MOD_KEY, ALT_KEY, "N"] as const;
 
 // Maps a first-class project id → its name, provided once at the list level so
 // each row resolves its ``project_id`` to a folder name without its own
@@ -1000,7 +1002,10 @@ function SidebarImpl({
           brand mark is dropped and the actions slide left to sit beside the
           window controls (see the [data-electron-mac] rules in index.css).
           Inert in a browser and on other platforms, which keep the row below. */}
-            <div className="sidebar-header-row flex h-12 shrink-0 items-center justify-between pr-3 pl-4">
+            {/* h-14 below md matches the mobile chat header height so the
+            Search bubble shares a centerline with the overflow bubble in the
+            chat strip beside the open drawer. */}
+            <div className="sidebar-header-row flex h-14 shrink-0 items-center justify-between pr-3 pl-4 md:h-12">
               {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
@@ -1054,7 +1059,7 @@ function SidebarImpl({
                   // transparent 1px border so the icon lands exactly on that
                   // column, flush with the Inbox row and folder rows.
                   SIDEBAR_ROW,
-                  "w-full justify-start border-0 font-normal",
+                  "group/new-session w-full justify-start border-0 font-normal",
                   SIDEBAR_HOVER_HIGHLIGHT,
                   isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
                 )}
@@ -1067,6 +1072,7 @@ function SidebarImpl({
                 <Link
                   to="/"
                   componentId="sidebar.new_chat"
+                  aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+N`}
                   onClick={(e) => {
                     switchTab("mine");
                     onNavClick(e);
@@ -1081,6 +1087,10 @@ function SidebarImpl({
                     )}
                   />
                   New session
+                  <CompactShortcutKeys
+                    keys={NEW_SESSION_KEYS}
+                    className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 opacity-0 transition-opacity group-focus-visible/new-session:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:group-hover/new-session:opacity-100"
+                  />
                 </Link>
               </Button>
               {/* Keep Scheduled in the primary nav group with the same row treatment as New session. */}
@@ -1498,7 +1508,7 @@ function ProjectFolder({
         }
         indentRows
         headerAction={
-          <ProjectFolderMenu
+          <ProjectFolderActions
             projectName={name}
             onNavigate={onRowClick}
             actions={orderedMenuActions}
@@ -2438,25 +2448,52 @@ function ConversationList({
                         // switching scope just exits selection. Only the
                         // "select" entry point hides, being already active.
                         !selectionMode ? (
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="icon-xs"
-                                aria-label="Select sessions"
-                                data-testid="toggle-selection-mode"
-                                className="text-muted-foreground"
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  onEnterSelectionMode("sessions");
-                                }}
-                              >
-                                <ListChecksIcon className="size-3.5" />
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipContent side="bottom">Select sessions</TooltipContent>
-                          </Tooltip>
+                          <div className="flex items-center gap-0.5">
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  asChild
+                                  variant="ghost"
+                                  size="icon-xs"
+                                  aria-label="New session"
+                                  data-testid="sessions-new-session"
+                                  className="text-muted-foreground"
+                                >
+                                  <Link
+                                    to="/"
+                                    componentId="sidebar.sessions_new_chat"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      onActiveTabChange("mine");
+                                      onRowClick(event);
+                                    }}
+                                  >
+                                    <MessageCirclePlusIcon className="size-3.5" />
+                                  </Link>
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent side="bottom">New session</TooltipContent>
+                            </Tooltip>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon-xs"
+                                  aria-label="Select sessions"
+                                  data-testid="toggle-selection-mode"
+                                  className="text-muted-foreground"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    onEnterSelectionMode("sessions");
+                                  }}
+                                >
+                                  <ListChecksIcon className="size-3.5" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent side="bottom">Select sessions</TooltipContent>
+                            </Tooltip>
+                          </div>
                         ) : undefined
                       }
                       persistentHeaderAction={
@@ -2732,7 +2769,7 @@ function SectionHeader({
               active && SIDEBAR_ACTIVE_HIGHLIGHT,
               hasAction &&
                 !showsMarker &&
-                "pr-8 [@media((hover:hover)_and_(pointer:fine))]:md:pr-2 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pr-8 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pr-8 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pr-8",
+                "pr-8 [@media((hover:hover)_and_(pointer:fine))]:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:pr-2 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pr-14",
             )
           : "group flex h-7 w-full items-center gap-1 border-0 pr-0 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
       )}
@@ -2774,10 +2811,12 @@ function SectionHeader({
         <span
           className={cn(
             "ml-auto flex shrink-0 items-center justify-center transition-opacity",
-            // Icon headers are project folders with one menu button; section
-            // headers reserve two slots for their select/filter controls.
+            // Touch project rows have one menu; fine pointers also get a shortcut.
             hasAction
-              ? cn(icon ? "mr-7" : "mr-14", clusterHoverDesktopMargin)
+              ? cn(
+                  icon ? "mr-7 [@media((hover:hover)_and_(pointer:fine))]:mr-14" : "mr-14",
+                  clusterHoverDesktopMargin,
+                )
               : hasPersistentAction
                 ? "mr-7"
                 : clusterRestMargin,
@@ -3277,7 +3316,6 @@ function ConversationMenuItems({
   onMarkRead,
   onProjectAssigned,
   moveToProject,
-  stopSession,
   setShareOpen,
   setForkOpen,
   setIsEditing,
@@ -3308,7 +3346,6 @@ function ConversationMenuItems({
   onMarkRead: () => void;
   onProjectAssigned?: (projectName: string) => void;
   moveToProject: ReturnType<typeof useMoveToProject>;
-  stopSession: ReturnType<typeof useStopSession>;
   setShareOpen: (open: boolean) => void;
   setForkOpen: (open: boolean) => void;
   setIsEditing: (editing: boolean) => void;
@@ -3526,14 +3563,7 @@ function ConversationMenuItems({
           <C.Item
             data-testid="stop-conversation"
             variant="destructive"
-            onSelect={() => {
-              // Clear any prior failure so a stale "couldn't stop"
-              // message doesn't greet the next attempt. Must happen
-              // here: Radix only fires the Dialog's onOpenChange for
-              // Radix-initiated changes, not this programmatic open.
-              stopSession.reset();
-              setStopOpen(true);
-            }}
+            onSelect={() => setStopOpen(true)}
           >
             <CircleStopIcon className="size-3.5" />
             Stop session
@@ -4037,7 +4067,6 @@ function ConversationRowImpl({
     onMarkRead: () => markConversationRead(conversation.id, conversation.updated_at),
     onProjectAssigned,
     moveToProject,
-    stopSession,
     setShareOpen,
     setForkOpen,
     setIsEditing,
@@ -4599,32 +4628,26 @@ function ConversationRowImpl({
                 and stops its runner. The conversation and its history are kept.
               </DialogDescription>
             </DialogHeader>
-            {stopSession.isError && (
-              <p className="text-ui text-destructive" role="alert">
-                Couldn't stop the session
-                {stopSession.error instanceof Error && stopSession.error.message
-                  ? `: ${stopSession.error.message}`
-                  : " — it may still be running"}
-                . Try again in a moment.
-              </p>
-            )}
             <DialogFooter>
-              <Button
-                type="button"
-                variant="ghost"
-                onClick={() => setStopOpen(false)}
-                disabled={stopSession.isPending}
-              >
+              <Button type="button" variant="ghost" onClick={() => setStopOpen(false)}>
                 Cancel
               </Button>
               <Button
                 type="button"
                 variant="destructive"
                 data-testid="stop-session-confirm"
-                onClick={() =>
-                  stopSession.mutate(conversation.id, { onSuccess: () => setStopOpen(false) })
-                }
-                loading={stopSession.isPending}
+                onClick={() => {
+                  // Close now and stop in the background — keeping the modal open
+                  // for the whole kill blocks the rest of the sidebar. A failure
+                  // surfaces as a toast since the dialog is already gone.
+                  setStopOpen(false);
+                  stopSession.mutate(conversation.id, {
+                    onError: (err) => {
+                      const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
+                      showToast(`Couldn't stop the session${detail}`);
+                    },
+                  });
+                }}
                 componentId="sidebar.conversation.stop"
               >
                 Stop session
@@ -4735,6 +4758,45 @@ function PinnedProjectFlyoutContent({
   );
 }
 
+function ProjectFolderActions({
+  projectName,
+  onNavigate,
+  actions,
+}: {
+  projectName: string;
+  onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
+  actions: ProjectFolderMenuActions;
+}) {
+  return (
+    <div className="flex items-center gap-0.5">
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            asChild
+            variant="ghost"
+            size="icon-xs"
+            aria-label={`New session in ${projectName}`}
+            data-testid="project-new-session"
+            className="hidden text-muted-foreground [@media((hover:hover)_and_(pointer:fine))]:flex"
+          >
+            <Link
+              to={`/?project=${encodeURIComponent(projectName)}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onNavigate(e);
+              }}
+            >
+              <MessageCirclePlusIcon className="size-3.5" data-icon-size="14" />
+            </Link>
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">New session in project</TooltipContent>
+      </Tooltip>
+      <ProjectFolderMenu projectName={projectName} onNavigate={onNavigate} actions={actions} />
+    </div>
+  );
+}
+
 // ── ProjectFolderMenu ─────────────────────────────────────────────────────────
 
 /** The menu body shared by the project-folder kebab and context menu. */
@@ -4743,11 +4805,13 @@ function ProjectFolderMenuItems({
   projectName,
   onNavigate,
   actions,
+  hideNewSessionOnDesktop = false,
 }: {
   components: MenuComponents;
   projectName: string;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
+  hideNewSessionOnDesktop?: boolean;
 }) {
   const { onMenuOpen, onMenuClose } = actions;
   useEffect(() => {
@@ -4757,7 +4821,13 @@ function ProjectFolderMenuItems({
 
   return (
     <>
-      <C.Item asChild data-testid="project-new-session-menu">
+      <C.Item
+        asChild
+        data-testid="project-new-session-menu"
+        className={
+          hideNewSessionOnDesktop ? "[@media((hover:hover)_and_(pointer:fine))]:hidden" : undefined
+        }
+      >
         <Link
           to={`/?project=${encodeURIComponent(projectName)}`}
           onClick={(e) => {
@@ -4838,6 +4908,7 @@ function useProjectFolderMenu(
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [renameValue, setRenameValue] = useState(projectName);
+  const renameInputRef = useRef<HTMLInputElement>(null);
   // The icon staged in the rename modal, committed only on Confirm:
   //   undefined = untouched (show the saved icon), string = a picked emoji,
   //   null = staged removal. Reset to `undefined` each time the modal opens.
@@ -4884,6 +4955,11 @@ function useProjectFolderMenu(
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
         <DialogContent
           onClick={(e) => e.stopPropagation()}
+          onOpenAutoFocus={(e) => {
+            e.preventDefault();
+            renameInputRef.current?.focus();
+            renameInputRef.current?.select();
+          }}
           // emoji-mart preventDefaults the pointer event, so Radix's own
           // outside-dismissal never fires for clicks elsewhere in the modal.
           // Catch them in the capture phase and close the picker ourselves,
@@ -5023,6 +5099,7 @@ function useProjectFolderMenu(
                 </PopoverContent>
               </Popover>
               <input
+                ref={renameInputRef}
                 className="w-full bg-transparent px-3 py-2 text-ui outline-none"
                 value={renameValue}
                 onChange={(e) => setRenameValue(e.target.value)}
@@ -5155,6 +5232,7 @@ function ProjectFolderMenu({
       <DropdownMenuContent align="end" className="min-w-40">
         <ProjectFolderMenuItems
           components={dropdownBundle}
+          hideNewSessionOnDesktop
           projectName={projectName}
           onNavigate={onNavigate}
           actions={actions}
