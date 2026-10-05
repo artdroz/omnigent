@@ -232,17 +232,28 @@ def _wait_for_plugin_skills(base_url: str, session_id: str) -> list[dict]:
 
 @pytest.mark.timeout(600)
 def test_plugin_commands_listed_in_slash_menu(
-    page: Page,
+    request: pytest.FixtureRequest,
     plugin_session: tuple[str, str],
 ) -> None:
     """The menu contains both the control skill and its sibling command.
 
-    :param page: Fresh browser page.
+    :param request: Used to open the browser page only once the host has
+        discovered the plugin, so a recording starts at the user journey.
     :param plugin_session: Server URL and session bound to the plugin host."""
     base_url, session_id = plugin_session
     _wait_for_plugin_skills(base_url, session_id)
 
+    page: Page = request.getfixturevalue("page")
     page.goto(f"{base_url}/c/{session_id}")
+
+    # A host whose harnesses bring plugins opens the one-time import review
+    # first; confirm it, as a user would, before reaching the composer.
+    imports = page.get_by_role("dialog", name="Your imports are ready")
+    expect(imports).to_be_visible(timeout=60_000)
+    expect(imports.get_by_role("list", name="Plugins")).to_contain_text(_PLUGIN)
+    imports.get_by_role("button", name="Confirm").click()
+    expect(imports).to_be_hidden()
+
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible(timeout=30_000)
 
@@ -262,3 +273,5 @@ def test_plugin_commands_listed_in_slash_menu(
         f'[data-testid="slash-menu-item-{_PLUGIN}:{_COMMAND}"]'
     )
     expect(command_row.first).to_be_visible(timeout=10_000)
+    # Hold the populated menu so a recording of this journey ends on it.
+    page.wait_for_timeout(2_000)
