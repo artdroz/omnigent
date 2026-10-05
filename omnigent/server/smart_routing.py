@@ -1335,12 +1335,7 @@ def _barred_candidates(
     *,
     prefixes: Sequence[str] | None = None,
 ) -> list[str]:
-    """Return the *candidates* that *harness*'s gateway rejects.
-
-    :func:`substitute_model` only ever picks from its candidates, so barring the
-    rejected ones among them also honors the generation rules a flat id list
-    cannot spell out.
-    """
+    """Return the *candidates* *harness* bars, for :func:`substitute_model`'s ``barred``."""
     return [m for m in candidates if harness_bars_model(harness, m, prefixes=prefixes)]
 
 
