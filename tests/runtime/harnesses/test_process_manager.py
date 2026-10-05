@@ -684,9 +684,40 @@ async def test_stop_process_closed_during_grace_wait_kills_without_awaiting(
             return 0
 
     coro = pm_mod._stop_process(_NeverExits())  # type: ignore[arg-type]
-    coro.send(None)  # SIGTERM sent; suspended in the grace wait
-    assert calls == ["terminate"]
-    coro.close()
+    try:
+        coro.send(None)  # SIGTERM sent; suspended in the grace wait
+        assert calls == ["terminate"]
+    finally:
+        coro.close()
+    assert calls == ["terminate", "kill"]
+
+
+async def test_stop_process_escalates_when_zygote_wait_swallows_the_grace_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zygote handle whose wait() gives up without an exit status is still killed.
+
+    ``ZygoteHarnessProc.wait()`` suppresses the cancellation ``wait_for`` injects
+    on timeout and returns its lost-exit sentinel with ``returncode`` unset.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+    from omnigent.runtime.harnesses._harness_zygote_client import ZygoteHarnessProc
+
+    monkeypatch.setattr(pm_mod, "_RELEASE_GRACE_S", 0.2)
+    calls: list[str] = []
+    monkeypatch.setattr(pm_mod._proc, "terminate_tree", lambda process: calls.append("terminate"))
+    monkeypatch.setattr(pm_mod._proc, "kill_tree", lambda process: calls.append("kill"))
+
+    class _StillRunning:
+        async def poll(self, pid: int) -> int | None:
+            return None
+
+    handle = ZygoteHarnessProc(4242, _StillRunning())  # type: ignore[arg-type]
+    try:
+        await pm_mod._stop_process(handle)
+    finally:
+        if handle._poll_task is not None:
+            handle._poll_task.cancel()
     assert calls == ["terminate", "kill"]
 
 

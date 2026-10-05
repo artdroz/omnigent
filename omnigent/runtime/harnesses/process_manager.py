@@ -540,8 +540,10 @@ async def _stop_process(process: asyncio.subprocess.Process | ZygoteHarnessProc)
     at once and reaps the corpse (bounded) before re-raising; a repeated
     cancellation interrupts only that reap wait, after the kill is sent.
     A coroutine close or interpreter exit kills without awaiting the reap.
-    A ``ZygoteHarnessProc`` swallows cancellation inside ``wait()``, so on
-    that path only the grace timeout escalates to a kill.
+    A ``ZygoteHarnessProc`` swallows cancellation inside ``wait()``, the
+    grace timeout included; a wait that returns without an exit status is
+    treated as not stopped and escalates, but the caller's cancellation
+    is lost on that path.
 
     :param process: The subprocess handle; a no-op if it already exited.
     """
@@ -553,6 +555,8 @@ async def _stop_process(process: asyncio.subprocess.Process | ZygoteHarnessProc)
         # handle strands both when an executor close() never runs.
         _proc.terminate_tree(process)
         await asyncio.wait_for(process.wait(), timeout=_RELEASE_GRACE_S)
+        if process.returncode is None:
+            raise TimeoutError("wait() returned without an exit status")
     except BaseException as exc:
         # Grace expired, the process vanished mid-teardown, or the caller was
         # cancelled: force-kill best-effort (an already-gone process is done).
