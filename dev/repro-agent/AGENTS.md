@@ -678,6 +678,11 @@ choice:
   even when a recording is available. For `needs_more_info` or
   `needs_manual_review`, include the known steps and clearly identify missing
   information or unverified steps; do not invent a successful reproduction.
+  For a component probe, label the manual user journey as unrun and report the
+  probe's observations separately. Before emitting either prose or JSON, match
+  each claimed observation to the executed operation and output. A printed label
+  is not proof that the named operation ran; a general stand-in caveat does not
+  make an unexecuted login, new process, connection, or recovery observed.
   You may also include a brief verdict and per-facet notes. Then, as the
   last thing before the JSON block, give concise test references per Step 3,
   including source locations and results. All of this is
@@ -790,8 +795,11 @@ Field meanings:
   other consumers. For credential hypotheses, include the configured-path
   control and observation from Step 1. Execute missing feasible checks before
   the final handoff; preserve concrete blockers and unverified causes explicitly.
-  For credential-related investigations, record the provider actually selected,
-  including fallback selection; attempted SDK setup is not successful execution.
+  For credential-related investigations, identify the provider that actually
+  returns credentials using its runtime type or call trace, including fallback
+  selection. Attempted SDK setup is not successful provider execution. Without
+  that evidence, keep provider identity unresolved and do not claim its failure
+  mode was ruled out by a different provider's successful control.
   Label fresh-instance header checks separately from new-process or successful-
   connection checks, and keep unexercised outcomes unverified throughout the handoff.
 - `recordings` — the Step 4 captures: a list of
