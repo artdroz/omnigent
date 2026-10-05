@@ -230,6 +230,9 @@ rules out. A familiar error message alone does not establish its cause.
 Follow the reported path to any shared registry, default, or policy definition
 that governs the behavior, then read its rationale, relevant callers, and tests.
 Do not infer the full contract from one local fallback.
+Even when the local fallback is explicit, follow the phase or operation type to
+its declaration and inspect other consumers for a shared table or default
+controlling error behavior. Cite that declaration, or a bounded search if absent.
 Follow imported policy symbols to their defining files: search for the declaration
 and other consumers. Record the governing symbol/value, definition path, historical
 rationale, and pinning test in `evidence`. A filename in search output or a symbol
@@ -243,10 +246,14 @@ provider uses, with bounded local services and fake credentials. Static
 credentials need no invented issuance or refresh service. Keep application token
 resolution and the installed SDK intact; replacing the suspected component with
 canned results assumes the cause. Put timeouts on discovery and subprocess calls.
-Get credential resolution working on its own before adding the host/reconnect
-loop. If initialization hangs, inspect the blocking stack. If it identifies
-external configuration metadata/discovery calls, provide controlled responses
-and record whether the control reached them. Preserve other concrete blockers.
+Start with the smallest credential consumer, such as request-header construction,
+and preserve its working control before adding a long-running process. Add the
+full process only when the remaining hypothesis requires it. If initialization
+hangs, capture the blocking stack and output in the same bounded tool call; keep
+probe logs under the workspace. Use that observation to choose the next probe.
+If the stack identifies external configuration metadata/discovery calls, provide
+controlled responses and record whether the control reached them. Preserve other
+concrete blockers.
 Load an isolated version of the reported profile and use its credential at the
 caller's transport boundary. Keep the same application credential object while
 exercising the suspected expiry or rejection. Record whether it refreshes or
