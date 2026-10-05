@@ -1125,6 +1125,28 @@ describe("ForkSessionDialog", () => {
       expect(screen.queryByTestId("fork-session-source-host-offline-hint")).toBeNull();
     });
 
+    it("drops the cross-host warning once a sandbox is picked instead", () => {
+      // A sandbox is a supported clone target, so the host-to-host warning from
+      // the pick that preceded it must not linger.
+      setHosts([
+        host({ host_id: "host_1", name: "arca", status: "offline" }),
+        host({ host_id: "host_2", name: "other-laptop", status: "online" }),
+      ]);
+      renderDialog({
+        ...CODING,
+        info: { managed_sandboxes_enabled: true, sandbox_provider: "modal" },
+      });
+
+      openHostSelect();
+      fireEvent.click(screen.getByTestId("fork-session-host-option-host_2"));
+      expect(screen.getByTestId("fork-session-cross-host-warning")).toBeInTheDocument();
+
+      openHostSelect();
+      fireEvent.click(screen.getByTestId("fork-session-sandbox-option"));
+      expect(screen.queryByTestId("fork-session-cross-host-warning")).toBeNull();
+      expect(screen.queryByTestId("fork-session-source-host-offline-hint")).toBeNull();
+    });
+
     it("clears the worktree branch when the host changes (no stale source branch)", () => {
       // Two online hosts; source ran on host_1 with branch "main" (prefills
       // the base ref). Switching to host_2 must reset the worktree fields so a
@@ -1228,9 +1250,11 @@ describe("ForkSessionDialog", () => {
       });
 
       // The sandbox chrome (repository fields) is active without a manual pick,
-      // and there is no host-directory reuse hint to reproduce.
+      // and there is no host-directory reuse hint to reproduce. The sandbox is a
+      // usable target, so the offline-source reconnect hint doesn't compete with it.
       expect(screen.getByTestId("fork-session-sandbox-hint")).toBeInTheDocument();
       expect(screen.queryByTestId("fork-session-reuse-dir-hint")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("fork-session-source-host-offline-hint")).toBeNull();
     });
 
     it("keeps a connected host as the default — a sandbox is never implicit while one is online", () => {
