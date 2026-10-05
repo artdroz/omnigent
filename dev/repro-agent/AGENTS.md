@@ -560,9 +560,9 @@ sufficient; do not create a module that matches prose verbatim or invent a
 behavioral failure. If the journey remains unverified, report that honestly.
 
 **Assert the reported behavior, not the shape of the fix you imagine.** Resolve
-runs your test unchanged against its fix; an assertion no correct fix can
-satisfy rejects the fix rather than the bug and sends the reproduction back for
-revision. Before handing off, check each assertion:
+must not weaken your assertions to make its fix pass, so an assertion no
+correct fix can satisfy rejects the fix rather than the bug and sends the
+reproduction back for revision. Before handing off, check each assertion:
 
 - Assert the user-visible outcome the report describes — "Models unavailable"
   no longer appears, a persist choice is offered — not the exact text, ids, or
