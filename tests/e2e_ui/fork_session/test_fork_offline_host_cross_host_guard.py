@@ -1,10 +1,10 @@
 """Browser e2e: forking a host-bound session must not silently land on a different host.
 
-With the source host offline, the fork dialog used to default the clone to a
-different online host and let it proceed; cross-host forks are unsupported, so
-the clone's runner never started. The dialog must instead leave the host
-unpicked with a reconnect hint, keep "Clone & start" greyed, and warn plainly
-when a different host is picked explicitly. The two-host state and the
+An offline source host must leave the clone's target unpicked, with a hint
+that names the host and asks for a reconnect, and "Clone & start" greyed;
+explicitly choosing another host must show a cross-host warning before any
+directory is typed. Cross-host forks are unsupported, so a silent default
+would create a clone whose runner never starts. The two-host state and the
 session's host/workspace are network stubs: the harness can't register two
 real hosts, and the logic under test is client-side.
 """
@@ -12,6 +12,7 @@ real hosts, and the logic under test is client-side.
 from __future__ import annotations
 
 import json
+import os
 import re
 
 import pytest
@@ -28,6 +29,12 @@ _OTHER_HOST_ID = "host_dbx_sandbox_e2e"
 _OTHER_HOST_NAME = "dbx-sandbox-e2e"
 _SRC_WS = "/work/project"
 _FORK_WS = "/work/elsewhere"
+
+
+def _hold_for_recording(page: Page) -> None:
+    """Keep a verified state on screen long enough to read when filming."""
+    if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
+        page.wait_for_timeout(1_500)
 
 
 def test_fork_of_offline_host_session_must_not_silently_land_on_another_host(
@@ -101,7 +108,10 @@ def test_fork_of_offline_host_session_must_not_silently_land_on_another_host(
         re.compile(rf".*/v1/sessions/{re.escape(session_id)}(\?.*)?$"),
         handle_session_detail,
     )
-    page.route(f"**/v1/hosts/{_OTHER_HOST_ID}/filesystem/**", handle_filesystem)
+    page.route(
+        re.compile(rf".*/v1/hosts/{_OTHER_HOST_ID}/filesystem([/?].*)?$"),
+        handle_filesystem,
+    )
 
     page.goto(f"{base_url}/c/{session_id}")
 
@@ -119,9 +129,7 @@ def test_fork_of_offline_host_session_must_not_silently_land_on_another_host(
     submit = page.get_by_test_id("fork-session-submit")
     expect(submit).to_have_text("Clone & start")
 
-    # Source host offline: the dialog must not quietly pick the other host.
-    # It names the offline host, says a cross-host clone isn't supported, and
-    # keeps submit greyed until the user chooses.
+    # Offline source host: no silent auto-pick of another host.
     host_trigger = page.get_by_test_id("fork-session-host-select")
     expect(host_trigger).to_be_visible()
     expect(host_trigger).not_to_contain_text(_OTHER_HOST_NAME)
@@ -130,8 +138,7 @@ def test_fork_of_offline_host_session_must_not_silently_land_on_another_host(
     expect(hint).to_contain_text(_SRC_HOST_NAME)
     expect(hint).to_contain_text("isn't supported")
     expect(submit).to_be_disabled()
-    # Hold each verified state briefly so a recording of the journey is readable.
-    page.wait_for_timeout(1_500)
+    _hold_for_recording(page)
 
     # An explicit cross-host pick is still allowed, but it is flagged plainly
     # before any directory is typed -- not just the soft file-references note.
@@ -150,4 +157,4 @@ def test_fork_of_offline_host_session_must_not_silently_land_on_another_host(
     expect(warning).to_be_visible()
     expect(page.get_by_test_id("fork-session-mismatch-warning")).to_have_count(0)
     expect(submit).to_be_enabled()
-    page.wait_for_timeout(1_500)
+    _hold_for_recording(page)

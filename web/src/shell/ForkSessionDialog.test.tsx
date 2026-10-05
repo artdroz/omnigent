@@ -681,7 +681,7 @@ describe("ForkSessionDialog", () => {
       expect(screen.getByTestId("fork-session-branch-input")).toBeInTheDocument();
     });
 
-    it("on a different host (e.g. non-owner), expands Advanced and needs a directory", () => {
+    it("on a different host (e.g. non-owner), defaults to the caller's host, warns, and needs a directory", () => {
       // Source ran on a host the caller doesn't have (their useHosts only
       // returns host_1) — the cross-host / non-owner case.
       renderDialog({
@@ -689,7 +689,12 @@ describe("ForkSessionDialog", () => {
         sourceWorkspace: "/owners/repo",
         sourceHostId: "host_other",
       });
-      // Defaults to the caller's own online host, not the source's.
+      // Defaults to the caller's own online host, not the source's: that host
+      // isn't theirs to reconnect, so no offline hint — but the cross-host
+      // warning still explains the limitation.
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("serena-laptop");
+      expect(screen.getByTestId("fork-session-cross-host-warning")).toBeInTheDocument();
+      expect(screen.queryByTestId("fork-session-source-host-offline-hint")).toBeNull();
       // A different machine → no "reuses the working directory" hint, and the
       // source path isn't prefilled (it's on someone else's box).
       expect(screen.queryByTestId("fork-session-reuse-dir-hint")).not.toBeInTheDocument();
@@ -1082,7 +1087,7 @@ describe("ForkSessionDialog", () => {
       const hint = screen.getByTestId("fork-session-source-host-offline-hint");
       expect(hint).toHaveTextContent("arca");
       expect(hint).toHaveTextContent(/isn't supported/);
-      // No silent cross-host default: nothing selected, submit disabled.
+      // No silent cross-host default.
       expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Select a host");
       expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
     });
@@ -1097,29 +1102,12 @@ describe("ForkSessionDialog", () => {
       ]);
       renderDialog(CODING);
 
-      const trigger = screen.getByTestId("fork-session-host-select");
-      fireEvent.pointerDown(trigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
-      fireEvent.click(trigger);
+      openHostSelect();
       fireEvent.click(screen.getByTestId("fork-session-host-option-host_2"));
 
       const warning = screen.getByTestId("fork-session-cross-host-warning");
       expect(warning).toHaveTextContent(/isn't supported/);
       // The explicit pick replaces the reconnect hint.
-      expect(screen.queryByTestId("fork-session-source-host-offline-hint")).toBeNull();
-    });
-
-    it("still defaults to the caller's own host when the source host isn't theirs", () => {
-      // Forking a shared session that ran on someone else's machine: the
-      // caller can't reconnect that host, so their own online host stays the
-      // default — but the cross-host warning still explains the limitation.
-      renderDialog({
-        sourceTitle: "My session",
-        sourceWorkspace: "/owners/repo",
-        sourceHostId: "host_other",
-      });
-
-      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("serena-laptop");
-      expect(screen.getByTestId("fork-session-cross-host-warning")).toBeInTheDocument();
       expect(screen.queryByTestId("fork-session-source-host-offline-hint")).toBeNull();
     });
 

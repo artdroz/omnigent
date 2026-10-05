@@ -917,12 +917,9 @@ export function ForkSessionForm({
   const sameFamilyAsSource = !switching || (sourceFamily !== null && sourceFamily === targetFamily);
   const sameAgentAsSource = !switching;
 
-  // Default host: the source host when online, else the first online host,
-  // once hosts load; only fills an empty slot. A caller's OWN source host that
-  // is merely offline picks nothing — cross-host clones aren't supported, so
-  // the hint below asks for a reconnect (a shared session's host isn't theirs
-  // to reconnect, so their own host stays the default). With no host online a
-  // sandbox-only deployment falls back to the sandbox rather than strand the picker.
+  // Default host: source host when online, else first online host; only fills
+  // an empty slot. The caller's own offline source host picks nothing (the hint
+  // asks for a reconnect); a sandbox is the fallback only with no host online.
   useEffect(() => {
     if (!isCodingSource || sandboxSelected || selectedHostId !== null) return;
     if (sourceHostId && sourceHostOnline) {
@@ -1109,9 +1106,8 @@ export function ForkSessionForm({
     // the same lineage as its worktree — not a mismatch.
     (sourceRepo === null || workspaceTrimmed !== sourceRepo);
 
-  // Default state: a coding clone on the source host still pointed at the
-  // source's directory. Drives the "reuses the original's working directory"
-  // indicator, which explains the default without forcing Advanced open. On a
+  // Coding clone on the source host still pointed at the source's directory;
+  // drives the "reuses the original's working directory" indicator. On a
   // different host this is false (the cross-host warning takes over instead).
   const usingSourceDir = onSourceHost && workspaceTrimmed !== "" && !showMismatchWarning;
 
