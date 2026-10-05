@@ -151,6 +151,8 @@ function createBrowserViewRegistry({
       // internal host slips through (SSRF via screenshot).
       agentNavLocked: false,
       agentOwnedOrigin: null,
+      agentOwnedHostId: null,
+      agentOwnedServerUrl: null,
       expiredAgentOrigins: new Set(),
       releaseAgentOrigin: null,
       // Design-mode listeners + webContents, set by browserIpc's enable handler
@@ -353,9 +355,15 @@ function createBrowserViewRegistry({
     // user-typed URL-bar nav permissive. Set only when a url is actually issued.
     if (url) entry.agentNavLocked = !!(opts && opts.agent);
     if (opts?.agent && opts.ownedOrigin) {
-      if (entry.agentOwnedOrigin !== opts.ownedOrigin) {
+      const sameOwner =
+        entry.agentOwnedOrigin === opts.ownedOrigin &&
+        entry.agentOwnedHostId === opts.ownedHostId &&
+        entry.agentOwnedServerUrl === opts.ownedServerUrl;
+      if (!sameOwner) {
         entry.releaseAgentOrigin?.();
         entry.agentOwnedOrigin = opts.ownedOrigin;
+        entry.agentOwnedHostId = opts.ownedHostId || null;
+        entry.agentOwnedServerUrl = opts.ownedServerUrl || null;
         entry.releaseAgentOrigin = opts.releaseOwnedOrigin || null;
       } else if (opts.releaseOwnedOrigin) {
         entry.releaseAgentOrigin = opts.releaseOwnedOrigin;
@@ -533,6 +541,8 @@ function createBrowserViewRegistry({
     if (!entry) return;
     if (entry.agentOwnedOrigin) entry.expiredAgentOrigins.add(entry.agentOwnedOrigin);
     entry.agentOwnedOrigin = null;
+    entry.agentOwnedHostId = null;
+    entry.agentOwnedServerUrl = null;
     entry.releaseAgentOrigin?.();
     entry.releaseAgentOrigin = null;
   }

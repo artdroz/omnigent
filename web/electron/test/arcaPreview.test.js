@@ -124,7 +124,12 @@ describe("Arca preview manager", () => {
     const socketPath = master.args[master.args.indexOf("-S") + 1];
     assert.ok(Buffer.byteLength(`${socketPath}.XXXXXXXXXX`) < 104);
     assert.equal(fs.statSync(require("node:path").dirname(socketPath)).mode & 0o777, 0o700);
-    owned.release();
+    const shutdown = owned.release();
+    const exit = fake.calls.at(-1);
+    assert.deepEqual(exit.args.slice(0, 6), ["ssh", "-F", "/dev/null", "-S", socketPath, "-O"]);
+    assert.equal(exit.args[6], "exit");
+    assert.equal(fs.existsSync(require("node:path").dirname(socketPath)), true);
+    await shutdown;
     assert.equal(fs.existsSync(require("node:path").dirname(socketPath)), false);
   });
 
@@ -163,10 +168,44 @@ describe("Arca preview manager", () => {
     assert.ok(forwards.every((call) => call.args.includes("/dev/null")));
     const masters = fake.calls.filter((call) => call.args.includes("-M"));
     assert.ok(masters.every((call) => call.args.includes("ClearAllForwardings=yes")));
+    assert.ok(masters.every((call) => call.args.includes("ControlPersist=no")));
     assert.equal(
       fake.children[fake.calls.findIndex((call) => call.args.includes("-M"))].stderr.resumed,
       true,
     );
+  });
+
+  it("bounds an unresponsive mux exit before killing the master and removing its socket", async () => {
+    const fake = successfulSpawner();
+    let exitChild;
+    let unlinked = false;
+    const manager = createArcaPreviewManager({
+      resolveArcaPathFn: () => "/arca",
+      spawnFn: (file, args) => {
+        if (args.includes("-O") && args.includes("exit")) {
+          exitChild = child();
+          return exitChild;
+        }
+        return fake.spawn(file, args);
+      },
+      socketReady: () => true,
+      socketPathFn: () => "/tmp/oa-test/s",
+      unlinkSocket: () => {
+        unlinked = true;
+      },
+      shutdownTimeoutMs: 5,
+    });
+    const owned = await manager.prepare({
+      conversationId: "bounded-exit",
+      url: "http://localhost:5173",
+      hostId: "host_arca",
+      serverUrl: "https://srv.example.com",
+    });
+    await owned.release();
+    const masterIndex = fake.calls.findIndex((call) => call.args.includes("-M"));
+    assert.equal(exitChild.killed, true);
+    assert.equal(fake.children[masterIndex].killed, true);
+    assert.equal(unlinked, true);
   });
 
   it("rejects a different, offline, or unknown requesting host", async () => {

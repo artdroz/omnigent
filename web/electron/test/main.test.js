@@ -292,7 +292,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { createWindow, createBrowserRegistryForWindow, loadServerUrl, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; } };";
+    "\nmodule.exports.testApi = { createWindow, createBrowserRegistryForWindow, loadServerUrl, pinWindow, matchesAgentPreviewOwner, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; } };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -1523,5 +1523,39 @@ describe("browser-view teardown on server change (src/main.js)", () => {
       liveCode,
       /app\.on\("before-quit"[\s\S]{0,500}browserRegistry\?\.closeAll\("app-quit"\)[\s\S]{0,700}app\.exit\(0\)/,
     );
+  });
+});
+
+describe("Arca preview owner reuse", () => {
+  it("requires the same verified host and full connected server identity", () => {
+    const h = loadNavigationHarness();
+    try {
+      const entry = {
+        agentOwnedOrigin: "http://localhost:5173",
+        agentOwnedHostId: "host_a",
+        agentOwnedServerUrl: "https://workspace.example/omnigent?o=1",
+      };
+      const preview = { origin: "http://localhost:5173" };
+      assert.equal(
+        h.api.matchesAgentPreviewOwner(
+          entry,
+          preview,
+          "host_a",
+          "https://workspace.example/omnigent?o=1",
+        ),
+        true,
+      );
+      assert.equal(
+        h.api.matchesAgentPreviewOwner(
+          entry,
+          preview,
+          "host_b",
+          "https://workspace.example/omnigent?o=1",
+        ),
+        false,
+      );
+    } finally {
+      h.cleanup();
+    }
   });
 });

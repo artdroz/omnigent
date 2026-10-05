@@ -886,6 +886,14 @@ function setWindowServerUrl(win, serverUrl) {
   state.serverUrl = serverUrl;
 }
 
+function matchesAgentPreviewOwner(entry, preview, hostId, serverUrl) {
+  return (
+    entry?.agentOwnedOrigin === preview.origin &&
+    entry.agentOwnedHostId === hostId &&
+    entry.agentOwnedServerUrl === serverUrl
+  );
+}
+
 /**
  * Record the version manifest of the server a window connected to (see
  * `fetchServerManifest` in src/url.js). Stored per-window because different
@@ -3514,8 +3522,13 @@ function registerIpc() {
         throw new Error("Arca localhost previews require a managed Databricks server");
       }
       const existing = registry.get(conversationId);
-      if (existing?.agentOwnedOrigin === preview.origin) {
-        return { ...opts, ownedOrigin: preview.origin };
+      if (matchesAgentPreviewOwner(existing, preview, opts.hostId, serverUrl)) {
+        return {
+          ...opts,
+          ownedOrigin: preview.origin,
+          ownedHostId: opts.hostId,
+          ownedServerUrl: serverUrl,
+        };
       }
       lifecycle.onCancel(() => registry.arcaPreview.release(conversationId));
       if (
@@ -3539,7 +3552,13 @@ function registerIpc() {
         owned.release();
         throw new Error("preview navigation was superseded");
       }
-      return { ...opts, ownedOrigin: owned.origin, releaseOwnedOrigin: owned.release };
+      return {
+        ...opts,
+        ownedOrigin: owned.origin,
+        ownedHostId: opts.hostId,
+        ownedServerUrl: serverUrl,
+        releaseOwnedOrigin: owned.release,
+      };
     },
   });
 }

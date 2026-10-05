@@ -157,6 +157,7 @@ function createArcaPreviewManager({
   socketReady = fs.existsSync,
   unlinkSocket = (socketPath) => fs.rmSync(socketPath, { force: true }),
   removeSocketDir = (socketDir) => fs.rmSync(socketDir, { recursive: true, force: true }),
+  shutdownTimeoutMs = 500,
   socketPathFn = () => {
     const socketDir = fs.mkdtempSync(path.join("/tmp", "oa-"));
     return { socketPath: path.join(socketDir, "s"), socketDir };
@@ -166,19 +167,66 @@ function createArcaPreviewManager({
   const owned = new Map();
   let sequence = 0;
 
+  function cleanupSocket(state) {
+    try {
+      if (state.socketPath) unlinkSocket(state.socketPath);
+    } catch {
+      /* already removed */
+    }
+    try {
+      if (state.socketDir) removeSocketDir(state.socketDir);
+    } catch {
+      /* already removed */
+    }
+  }
+
   function release(conversationId, token) {
     const current = owned.get(conversationId);
-    if (!current || (token && current.token !== token)) return;
+    if (!current || (token && current.token !== token)) return null;
     owned.delete(conversationId);
     current.cancel?.();
-    terminate(current.child);
-    if (current.socketPath) unlinkSocket(current.socketPath);
-    if (current.socketDir) removeSocketDir(current.socketDir);
+    let control = null;
+    if (current.master && !current.masterExited && current.socketPath) {
+      try {
+        // Keep the socket reachable until the exact owned mux master has been
+        // asked to exit; the timer below bounds wrapper incompatibility.
+        control = spawnFn(
+          current.arcaPath,
+          ["ssh", "-F", "/dev/null", "-S", current.socketPath, "-O", "exit"],
+          { stdio: ["ignore", "ignore", "ignore"], detached: true },
+        );
+      } catch {
+        /* fall through to process-group termination */
+      }
+    }
+    if (!control) {
+      terminate(current.child);
+      if (current.master !== current.child) terminate(current.master);
+      cleanupSocket(current);
+      return null;
+    }
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (timedOut = false) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (timedOut) terminate(control);
+        terminate(current.child);
+        if (current.master !== current.child) terminate(current.master);
+        cleanupSocket(current);
+        resolve();
+      };
+      const timer = setTimeout(() => finish(true), shutdownTimeoutMs);
+      control.once("error", () => finish());
+      control.once("exit", () => finish());
+    });
   }
 
   async function prepare({ conversationId, url, hostId, serverUrl, deadline: requestedDeadline }) {
     const preview = loopbackPreview(url);
-    release(conversationId);
+    const priorRelease = release(conversationId);
+    if (priorRelease) await priorRelease;
     if (!preview) return null;
     if (typeof hostId !== "string" || !hostId)
       throw new Error("the requesting session's host is unknown");
@@ -187,7 +235,16 @@ function createArcaPreviewManager({
     const token = ++sequence;
     const deadline = Math.min(requestedDeadline ?? Infinity, Date.now() + timeoutMs);
     if (deadline <= Date.now()) throw new Error("timed out preparing the Arca localhost preview");
-    const state = { token, child: null, cancel: null, socketPath: null, socketDir: null };
+    const state = {
+      token,
+      arcaPath,
+      child: null,
+      master: null,
+      masterExited: false,
+      cancel: null,
+      socketPath: null,
+      socketDir: null,
+    };
     owned.set(conversationId, state);
     const onChild = (child, cancel) => {
       if (owned.get(conversationId)?.token !== token) {
@@ -205,20 +262,37 @@ function createArcaPreviewManager({
       const socketPath = typeof socket === "string" ? socket : socket.socketPath;
       state.socketPath = socketPath;
       state.socketDir = typeof socket === "string" ? null : socket.socketDir;
+      // ControlPersist=no keeps config from daemonizing away from our process
+      // group. A sudden Electron SIGKILL can still orphan this stopgap.
       const master = spawnFn(
         arcaPath,
-        ["ssh", "-M", "-S", socketPath, "-o", "ClearAllForwardings=yes", "-N"],
+        [
+          "ssh",
+          "-M",
+          "-S",
+          socketPath,
+          "-o",
+          "ClearAllForwardings=yes",
+          "-o",
+          "ControlPersist=no",
+          "-N",
+        ],
         { stdio: ["ignore", "ignore", "pipe"], detached: true },
       );
       master.stderr?.resume?.();
       state.child = master;
+      state.master = master;
       let rejectMaster;
       const masterExit = new Promise((_, reject) => {
         rejectMaster = reject;
-        master.on("error", reject);
-        master.on("exit", (code) =>
-          reject(new Error(`Arca preview exited (${code ?? "unknown"})`)),
-        );
+        master.on("error", (error) => {
+          state.masterExited = true;
+          reject(error);
+        });
+        master.on("exit", (code) => {
+          state.masterExited = true;
+          reject(new Error(`Arca preview exited (${code ?? "unknown"})`));
+        });
       });
       state.cancel = () => rejectMaster(new Error("preview was cancelled"));
       await Promise.race([waitForSocket(socketPath, deadline, socketReady), masterExit]);
@@ -275,7 +349,7 @@ function createArcaPreviewManager({
       });
       return { origin: preview.origin, release: () => release(conversationId, token) };
     } catch (error) {
-      release(conversationId, token);
+      await release(conversationId, token);
       throw error;
     }
   }

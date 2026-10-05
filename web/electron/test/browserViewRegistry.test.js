@@ -381,6 +381,30 @@ describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every h
     assert.equal(releases, 1);
   });
 
+  it("does not reuse a same-origin preview after the verified execution host changes", () => {
+    const { registry } = makeEventCapturingRegistry();
+    let firstReleases = 0;
+    let secondReleases = 0;
+    registry.openOrNavigate("conv_1", "http://localhost:5173/app", undefined, {
+      agent: true,
+      ownedOrigin: "http://localhost:5173",
+      ownedHostId: "host_a",
+      ownedServerUrl: "https://workspace.example/omnigent?o=1",
+      releaseOwnedOrigin: () => (firstReleases += 1),
+    });
+    registry.openOrNavigate("conv_1", "http://localhost:5173/next", undefined, {
+      agent: true,
+      ownedOrigin: "http://localhost:5173",
+      ownedHostId: "host_b",
+      ownedServerUrl: "https://workspace.example/omnigent?o=1",
+      releaseOwnedOrigin: () => (secondReleases += 1),
+    });
+    const entry = registry.get("conv_1");
+    assert.equal(firstReleases, 1);
+    assert.equal(secondReleases, 0);
+    assert.equal(entry.agentOwnedHostId, "host_b");
+  });
+
   it("retires a released preview and closes a stale history reload", () => {
     const { registry, fire, loaded } = makeEventCapturingRegistry();
     let releases = 0;
