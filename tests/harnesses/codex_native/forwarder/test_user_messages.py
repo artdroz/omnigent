@@ -18,6 +18,7 @@ class _ScriptedEventClient(httpx.AsyncClient):
     """Return scripted event responses while recording accepted POST attempts."""
 
     def __init__(self, statuses: list[int]) -> None:
+        super().__init__()
         self.statuses = list(statuses)
         self.posts: list[dict[str, Any]] = []
         self.accepted_posts: list[dict[str, Any]] = []
@@ -272,9 +273,9 @@ async def test_cancelled_user_post_releases_claim_for_retry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_successful_replay_dedup_and_anonymous_counter_commit() -> None:
-    """Accepted message claims dedupe, while anonymous keys advance on success."""
-    client = _ScriptedEventClient([202, 422, 202, 202])
+async def test_acknowledged_replay_dedups_and_anonymous_counter_advances_on_claim() -> None:
+    """Accepted stable claims dedupe; anonymous keys advance on claim, even when rejected."""
+    client = _ScriptedEventClient([202, 422, 202])
     state = fwd._CodexForwarderState()
     stable: dict[str, Any] = _user_params()
 
@@ -295,3 +296,88 @@ async def test_successful_replay_dedup_and_anonymous_counter_commit() -> None:
         "thread_1:turn_1:anon-1",
     ]
     assert state.peek_anon_item_key("thread_1", "turn_1") == "thread_1:turn_1:anon-2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"type": "agentMessage", "id": "assistant_1", "text": "reply"},
+        {"type": "plan", "id": "plan_1", "text": "the plan"},
+        {"type": "enteredReviewMode", "id": "review_1", "review": "check auth"},
+    ],
+    ids=["agentMessage", "plan", "enteredReviewMode"],
+)
+async def test_rejected_assistant_side_claim_is_retried_on_replay(item: dict[str, Any]) -> None:
+    """Every stable-id message type releases a rejected claim and dedups once accepted."""
+    client = _ScriptedEventClient([422, 202])
+    state = fwd._CodexForwarderState()
+    params: dict[str, Any] = {"threadId": "thread_1", "turnId": "turn_1", "item": item}
+
+    for _ in range(3):
+        await fwd._handle_completed_item_inner(client, "conv_x", params, forwarder_state=state)
+
+    key = f"thread_1:turn_1:{item['id']}"
+    assert [post["data"]["source_id"] for post in client.posts] == [key, key]
+    assert len(client.accepted_posts) == 1
+    assert state.synced_item_keys == {key}
+    assert state.pending_item_claims == set()
+
+
+@pytest.mark.asyncio
+async def test_assistant_defers_while_recovered_user_post_is_in_flight() -> None:
+    """A stable-id reply waits for the user bubble whose POST another task still owns."""
+    client = _ScriptedEventClient([202])
+    state = fwd._CodexForwarderState(
+        codex_client=_ResumeClient(),  # type: ignore[arg-type]
+    )
+    assistant_params: dict[str, Any] = {
+        "threadId": "thread_1",
+        "turnId": "turn_1",
+        "item": {"type": "agentMessage", "id": "assistant_1", "text": "reply"},
+    }
+    assert state.reserve_item_key("thread_1:turn_1:user_1")
+
+    await fwd._handle_completed_item_inner(
+        client, "conv_x", assistant_params, forwarder_state=state
+    )
+
+    assert client.posts == []
+    assert state.pending_item_claims == {"thread_1:turn_1:user_1"}
+    assert state.synced_item_keys == set()
+
+    state.commit_item_key("thread_1:turn_1:user_1")
+    state.note_user_message_posted("turn_1")
+    await fwd._handle_completed_item_inner(
+        client, "conv_x", assistant_params, forwarder_state=state
+    )
+
+    assert [post["data"]["source_id"] for post in client.accepted_posts] == [
+        "thread_1:turn_1:assistant_1"
+    ]
+    assert state.synced_item_keys == {"thread_1:turn_1:user_1", "thread_1:turn_1:assistant_1"}
+
+
+@pytest.mark.asyncio
+async def test_anonymous_assistant_posts_while_recovered_user_post_is_in_flight() -> None:
+    """An anonymous reply has no replay identity, so it is posted rather than dropped."""
+    client = _ScriptedEventClient([202])
+    state = fwd._CodexForwarderState(
+        codex_client=_ResumeClient(),  # type: ignore[arg-type]
+    )
+    assistant_params: dict[str, Any] = {
+        "threadId": "thread_1",
+        "turnId": "turn_1",
+        "item": {"type": "agentMessage", "text": "reply"},
+    }
+    assert state.reserve_item_key("thread_1:turn_1:user_1")
+
+    await fwd._handle_completed_item_inner(
+        client, "conv_x", assistant_params, forwarder_state=state
+    )
+
+    assert [post["data"]["source_id"] for post in client.accepted_posts] == [
+        "thread_1:turn_1:anon-0"
+    ]
+    assert state.synced_item_keys == {"thread_1:turn_1:anon-0"}
+    assert state.pending_item_claims == {"thread_1:turn_1:user_1"}

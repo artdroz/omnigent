@@ -9,7 +9,7 @@ import json
 import logging
 import urllib.error
 import urllib.request
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -5054,6 +5054,38 @@ def _claim_completed_item(
     return item_key
 
 
+async def _deliver_claimed_message(
+    forwarder_state: _CodexForwarderState | None,
+    source_id: str,
+    *,
+    replayable: bool,
+    deliver: Callable[[], Awaitable[bool]],
+) -> bool:
+    """
+    Run one message POST and settle its stable-id reservation.
+
+    An acknowledged POST commits the reserved key; a rejected, skipped, or
+    cancelled delivery releases it so a later replay can retry the same
+    source id. Anonymous and dedup-disabled items (``replayable`` is
+    ``False``) keep their eager claim and are not settled here.
+
+    :param forwarder_state: Mutable forwarder state holding the reservation.
+    :param source_id: Reserved stable source id, e.g. ``"thread_1:turn_1:item-1"``.
+    :param replayable: Whether ``source_id`` was reserved with ``defer_commit``.
+    :param deliver: Coroutine factory performing the POST; returns acceptance.
+    :returns: Whether the server accepted the item.
+    """
+    try:
+        posted = await deliver()
+    except BaseException:
+        if forwarder_state is not None and replayable:
+            forwarder_state.release_item_key(source_id)
+        raise
+    if forwarder_state is not None and replayable:
+        forwarder_state.settle_item_key(source_id, accepted=posted)
+    return posted
+
+
 async def _handle_completed_item(
     client: httpx.AsyncClient,
     session_id: str,
@@ -5161,92 +5193,65 @@ async def _handle_completed_item_inner(
     if source_id is None:
         return
     if item_type == "userMessage":
-        try:
-            posted = await _post_user_message(
-                client,
-                session_id,
-                params,
-                item,
-                source_id=source_id,
-            )
-        except BaseException:
-            if forwarder_state is not None and replayable_item:
-                forwarder_state.release_item_key(source_id)
-            raise
-        if forwarder_state is not None and replayable_item:
-            forwarder_state.settle_item_key(source_id, accepted=posted)
+        posted = await _deliver_claimed_message(
+            forwarder_state,
+            source_id,
+            replayable=replayable_item,
+            deliver=lambda: _post_user_message(
+                client, session_id, params, item, source_id=source_id
+            ),
+        )
         if posted and forwarder_state is not None:
             turn_id = _turn_id_from_payload(params)
             if turn_id:
                 forwarder_state.note_user_message_posted(turn_id)
         return
     if item_type == "agentMessage":
-        # User-before-assistant ordering guarantee. On a fresh thread the
-        # forwarder subscribes via ``thread/resume`` only after the first
-        # turn starts, so the early ``userMessage`` event can stream past
-        # before the subscription lands — it is then recovered only via a
-        # later resume backfill, which can post it AFTER this reply. Since
-        # Omnigent assigns each mirrored item a position by POST arrival order
-        # and the web UI renders strictly by position, that inverts the
-        # bubbles. Recover and post the turn's user message first so it
-        # always takes the earlier position.
-        try:
+
+        async def _deliver_agent_message() -> bool:
+            # User-before-assistant ordering guarantee. On a fresh thread the
+            # forwarder subscribes via ``thread/resume`` only after the first
+            # turn starts, so the early ``userMessage`` event can stream past
+            # before the subscription lands — it is then recovered only via a
+            # later resume backfill, which can post it AFTER this reply. Since
+            # Omnigent assigns each mirrored item a position by POST arrival order
+            # and the web UI renders strictly by position, that inverts the
+            # bubbles. Recover and post the turn's user message first so it
+            # always takes the earlier position.
             user_ready = await _ensure_user_message_posted(
-                client,
-                session_id,
-                params,
-                forwarder_state,
+                client, session_id, params, forwarder_state
             )
-            if user_ready is False and forwarder_state is not None:
-                # Do not let a rejected recovery POST put the assistant ahead
-                # of a user bubble that a later resume replay can still save.
-                forwarder_state.release_item_key(source_id)
-                return
-            posted = await _post_agent_message(
-                client,
-                session_id,
-                params,
-                item,
-                source_id=source_id,
-            )
-        except BaseException:
-            if forwarder_state is not None and replayable_item:
-                forwarder_state.release_item_key(source_id)
-            raise
-        if forwarder_state is not None and replayable_item:
-            forwarder_state.settle_item_key(source_id, accepted=posted)
+            if user_ready is False and replayable_item:
+                # The user item is still in flight elsewhere. Skip this
+                # stable-id reply for now; releasing its reservation lets the
+                # delivery that follows the user bubble post it in order.
+                return False
+            return await _post_agent_message(client, session_id, params, item, source_id=source_id)
+
+        await _deliver_claimed_message(
+            forwarder_state,
+            source_id,
+            replayable=replayable_item,
+            deliver=_deliver_agent_message,
+        )
         return
     if item_type == "plan":
-        try:
-            posted = await _post_plan_item(
-                client,
-                session_id,
-                params,
-                item,
-                source_id=source_id,
-            )
-        except BaseException:
-            if forwarder_state is not None and replayable_item:
-                forwarder_state.release_item_key(source_id)
-            raise
-        if forwarder_state is not None and replayable_item:
-            forwarder_state.settle_item_key(source_id, accepted=posted)
+        await _deliver_claimed_message(
+            forwarder_state,
+            source_id,
+            replayable=replayable_item,
+            deliver=lambda: _post_plan_item(client, session_id, params, item, source_id=source_id),
+        )
         return
     if item_type in _REVIEW_MODE_ITEM_TYPES:
-        try:
-            posted = await _post_review_mode_marker(
-                client,
-                session_id,
-                params,
-                item,
-                source_id=source_id,
-            )
-        except BaseException:
-            if forwarder_state is not None and replayable_item:
-                forwarder_state.release_item_key(source_id)
-            raise
-        if forwarder_state is not None and replayable_item:
-            forwarder_state.settle_item_key(source_id, accepted=posted)
+        await _deliver_claimed_message(
+            forwarder_state,
+            source_id,
+            replayable=replayable_item,
+            deliver=lambda: _post_review_mode_marker(
+                client, session_id, params, item, source_id=source_id
+            ),
+        )
         return
     if item_type in _TOOL_ITEM_TYPES:
         if item_type == "fileChange":
@@ -6114,8 +6119,10 @@ async def _ensure_user_message_posted(
     :param forwarder_state: Mutable forwarder state tracking posted user
         turns and holding the Codex app-server client.
     :returns: ``True`` when the user item is already or newly posted,
-        ``False`` when a recovered item was rejected, or ``None`` when no
-        recoverable user item was found.
+        ``False`` when its stable-id key is still reserved by another
+        in-flight POST (the caller should defer the reply), or ``None``
+        when no recoverable user item was found or the recovered POST was
+        rejected.
     """
     if forwarder_state is None:
         return None
@@ -6176,9 +6183,8 @@ async def _ensure_user_message_posted(
         return True
     if replayable_user:
         forwarder_state.release_item_key(source_id)
-    # An anonymous or permanently rejected user item has no safe replay
-    # identity. Let the valid assistant output through rather than hiding it
-    # forever behind an item that cannot be retried reliably.
+    # Let the assistant output through: a rejected stable-id user item stays
+    # replayable by the next backfill, an anonymous one has no replay identity.
     return None
 
 
