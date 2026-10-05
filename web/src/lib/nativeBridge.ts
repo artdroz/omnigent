@@ -27,6 +27,17 @@
  */
 export type SidebarDragPhase = "begin" | "move" | "open" | "close";
 
+export interface BrowserRecentSessionInput {
+  type: "keydown" | "keyup";
+  key: "Tab" | "Control" | "Escape";
+  code: string;
+  ctrlKey: boolean;
+  shiftKey: boolean;
+  altKey: boolean;
+  metaKey: boolean;
+  repeat: boolean;
+}
+
 /**
  * Extra hints for the badge on shells that render it as a tappable OS
  * notification. Android has no numeric icon badge, so the count is surfaced as
@@ -164,6 +175,8 @@ export interface NativeViewModeParams {
  */
 interface ElectronDesktopApi extends NativeShellApi {
   kind: "electron";
+  /** The runner picked during onboarding for this server, returned once. */
+  takeOnboardingRunner?: () => Promise<"local" | "remote" | null>;
   /**
    * Desktop auto-update bridge — CONFIG ONLY on current shells. Update
    * notifications are shell-owned (native corner overlay + Server menu); this
@@ -173,6 +186,8 @@ interface ElectronDesktopApi extends NativeShellApi {
    * idle, so the web never shows a (duplicate) banner. Absent on older shells.
    */
   updates?: ElectronUpdateBridge;
+  /** Reveal one of this machine's files in the OS file manager. */
+  revealFile?: (hostId: string, path: string) => Promise<boolean>;
   /** This machine's identity (CLI installed + host id) — fast, no subprocess. */
   getHostIdentity?: () => Promise<HostIdentity | null>;
   /** Start / stop / restart this machine's host daemon for the window's server. */
@@ -206,6 +221,16 @@ interface ElectronDesktopApi extends NativeShellApi {
    * predating the feature — callers must optional-chain.
    */
   browserSetSuppressed?: (suppressed: boolean) => Promise<{ ok: boolean; error?: string }>;
+  /** Forward the recent-session gesture from a focused embedded Browser page. */
+  onBrowserRecentSessionInput?: (
+    callback: (input: BrowserRecentSessionInput) => void,
+  ) => () => void;
+  /** Enable native input interception only while this renderer supports it. */
+  browserSetRecentSessionSwitchSupported?: (
+    supported: boolean,
+  ) => Promise<{ ok: boolean; error?: string }>;
+  /** Clear native key interception when the recent-session gesture was declined. */
+  browserCancelRecentSessionSwitch?: () => Promise<{ ok: boolean; error?: string }>;
 }
 
 /** A lifecycle action for the host daemon. */
@@ -339,10 +364,19 @@ export interface ServerPickerInfo {
   /** Origin this window is connected to, e.g. `"http://localhost:8000"`. */
   currentOrigin: string;
   /**
+   * The server URL the user picked when sign-in moved to `currentOrigin`'s host
+   * (it may carry a workspace `?o=` selector), else null. Absent on older shells.
+   */
+  currentServer?: string | null;
+  /** Recent URL → the server URL the user picked for it, for display. Absent on older shells. */
+  recentLabels?: Record<string, string>;
+  /**
    * Server URLs supplied through macOS Managed Preferences. Optional because a
    * newer server-served SPA can run inside a desktop shell that predates MDM.
    */
   managedServers?: string[];
+  /** Display names for managed servers, server URL → name. Absent on older shells. */
+  managedServerNames?: Record<string, string>;
   /** Recently-connected server URLs, most recent first. */
   recentServers: string[];
   /**
@@ -459,6 +493,42 @@ export function updateBridge(): ElectronUpdateBridge | undefined {
  */
 export function supportsBrowser(): boolean {
   return typeof electronApi()?.browserOpenOrNavigate === "function";
+}
+
+/** Subscribe to recent-session key events forwarded from an embedded Browser page. */
+export function onBrowserRecentSessionInput(
+  callback: (input: BrowserRecentSessionInput) => void,
+): () => void {
+  const electron = electronApi();
+  if (!electron?.onBrowserRecentSessionInput) return () => {};
+  try {
+    return electron.onBrowserRecentSessionInput(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] browser recent-session input subscription failed:", err);
+    return () => {};
+  }
+}
+
+/** Advertise whether this renderer can handle embedded-page Ctrl+Tab events. */
+export async function setBrowserRecentSessionSwitchSupported(supported: boolean): Promise<void> {
+  const electron = electronApi();
+  if (!electron?.browserSetRecentSessionSwitchSupported) return;
+  try {
+    await electron.browserSetRecentSessionSwitchSupported(supported);
+  } catch (err) {
+    console.warn("[nativeBridge] browser recent-session support update failed:", err);
+  }
+}
+
+/** Tell Electron that a forwarded Ctrl+Tab did not open the session switcher. */
+export async function cancelBrowserRecentSessionSwitch(): Promise<void> {
+  const electron = electronApi();
+  if (!electron?.browserCancelRecentSessionSwitch) return;
+  try {
+    await electron.browserCancelRecentSessionSwitch();
+  } catch (err) {
+    console.warn("[nativeBridge] browser recent-session cancellation failed:", err);
+  }
 }
 
 /**
@@ -838,6 +908,18 @@ export async function getHostIdentity(): Promise<HostIdentity | null> {
 }
 
 /**
+ * The runner ("local" | "remote") picked during desktop onboarding for this
+ * server, handed over once; null otherwise or outside Electron.
+ */
+export async function takeOnboardingRunner(): Promise<"local" | "remote" | null> {
+  try {
+    return (await electronApi()?.takeOnboardingRunner?.()) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Start / stop / restart this machine's host daemon for the window's server,
  * via the desktop shell. Resolves `{ ok, error? }`; a no-op `{ ok: false }`
  * outside the shell.
@@ -937,5 +1019,19 @@ export async function resetCliPath(): Promise<CliStatus | null> {
   } catch (err) {
     console.warn("[nativeBridge] electron resetCliPath failed:", err);
     return null;
+  }
+}
+
+/** True when the desktop shell can reveal this machine's files in the OS file manager. */
+export function supportsFileReveal(): boolean {
+  return typeof electronApi()?.revealFile === "function";
+}
+
+/** Ask the desktop shell to reveal ``path``; resolves false if it could not. */
+export async function revealFile(hostId: string, path: string): Promise<boolean> {
+  try {
+    return (await electronApi()?.revealFile?.(hostId, path)) ?? false;
+  } catch {
+    return false;
   }
 }
