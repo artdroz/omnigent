@@ -352,3 +352,36 @@ async def test_a_stale_fingerprint_from_before_this_fix_still_routes_once(
     second = await _resume_first_prompt(client, session_id, live_model=ROUTER_PICK)
     assert second["action"] == "allow", second
     assert len(_routing_decisions(db_uri, session_id)) == 1
+
+
+async def test_a_failed_decision_record_drops_the_pin_so_the_next_prompt_routes_again(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A routed pin whose decision label cannot be written does not freeze routing.
+
+    Left in place, that unlabeled pin would read as the user's and the session
+    would never route again. The hook drops it and lets the prompt run
+    unrouted; the next prompt routes and records normally.
+    """
+    session_id = await _smart_routing_session(client, agent_name="routing-resume-label-fails")
+
+    def _unavailable(self: object, conversation_id: str, updates: object, *args: object) -> None:
+        raise OperationalError("INSERT INTO conversation_labels", {}, Exception("locked"))
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "set_labels", _unavailable)
+    first = await _resume_first_prompt(client, session_id, live_model=CREATE_PICK)
+    assert first["action"] == "allow", first
+    assert first["terminal"] is False
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.model_override is None
+
+    monkeypatch.undo()
+    second = await _resume_first_prompt(client, session_id, live_model=CREATE_PICK)
+    assert second["action"] == "route", second
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.model_override == ROUTER_PICK

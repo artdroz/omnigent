@@ -514,3 +514,35 @@ def test_update_conversation_writes_and_deletes_labels_with_the_row(
     got = conversation_store.get_conversation(conv.id)
     assert got is not None
     assert got.labels == {"keep": "1", "added": "2"}
+
+
+def test_update_conversation_rolls_back_the_row_and_labels_together(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure after the label delete leaves the row and labels as they were.
+
+    The column update, the label delete and the label upsert share one
+    transaction, so a store error mid-way must not persist any of them.
+    """
+    from omnigent.stores.conversation_store import sqlalchemy_store
+
+    conv = conversation_store.create_conversation()
+    conversation_store.update_conversation(conv.id, model_override="claude-opus-4-7")
+    conversation_store.set_labels(conv.id, {"drop": "1"})
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("label upsert failed")
+
+    monkeypatch.setattr(sqlalchemy_store, "_upsert_labels", _boom)
+    with pytest.raises(RuntimeError, match="label upsert failed"):
+        conversation_store.update_conversation(
+            conv.id,
+            model_override="claude-sonnet-4-5",
+            label_updates={"added": "2"},
+            label_deletes=["drop"],
+        )
+    got = conversation_store.get_conversation(conv.id)
+    assert got is not None
+    assert got.model_override == "claude-opus-4-7"
+    assert got.labels == {"drop": "1"}

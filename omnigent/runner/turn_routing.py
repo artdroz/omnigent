@@ -456,18 +456,11 @@ def already_routed(conv: Any) -> bool:
 def user_pinned_model(conv: Any) -> bool:
     """Report whether this session's ``model_override`` is its user's own pin.
 
-    ``model_override`` carries REQUESTS only — the picker PATCH, a create's
-    explicit model, a scheduled task's configured model — since harness-side
-    model REPORTS (launch defaults, in-pane ``/model`` switches) land in
-    ``reported_model``. Routing's own pins carry provenance: a routed turn
-    stamps the decision label :func:`already_routed` reads first, and a
-    Smart Routing create records the routed prompt's fingerprint — awaiting
-    a first-prompt claim, or a fresh route for an edited prompt — which marks
-    the override as routing's. A user's own model request (the picker PATCH)
-    retires that fingerprint, so a pick made over the create's is a pin too.
-
-    Children are exempt: a routed parent deliberately routes its spawns past
-    an orchestrator-supplied model, the same choice the composer gate makes.
+    A top-level override without routing provenance is a user pin: harness
+    reports land in ``reported_model``, and routing's own pins carry either
+    the decision label (:func:`already_routed`) or a Smart Routing create's
+    prompt fingerprint, which a user's model request retires. Children stay
+    routable: a routed parent routes its spawns past an orchestrator model.
 
     :param conv: Conversation row for the session.
     :returns: ``True`` when the session must keep its model unrouted.
@@ -590,6 +583,7 @@ async def resolve_turn_route(
     reuse_create_route: Callable[[], Awaitable[bool]] | None = None,
     pin: Callable[[str], Awaitable[bool]] | None = None,
     persist: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
+    unpin: Callable[[str], Awaitable[None]] | None = None,
     record_decline: Callable[[str], Awaitable[None]] | None = None,
 ) -> TurnRouteDecision:
     """Decide what happens to one submitted prompt.
@@ -618,6 +612,11 @@ async def resolve_turn_route(
         skips the pin (unit tests).
     :param persist: Coroutine recording the decision chip, called as
         ``persist(model, verdict)``. ``None`` skips persistence.
+    :param unpin: Coroutine undoing ``pin`` when the decision could not be
+        recorded, called with the model ``pin`` wrote. Without its label a
+        routed pin would read as the user's (:func:`user_pinned_model`) and
+        end routing for the session, so the prompt runs unrouted instead and
+        the next one routes again. ``None`` leaves the pin in place.
     :param record_decline: Coroutine persisting a declined chip when a
         routing CALL failed, called with the cause. Only the failure
         branches use it — the benign allows (already routed, routing off,
@@ -722,6 +721,16 @@ async def resolve_turn_route(
             await persist(model, verdict)
         except Exception:
             _logger.exception("route-turn: decision persist failed for session=%s", session_id)
+            # An unlabeled pin would read as the user's; drop it so the next
+            # prompt routes again, and let this one run unrouted.
+            if unpin is not None:
+                try:
+                    await unpin(model)
+                except Exception:
+                    _logger.exception(
+                        "route-turn: could not drop the unrecorded pin for session=%s", session_id
+                    )
+            return _allow("routing unavailable (could not record the decision)")
     rationale = verdict.get("rationale")
     return TurnRouteDecision(
         # A no-op verdict must be terminal AND unblocking: there is nothing to

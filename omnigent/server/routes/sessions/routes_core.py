@@ -2665,8 +2665,8 @@ def register_core_routes(
                 request, conv, conversation_store, runner_router
             )
 
-        # The user's own model request supersedes a Smart Routing create's pick,
-        # so its fingerprint leaves in the same write; a rejected switch hands it back.
+        # An explicit user model change supersedes the Smart Routing pick, so delete
+        # its fingerprint in the same write; the rejected-switch path restores it.
         retired_create_route: str | None = None
         if conv is not None and (model_override is not None or clear_model):
             retired_create_route = conv.labels.get(CREATE_ROUTE_PROMPT_LABEL_KEY)
@@ -2689,7 +2689,9 @@ def register_core_routes(
             share_workspace_files=(body.share_workspace_files if set_share_workspace else None),
             terminal_launch_args=terminal_launch_args,
             archived=body.archived,
-            label_deletes=(CREATE_ROUTE_PROMPT_LABEL_KEY,) if retired_create_route else (),
+            label_deletes=(
+                (CREATE_ROUTE_PROMPT_LABEL_KEY,) if retired_create_route is not None else ()
+            ),
         )
         if updated is None:
             raise _session_not_found()

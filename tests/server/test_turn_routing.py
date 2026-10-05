@@ -59,6 +59,7 @@ def _routed_labels() -> dict[str, str]:
 @dataclass
 class _Recorder:
     pinned: list[str] = field(default_factory=list)
+    unpinned: list[str] = field(default_factory=list)
     chips: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     routed: list[tuple[str | None, str]] = field(default_factory=list)
     pin_ok: bool = True
@@ -73,6 +74,9 @@ class _Recorder:
 
     async def persist(self, model: str, verdict: dict[str, Any]) -> None:
         self.chips.append((model, verdict))
+
+    async def unpin(self, model: str) -> None:
+        self.unpinned.append(model)
 
 
 def _request(**overrides: Any) -> TurnRouteRequest:
@@ -441,16 +445,32 @@ async def test_a_failed_pin_declines_the_route() -> None:
     assert rec.chips == []
 
 
-async def test_a_failed_chip_persist_still_routes() -> None:
+async def test_a_failed_decision_record_drops_the_pin_for_the_next_prompt() -> None:
+    """A pin whose decision could not be recorded must not outlive the failure.
+
+    Without its decision label the routed pin would read as the user's own
+    (:func:`user_pinned_model`) and end routing for the session. The pin is
+    dropped and this prompt runs unrouted, so the next prompt routes again.
+    """
+
     async def _boom(model: str, verdict: dict[str, Any]) -> None:
         del model, verdict
         raise RuntimeError("store down")
 
     rec = _Recorder()
     decision = await resolve_turn_route(
-        "conv_1", _request(), conv=_FakeConv(), route_turn=rec.route, pin=rec.pin, persist=_boom
+        "conv_1",
+        _request(),
+        conv=_FakeConv(),
+        route_turn=rec.route,
+        pin=rec.pin,
+        persist=_boom,
+        unpin=rec.unpin,
     )
-    assert decision.action == "route"
+    assert decision.action == "allow"
+    assert decision.terminal is False
+    assert rec.pinned == [ROUTED_MODEL]
+    assert rec.unpinned == [ROUTED_MODEL]
 
 
 # ── Wire types ──────────────────────────────────────────────────────

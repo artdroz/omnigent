@@ -1796,6 +1796,12 @@ def register_hooks_routes(
             _publish_routed_model(session_id, model)
             return True
 
+        async def _unpin(model: str) -> None:
+            """Drop a routed pin whose decision was not recorded, if still ours."""
+            await asyncio.to_thread(
+                conversation_store.clear_model_override_if_matches, session_id, model
+            )
+
         async def _persist(model: str, verdict: dict[str, Any]) -> None:
             decision_id = await _emit_server_routing_decision(
                 session_id,
@@ -1854,6 +1860,7 @@ def register_hooks_routes(
             reuse_create_route=_reuse_create_route,
             pin=_pin,
             persist=_persist,
+            unpin=_unpin,
             record_decline=_record_decline,
         )
         _logger.info(
