@@ -246,6 +246,11 @@ provider uses, with bounded local services and fake credentials. Static
 credentials need no invented issuance or refresh service. Keep application token
 resolution and the installed SDK intact; replacing the suspected component with
 canned results assumes the cause. Put timeouts on discovery and subprocess calls.
+After the control succeeds, follow the retained auth wrapper to its credential-
+producing delegate. Record that delegate's runtime class/module and the method
+actually invoked on it, without credential values. Profile-loading logs or
+subprocess calls shared by several providers do not identify which succeeded.
+If the executing delegate cannot be established, keep provider identity unresolved.
 Start with the smallest credential consumer, such as request-header construction,
 and preserve its working control before adding a long-running process. Add the
 full process only when the remaining hypothesis requires it. If initialization
