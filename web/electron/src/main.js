@@ -879,7 +879,11 @@ function pinWindow(win, origin, attemptToKeep) {
  */
 function setWindowServerUrl(win, serverUrl) {
   const state = windows.get(win);
-  if (state) state.serverUrl = serverUrl;
+  if (!state) return;
+  if (state.serverUrl && state.serverUrl !== serverUrl) {
+    state.browserRegistry?.closeAll("server-changed");
+  }
+  state.serverUrl = serverUrl;
 }
 
 /**
@@ -3509,13 +3513,23 @@ function registerIpc() {
       ) {
         throw new Error("Arca localhost previews require a managed Databricks server");
       }
+      const existing = registry.get(conversationId);
+      if (existing?.agentOwnedOrigin === preview.origin) {
+        return { ...opts, ownedOrigin: preview.origin };
+      }
       lifecycle.onCancel(() => registry.arcaPreview.release(conversationId));
-      registry.clearAgentOrigin(conversationId, true);
+      if (
+        existing?.agentOwnedOrigin &&
+        !registry.discardForNavigation(conversationId, lifecycle.intentToken)
+      ) {
+        throw new Error("preview navigation was superseded");
+      }
       const owned = await registry.arcaPreview.prepare({
         conversationId,
         url,
         hostId: opts.hostId,
         serverUrl,
+        deadline: lifecycle.deadline,
       });
       if (
         browserRegistryForSender(event) !== registry ||

@@ -26,7 +26,11 @@ interface BrowserDesktopBridge {
     url: string,
     bounds?: unknown,
     opts?: { force?: boolean; agent?: boolean; hostId?: string | null },
+    previewRequestId?: string,
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+  browserBeginPreviewNavigation?: (
+    conversationId: string,
+  ) => Promise<{ ok: boolean; requestId?: string; deadline?: number; error?: string }>;
   browserScreenshot?: (
     conversationId: string,
   ) => Promise<{ ok: boolean; dataUrl?: string; error?: string }>;
@@ -238,12 +242,49 @@ async function dispatch(
         } catch {
           /* Electron returns the URL validation error. */
         }
-        if (isLoopback) await prefetchSessionHostChain(queryClient, conversationId);
-        const r = await desktop.browserOpenOrNavigate(conversationId, url, undefined, {
-          force: true,
-          agent: true,
-          hostId: getSessionHost(conversationId),
-        });
+        let previewRequestId: string | undefined;
+        if (isLoopback) {
+          if (!desktop.browserBeginPreviewNavigation) {
+            return { ok: false, error: "this desktop shell does not support localhost previews" };
+          }
+          const request = await desktop.browserBeginPreviewNavigation(conversationId);
+          if (!request.ok || !request.requestId || !request.deadline) {
+            return { ok: false, error: request.error ?? "could not begin localhost preview" };
+          }
+          previewRequestId = request.requestId;
+          const remaining = request.deadline - Date.now();
+          if (remaining <= 0) return { ok: false, error: "localhost preview timed out" };
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([
+              prefetchSessionHostChain(queryClient, conversationId),
+              new Promise<never>((_, reject) => {
+                timer = setTimeout(
+                  () => reject(new Error("localhost preview timed out")),
+                  remaining,
+                );
+              }),
+            ]);
+          } finally {
+            if (timer) clearTimeout(timer);
+          }
+          if (Date.now() >= request.deadline) {
+            return { ok: false, error: "localhost preview timed out" };
+          }
+        }
+        const openArgs = [
+          conversationId,
+          url,
+          undefined,
+          {
+            force: true,
+            agent: true,
+            hostId: getSessionHost(conversationId),
+          },
+        ] as const;
+        const r = previewRequestId
+          ? await desktop.browserOpenOrNavigate(...openArgs, previewRequestId)
+          : await desktop.browserOpenOrNavigate(...openArgs);
         if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
         return { ok: true, data: { final_url: url } };
       }

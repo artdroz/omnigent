@@ -151,7 +151,7 @@ function createBrowserViewRegistry({
       // internal host slips through (SSRF via screenshot).
       agentNavLocked: false,
       agentOwnedOrigin: null,
-      expiredAgentOrigin: null,
+      expiredAgentOrigins: new Set(),
       releaseAgentOrigin: null,
       // Design-mode listeners + webContents, set by browserIpc's enable handler
       // and cleared on disable/close (console-message forwarder + native-gesture
@@ -308,9 +308,11 @@ function createBrowserViewRegistry({
       } catch {
         /* malformed targets cannot match an expired origin */
       }
-      if (!isInPlace && isMainFrame && targetOrigin === entry.expiredAgentOrigin) {
+      if (!isInPlace && isMainFrame && entry.expiredAgentOrigins.has(targetOrigin)) {
         close(conversationId, "preview-expired");
+        return;
       }
+      if (!isInPlace && isMainFrame) beginNavigation(conversationId);
     });
     wc.on("did-navigate", (_event, targetUrl) => {
       let targetOrigin = null;
@@ -351,10 +353,15 @@ function createBrowserViewRegistry({
     // user-typed URL-bar nav permissive. Set only when a url is actually issued.
     if (url) entry.agentNavLocked = !!(opts && opts.agent);
     if (opts?.agent && opts.ownedOrigin) {
-      entry.releaseAgentOrigin?.();
-      entry.agentOwnedOrigin = opts.ownedOrigin;
-      entry.expiredAgentOrigin = null;
-      entry.releaseAgentOrigin = opts.releaseOwnedOrigin || null;
+      if (entry.agentOwnedOrigin !== opts.ownedOrigin) {
+        entry.releaseAgentOrigin?.();
+        entry.agentOwnedOrigin = opts.ownedOrigin;
+        entry.releaseAgentOrigin = opts.releaseOwnedOrigin || null;
+      } else if (opts.releaseOwnedOrigin) {
+        entry.releaseAgentOrigin = opts.releaseOwnedOrigin;
+      }
+      entry.expiredAgentOrigins.delete(opts.ownedOrigin);
+      bindNavigationCancel(conversationId, intentToken, null);
     }
     if (bounds) entry.boundsController.setRendererBounds(bounds);
     // Only attach immediately when this is the active conversation; otherwise
@@ -383,6 +390,9 @@ function createBrowserViewRegistry({
         try {
           entry.view.webContents.loadURL(url);
         } catch (e) {
+          if (opts?.releaseOwnedOrigin && entry.releaseAgentOrigin === opts.releaseOwnedOrigin) {
+            clearAgentOrigin(conversationId);
+          }
           return { ok: false, error: `loadURL failed: ${e && e.message ? e.message : e}` };
         }
       }
@@ -454,10 +464,12 @@ function createBrowserViewRegistry({
     return { ok: true };
   }
 
-  function close(conversationId, reason) {
-    const intent = intents.get(conversationId);
-    intents.delete(conversationId);
-    intent?.cancel?.();
+  function close(conversationId, reason, preserveIntent = false) {
+    if (!preserveIntent) {
+      const intent = intents.get(conversationId);
+      intents.delete(conversationId);
+      intent?.cancel?.();
+    }
     const entry = entries.get(conversationId);
     if (!entry) return { ok: true, removed: false };
     if (activeConversationId === conversationId) {
@@ -490,15 +502,21 @@ function createBrowserViewRegistry({
       entry.designModeWebContents = null;
     }
     entry.boundsController.clear();
-    entry.releaseAgentOrigin?.();
     try {
       entry.view.webContents.close();
     } catch {
       /* already destroyed */
     }
+    entry.releaseAgentOrigin?.();
     entries.delete(conversationId);
     sendToRenderer("browser-view-closed", { conversationId, reason: reason || null });
     return { ok: true, removed: true };
+  }
+
+  function discardForNavigation(conversationId, token) {
+    if (!isNavigationCurrent(conversationId, token)) return false;
+    close(conversationId, "preview-replaced", true);
+    return isNavigationCurrent(conversationId, token);
   }
 
   function closeAll(reason) {
@@ -510,18 +528,13 @@ function createBrowserViewRegistry({
     }
   }
 
-  function clearAgentOrigin(conversationId, blank = false) {
+  function clearAgentOrigin(conversationId) {
     const entry = entries.get(conversationId);
     if (!entry) return;
-    entry.releaseAgentOrigin?.();
-    entry.expiredAgentOrigin = entry.agentOwnedOrigin;
+    if (entry.agentOwnedOrigin) entry.expiredAgentOrigins.add(entry.agentOwnedOrigin);
     entry.agentOwnedOrigin = null;
+    entry.releaseAgentOrigin?.();
     entry.releaseAgentOrigin = null;
-    try {
-      if (blank) entry.view.webContents.loadURL("about:blank");
-    } catch {
-      /* view destroyed */
-    }
   }
 
   return {
@@ -534,6 +547,7 @@ function createBrowserViewRegistry({
     close,
     closeAll,
     clearAgentOrigin,
+    discardForNavigation,
     beginNavigation,
     bindNavigationCancel,
     isNavigationCurrent,

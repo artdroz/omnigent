@@ -357,7 +357,31 @@ describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every h
     assert.equal(releases, 1);
   });
 
-  it("blanks a released preview and closes a stale history reload", () => {
+  it("transfers an admitted preview out of pending cancellation until departure commits", () => {
+    const { registry, fire } = makeEventCapturingRegistry();
+    let cancellations = 0;
+    let releases = 0;
+    const token = registry.beginNavigation("conv_1");
+    registry.bindNavigationCancel("conv_1", token, () => (cancellations += 1));
+    registry.openOrNavigate("conv_1", "http://localhost:5173/app", undefined, {
+      agent: true,
+      intentToken: token,
+      ownedOrigin: "http://localhost:5173",
+      releaseOwnedOrigin: () => (releases += 1),
+    });
+    registry.beginNavigation("conv_1");
+    assert.equal(cancellations, 0);
+    assert.equal(releases, 0);
+    const rejected = registry.openOrNavigate("conv_1", "http://10.0.0.5/private", undefined, {
+      agent: true,
+    });
+    assert.equal(rejected.ok, false);
+    assert.equal(releases, 0);
+    fire("did-navigate", "https://example.com/away");
+    assert.equal(releases, 1);
+  });
+
+  it("retires a released preview and closes a stale history reload", () => {
     const { registry, fire, loaded } = makeEventCapturingRegistry();
     let releases = 0;
     registry.openOrNavigate("conv_1", "http://localhost:5173", undefined, {
@@ -365,9 +389,27 @@ describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every h
       ownedOrigin: "http://localhost:5173",
       releaseOwnedOrigin: () => (releases += 1),
     });
-    registry.clearAgentOrigin("conv_1", true);
+    registry.clearAgentOrigin("conv_1");
     assert.equal(releases, 1);
-    assert.equal(loaded.at(-1), "about:blank");
+    assert.equal(loaded.at(-1), "http://localhost:5173");
+    fire("did-start-navigation", "http://localhost:5173/from-history");
+    assert.equal(registry.has("conv_1"), false);
+  });
+
+  it("remembers every retired preview origin until the view is discarded", () => {
+    const { registry, fire } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "http://localhost:5173", undefined, {
+      agent: true,
+      ownedOrigin: "http://localhost:5173",
+      releaseOwnedOrigin: () => {},
+    });
+    registry.clearAgentOrigin("conv_1");
+    registry.openOrNavigate("conv_1", "http://localhost:4173", undefined, {
+      agent: true,
+      ownedOrigin: "http://localhost:4173",
+      releaseOwnedOrigin: () => {},
+    });
+    registry.clearAgentOrigin("conv_1");
     fire("did-start-navigation", "http://localhost:5173/from-history");
     assert.equal(registry.has("conv_1"), false);
   });
@@ -570,5 +612,16 @@ describe("browserViewRegistry — pending navigation lifecycle", () => {
     registry.bindNavigationCancel("conv_2", token, () => (cancellations += 1));
     registry.closeAll("server-changed");
     assert.equal(cancellations, 3);
+  });
+
+  it("invalidates pending preparation when a main-frame page navigation starts", () => {
+    const { registry, fire } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com");
+    const token = registry.beginNavigation("conv_1");
+    let cancellations = 0;
+    registry.bindNavigationCancel("conv_1", token, () => (cancellations += 1));
+    fire("did-start-navigation", "https://example.com/next");
+    assert.equal(cancellations, 1);
+    assert.equal(registry.isNavigationCurrent("conv_1", token), false);
   });
 });

@@ -3,6 +3,7 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
+const fs = require("node:fs");
 const {
   createArcaPreviewManager,
   loopbackPreview,
@@ -106,6 +107,27 @@ describe("Arca localhost preview URL", () => {
 });
 
 describe("Arca preview manager", () => {
+  it("uses a private control socket short enough for Darwin temporary suffixes", async () => {
+    const fake = successfulSpawner();
+    const manager = createArcaPreviewManager({
+      resolveArcaPathFn: () => "/arca",
+      spawnFn: fake.spawn,
+      socketReady: () => true,
+    });
+    const owned = await manager.prepare({
+      conversationId: "short-socket",
+      url: "http://localhost:5173",
+      hostId: "host_arca",
+      serverUrl: "https://srv.example.com",
+    });
+    const master = fake.calls.find((call) => call.args.includes("-M"));
+    const socketPath = master.args[master.args.indexOf("-S") + 1];
+    assert.ok(Buffer.byteLength(`${socketPath}.XXXXXXXXXX`) < 104);
+    assert.equal(fs.statSync(require("node:path").dirname(socketPath)).mode & 0o777, 0o700);
+    owned.release();
+    assert.equal(fs.existsSync(require("node:path").dirname(socketPath)), false);
+  });
+
   it("verifies the exact server host then starts requested independent forwards", async () => {
     const fake = successfulSpawner();
     const manager = createArcaPreviewManager({

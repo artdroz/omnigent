@@ -210,8 +210,16 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @param {{x:number,y:number,width:number,height:number,devicePixelRatio?:number}} [bounds]
    * @param {{force?: boolean, agent?: boolean, hostId?: string|null}} [opts]
    */
-  browserOpenOrNavigate: (conversationId, url, bounds, opts) =>
-    ipcRenderer.invoke("omnigent:browser-open-or-navigate", { conversationId, url, bounds, opts }),
+  browserBeginPreviewNavigation: (conversationId) =>
+    ipcRenderer.invoke("omnigent:browser-begin-preview-navigation", { conversationId }),
+  browserOpenOrNavigate: (conversationId, url, bounds, opts, previewRequestId) =>
+    ipcRenderer.invoke("omnigent:browser-open-or-navigate", {
+      conversationId,
+      url,
+      bounds,
+      opts,
+      previewRequestId,
+    }),
   /**
    * Attach a conversation's view to the host window (detaching the previous
    * active one). Pass null to detach everything (no pane mounted).

@@ -261,7 +261,9 @@ function registerBrowserIpc({
   isPinnedOriginSender,
   getRegistryForEvent,
   prepareAgentNavigation = async (_event, _conversationId, _url, opts) => opts,
+  previewTimeoutMs = 25_000,
 }) {
+  const previewRequests = new Map();
   /**
    * Resolve the sender's registry after the privileged-origin gate. Returns
    * `{ registry }` on success or `{ error }` (a structured result, never a
@@ -286,13 +288,42 @@ function registerBrowserIpc({
     }
   };
 
+  ipcMain.handle("omnigent:browser-begin-preview-navigation", (event, args) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, error: g.error };
+    const { conversationId } = args ?? {};
+    if (typeof conversationId !== "string" || !conversationId) {
+      return { ok: false, error: "conversationId is required" };
+    }
+    const intentToken = g.registry.beginNavigation(conversationId);
+    const requestId = crypto.randomBytes(16).toString("hex");
+    const deadline = Date.now() + previewTimeoutMs;
+    const timer = setTimeout(() => {
+      const request = previewRequests.get(requestId);
+      if (!request) return;
+      previewRequests.delete(requestId);
+      if (request.registry.isNavigationCurrent(conversationId, intentToken)) {
+        request.registry.beginNavigation(conversationId);
+      }
+    }, previewTimeoutMs);
+    timer.unref?.();
+    previewRequests.set(requestId, {
+      registry: g.registry,
+      conversationId,
+      intentToken,
+      deadline,
+      timer,
+    });
+    return { ok: true, requestId, deadline };
+  });
+
   // Open (create-if-absent) or navigate a conversation's view, and measure it
   // into place. `force` reloads even on the same URL (agent "bring me back"
   // intent). Returns the registry's structured `{ ok, created, error }`.
   ipcMain.handle("omnigent:browser-open-or-navigate", async (event, args) => {
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
-    const { conversationId, url, bounds } = args ?? {};
+    const { conversationId, url, bounds, previewRequestId } = args ?? {};
     const rendererOpts = args?.opts;
     let opts = {
       force: !!rendererOpts?.force,
@@ -302,9 +333,25 @@ function registerBrowserIpc({
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
-    const intentToken = g.registry.beginNavigation(conversationId);
+    let request = null;
+    if (typeof previewRequestId === "string") {
+      request = previewRequests.get(previewRequestId) ?? null;
+      previewRequests.delete(previewRequestId);
+      if (request) clearTimeout(request.timer);
+      if (
+        !request ||
+        request.registry !== g.registry ||
+        request.conversationId !== conversationId ||
+        request.deadline <= Date.now() ||
+        !g.registry.isNavigationCurrent(conversationId, request.intentToken)
+      ) {
+        return { ok: false, created: false, error: "navigation was superseded" };
+      }
+    }
+    const intentToken = request?.intentToken ?? g.registry.beginNavigation(conversationId);
     const lifecycle = {
       intentToken,
+      deadline: request?.deadline,
       onCancel: (cancel) => g.registry.bindNavigationCancel(conversationId, intentToken, cancel),
     };
     let preparedRelease = null;
@@ -448,6 +495,7 @@ function registerBrowserIpc({
     if (g.error) return { ok: false, error: g.error };
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
+    g.registry.beginNavigation(args.conversationId);
     goBack(entry.view.webContents);
     return { ok: true, ...readNavState(entry.view.webContents) };
   });
@@ -457,6 +505,7 @@ function registerBrowserIpc({
     if (g.error) return { ok: false, error: g.error };
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
+    g.registry.beginNavigation(args.conversationId);
     goForward(entry.view.webContents);
     return { ok: true, ...readNavState(entry.view.webContents) };
   });
@@ -466,6 +515,7 @@ function registerBrowserIpc({
     if (g.error) return { ok: false, error: g.error };
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
+    g.registry.beginNavigation(args.conversationId);
     try {
       entry.view.webContents.reload();
     } catch {

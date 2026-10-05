@@ -2,9 +2,7 @@
 
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
-const { randomUUID } = require("node:crypto");
 const { normalizeSafeServerUrl, resolveArcaPath } = require("./arca");
 const { WORKSPACE_UI_PATH } = require("./url");
 
@@ -43,9 +41,9 @@ function sameServer(left, right) {
   const a = serverIdentity(left);
   const b = serverIdentity(right);
   if (!a || !b || a.base !== b.base) return false;
-  // Status records normally omit `?o=` because the CLI stores its API base
-  // without query state; the scoped `--server` command supplies that selector.
-  // If a record does carry one, it must exactly match the requested workspace.
+  // The scoped status request is routed with the requested selector, but its
+  // daemon record normally omits `?o=` and does not attest that selector.
+  // Reject an explicit mismatch whenever the record does carry one.
   return !a.workspace || (!!b.workspace && a.workspace === b.workspace);
 }
 
@@ -158,7 +156,11 @@ function createArcaPreviewManager({
   timeoutMs = PREPARE_TIMEOUT_MS,
   socketReady = fs.existsSync,
   unlinkSocket = (socketPath) => fs.rmSync(socketPath, { force: true }),
-  socketPathFn = () => path.join(os.tmpdir(), `omnigent-arca-${randomUUID()}.sock`),
+  removeSocketDir = (socketDir) => fs.rmSync(socketDir, { recursive: true, force: true }),
+  socketPathFn = () => {
+    const socketDir = fs.mkdtempSync(path.join("/tmp", "oa-"));
+    return { socketPath: path.join(socketDir, "s"), socketDir };
+  },
   onExit = () => {},
 } = {}) {
   const owned = new Map();
@@ -171,9 +173,10 @@ function createArcaPreviewManager({
     current.cancel?.();
     terminate(current.child);
     if (current.socketPath) unlinkSocket(current.socketPath);
+    if (current.socketDir) removeSocketDir(current.socketDir);
   }
 
-  async function prepare({ conversationId, url, hostId, serverUrl }) {
+  async function prepare({ conversationId, url, hostId, serverUrl, deadline: requestedDeadline }) {
     const preview = loopbackPreview(url);
     release(conversationId);
     if (!preview) return null;
@@ -182,8 +185,9 @@ function createArcaPreviewManager({
     const arcaPath = resolveArcaPathFn();
     if (!arcaPath) throw new Error("the arca CLI was not found on this machine");
     const token = ++sequence;
-    const deadline = Date.now() + timeoutMs;
-    const state = { token, child: null, cancel: null, socketPath: null };
+    const deadline = Math.min(requestedDeadline ?? Infinity, Date.now() + timeoutMs);
+    if (deadline <= Date.now()) throw new Error("timed out preparing the Arca localhost preview");
+    const state = { token, child: null, cancel: null, socketPath: null, socketDir: null };
     owned.set(conversationId, state);
     const onChild = (child, cancel) => {
       if (owned.get(conversationId)?.token !== token) {
@@ -197,8 +201,10 @@ function createArcaPreviewManager({
     try {
       await verifyArcaHost({ arcaPath, serverUrl, hostId, spawnFn, deadline, onChild });
       if (owned.get(conversationId)?.token !== token) throw new Error("preview was superseded");
-      const socketPath = socketPathFn();
+      const socket = socketPathFn();
+      const socketPath = typeof socket === "string" ? socket : socket.socketPath;
       state.socketPath = socketPath;
+      state.socketDir = typeof socket === "string" ? null : socket.socketDir;
       const master = spawnFn(
         arcaPath,
         ["ssh", "-M", "-S", socketPath, "-o", "ClearAllForwardings=yes", "-N"],
@@ -264,6 +270,7 @@ function createArcaPreviewManager({
         if (owned.get(conversationId)?.token !== token) return;
         owned.delete(conversationId);
         unlinkSocket(socketPath);
+        if (state.socketDir) removeSocketDir(state.socketDir);
         onExit(conversationId);
       });
       return { origin: preview.origin, release: () => release(conversationId, token) };

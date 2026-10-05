@@ -1511,6 +1511,13 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     );
   });
 
+  it("closes previews when the full connected server identity changes", () => {
+    assert.match(
+      liveCode,
+      /function setWindowServerUrl\(win,\s*serverUrl\)[\s\S]{0,300}state\.serverUrl\s*!==\s*serverUrl[\s\S]{0,160}browserRegistry\?\.closeAll\("server-changed"\)/,
+    );
+  });
+
   it("releases every registry before the forced app-exit fallback can run", () => {
     assert.match(
       liveCode,

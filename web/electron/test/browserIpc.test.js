@@ -134,6 +134,7 @@ function makeRegistry(conversationId, webContents) {
     beginNavigation: () => ++intent,
     bindNavigationCancel: (_id, token) => token === intent,
     isNavigationCurrent: (_id, token) => token === intent,
+    intent: () => intent,
     suppressedCalls,
     opened,
     cleared,
@@ -147,6 +148,7 @@ function setup({
   conversationId = "conv_1",
   webContents,
   prepareAgentNavigation,
+  previewTimeoutMs,
 } = {}) {
   const ipcMain = makeIpcMain();
   const wc = webContents ?? makeWebContents();
@@ -158,6 +160,7 @@ function setup({
     isPinnedOriginSender: () => pinned,
     getRegistryForEvent: () => registry,
     prepareAgentNavigation,
+    previewTimeoutMs,
   });
   return { ipcMain, registry, wc, sent, event };
 }
@@ -292,6 +295,54 @@ describe("browserIpc — devtools toggle", () => {
 });
 
 describe("browserIpc — url live-tracking", () => {
+  it("mints and consumes a preview intent before preparation", async () => {
+    let lifecycle;
+    const ctx = setup({
+      prepareAgentNavigation: async (_event, _id, _url, opts, value) => {
+        lifecycle = value;
+        return opts;
+      },
+    });
+    const begun = await ctx.ipcMain.invoke("omnigent:browser-begin-preview-navigation", ctx.event, {
+      conversationId: "conv_arca",
+    });
+    assert.equal(begun.ok, true);
+    const opened = await ctx.ipcMain.invoke("omnigent:browser-open-or-navigate", ctx.event, {
+      conversationId: "conv_arca",
+      url: "http://localhost:5173",
+      opts: { agent: true },
+      previewRequestId: begun.requestId,
+    });
+    assert.equal(opened.ok, true);
+    assert.equal(lifecycle.intentToken, 1);
+    assert.equal(lifecycle.deadline, begun.deadline);
+    assert.equal(ctx.registry.intent(), 1);
+  });
+
+  it("expires a preview intent before late metadata can reach preparation", async () => {
+    let prepares = 0;
+    const ctx = setup({
+      previewTimeoutMs: 5,
+      prepareAgentNavigation: async () => {
+        prepares += 1;
+      },
+    });
+    const begun = await ctx.ipcMain.invoke("omnigent:browser-begin-preview-navigation", ctx.event, {
+      conversationId: "conv_arca",
+    });
+    await new Promise((resolve) => {
+      setTimeout(resolve, 10);
+    });
+    const opened = await ctx.ipcMain.invoke("omnigent:browser-open-or-navigate", ctx.event, {
+      conversationId: "conv_arca",
+      url: "http://localhost:5173",
+      opts: { agent: true },
+      previewRequestId: begun.requestId,
+    });
+    assert.equal(opened.ok, false);
+    assert.equal(prepares, 0);
+  });
+
   it("prepares an agent navigation before opening and surfaces preparation failure", async () => {
     const prepared = { agent: true, ownedOrigin: "http://localhost:5173" };
     const calls = [];

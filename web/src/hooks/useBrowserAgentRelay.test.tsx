@@ -79,6 +79,11 @@ function jsonResponse(body: unknown, ok = true): Response {
  *  on the exact calls / scripted JS. */
 function installBridge(overrides: Record<string, unknown> = {}) {
   const bridge = {
+    browserBeginPreviewNavigation: vi.fn().mockResolvedValue({
+      ok: true,
+      requestId: "preview_request_1",
+      deadline: Date.now() + 25_000,
+    }),
     browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: true, created: true }),
     browserScreenshot: vi
       .fn()
@@ -232,6 +237,7 @@ describe("useBrowserAgentRelay — claim-first protocol", () => {
       agent: true,
       hostId: null,
     });
+    expect(bridge.browserBeginPreviewNavigation).not.toHaveBeenCalled();
     expect(getSessionSlim).not.toHaveBeenCalled();
     const resultUrl = String(
       authenticatedFetch.mock.calls.find((c) =>
@@ -266,7 +272,25 @@ describe("useBrowserAgentRelay — claim-first protocol", () => {
       "http://localhost:5173/app",
       undefined,
       { force: true, agent: true, hostId: "host_arca" },
+      "preview_request_1",
     );
+  });
+
+  it("times out cold metadata without opening a late preview", async () => {
+    getSessionSlim.mockImplementationOnce(() => new Promise(() => {}));
+    const bridge = installBridge({
+      browserBeginPreviewNavigation: vi.fn().mockResolvedValue({
+        ok: true,
+        requestId: "expiring_request",
+        deadline: Date.now() + 10,
+      }),
+    });
+    authenticatedFetch.mockResolvedValueOnce(WON).mockResolvedValueOnce(jsonResponse({}));
+
+    await runAction(actionEvent("navigate", { url: "http://localhost:5173" }));
+
+    expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+    expect((postedResult().result as { error: string }).error).toMatch(/timed out/);
   });
 });
 
