@@ -7118,6 +7118,11 @@ async def _execute_os_env_tool(
         session.
     :returns: Serialized tool result string.
     """
+    if tool_name == SysOsShellTool.name():
+        rejected = unknown_shell_argument_error(args)
+        if rejected is not None:
+            return json.dumps(rejected)
+
     from omnigent.inner.os_env import _DEFAULT_READ_LIMIT, create_os_environment
 
     os_env = None
@@ -7191,9 +7196,6 @@ async def _execute_os_env_tool(
             if filesystem_registry is not None and conversation_id is not None:
                 filesystem_registry.record_change(_path, "modified", conversation_id)
         elif tool_name == SysOsShellTool.name():
-            rejected = unknown_shell_argument_error(args)
-            if rejected is not None:
-                return json.dumps(rejected)
             result = await os_env.shell(
                 command=cast("str", args.get("command", "")),
                 timeout=cast("int | None", args.get("timeout")),

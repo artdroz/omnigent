@@ -2511,10 +2511,21 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runner_os_env_shell_rejects_unknown_argument_names() -> None:
+async def test_runner_os_env_shell_rejects_unknown_argument_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import create_os_environment
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
     from omnigent.spec.types import AgentSpec
+
+    environments_created: list[object] = []
+
+    def _tracking_create(spec, **kwargs):
+        environments_created.append(spec)
+        return create_os_environment(spec, **kwargs)
+
+    monkeypatch.setattr("omnigent.inner.os_env.create_os_environment", _tracking_create)
 
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -2538,6 +2549,7 @@ async def test_runner_os_env_shell_rejects_unknown_argument_names() -> None:
         assert "timeout_seconds" in rejected_result["error"]
         assert "command, timeout" in rejected_result["error"]
         assert not root.joinpath("ran.txt").exists()
+        assert environments_created == []
 
         accepted = await _execute_os_env_tool(
             "sys_os_shell",
@@ -2547,6 +2559,7 @@ async def test_runner_os_env_shell_rejects_unknown_argument_names() -> None:
         )
         assert json.loads(accepted)["exit_code"] == 0
         assert root.joinpath("ran.txt").exists()
+        assert len(environments_created) == 1
 
 
 @pytest.mark.asyncio
