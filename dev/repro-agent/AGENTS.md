@@ -236,21 +236,24 @@ rationale, and pinning test in `evidence`. A filename in search output or a symb
 in a caller is not a definition read. If no shared definition exists, record the
 search that established that before choosing the test's expected result.
 
-When reported authentication endpoints are unavailable or sanitized, use bounded
-local discovery, refresh, and transport services with fake credentials to exercise
-the configured path. Keep application token resolution and the installed SDK
-intact; replacing the suspected component with canned results assumes the cause.
-Record the controlled external boundaries and remaining incident uncertainty.
-Put timeouts on discovery and subprocess calls. A controlled check does not by
-itself reproduce an unavailable production incident.
-Start with a working control: load an isolated version of the reported profile
-through the real credential-selection code and SDK, obtain a token from a
-controlled external service, and use it at the caller's transport boundary.
-Keep the same application credential object while exercising expiry or rejection.
-Record whether it refreshes or recovers; mocking that object or its factory cannot
-satisfy this check. Complete this before writing a test that assumes stale
-credentials are the cause. Preserve any concrete blocker and unsupported hypothesis
-in the handoff; a failing mock does not establish the reported reproduction.
+For credential-lifetime or recovery hypotheses, first establish a working control
+through the reported credential-selection code and SDK. When external auth
+services are unavailable or sanitized, substitute only boundaries that this
+provider uses, with bounded local services and fake credentials. Static
+credentials need no invented issuance or refresh service. Keep application token
+resolution and the installed SDK intact; replacing the suspected component with
+canned results assumes the cause. Put timeouts on discovery and subprocess calls.
+Get credential resolution working on its own before adding the host/reconnect
+loop. If initialization hangs, inspect the blocking stack. If it identifies
+external configuration metadata/discovery calls, provide controlled responses
+and record whether the control reached them. Preserve other concrete blockers.
+Load an isolated version of the reported profile and use its credential at the
+caller's transport boundary. Keep the same application credential object while
+exercising the suspected expiry or rejection. Record whether it refreshes or
+recovers; mocking that object or its factory cannot satisfy this check. Complete
+this before writing a test that assumes stale credentials are the cause. A
+controlled check does not by itself reproduce an unavailable production incident;
+retain the controlled boundaries, concrete blockers and unsupported hypotheses.
 
 Keep this investigation bounded to the reported journey; a complete diagnosis
 is not required to hand off a valid reproduction. Preserve unresolved intent in
@@ -773,6 +776,13 @@ Field meanings:
   only — you do not fix). Include the tested configuration, sources for expected
   behavior, competing explanations checked, and remaining uncertainty. Keep this
   concise and distinguish observations from inferences; never include secrets.
+  Before finalizing, check that this field contains the governing definition
+  (symbol/value and source), its rationale and pinning test, or the bounded
+  search establishing that no shared definition exists. A local handler alone
+  does not establish that absence: inspect shared policy/type declarations and
+  other consumers. For credential hypotheses, include the configured-path
+  control and observation from Step 1. Execute missing feasible checks before
+  the final handoff; preserve concrete blockers and unverified causes explicitly.
 - `recordings` — the Step 4 captures: a list of
   `{"surface", "kind", "path", "format", "capture_mode", "caption"}` objects. `kind` is
   `"before"` for a `reproduced` facet's failing run or `"fixed"` for an

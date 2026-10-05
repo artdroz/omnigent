@@ -33,17 +33,22 @@ check cannot run, name the concrete blocker and keep the cause unresolved.
    its caller handles those tokens, not how the configured credential provider
    behaves. Record which parts actually ran and which were substituted. A
    fail-before/pass-after test of that substitute does not confirm the incident.
-   When reported authentication endpoints are unavailable or sanitized, use
-   bounded local discovery, refresh, and transport services with fake credentials
-   to exercise the configured path. Keep application token resolution and the
-   installed SDK intact; record the controlled external boundaries and remaining
-   incident uncertainty. Put timeouts on discovery and subprocess calls.
-   Start with a working control: load an isolated version of the reported
-   profile through the real credential-selection code and SDK, obtain a token
-   from a controlled external service, and use it at the caller's transport
-   boundary. Keep the same application credential object while exercising
-   expiry or rejection. Record whether it refreshes or recovers before proposing
-   a cache reset. Mocking that object or its factory cannot satisfy this check.
+   For credential-lifetime or recovery hypotheses, first establish a working
+   control through the reported credential-selection code and SDK. When external
+   auth services are unavailable or sanitized, substitute only boundaries this
+   provider uses, with bounded local services and fake credentials. Static
+   credentials need no invented issuance or refresh service. Keep application
+   token resolution and the installed SDK intact, and time out discovery and
+   subprocess calls. Get credential resolution working on its own before adding
+   the host/reconnect loop. If initialization hangs, inspect the blocking stack.
+   If it identifies external configuration metadata/discovery calls, provide
+   controlled responses and record whether the control reached them. Preserve
+   other concrete blockers. Load an isolated reported profile and use its credential
+   at the caller's transport boundary. Keep the same application credential
+   object while exercising the suspected expiry or rejection; record whether it
+   refreshes or recovers before proposing a cache reset. Mocking that object or
+   its factory cannot satisfy this check. Retain the controlled boundaries and
+   remaining incident uncertainty.
 3. **Find the design intent.** Read nearby tests and documentation, targeted
    `git log -S`/`git blame`, and relevant commit/PR discussion. Cite the source
    and revision; distinguish documented rationale from inference and note
@@ -65,8 +70,9 @@ check cannot run, name the concrete blocker and keep the cause unresolved.
    Repair unsupported repro expectations with the original evidence preserved;
    label tests of a proposed policy as such, not proof the old policy was a bug.
    Before adding a retry, trace the retried operation's state writes and external
-   effects. Test failure after an effect commits but before success reaches the
-   caller; retry counts alone do not show safety. Preserve existing behavior
+   effects. If there are none, record the inspected read-only path. Otherwise,
+   test failure after an effect commits but before success reaches the caller;
+   retry counts alone do not show safety. Preserve existing behavior
    when the proposed retry lacks that evidence, and record the unsupported
    proposal as remaining work.
 
