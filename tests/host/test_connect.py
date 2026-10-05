@@ -33,6 +33,7 @@ from omnigent.host.connect import (
 )
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_LOGIN_EXPIRED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -997,6 +998,51 @@ async def test_handle_launch_refuses_unconfigured_harness(
     assert "'codex'" in (result.error or "")
     assert "test-laptop" in (result.error or "")
     assert "omni setup" in (result.error or "")
+    assert result.runner_id is None
+    # No runner subprocess may exist after a refusal.
+    assert host._runners == {}
+
+
+async def test_handle_launch_refuses_when_host_login_expired(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refuse a launch up front when the host's own stored login has expired.
+
+    The control tunnel authenticates once and its heartbeat keeps the host
+    reporting online, so a runner spawned after the login lapses would carry no
+    accepted bearer and be rejected (HTTP 401) on the token endpoint and tunnel
+    upgrades, then exit. Emitting the structured ``host_login_expired`` code
+    here is what lets the server answer 503 with a re-login hint instead of
+    accepting a doomed session. The ``absent``/``ok`` states (managed hosts,
+    never-logged-in or auth-disabled servers, and live logins) are exercised by
+    the proceed-to-spawn tests and must NOT trip this refusal.
+    """
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    # No warm bearer, and this server's stored login reads EXPIRED.
+    monkeypatch.setattr(host, "_current_auth_token", lambda *, initialize: None)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.stored_token_status",
+        lambda server_url: "expired",
+    )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_stale_login",
+        binding_token="token_stale",
+        workspace=str(workspace),
+        harness=None,
+    )
+    result = await host._handle_launch(frame)
+
+    assert isinstance(result, HostLaunchRunnerResultFrame)
+    assert result.status == "failed"
+    # The structured code is what the server's 503 mapping keys on.
+    assert result.error_code == HOST_LOGIN_EXPIRED_ERROR_CODE
+    message = result.error or ""
+    assert "test-laptop" in message
+    assert "login" in message.lower()
     assert result.runner_id is None
     # No runner subprocess may exist after a refusal.
     assert host._runners == {}

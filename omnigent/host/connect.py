@@ -61,6 +61,7 @@ from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
+    HOST_LOGIN_EXPIRED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -1855,6 +1856,26 @@ class HostProcess:
             self._current_auth_token,
             initialize=False,
         )
+        if initial_auth_token is None:
+            # The control tunnel authenticated once and its heartbeat keeps the
+            # host reporting online even after the stored login lapses, so a
+            # runner spawned now would be rejected (HTTP 401) and exit. Refuse an
+            # expired login up front; "absent" (managed/never-logged-in) reads are
+            # left alone, as is the connected-host 401/403 tunnel retry.
+            from omnigent.cli_auth import stored_token_status
+
+            if await asyncio.to_thread(stored_token_status, self._server_url) == "expired":
+                from omnigent.cli_invocation import cli_invocation
+
+                return self._launch_failed(
+                    frame,
+                    (
+                        f"host {self._identity.name!r} stored login has expired — "
+                        f"run `{cli_invocation()} login` on the host machine to "
+                        "restore session launches"
+                    ),
+                    error_code=HOST_LOGIN_EXPIRED_ERROR_CODE,
+                )
         env = _build_runner_env(
             os.environ,
             server_url=self._server_url,

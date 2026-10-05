@@ -38,6 +38,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_LOGIN_EXPIRED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostCreateDirFrame,
     HostDetectCredentialsFrame,
@@ -1089,6 +1090,18 @@ def create_hosts_router(
 
         if result.get("status") == "failed":
             await _rollback_failed_launch()
+            if result.get("error_code") == HOST_LOGIN_EXPIRED_ERROR_CODE:
+                # Map the host's refusal to an actionable 503 (re-login on the
+                # host) rather than the generic 502. The message is authored here,
+                # not echoed from the host, so host log text cannot leak.
+                from omnigent.cli_invocation import cli_invocation
+
+                raise OmnigentError(
+                    "The host's stored login has expired; run "
+                    f"`{cli_invocation()} login` on the host machine to "
+                    "launch sessions on it again.",
+                    code=ErrorCode.HOST_LOGIN_EXPIRED,
+                )
             refusal_code = classify_launch_refusal(
                 result.get("error_code"),
                 result.get("error"),

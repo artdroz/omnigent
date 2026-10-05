@@ -203,6 +203,13 @@ class ErrorCode:
         exists on the selected host (HTTP 410). Retrying cannot recreate
         deleted workspace state; the user must start a session in a valid
         workspace.
+    :cvar HOST_LOGIN_EXPIRED: The selected host's own stored login has
+        expired, so no runner it spawns can authenticate — each is rejected
+        (HTTP 401) and exits (the host refused the launch with the
+        ``host_login_expired`` error code). HTTP 503: the host cannot serve
+        launches until its operator re-runs ``omnigent login`` on the host
+        machine, so the client should surface a re-login affordance rather
+        than retry blindly. A host/config state, not a server fault.
     :cvar SESSION_AGENT_MISSING: The session's bound agent no longer
         resolves — its stored bundle was deleted or rebound out from under
         an active session (HTTP 410). A session-lifecycle condition, not a
@@ -242,6 +249,9 @@ class ErrorCode:
     # the host's wire error code passes through as the API error code.
     HARNESS_NOT_CONFIGURED = "harness_not_configured"
     WORKSPACE_MISSING = "workspace_missing"
+    # Keep the string equal to frames.HOST_LOGIN_EXPIRED_ERROR_CODE —
+    # the host's wire error code passes through as the API error code.
+    HOST_LOGIN_EXPIRED = "host_login_expired"
     SESSION_AGENT_MISSING = "session_agent_missing"
     UPSTREAM_CANCELLED = "upstream_cancelled"
     STALE_CURSOR = "stale_cursor"
@@ -275,6 +285,10 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # neither a 400 (input is fine) nor a 503 (a retry won't help).
     ErrorCode.HARNESS_NOT_CONFIGURED: 412,
     ErrorCode.WORKSPACE_MISSING: 410,
+    # 503: the host is reachable but can't launch runners until its operator
+    # re-authenticates it; the API caller's own auth is fine, so this is not a
+    # 4xx, and the state clears on host re-login rather than on a blind retry.
+    ErrorCode.HOST_LOGIN_EXPIRED: 503,
     # 410 Gone, like WORKSPACE_MISSING: a valid request whose bound agent was
     # deleted; a retry cannot recreate it.
     ErrorCode.SESSION_AGENT_MISSING: 410,
@@ -312,6 +326,8 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     ErrorCode.RUNNER_UNAVAILABLE: ErrorCategory.CONFIG,
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: ErrorCategory.CONFIG,
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorCategory.CONFIG,
+    # The host's stored login lapsed; its operator must re-authenticate it.
+    ErrorCode.HOST_LOGIN_EXPIRED: ErrorCategory.CONFIG,
     # The human deleted their own workspace on the host.
     ErrorCode.WORKSPACE_MISSING: ErrorCategory.USER,
     # The session's agent was deleted or rebound; the caller must recreate the
@@ -349,6 +365,7 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     # Launch-time hard stops: the task cannot start until the host/deploy changes.
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: ErrorImpact.BLOCKING,
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorImpact.BLOCKING,
+    ErrorCode.HOST_LOGIN_EXPIRED: ErrorImpact.BLOCKING,
     ErrorCode.WORKSPACE_MISSING: ErrorImpact.BLOCKING,
     ErrorCode.SESSION_AGENT_MISSING: ErrorImpact.BLOCKING,
     # Self-healing: a session state that resumes on reconnect, a routing
@@ -393,6 +410,8 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.WRONG_REPLICA: ErrorPhase.ROUTING,
     ErrorCode.RUNNER_UNAVAILABLE: ErrorPhase.RUNNER_LAUNCH,
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: ErrorPhase.RUNNER_LAUNCH,
+    # The host refuses before any runner process exists, at launch admission.
+    ErrorCode.HOST_LOGIN_EXPIRED: ErrorPhase.RUNNER_LAUNCH,
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorPhase.HARNESS_SETUP,
     ErrorCode.WORKSPACE_MISSING: ErrorPhase.HARNESS_SETUP,
     ErrorCode.SESSION_AGENT_MISSING: ErrorPhase.HARNESS_SETUP,

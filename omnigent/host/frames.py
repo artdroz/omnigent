@@ -46,6 +46,11 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 
+# The host's control tunnel outlives its stored login, so it can keep accepting
+# launches whose runners would all be rejected (HTTP 401); the daemon emits this
+# when it refuses one. Keep equal to ``ErrorCode.HOST_LOGIN_EXPIRED``'s value.
+HOST_LOGIN_EXPIRED_ERROR_CODE = "host_login_expired"
+
 # Capability tokens a host advertises in ``HostHelloFrame.capabilities``. A token
 # is present only in builds that have the feature, so the server gates on
 # presence — no host-version table to maintain, and a build that lacks the
