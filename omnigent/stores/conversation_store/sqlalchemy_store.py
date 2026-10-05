@@ -3360,9 +3360,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             with a column (routing provenance beside ``model_override``).
             ``None`` writes none.
         :param label_deletes: Label keys to delete in that same transaction.
+            A key named in both parameters ends up upserted: deletes run first.
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
         """
+        if isinstance(label_deletes, str):
+            raise TypeError("label_deletes takes a collection of label keys, not one str")
         now = now_epoch()
         encoded_terminal_launch_args = (
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None

@@ -6667,7 +6667,7 @@ async def _stamp_routing_decision_label(
     session_id: str,
     conversation_store: ConversationStore,
     decision_id: str | None,
-) -> None:
+) -> bool:
     """Record the decision behind a session's pinned model as a label.
 
     The child-sessions API reads it to render which decision produced a
@@ -6676,9 +6676,11 @@ async def _stamp_routing_decision_label(
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store exposing ``set_labels``.
     :param decision_id: Decision identity, or ``None`` to skip.
+    :returns: ``True`` when the label is in place (or there was nothing to
+        write); ``False`` when the write failed and was only logged.
     """
     if decision_id is None:
-        return
+        return True
     try:
         await asyncio.to_thread(
             conversation_store.set_labels,
@@ -6692,6 +6694,8 @@ async def _stamp_routing_decision_label(
             exc_info=True,
             extra={"session_id": session_id},
         )
+        return False
+    return True
 
 
 async def _record_create_route_prompt(

@@ -1,27 +1,8 @@
-"""E2E: Smart Routing must keep a session's prior model across a resume.
+"""HTTP integration coverage for keeping a user-selected model across Smart Routing resume hooks.
 
-The user journey these tests drive, through the same HTTP surface the product
-uses (``POST /v1/sessions``, ``PATCH /v1/sessions/{id}``, and the
-``hooks/route-turn`` relay a native pane's first-prompt hook fires):
-
-1. create a session with Smart Routing on (model-level routing, native pane);
-2. run it on a model — either the router's own first-prompt pick, or a model
-   the user chose themselves in the composer picker;
-3. close the pane and resume the session — the resumed pane's bridge dir is
-   fresh, so its first-prompt hook makes the route-turn round trip again;
-4. type a prompt: the session must stay on the model it was already using.
-
-The failure being guarded: on resume the hook re-runs routing and PICKS A
-MODEL AGAIN, switching the session off the model the user was already on.
-A session whose model was pinned by the user (Smart Routing left on, no
-routing decision recorded yet) loses that pin to the router's fresh pick.
-The same pin must win when the user made it over a Smart Routing create's
-own pick, and a model the harness merely REPORTS is not a pin at all.
-
-No real TUI or gateway is needed: the route-turn relay is the exact request a
-resumed native pane sends, and the router is the canned
-:class:`~tests.server.helpers.FakeRoutingClient`, so the assertions can name
-exact models.
+The route-turn relay is the exact request a resumed native pane's first-prompt
+hook sends, and the routing judge is the canned FakeRoutingClient, so the
+assertions name exact models. No TUI or gateway is involved.
 """
 
 from __future__ import annotations
@@ -354,26 +335,49 @@ async def test_a_stale_fingerprint_from_before_this_fix_still_routes_once(
     assert len(_routing_decisions(db_uri, session_id)) == 1
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        OperationalError("INSERT INTO conversation_labels", {}, Exception("locked")),
+        OSError("disk full"),
+    ],
+    ids=["database-error", "os-error"],
+)
 async def test_a_failed_decision_record_drops_the_pin_so_the_next_prompt_routes_again(
     client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
 ) -> None:
     """A routed pin whose decision label cannot be written does not freeze routing.
 
     Left in place, that unlabeled pin would read as the user's and the session
-    would never route again. The hook drops it and lets the prompt run
-    unrouted; the next prompt routes and records normally.
+    would never route again. The hook drops it, points the picker back at the
+    model the pane reports, and lets the prompt run unrouted; the next prompt
+    routes and records normally.
     """
     session_id = await _smart_routing_session(client, agent_name="routing-resume-label-fails")
+    report = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_model_change", "data": {"model": CREATE_PICK}},
+    )
+    assert report.status_code == 202, report.text
+    published: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, event: published.append((sid, event)),
+    )
 
     def _unavailable(self: object, conversation_id: str, updates: object, *args: object) -> None:
-        raise OperationalError("INSERT INTO conversation_labels", {}, Exception("locked"))
+        raise failure
 
     monkeypatch.setattr(SqlAlchemyConversationStore, "set_labels", _unavailable)
     first = await _resume_first_prompt(client, session_id, live_model=CREATE_PICK)
     assert first["action"] == "allow", first
     assert first["terminal"] is False
+    # The pin announced the routed model; the unpin pointed the picker back.
+    models = [event["model"] for _, event in published if event.get("type") == "session.model"]
+    assert models[-2:] == [ROUTER_PICK, CREATE_PICK], models
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.get_conversation(session_id)
     assert conv is not None

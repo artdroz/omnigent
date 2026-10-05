@@ -1798,9 +1798,13 @@ def register_hooks_routes(
 
         async def _unpin(model: str) -> None:
             """Drop a routed pin whose decision was not recorded, if still ours."""
-            await asyncio.to_thread(
+            cleared = await asyncio.to_thread(
                 conversation_store.clear_model_override_if_matches, session_id, model
             )
+            # ``_pin`` told the picker about the routed model; point it back.
+            previous = (conv.model_override or conv.reported_model) if conv is not None else None
+            if cleared and previous:
+                _publish_routed_model(session_id, previous)
 
         async def _persist(model: str, verdict: dict[str, Any]) -> None:
             decision_id = await _emit_server_routing_decision(
@@ -1811,7 +1815,12 @@ def register_hooks_routes(
                 scope=decision_scope(),
                 harness=route_request.harness,
             )
-            await _stamp_routing_decision_label(session_id, conversation_store, decision_id)
+            # An unlabeled pin would read as the user's: a swallowed label failure
+            # must still surface so the policy drops the pin.
+            if not await _stamp_routing_decision_label(
+                session_id, conversation_store, decision_id
+            ):
+                raise RuntimeError("routing decision label was not written")
 
         async def _record_decline(cause: str) -> None:
             """Persist the declined chip for a failed routing call.

@@ -133,15 +133,7 @@ async def test_an_earlier_routing_decision_is_the_authoritative_no_op() -> None:
 
 
 async def test_a_users_pinned_model_is_kept_unrouted() -> None:
-    """A ``model_override`` with no routing labels is the user's own pin.
-
-    Harness-side model reports land in ``reported_model``, and routing's own
-    pins carry a label (the decision label, or the create-prompt fingerprint),
-    so a bare override can only be a request the user made — the picker PATCH,
-    an explicit create model, a scheduled task's configured model. The pin
-    wins over the router, the same answer the composer gate gives, on every
-    hook round trip — a resumed pane's fresh bridge dir repeats it.
-    """
+    """A top-level user override bypasses routing until cleared."""
     rec = _Recorder()
     decision = await resolve_turn_route(
         "conv_1",
@@ -158,6 +150,16 @@ async def test_a_users_pinned_model_is_kept_unrouted() -> None:
     assert rec.routed == []
     assert rec.pinned == []
     assert rec.chips == []
+
+
+def test_a_routed_sessions_pin_is_not_a_user_pin_on_its_own() -> None:
+    """The predicate stands alone: a decision label marks the pin as routing's."""
+    from omnigent.runner.turn_routing import user_pinned_model
+
+    assert (
+        user_pinned_model(_FakeConv(model_override=ROUTED_MODEL, labels=_routed_labels())) is False
+    )
+    assert user_pinned_model(_FakeConv(model_override=ROUTED_MODEL)) is True
 
 
 async def test_a_create_routed_pin_is_not_the_users_and_an_edited_prompt_routes() -> None:

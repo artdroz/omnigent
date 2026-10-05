@@ -546,3 +546,12 @@ def test_update_conversation_rolls_back_the_row_and_labels_together(
     assert got is not None
     assert got.model_override == "claude-opus-4-7"
     assert got.labels == {"drop": "1"}
+
+
+def test_update_conversation_rejects_a_bare_string_for_label_deletes(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A ``str`` is a ``Sequence[str]`` too; it must not delete one key per character."""
+    conv = conversation_store.create_conversation()
+    with pytest.raises(TypeError, match="collection of label keys"):
+        conversation_store.update_conversation(conv.id, label_deletes="drop")

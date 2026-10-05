@@ -465,13 +465,20 @@ def user_pinned_model(conv: Any) -> bool:
     :param conv: Conversation row for the session.
     :returns: ``True`` when the session must keep its model unrouted.
     """
-    from omnigent.runner.subagent_routing import CREATE_ROUTE_PROMPT_LABEL_KEY
+    from omnigent.runner.subagent_routing import (
+        CREATE_ROUTE_PROMPT_LABEL_KEY,
+        ROUTING_DECISION_LABEL_KEY,
+    )
 
     if getattr(conv, "model_override", None) is None:
         return False
     if getattr(conv, "parent_conversation_id", None) is not None:
         return False
     labels = getattr(conv, "labels", None) or {}
+    # Self-contained: a routed session's pin is routing's even for a caller
+    # that did not consult already_routed() first.
+    if labels.get(ROUTING_DECISION_LABEL_KEY):
+        return False
     return not labels.get(CREATE_ROUTE_PROMPT_LABEL_KEY)
 
 

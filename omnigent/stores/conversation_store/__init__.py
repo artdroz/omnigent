@@ -974,6 +974,7 @@ class ConversationStore(ABC):
             with a column (routing provenance beside ``model_override``).
             ``None`` writes none.
         :param label_deletes: Label keys to delete in that same transaction.
+            A key named in both parameters ends up upserted: deletes run first.
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
         """
