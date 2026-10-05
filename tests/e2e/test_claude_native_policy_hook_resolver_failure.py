@@ -15,6 +15,7 @@ hostname (``localhost``, so each fresh connection performs a real lookup).
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import os
 import signal
@@ -36,6 +37,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # Every HTTP call the test itself makes targets 127.0.0.1 (an IP literal, no
 # getaddrinfo); CI shells often carry an egress proxy, so bypass autodetection.
 _http = httpx.Client(trust_env=False)
+atexit.register(_http.close)
 
 _PYTHONPATH = os.pathsep.join(
     [
@@ -62,7 +64,7 @@ _SUSTAINED_BUDGET_S = 3.0
 # The prior Claude session id the hook stamps onto its evaluation request.
 _EXTERNAL_SID = "11111111-2222-4333-8444-555566667777"
 
-_PROMPT = "polly still has blocking comments, loop until polly's review is green"
+_PROMPT = "summarize the open issues in this repository"
 
 
 def _find_free_port() -> int:
@@ -110,26 +112,28 @@ def _wait_http_ok(url: str, deadline: float) -> None:
 def _start_server(tmp_path: Path) -> tuple[subprocess.Popen[bytes], int]:
     """Spawn a real ``omnigent server`` on a free loopback port; return it + port."""
     port = _find_free_port()
-    log = (tmp_path / "server.log").open("w")
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            "from omnigent.cli import main; main()",
-            "server",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--database-uri",
-            f"sqlite:///{tmp_path / 'db.sqlite'}",
-            "--artifact-location",
-            str(tmp_path / "artifacts"),
-        ],
-        env=_localhost_env({}),
-        stdout=log,
-        stderr=subprocess.STDOUT,
-    )
+    # The child dups the fd at spawn, so the parent closes its handle at once
+    # and leaks no descriptor while the server keeps writing its own log.
+    with (tmp_path / "server.log").open("w") as log:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "from omnigent.cli import main; main()",
+                "server",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--database-uri",
+                f"sqlite:///{tmp_path / 'db.sqlite'}",
+                "--artifact-location",
+                str(tmp_path / "artifacts"),
+            ],
+            env=_localhost_env({}),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
     _wait_http_ok(f"http://127.0.0.1:{port}/health", time.monotonic() + _HEALTH_TIMEOUT_S)
     return proc, port
 
@@ -161,6 +165,9 @@ class _ResolverFault:
         self._host = host
         self._port = port
         self._real = socket.getaddrinfo
+        # The relay's background loop and the test thread both resolve through
+        # this hook, so guard the active/clear/counter state against races.
+        self._lock = threading.Lock()
         self.active = False
         self._clear_at: float | None = None
         self.calls_failed = 0
@@ -170,17 +177,23 @@ class _ResolverFault:
         return name == self._host
 
     def getaddrinfo(self, host, port=None, *args, **kwargs):  # type: ignore[no-untyped-def]
-        if self.active and self._match(host) and (port is None or str(port) == str(self._port)):
-            if self._clear_at is not None and time.monotonic() >= self._clear_at:
-                self.active = False
-            else:
-                self.calls_failed += 1
-                raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+        with self._lock:
+            if (
+                self.active
+                and self._match(host)
+                and (port is None or str(port) == str(self._port))
+            ):
+                if self._clear_at is not None and time.monotonic() >= self._clear_at:
+                    self.active = False
+                else:
+                    self.calls_failed += 1
+                    raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
         return self._real(host, port, *args, **kwargs)
 
     def activate(self, clear_after: float | None = None) -> None:
-        self._clear_at = None if clear_after is None else time.monotonic() + clear_after
-        self.active = True
+        with self._lock:
+            self._clear_at = None if clear_after is None else time.monotonic() + clear_after
+            self.active = True
 
     def install(self) -> None:
         socket.getaddrinfo = self.getaddrinfo
@@ -255,17 +268,20 @@ class _Relay:
 
     def close(self) -> None:
         self._relay.close()
+        # Close the async client on the loop it was created and used on, before
+        # that loop stops; a fresh asyncio.run() loop cannot close it cleanly.
+        asyncio.run_coroutine_threadsafe(self._client.aclose(), self._loop).result(timeout=5)
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=5)
-        asyncio.run(self._client.aclose())
+        self._loop.close()
 
 
 @pytest.fixture(scope="module")
 def _server(tmp_path_factory: pytest.TempPathFactory):
     tmp_path = tmp_path_factory.mktemp("policy-hook-dns")
     proc, port = _start_server(tmp_path)
-    session_id = _create_session(port)
     try:
+        session_id = _create_session(port)
         yield port, session_id, tmp_path
     finally:
         _terminate(proc)

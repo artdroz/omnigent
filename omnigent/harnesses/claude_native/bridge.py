@@ -6598,6 +6598,7 @@ def _tool_relay_handler_factory(
             from omnigent.native.native_policy_hook import (
                 EvaluateRetryBudget,
                 evaluation_response_to_hook_output,
+                event_long_polls_ask,
                 fail_ask_hook_output,
                 hook_payload_to_evaluation_request,
                 is_transient_connect_error,
@@ -6633,10 +6634,13 @@ def _tool_relay_handler_factory(
             last_exc: BaseException | None = None
             attempts = 0
             started = time.monotonic()
-            # Same transient budget and held-poll re-park as the direct hook
-            # path: a resolver blip that clears within seconds must not drop
-            # the prompt, and a gateway-severed ASK long-poll re-attaches.
+            # Same transient budget as the direct hook path: a resolver blip
+            # that clears within seconds must not drop the prompt. Only an
+            # event that parks an interactive ASK (PreToolUse) re-attaches a
+            # gateway-severed long-poll; a request gate (UserPromptSubmit) has
+            # no held poll to re-park and must fail closed within the budget.
             budget = EvaluateRetryBudget()
+            can_repark = event_long_polls_ask(hook_event)
             while True:
                 attempts += 1
                 attempt_started = time.monotonic()
@@ -6648,7 +6652,7 @@ def _tool_relay_handler_factory(
                 except Exception as exc:  # noqa: BLE001 — shaped fail-closed below
                     last_exc = exc
                     last_error = transport_failure_detail(exc)
-                    severed = budget.held_poll_severed(attempt_started, exc)
+                    severed = can_repark and budget.held_poll_severed(attempt_started, exc)
                     if not severed and not is_transient_connect_error(exc):
                         break
                 else:
@@ -6656,13 +6660,14 @@ def _tool_relay_handler_factory(
                     if resp.status_code == HTTPStatus.OK:
                         try:
                             verdict = json.loads(resp.content)
-                        except (ValueError, TypeError):
+                        except (ValueError, TypeError) as parse_exc:
+                            last_exc = parse_exc
                             last_error = "malformed EvaluationResponse body"
                         break
                     last_error = f"server returned HTTP {resp.status_code}"
                     if resp.status_code < 500:
                         break
-                    severed = budget.held_poll_severed(attempt_started)
+                    severed = can_repark and budget.held_poll_severed(attempt_started)
                 if severed:
                     budget.repark()
                     continue

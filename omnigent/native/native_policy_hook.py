@@ -635,15 +635,35 @@ class EvaluateRetryBudget:
         return True
 
 
+def event_long_polls_ask(hook_event: str) -> bool:
+    """
+    Whether the server parks an interactive ASK long-poll for *hook_event*.
+
+    Only ``PreToolUse`` publishes an approval card the server holds open while
+    it waits for a human decision, so only its POST can be severed mid-poll by
+    the gateway's request ceiling and must re-park the same elicitation. A
+    ``UserPromptSubmit`` request gate (and ``PostToolUse``) is answered
+    promptly, so a late failure there is a sick server, not a severed poll: it
+    must fail closed within the transient budget rather than re-park unbounded.
+    """
+    return hook_event == _PRE_TOOL_USE
+
+
 def is_transient_connect_error(exc: BaseException) -> bool:
     """
-    Whether *exc* means the server was never reached, so a retry may succeed.
+    Whether *exc* means the server was never cleanly reached, so a retry may help.
 
     :param exc: Exception raised by an evaluate POST.
-    :returns: ``True`` for httpx connect errors and timeouts and for the raw
-        :class:`OSError` a non-httpx client may raise.
+    :returns: ``True`` for httpx connect errors and timeouts, a stdlib
+        :class:`ConnectionError` (refused / reset / aborted), and the raw
+        :class:`socket.gaierror` a non-httpx client may surface. A bare
+        :class:`OSError` (file / permission / disk) is not a connect failure
+        and is treated as final.
     """
-    return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, OSError))
+    return isinstance(
+        exc,
+        (httpx.ConnectError, httpx.ConnectTimeout, ConnectionError, socket.gaierror),
+    )
 
 
 def transport_failure_detail(exc: BaseException) -> str:

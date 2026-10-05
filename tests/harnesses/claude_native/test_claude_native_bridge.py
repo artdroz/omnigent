@@ -11224,17 +11224,19 @@ class _ScriptedPolicyClient:
     def __init__(self, *steps: dict[str, object] | int | BaseException | None) -> None:
         self.steps = list(steps)
         self.calls = 0
+        self.bodies: list[dict[str, object] | None] = []
 
     async def post(self, url: str, json: dict[str, object] | None = None) -> SimpleNamespace:
         """Replay the next step as a minimal httpx-Response-shaped namespace.
 
         :param url: Evaluate path (ignored).
-        :param json: Forwarded EvaluationRequest (ignored).
+        :param json: Forwarded EvaluationRequest; recorded for identity checks.
         :returns: Response namespace, or raises the scripted failure.
         """
         import json as _json
 
-        del url, json
+        del url
+        self.bodies.append(json)
         step = self.steps[min(self.calls, len(self.steps) - 1)]
         self.calls += 1
         if step is None:
@@ -11467,6 +11469,96 @@ async def test_hook_evaluate_endpoint_reparks_a_held_poll_the_gateway_severed(
         )
         assert body == "", f"re-parked poll must answer the verdict, got {body!r}"
         assert client.calls == 2
+        first_id = client.bodies[0]["_omnigent_elicitation_id"]
+        assert first_id and client.bodies[1]["_omnigent_elicitation_id"] == first_id, (
+            "a re-parked poll must re-POST the same elicitation id so the server "
+            f"re-attaches the parked ask instead of raising a second card: {client.bodies!r}"
+        )
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_does_not_repark_a_block_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A request-gate event never re-parks: a held 5xx fails closed within budget.
+
+    Only PreToolUse parks an interactive ask the gateway can sever. A
+    UserPromptSubmit 5xx that arrives past the held-poll floor is a sick
+    server, so it must fail closed once the budget is spent rather than
+    re-POST without bound (which would hang the prompt forever).
+    """
+    from omnigent.native import native_policy_hook
+
+    _fast_evaluate_retries(monkeypatch, budget_s=0.0)
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_HELD_POLL_FLOOR_S", 0.0)
+    client = _ScriptedPolicyClient(503)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _USER_PROMPT_SUBMIT_PAYLOAD,
+        )
+        output = json.loads(body)
+        assert output["decision"] == "block", output
+        assert "HTTP 503" in output["reason"], output
+        assert client.calls == 1, f"a block event must not re-park, saw {client.calls} POSTs"
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_recovers_from_fast_5xx(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fast 5xx responses retry within the budget and recover to the real verdict.
+
+    A 5xx that returns well inside the held-poll floor is an ordinary server
+    hiccup, not a severed poll: the loop retries over the transient budget and
+    the recovered allow lets the prompt through.
+    """
+    _fast_evaluate_retries(monkeypatch, budget_s=5.0)
+    client = _ScriptedPolicyClient(500, 500, {"result": "POLICY_ACTION_ALLOW"})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _USER_PROMPT_SUBMIT_PAYLOAD,
+        )
+        assert body == "", f"a recovered 5xx must let the prompt through, got {body!r}"
+        assert client.calls == 3
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_treats_malformed_200_as_final(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 200 with an unparseable body fails closed at once, with no retry.
+
+    A malformed success body will not become valid on retry, so the relay
+    stops immediately and fails closed with a readable reason.
+    """
+    _fast_evaluate_retries(monkeypatch, budget_s=5.0)
+    client = _ScriptedPolicyClient(200)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _USER_PROMPT_SUBMIT_PAYLOAD,
+        )
+        output = json.loads(body)
+        assert output["decision"] == "block", output
+        assert "malformed EvaluationResponse body" in output["reason"], output
+        assert client.calls == 1, f"a malformed 200 is final, saw {client.calls} POSTs"
     finally:
         relay.close()
 
