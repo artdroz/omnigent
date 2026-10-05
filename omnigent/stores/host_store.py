@@ -364,6 +364,10 @@ class HostStore:
                     )
                 # Known host_id (same user_id, or reown opted in): update
                 # user_id/name in case they changed, then refresh status and timestamp.
+                if allow_host_id_reown:
+                    self._absorb_stale_name_holder(
+                        session, host_id=host_id, user_id=user_id, name=name
+                    )
                 row.user_id = user_id
                 row.account_generation = generation
                 row.name = name
@@ -529,6 +533,56 @@ class HostStore:
 
         return new_row
 
+    @staticmethod
+    def _absorb_stale_name_holder(
+        session: Session,
+        *,
+        host_id: str,
+        user_id: str,
+        name: str,
+    ) -> None:
+        """Fold another live row holding ``(user_id, name)`` into *host_id*.
+
+        Re-owning *host_id* to ``(user_id, name)`` would otherwise violate the
+        ``(workspace_id, user_id, name)`` unique constraint when that slot holds
+        an older identity of the same machine (e.g. registered as ``local``
+        before the host_id was reset under an accounts user). Its conversations
+        move to *host_id* and the stale row is deleted, like a host_id rotation.
+
+        :param session: The active SQLAlchemy session.
+        :param host_id: The connecting host_id that keeps its row, e.g.
+            ``"184307b33f774b67a5c47b7908061517"``.
+        :param user_id: Owner the row is moving to, e.g. ``"local"``.
+        :param name: Host name being recorded, e.g. ``"corey-laptop"``.
+        """
+        stale = session.execute(
+            select(SqlHost).where(
+                SqlHost.workspace_id == current_workspace_id(),
+                SqlHost.user_id == user_id,
+                SqlHost.name == name,
+                SqlHost.host_id != host_id,
+                SqlHost.deleted_at.is_(None),
+            )
+        ).scalar_one_or_none()
+        if stale is None:
+            return
+        stale_host_id = stale.host_id
+        session.execute(
+            update(SqlConversationMetadata)
+            .where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.host_id == stale_host_id,
+            )
+            .values(host_id=host_id)
+        )
+        session.execute(
+            sql_delete(SqlHost).where(
+                SqlHost.workspace_id == current_workspace_id(),
+                SqlHost.host_id == stale_host_id,
+            )
+        )
+        session.flush()
+
     def _reown_host_id(
         self,
         session: Session,
@@ -576,6 +630,7 @@ class HostStore:
         if existing is None:
             return None
         created_at = existing.created_at
+        self._absorb_stale_name_holder(session, host_id=host_id, user_id=user_id, name=name)
         session.execute(
             update(SqlHost)
             .where(

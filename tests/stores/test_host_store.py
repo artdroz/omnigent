@@ -396,6 +396,43 @@ def test_reown_host_id_across_owner_change_preserves_conversation_binding(
     assert host_store.list_hosts(user_id="admin@example.com") == []
 
 
+def test_reown_merges_stale_same_name_host_of_new_owner(
+    host_store: HostStore,
+    db_uri: str,
+) -> None:
+    """Re-owning a host_id absorbs the new owner's stale same-name row.
+
+    The machine first registered as ``local`` (old host_id), then got a
+    fresh host_id under an accounts user. When the local server flips back
+    to single-user, re-owning the new host_id to ``local`` would collide
+    with the old row on ``(user_id, name)``. The old row is the same
+    machine's previous identity, so its conversations move to the
+    connecting host_id and the stale row goes away.
+    """
+    conversations = SqlAlchemyConversationStore(db_uri)
+    old_id = "51f0d125f0854d89aae33a6f8e3f8739"
+    new_id = "184307b33f774b67a5c47b7908061517"
+    host_store.upsert_on_connect(
+        host_id=old_id, name="laptop", user_id="local", allow_host_id_reown=True
+    )
+    old_conv = conversations.create_conversation(host_id=old_id, workspace="/home/me/proj")
+    host_store.upsert_on_connect(
+        host_id=new_id, name="laptop", user_id="admin@example.com", allow_host_id_reown=True
+    )
+
+    reowned = host_store.upsert_on_connect(
+        host_id=new_id, name="laptop", user_id="local", allow_host_id_reown=True
+    )
+
+    assert reowned.host_id == new_id
+    assert reowned.user_id == "local"
+    assert [h.host_id for h in host_store.list_hosts(user_id="local")] == [new_id]
+    assert host_store.list_hosts(user_id="admin@example.com") == []
+    rebound = conversations.get_conversation(old_conv.id)
+    assert rebound is not None
+    assert rebound.host_id == new_id
+
+
 def test_reown_disabled_rejects_foreign_owner_claiming_host_id(
     host_store: HostStore,
 ) -> None:
