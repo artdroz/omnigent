@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import secrets
 import stat
@@ -15,18 +16,46 @@ from collections.abc import Callable, Iterator, MutableMapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import tomllib
 
 from omnigent.native import native_bridge_common
 
+if TYPE_CHECKING:
+    from omnigent.inner.terminal import TerminalInstance
+
 CODEX_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.codex_native.bridge_id"
 CODEX_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_CODEX_NATIVE_BRIDGE_DIR"
 CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"
 
+# Maximum time for a fresh TUI to emit ``thread/started``. Deliberately
+# generous because a host-spawned TUI cold-starts over the runner.
+CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS = 30.0
+# A configured command (for example ``codex-wrapper``) may do bounded setup
+# before it execs Codex. Direct launches retain the watchdog above; this
+# allowance is advertised only for an explicit command override.
+CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS = 120.0
+# Give the runner time to publish bridge state or its startup error at the end
+# of the configured-command watchdog before the executor reports a generic miss.
+CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS = 5.0
+
+_CODEX_COMPOSER_GLYPH = "›"
+_CODEX_DISABLED_COMPOSER_TEXT = frozenset(
+    {
+        "Input disabled.",
+        "Shutting down...",
+        "Answer the questions to continue.",
+        "Respond to the tool suggestion to continue.",
+        "Respond to the MCP server request to continue.",
+    }
+)
+
 _STATE_FILE = "state.json"
 _STATE_LOCK_FILE = "state.lock"
 _STARTUP_ERROR_FILE = "startup_error.json"
+_STARTUP_TIMEOUT_FILE = "startup_timeout.json"
+_STARTUP_TIMEOUT_MAX_BYTES = 256
 # Per-MCP-server startup state mirrored from Codex's
 # ``mcpServer/startupStatus/updated`` notifications. Written by the
 # forwarder (and by ``wait_for_thread_started`` while it drains startup
@@ -56,6 +85,40 @@ _BRIDGE_ROOT = Path.home() / ".omnigent" / "codex-native"
 _ORPHAN_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 
+def _codex_composer_interactive(pane: str) -> bool:
+    """Return whether Codex's message composer is accepting input.
+
+    Codex renders its live composer as the last pane row whose trimmed text
+    starts with ``›``. The same glyph is dimmed while input is disabled, so
+    reject the disabled placeholder text that accompanies those states.
+
+    :param pane: ANSI-stripped tmux pane text.
+    :returns: ``True`` when the Codex message composer is mounted and enabled.
+    """
+    for line in reversed(pane.splitlines()):
+        row = line.lstrip()
+        if not row.startswith(_CODEX_COMPOSER_GLYPH):
+            continue
+        composer_text = row[len(_CODEX_COMPOSER_GLYPH) :].strip()
+        return composer_text not in _CODEX_DISABLED_COMPOSER_TEXT
+    return False
+
+
+def codex_terminal_interactive(bridge_dir: Path, pane: str) -> bool:
+    """Return whether Codex has a live thread and accepts terminal input.
+
+    A fresh TUI renders before its app-server thread exists, while a resume
+    preloads bridge state before launching the TUI. Requiring both bridge state
+    and the enabled composer gives the same semantic endpoint for both paths
+    without waiting for MCP servers to finish starting.
+
+    :param bridge_dir: Per-session Codex bridge directory.
+    :param pane: ANSI-stripped tmux pane text.
+    :returns: ``True`` when a message typed now can enter the Codex thread.
+    """
+    return read_bridge_state(bridge_dir) is not None and _codex_composer_interactive(pane)
+
+
 def bridge_root() -> Path:
     """
     Return the configured Codex-native bridge root.
@@ -66,6 +129,27 @@ def bridge_root() -> Path:
         ``Path("~/.omnigent/codex-native")``.
     """
     return _BRIDGE_ROOT
+
+
+@dataclass(frozen=True)
+class CodexStartupFailure:
+    """
+    Why a native Codex app-server has not started its thread.
+
+    :param message: Human-readable cause, e.g. ``"Codex is waiting for a
+        sign-in in this session's terminal."``.
+    :param code: Semantic failure code for the turn error, e.g.
+        ``"databricks_sign_in_pending"``; ``None`` for records written
+        without one.
+    :param title: Short headline for the error card, or ``None``.
+    :param remediation: Concrete next step, e.g. the sign-in link and
+        code, or ``None``.
+    """
+
+    message: str
+    code: str | None = None
+    title: str | None = None
+    remediation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -138,11 +222,12 @@ def prepare_bridge_dir(bridge_id: str) -> Path:
     :returns: Prepared absolute bridge directory.
     """
     bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(bridge_dir, 0o700)
-    # Owner-pid marker for the periodic dead-owner prune; refreshed every
-    # turn so it always names the current runner. See native_bridge_common.
-    native_bridge_common.write_owner_pid_marker(bridge_dir)
+    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
+        bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(bridge_dir, 0o700)
+        # Owner-pid marker for the periodic dead-owner prune; refreshed every
+        # turn so it always names the current runner. See native_bridge_common.
+        native_bridge_common.write_owner_pid_marker(bridge_dir)
     return bridge_dir
 
 
@@ -154,7 +239,7 @@ def prune_orphaned_bridge_dirs() -> int:
     cannot imply that the local rollout is disposable. Keep the whole bridge
     for 7 days after its latest bridge preparation or rollout activity, then
     remove it intact.
-    Explicit session deletion remains immediate. The runner calls this via
+    Explicit session deletion remains immediate. Global maintenance calls this via
     ``native_bridge_common.reap_orphaned_native_bridge_dirs`` at startup.
 
     :returns: The number of orphaned bridge dirs pruned.
@@ -822,6 +907,64 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
         _write_bridge_state_unlocked(bridge_dir, state)
 
 
+def _validated_startup_timeout(value: object) -> float | None:
+    """Return a bounded configured-command timeout, or ``None`` if invalid."""
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or value <= 0
+        or value > CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS
+        or not math.isfinite(value)
+    ):
+        return None
+    return float(value)
+
+
+def write_bridge_startup_timeout(bridge_dir: Path, timeout_seconds: float) -> None:
+    """Advertise a bounded configured-command startup wait to the executor.
+
+    This is launch policy, not a completion claim. It remains beside successful
+    state or a startup error until :func:`clear_bridge_state` starts the next
+    launch, so a retiring forwarder cannot erase a successor's newer marker.
+    """
+    timeout = _validated_startup_timeout(timeout_seconds)
+    if timeout is None:
+        raise ValueError(
+            "timeout_seconds must be finite, positive, and no greater than "
+            f"{CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS:g}"
+        )
+    with _bridge_state_lock(bridge_dir):
+        path = bridge_dir / _STARTUP_TIMEOUT_FILE
+        fd, tmp_name = tempfile.mkstemp(prefix=f"{_STARTUP_TIMEOUT_FILE}.", dir=str(bridge_dir))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"timeout_seconds": timeout}, handle, allow_nan=False, sort_keys=True)
+                handle.write("\n")
+            os.replace(tmp_name, path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+
+
+def read_bridge_startup_timeout(bridge_dir: Path) -> float | None:
+    """Read the configured-command startup wait, ignoring malformed input."""
+    path = bridge_dir / _STARTUP_TIMEOUT_FILE
+    try:
+        with path.open("rb") as handle:
+            payload = handle.read(_STARTUP_TIMEOUT_MAX_BYTES + 1)
+    except OSError:
+        return None
+    if len(payload) > _STARTUP_TIMEOUT_MAX_BYTES:
+        return None
+    try:
+        raw = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return _validated_startup_timeout(raw.get("timeout_seconds"))
+
+
 def clear_bridge_state(bridge_dir: Path) -> None:
     """
     Remove stale native Codex runtime state for a bridge directory.
@@ -840,6 +983,7 @@ def clear_bridge_state(bridge_dir: Path) -> None:
         for name in (
             _STATE_FILE,
             _STARTUP_ERROR_FILE,
+            _STARTUP_TIMEOUT_FILE,
             _MCP_STARTUP_FILE,
         ):
             try:
@@ -848,21 +992,45 @@ def clear_bridge_state(bridge_dir: Path) -> None:
                 continue
 
 
-def write_bridge_startup_error(bridge_dir: Path, message: str) -> None:
+def write_bridge_startup_error(
+    bridge_dir: Path,
+    message: str,
+    *,
+    code: str | None = None,
+    title: str | None = None,
+    remediation: str | None = None,
+) -> None:
     """
-    Record why a native Codex app-server never started its thread (issue #59).
+    Record why a native Codex app-server has not started its thread (issue #59).
+
+    The record is either a hard failure (the TUI exited, the event stream
+    ended) or a still-pending startup (the pane is alive but waiting, e.g.
+    on a sign-in prompt). Chat turns read it to fail fast with the cause.
 
     :param bridge_dir: Native Codex bridge directory.
     :param message: Human-readable failure cause.
+    :param code: Semantic failure code the turn error should carry, e.g.
+        ``"databricks_sign_in_pending"``. ``None`` leaves the turn's
+        generic code in place.
+    :param title: Short headline for the error card, e.g. ``"Codex is
+        waiting for a sign-in"``.
+    :param remediation: Concrete next step, e.g. the sign-in link and code.
     :returns: None.
     """
+    record: dict[str, str] = {"message": message}
+    if code:
+        record["code"] = code
+    if title:
+        record["title"] = title
+    if remediation:
+        record["remediation"] = remediation
     try:
         bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         path = bridge_dir / _STARTUP_ERROR_FILE
         fd, tmp_name = tempfile.mkstemp(prefix=f"{_STARTUP_ERROR_FILE}.", dir=str(bridge_dir))
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump({"message": message}, handle, sort_keys=True)
+                json.dump(record, handle, sort_keys=True)
                 handle.write("\n")
             os.replace(tmp_name, path)
         finally:
@@ -887,12 +1055,13 @@ def clear_bridge_startup_error(bridge_dir: Path) -> None:
         (bridge_dir / _STARTUP_ERROR_FILE).unlink()
 
 
-def read_bridge_startup_error(bridge_dir: Path) -> str | None:
+def read_bridge_startup_failure(bridge_dir: Path) -> CodexStartupFailure | None:
     """
-    Read a recorded native Codex startup-failure message, if any.
+    Read the recorded native Codex startup failure, if any.
 
     :param bridge_dir: Native Codex bridge directory.
-    :returns: The recorded failure cause, or ``None`` if absent/unreadable.
+    :returns: The recorded failure with its optional semantic code, title
+        and remediation, or ``None`` if absent/unreadable.
     """
     path = bridge_dir / _STARTUP_ERROR_FILE
     if not path.is_file():
@@ -904,7 +1073,30 @@ def read_bridge_startup_error(bridge_dir: Path) -> str | None:
     if not isinstance(raw, dict):
         return None
     message = raw.get("message")
-    return message if isinstance(message, str) and message else None
+    if not isinstance(message, str) or not message:
+        return None
+
+    def _optional(key: str) -> str | None:
+        value = raw.get(key)
+        return value if isinstance(value, str) and value else None
+
+    return CodexStartupFailure(
+        message=message,
+        code=_optional("code"),
+        title=_optional("title"),
+        remediation=_optional("remediation"),
+    )
+
+
+def read_bridge_startup_error(bridge_dir: Path) -> str | None:
+    """
+    Read a recorded native Codex startup-failure message, if any.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: The recorded failure cause, or ``None`` if absent/unreadable.
+    """
+    failure = read_bridge_startup_failure(bridge_dir)
+    return failure.message if failure is not None else None
 
 
 def read_mcp_startup(bridge_dir: Path) -> dict[str, dict[str, str | None]]:
@@ -1111,6 +1303,25 @@ def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
         active_turn_id=parsed_active_turn_id,
         cwd=cwd if isinstance(cwd, str) and cwd else None,
     )
+
+
+def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
+    """Provider ``input_ready_probe``: the app-server thread is bound to *session_id*.
+
+    The runner writes bridge state only after the TUI's thread is known (fresh
+    discovery, known-thread resume, or a thread switch that moved the terminal
+    to a new session), which is when web turns can be routed into it.
+
+    :param session_id: Omnigent conversation id currently owning the terminal.
+    :param instance: The live Codex terminal; its ``CODEX_HOME`` locates the
+        bridge directory (see :func:`codex_home_for_bridge_dir`).
+    :returns: Whether bridge state names a thread for *session_id*.
+    """
+    codex_home = instance.env.get("CODEX_HOME")
+    if not codex_home:
+        return False
+    state = read_bridge_state(Path(codex_home).parent)
+    return state is not None and state.session_id == session_id
 
 
 def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:

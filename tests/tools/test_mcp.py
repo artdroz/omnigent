@@ -730,18 +730,56 @@ def test_format_call_result_error_prefix() -> None:
 
 def test_format_call_result_non_text_content() -> None:
     """
-    Non-text content (e.g. images) is serialized as JSON via
-    ``model_dump()``.
+    Image content uses the tagged transport envelope.
     """
-    block = ImageContent(type="image", data="base64data", mimeType="image/png")
+    from tests._image_fixtures import _TINY_PNG_BASE64
+
+    block = ImageContent(type="image", data=_TINY_PNG_BASE64, mimeType="image/png")
     result = MagicMock()
     result.content = [block]
     result.isError = False
 
     formatted = _format_call_result(result)
     parsed = json.loads(formatted)
-    assert parsed["type"] == "image"
-    assert parsed["data"] == "base64data"
+    assert parsed["__omnigent_mcp_image_result__"] == 1
+    assert parsed["content"][0]["type"] == "image"
+    assert parsed["content"][0]["data"] == _TINY_PNG_BASE64
+
+
+@pytest.mark.parametrize("is_error", [False, True])
+@pytest.mark.parametrize(
+    ("data", "mime_type"),
+    [("", "image/png"), ("abcd", "application/octet-stream")],
+)
+def test_format_call_result_malformed_image_keeps_valid_neighbor(
+    data: str, mime_type: str, is_error: bool
+) -> None:
+    from omnigent.runtime.mcp_tool_result import (
+        decode_mcp_image_result,
+        mcp_response_from_tool_result,
+    )
+    from tests._image_fixtures import _TINY_PNG_BASE64
+
+    valid = ImageContent(type="image", data=_TINY_PNG_BASE64, mimeType="image/png")
+    malformed = ImageContent(type="image", data=data, mimeType=mime_type)
+    trailing = "Required trailing detail: blue."
+    output = _format_call_result(
+        CallToolResult(
+            content=[valid, malformed, TextContent(type="text", text=trailing)],
+            isError=is_error,
+        )
+    )
+
+    parsed = json.loads(output)
+    assert decode_mcp_image_result(parsed) is not None
+    assert mcp_response_from_tool_result(parsed) == {
+        "content": [
+            valid.model_dump(mode="json", exclude_none=True),
+            {"type": "text", "text": json.dumps(malformed.model_dump())},
+            {"type": "text", "text": trailing},
+        ],
+        "isError": is_error,
+    }
 
 
 def test_format_call_result_empty_content() -> None:
@@ -1163,7 +1201,7 @@ def test_backoff_delay_capped_at_max() -> None:
 
 
 @pytest.mark.asyncio()
-async def test_call_tool_reconnects_on_connection_error() -> None:
+async def test_call_tool_reconnects_on_connection_error(caplog: pytest.LogCaptureFixture) -> None:
     """
     When a tool call fails with a connection error, the
     connection reconnects with backoff and retries.
@@ -1190,10 +1228,21 @@ async def test_call_tool_reconnects_on_connection_error() -> None:
         # Patch the _sleep indirection so retry backoff is instant.
         with patch.object(conn, "_reconnect", new_callable=AsyncMock) as mock_reconnect:
             with patch("omnigent.tools.mcp._sleep", new_callable=AsyncMock):
-                result = await conn.call_tool("test_tool", {"query": "hi"})
+                result = await conn.call_tool(
+                    "test_tool", {"query": "private arguments"}, session_id="conv_retry"
+                )
 
         assert result == "recovered"
         mock_reconnect.assert_awaited_once()
+        records = [
+            r for r in caplog.records if getattr(r, "event_name", None) == "mcp_tool_reconnect"
+        ]
+        assert len(records) == 1
+        record = records[0]
+        assert record.session_id == "conv_retry"
+        assert record.exc_info is not None and isinstance(record.exc_info[1], EOFError)
+        assert record.attributes == {"transport_error_type": None}
+        assert "private arguments" not in record.getMessage()
 
     await conn.close()
 
@@ -1280,7 +1329,9 @@ async def test_call_tool_reconnects_on_dead_session_timeout() -> None:
 
 
 @pytest.mark.asyncio()
-async def test_call_tool_reconnects_on_swallowed_transport_error_timeout() -> None:
+async def test_call_tool_reconnects_on_swallowed_transport_error_timeout(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """
     The locked MCP SDK can swallow a mid-response network failure
     entirely (streamable-HTTP SSE/JSON response paths), leaving the
@@ -1326,6 +1377,13 @@ async def test_call_tool_reconnects_on_swallowed_transport_error_timeout() -> No
         # error must not linger past the successful retry to
         # misclassify a future genuine tool timeout.
         assert conn._transport_error is None
+        records = [
+            r for r in caplog.records if getattr(r, "event_name", None) == "mcp_tool_reconnect"
+        ]
+        assert len(records) == 1
+        record = records[0]
+        assert record.exc_info is not None and isinstance(record.exc_info[1], McpError)
+        assert record.attributes == {"transport_error_type": "ReadError"}
 
     await conn.close()
 
