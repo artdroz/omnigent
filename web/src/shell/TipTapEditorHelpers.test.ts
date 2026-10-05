@@ -242,6 +242,13 @@ function secondFox(text: string): number {
   return text.indexOf("fox", text.indexOf("sleepy"));
 }
 
+/** Start of the n-th (0-based) copy of `word` in `text`. */
+function nthIndex(text: string, word: string, n: number): number {
+  let idx = -1;
+  for (let i = 0; i <= n; i++) idx = text.indexOf(word, idx + 1);
+  return idx;
+}
+
 describe("repeated word after invisible markup", () => {
   // The image URL and link target exist only in the raw file, so raw offsets
   // run far ahead of text offsets by the time the repeated word appears.
@@ -311,8 +318,8 @@ describe("repeated word after invisible markup", () => {
   it("breaks ties between identical lines with the scaled offset", () => {
     const raw = "- a fox\n- a fox\n- a fox";
     const text = "a fox\na fox\na fox";
-    const secondLineFoxInText = text.indexOf("fox", 6);
-    const secondLineFoxInRaw = raw.indexOf("fox", 8);
+    const secondLineFoxInText = nthIndex(text, "fox", 1);
+    const secondLineFoxInRaw = nthIndex(raw, "fox", 1);
 
     const data = computeSelectionData(
       secondLineFoxInText,
@@ -332,6 +339,39 @@ describe("repeated word after invisible markup", () => {
     const text = "fox one fox two fox";
     const range = findPmRangeForComment(makeDoc(text), makeComment("fox", 7), text);
     expect(range).toEqual({ from: 8, to: 11 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Formatting on the selected word itself
+// ---------------------------------------------------------------------------
+
+describe("formatting on the selected word itself", () => {
+  // Emphasis or code markers around the selected copy mean no verbatim text
+  // around it matches on the raw side; the surrounding words still identify it.
+  it.each([
+    ["bold first copy", "the **fox** and the fox", "the fox and the fox", "fox", 0],
+    ["bold second copy", "the fox and the **fox**", "the fox and the fox", "fox", 1],
+    [
+      "code-formatted first copy",
+      "run `build` then build again",
+      "run build then build again",
+      "build",
+      0,
+    ],
+  ] as const)("%s", (_name, raw, text, word, occurrence) => {
+    const textFrom = nthIndex(text, word, occurrence);
+    const rawFrom = nthIndex(raw, word, occurrence);
+
+    const data = computeSelectionData(textFrom, textFrom + word.length, makeDoc(text), raw);
+    expect(data).toEqual({
+      start_index: rawFrom,
+      end_index: rawFrom + word.length,
+      anchor_content: word,
+    });
+
+    const range = findPmRangeForComment(makeDoc(text), makeComment(word, rawFrom), raw);
+    expect(range).toEqual({ from: textFrom, to: textFrom + word.length });
   });
 });
 

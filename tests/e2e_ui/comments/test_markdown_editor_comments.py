@@ -53,11 +53,12 @@ _REPEATED_PARAGRAPH = (
     "and a third fox watches from the hill."
 )
 
-# Markup the editor never shows (an image URL, a link target) sits before the
-# paragraphs, so raw-file offsets run well ahead of the rendered text.
+# Markup the editor never shows (an image target, a link target) sits before
+# the paragraphs, so raw-file offsets run well ahead of the rendered text. The
+# image is a self-contained 1x1 PNG so the browser makes no external request.
 _IMAGE_URL = (
-    "https://user-images.githubusercontent.com/12345678/"
-    "0f8e2c3a-7b1d-4e9a-9c2f-architecture-overview-diagram-v2.png"
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+    "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
 )
 _LINK_URL = (
     "https://docs.example.com/engineering/design/comment-anchoring/overview"
@@ -90,6 +91,7 @@ _WORD_CENTER_JS = """
   const full = nodes.map((t) => t.data).join("");
   let idx = -1;
   for (let i = 0; i <= occurrence; i++) idx = full.indexOf(word, idx + 1);
+  if (idx === -1) return null;
   let acc = 0;
   for (const t of nodes) {
     if (idx < acc + t.data.length) {
@@ -138,6 +140,7 @@ def _occurrence_of(offsets: list[int], offset: int | None) -> int | None:
 
 def _highlight_word(page: Page, paragraph: Locator, occurrence: int) -> None:
     """Double-click the n-th copy of ``_WORD`` so only that word is selected."""
+    paragraph.scroll_into_view_if_needed()
     center = paragraph.evaluate(_WORD_CENTER_JS, [_WORD, occurrence])
     assert center is not None, f"occurrence {occurrence} of {_WORD!r} not found in paragraph"
     page.mouse.dblclick(center["x"], center["y"])
@@ -149,7 +152,13 @@ def _editor_decorations(editor: Locator, selector: str) -> list[dict]:
 
 
 def _open_markdown_in_editor(page: Page, file_path: str) -> tuple[Locator, Locator]:
-    """Open ``file_path`` from the files panel and wait for the rich-text editor."""
+    """Open ``file_path`` from the files panel and wait for the rich-text editor.
+
+    The changed-file row renders two buttons carrying the filename (open and
+    Download), so the open button is filtered by its visible text. Two
+    FileViewer instances mount with the same test id (hidden mobile drawer and
+    desktop rail); the visible one is matched directly.
+    """
     open_right_rail(page)
     file_button = page.get_by_role("button", name=re.compile(re.escape(file_path))).filter(
         has_text=file_path
@@ -157,6 +166,7 @@ def _open_markdown_in_editor(page: Page, file_path: str) -> tuple[Locator, Locat
     expect(file_button).to_be_visible(timeout=30_000)
     file_button.click()
     file_viewer = page.locator('[data-testid="file-viewer"]:visible')
+    expect(file_viewer).to_be_visible()
     editor = file_viewer.locator("[contenteditable='true']")
     expect(editor).to_be_visible(timeout=15_000)
     expect(editor).to_contain_text(_REPEATED_PARAGRAPH)
@@ -224,29 +234,8 @@ def test_markdown_rich_text_editor_add_comment(
     """
     base_url, session_id, file_path = seeded_markdown_session
     page.goto(f"{base_url}/c/{session_id}")
-    # The rail defaults open but is remembered per session; ensure it is open so the files panel is
-    # reachable.
-    open_right_rail(page)
+    file_viewer, editor_content = _open_markdown_in_editor(page, file_path)
 
-    # Wait for the markdown file to appear in the files panel. The panel
-    # polls the workspace changed-files endpoint; the PUT-seeded file shows
-    # up as a new addition relative to the git baseline.
-    # The changed-file row renders two buttons carrying the filename: the
-    # file-open button (visible text) and an icon-only Download button
-    # (aria-label "Download <name>"). Filter to the open button by its
-    # visible text so the locator stays single-element under strict mode.
-    file_button = page.get_by_role(
-        "button", name=re.compile(re.escape(_MARKDOWN_FILE_PATH))
-    ).filter(has_text=_MARKDOWN_FILE_PATH)
-    expect(file_button).to_be_visible(timeout=30_000)
-    file_button.click()
-
-    # The FileViewer should open and show the filename.
-    # Two FileViewer instances mount with the same test id (hidden mobile
-    # drawer + desktop rail). Match the visible one directly rather than by
-    # DOM order — order is not guaranteed. Matches test_markdown_rich_rendering.
-    file_viewer = page.locator('[data-testid="file-viewer"]:visible')
-    expect(file_viewer).to_be_visible()
     # The open file is identified by its tab (the desktop viewer header no
     # longer repeats a top-level filename — it's redundant with the tab).
     # exact=True targets the close button, not the tab div whose accessible
@@ -255,13 +244,9 @@ def test_markdown_rich_text_editor_add_comment(
         page.get_by_role("button", name=f"Close {_MARKDOWN_FILE_PATH}", exact=True).first
     ).to_be_visible()
 
-    # Markdown files default to rich-text editor mode. The editor renders the
-    # heading and paragraph into styled HTML via TipTap; the raw markdown
-    # syntax characters (# , **) are NOT visible in the editor surface.
-    editor_content = file_viewer.locator("[contenteditable='true']")
-    expect(editor_content).to_be_visible(timeout=10_000)
-
-    # Confirm the heading and selectable paragraph are rendered.
+    # Markdown files default to rich-text editor mode: the heading and paragraph
+    # render as styled HTML, and the raw syntax characters (# , **) are NOT
+    # visible in the editor surface.
     expect(editor_content).to_contain_text("Editor Comment Test")
     expect(editor_content).to_contain_text(_SELECTABLE_TEXT)
 
@@ -361,28 +346,7 @@ def test_heading_text_anchor_content_excludes_prefix(
     """
     base_url, session_id, file_path = seeded_markdown_session
     page.goto(f"{base_url}/c/{session_id}")
-    # The rail defaults open but is remembered per session; ensure it is open so the files panel is
-    # reachable.
-    open_right_rail(page)
-
-    # The changed-file row renders two buttons carrying the filename: the
-    # file-open button (visible text) and an icon-only Download button
-    # (aria-label "Download <name>"). Filter to the open button by its
-    # visible text so the locator stays single-element under strict mode.
-    file_button = page.get_by_role(
-        "button", name=re.compile(re.escape(_MARKDOWN_FILE_PATH))
-    ).filter(has_text=_MARKDOWN_FILE_PATH)
-    expect(file_button).to_be_visible(timeout=30_000)
-    file_button.click()
-
-    # Two FileViewer instances mount with the same test id (hidden mobile
-    # drawer + desktop rail). Match the visible one directly rather than by
-    # DOM order — order is not guaranteed. Matches test_markdown_rich_rendering.
-    file_viewer = page.locator('[data-testid="file-viewer"]:visible')
-    expect(file_viewer).to_be_visible()
-
-    editor_content = file_viewer.locator("[contenteditable='true']")
-    expect(editor_content).to_be_visible(timeout=10_000)
+    file_viewer, editor_content = _open_markdown_in_editor(page, file_path)
 
     # The heading is rendered by TipTap as an h2 element — ``## `` is NOT
     # visible text. Locate the h2 by its full rendered text and select it.

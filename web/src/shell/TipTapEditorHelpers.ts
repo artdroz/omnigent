@@ -7,9 +7,10 @@
 // Strategy (both directions):
 //   1. Build the PM text content with "\n" between blocks as a proxy for the
 //      raw file content.
-//   2. Locate anchor_content together with the text around it on the same line,
-//      so a short selection resolves to the copy the user picked even when the
-//      same text repeats nearby.  The scaled offset only breaks ties.
+//   2. Pick the copy of anchor_content whose surrounding words match the words
+//      around the selection, so a short selection resolves to the copy the user
+//      picked even when the same text repeats nearby.  The scaled offset only
+//      breaks ties.
 //   3. Map between text-content offset and PM position via binary search on
 //      doc.textBetween(0, mid, "\n").length — O(log n · n) for typical docs.
 
@@ -18,78 +19,82 @@ import type { Comment } from "@/hooks/useComments";
 
 const SEP = "\n";
 
-/** Longest run of surrounding text tried on each side of the anchor. */
-const MAX_CONTEXT = 256;
-/** Shorter runs tried when the longer ones do not occur verbatim. */
-const CONTEXT_STEPS = [128, 64, 32, 16, 8, 4, 2, 1, 0];
+/** Words compared on each side of an anchor to tell repeated copies apart. */
+const CONTEXT_WORDS = 8;
+/** Characters inspected on each side of an anchor when collecting those words. */
+const CONTEXT_CHARS = 200;
+const WORD = /[\p{L}\p{N}]+/gu;
+
+interface ContextWords {
+  before: string[];
+  after: string[];
+}
+
+const NO_CONTEXT: ContextWords = { before: [], after: [] };
 
 /**
- * Returns the occurrence of `needle` whose start is closest to `hint`.
+ * Words on the same line around `[from, to)`, nearest first.
  *
- * A fixed forward search window is not enough for short selections: another
- * copy of the same text can sit well within that window, and `indexOf`
- * returns the first one rather than the one the user selected.
+ * Markdown syntax is punctuation, so the raw file and the rendered text yield
+ * the same words even when the anchor itself is wrapped in `**` or backticks.
  */
-function nearestOccurrence(haystack: string, needle: string, hint: number): number {
+function contextWords(text: string, from: number, to: number): ContextWords {
+  const head = text.slice(Math.max(0, from - CONTEXT_CHARS), from);
+  const headCut = head.lastIndexOf(SEP);
+  const tail = text.slice(to, to + CONTEXT_CHARS);
+  const tailCut = tail.indexOf(SEP);
+  const before = (headCut === -1 ? head : head.slice(headCut + 1)).match(WORD) ?? [];
+  const after = (tailCut === -1 ? tail : tail.slice(0, tailCut)).match(WORD) ?? [];
+  return {
+    before: before.reverse().slice(0, CONTEXT_WORDS),
+    after: after.slice(0, CONTEXT_WORDS),
+  };
+}
+
+function commonPrefix(a: string[], b: string[]): number {
+  let n = 0;
+  while (n < a.length && n < b.length && a[n] === b[n]) n++;
+  return n;
+}
+
+/**
+ * Returns the occurrence of `needle` whose surrounding words best match
+ * `context`; `hint` breaks ties.  With no context this is the occurrence
+ * nearest to `hint`.  Returns -1 when `needle` does not occur.
+ */
+function locateOccurrence(
+  haystack: string,
+  needle: string,
+  context: ContextWords,
+  hint: number,
+): number {
   if (!needle) return -1;
+  const first = haystack.indexOf(needle);
+  if (first === -1 || haystack.indexOf(needle, first + 1) === -1) return first;
+
+  const maxScore = context.before.length + context.after.length;
   let best = -1;
+  let bestScore = -1;
   let bestDistance = Number.POSITIVE_INFINITY;
-  let from = 0;
+  let from = first;
   while (from <= haystack.length) {
     const found = haystack.indexOf(needle, from);
     if (found === -1) break;
+    const around = contextWords(haystack, found, found + needle.length);
+    const score =
+      commonPrefix(context.before, around.before) + commonPrefix(context.after, around.after);
     const distance = Math.abs(found - hint);
-    if (distance < bestDistance) {
+    if (score > bestScore || (score === bestScore && distance < bestDistance)) {
       best = found;
+      bestScore = score;
       bestDistance = distance;
-    } else if (found > hint) {
-      break;
     }
+    // Copies past the hint only get farther away, so a best match that already
+    // has every context word cannot be beaten.
+    if (bestScore === maxScore && found > hint && distance >= bestDistance) break;
     from = found + 1;
   }
   return best;
-}
-
-/** The text sharing a line with `[from, to)`, split into prefix and suffix. */
-function lineContext(text: string, from: number, to: number): { prefix: string; suffix: string } {
-  const lineStart = from > 0 ? text.lastIndexOf(SEP, from - 1) + 1 : 0;
-  const nextSep = text.indexOf(SEP, to);
-  const lineEnd = nextSep === -1 ? text.length : nextSep;
-  return { prefix: text.slice(lineStart, from), suffix: text.slice(to, lineEnd) };
-}
-
-function contextLengths(available: number): number[] {
-  const longest = Math.min(available, MAX_CONTEXT);
-  return [longest, ...CONTEXT_STEPS.filter((n) => n < longest)];
-}
-
-/**
- * Locates `needle` in `haystack`, telling repeated copies apart by the text
- * that surrounded it where it came from. Markdown syntax exists only on the raw
- * side, so context pairs are tried from the longest total down to the bare
- * needle; `hint` breaks ties. Returns the start of `needle`, or -1.
- */
-function locateWithContext(
-  haystack: string,
-  needle: string,
-  prefix: string,
-  suffix: string,
-  hint: number,
-): number {
-  if (!needle || haystack.indexOf(needle) === -1) return -1;
-
-  const pairs: [number, number][] = [];
-  for (const p of contextLengths(prefix.length)) {
-    for (const s of contextLengths(suffix.length)) pairs.push([p, s]);
-  }
-  pairs.sort((a, b) => b[0] + b[1] - (a[0] + a[1]) || Math.min(b[0], b[1]) - Math.min(a[0], a[1]));
-
-  for (const [p, s] of pairs) {
-    const context = prefix.slice(prefix.length - p) + needle + suffix.slice(0, s);
-    const found = nearestOccurrence(haystack, context, hint - p);
-    if (found !== -1) return found + p;
-  }
-  return -1;
 }
 
 /**
@@ -117,9 +122,9 @@ function textOffsetToPmPos(doc: ProseMirrorNode, offset: number): number {
 /**
  * Finds the PM [from, to) range for a saved comment.
  *
- * Uses anchor_content as the text to locate. The raw text around start_index
- * identifies which copy of a repeated anchor the comment belongs to; the
- * start_index scaled by the textContent/rawContent ratio breaks ties.
+ * Uses anchor_content as the text to locate. The words around start_index in
+ * the raw file identify which copy of a repeated anchor the comment belongs
+ * to; start_index scaled by the textContent/rawContent ratio breaks ties.
  *
  * Returns null when anchor_content is absent or not found in the document.
  */
@@ -140,12 +145,12 @@ export function findPmRangeForComment(
   // The surrounding raw text is only meaningful while the stored offset still
   // points at the anchor (the file may have changed since the comment was made).
   const rawEnd = start_index + anchor_content.length;
-  const { prefix, suffix } =
+  const context =
     rawContent.slice(start_index, rawEnd) === anchor_content
-      ? lineContext(rawContent, start_index, rawEnd)
-      : { prefix: "", suffix: "" };
+      ? contextWords(rawContent, start_index, rawEnd)
+      : NO_CONTEXT;
 
-  const textFrom = locateWithContext(textContent, anchor_content, prefix, suffix, hint);
+  const textFrom = locateOccurrence(textContent, anchor_content, context, hint);
   if (textFrom === -1) return null;
 
   const from = textOffsetToPmPos(doc, textFrom);
@@ -159,8 +164,8 @@ export function findPmRangeForComment(
  * Computes raw-file comment anchor data for a PM selection range.
  *
  * Extracts the selected text as anchor_content, then searches for it in
- * rawContent together with the text around the selection; the scaled
- * text-content offset breaks ties between identical copies.
+ * rawContent using the words around the selection; the scaled text-content
+ * offset breaks ties between identical copies.
  *
  * When the text cannot be found verbatim in the raw file (e.g. multi-line
  * selections, table cells, or code blocks whose markdown syntax the parser
@@ -186,12 +191,12 @@ export function computeSelectionData(
   const hint =
     textContent.length > 0 ? Math.round((textFrom * rawContent.length) / textContent.length) : 0;
 
-  const { prefix, suffix } =
+  const context =
     textContent.slice(textFrom, textTo) === anchor_content
-      ? lineContext(textContent, textFrom, textTo)
-      : { prefix: "", suffix: "" };
+      ? contextWords(textContent, textFrom, textTo)
+      : NO_CONTEXT;
 
-  const idx = locateWithContext(rawContent, anchor_content, prefix, suffix, hint);
+  const idx = locateOccurrence(rawContent, anchor_content, context, hint);
 
   // Fall back to proportional indices when the anchor text isn't found
   // verbatim (multi-line, table, code block selections).
