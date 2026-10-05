@@ -783,6 +783,10 @@ Field meanings:
   other consumers. For credential hypotheses, include the configured-path
   control and observation from Step 1. Execute missing feasible checks before
   the final handoff; preserve concrete blockers and unverified causes explicitly.
+  For credential-related investigations, record the provider actually selected,
+  including fallback selection; attempted SDK setup is not successful execution.
+  Label fresh-instance header checks separately from new-process or successful-
+  connection checks, and keep unexercised outcomes unverified throughout the handoff.
 - `recordings` — the Step 4 captures: a list of
   `{"surface", "kind", "path", "format", "capture_mode", "caption"}` objects. `kind` is
   `"before"` for a `reproduced` facet's failing run or `"fixed"` for an
