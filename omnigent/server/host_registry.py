@@ -357,6 +357,7 @@ class HostConnection:
     connected_at: float
     last_frame_at: float
     account_generation: str | None = None
+    runner_ids: set[str] = field(default_factory=set)
     # True when this tunnel authenticated with a valid managed-sandbox launch
     # token, i.e. a server-provisioned sandbox proving itself on connect — not a
     # user machine reusing a managed host's id under ordinary login. Read by the
@@ -511,6 +512,7 @@ class HostRegistry:
             connected_at=now,
             last_frame_at=now,
             registered_with_managed_token=registered_with_managed_token,
+            runner_ids=set(hello.runners),
         )
         with self._lock:
             key = (ws_id, host_id)

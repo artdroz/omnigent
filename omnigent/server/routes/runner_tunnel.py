@@ -185,6 +185,7 @@ def create_runner_tunnel_router(
     *,
     allowed_tunnel_tokens: frozenset[str] | None = None,
     on_runner_disconnect: Callable[[str], Awaitable[None]] | None = None,
+    on_runner_connection_lost: Callable[[str, str, int], Awaitable[None]] | None = None,
     on_runner_connect: Callable[[str], Awaitable[None]] | None = None,
     auth_provider: AuthProvider | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
@@ -491,6 +492,26 @@ def create_runner_tunnel_router(
                 ),
             }
 
+        lost_at_ms: int | None = None
+        disconnect_notified = False
+
+        async def _notify_disconnect() -> None:
+            nonlocal disconnect_notified
+            if disconnect_notified:
+                return
+            disconnect_notified = True
+            try:
+                if on_runner_connection_lost is not None and session is not None:
+                    await on_runner_connection_lost(
+                        runner_id,
+                        session.connection_id,
+                        lost_at_ms if lost_at_ms is not None else time.time_ns() // 1_000_000,
+                    )
+                elif on_runner_disconnect is not None:
+                    await on_runner_disconnect(runner_id)
+            except Exception:
+                _logger.exception("on_runner_disconnect callback failed for %s", runner_id)
+
         try:
             # 3. Receive hello frame.
             raw = await ws.receive_text()
@@ -528,6 +549,7 @@ def create_runner_tunnel_router(
                     runner_id=runner_id,
                     version=frame.runner_version,
                     connection_id=frame.connection_id,
+                    runner_connection_id=session.connection_id,
                 ),
             )
 
@@ -587,6 +609,7 @@ def create_runner_tunnel_router(
                     {sender_task, ping_task, receive_task},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+                lost_at_ms = time.time_ns() // 1_000_000
                 # Every helper that had finished, by role: a server-declared
                 # ping timeout may or may not already carry the peer's close.
                 ended_by = ",".join(sorted(t.get_name().split(":", 1)[0] for t in done))
@@ -656,14 +679,7 @@ def create_runner_tunnel_router(
                     return_exceptions=True,
                 )
                 registry.deregister(runner_id, session)
-                if on_runner_disconnect is not None:
-                    try:
-                        await on_runner_disconnect(runner_id)
-                    except Exception:
-                        _logger.exception(
-                            "on_runner_disconnect callback failed for %s",
-                            runner_id,
-                        )
+                await _notify_disconnect()
 
         except WebSocketDisconnect as exc:
             shutdown_state.note_tunnel_close_code(getattr(exc, "code", None))
@@ -680,14 +696,7 @@ def create_runner_tunnel_router(
                     **_connection_attrs(),
                 ),
             )
-            if on_runner_disconnect is not None:
-                try:
-                    await on_runner_disconnect(runner_id)
-                except Exception:
-                    _logger.exception(
-                        "on_runner_disconnect callback failed for %s",
-                        runner_id,
-                    )
+            await _notify_disconnect()
         except Exception:
             _logger.exception(
                 "Tunnel error for runner %s",
@@ -698,14 +707,7 @@ def create_runner_tunnel_router(
                 registry.deregister(runner_id, session)
             else:
                 registry.deregister(runner_id)
-            if on_runner_disconnect is not None:
-                try:
-                    await on_runner_disconnect(runner_id)
-                except Exception:
-                    _logger.exception(
-                        "on_runner_disconnect callback failed for %s",
-                        runner_id,
-                    )
+            await _notify_disconnect()
 
     return router
 

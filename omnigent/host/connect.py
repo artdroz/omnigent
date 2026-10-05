@@ -16,10 +16,12 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
@@ -102,6 +104,8 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostShutdownAckFrame,
+    HostShutdownFrame,
     HostSkillContentFrame,
     HostSkillContentResultFrame,
     HostSkillsFrame,
@@ -127,6 +131,11 @@ from omnigent.host.git_worktree import (
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
+from omnigent.host.shutdown import (
+    SHUTDOWN_NOTIFY_TIMEOUT_S,
+    ShutdownIntent,
+    read_shutdown_request,
+)
 from omnigent.inner import _proc
 from omnigent.onboarding.harness_auth import (
     adopt_env_credential,
@@ -1281,6 +1290,118 @@ class HostProcess:
         self._lifecycle_lock = lifecycle_lock
         self._lifecycle_task: asyncio.Task[None] | None = None
         self._lifecycle_lost = asyncio.Event()
+        self._process_id = (
+            lifecycle_lock.process_id() if lifecycle_lock is not None else None
+        ) or uuid.uuid4().hex
+        self._connection_id: str | None = None
+        self._shutdown_intent: ShutdownIntent | None = None
+        self._shutdown_ack = asyncio.Event()
+        self._shutdown_task: asyncio.Task[None] | None = None
+        self._run_task: asyncio.Task[None] | None = None
+        self._tearing_down = False
+        self._spawning_runner_ids: set[str] = set()
+
+    def _on_shutdown_signal(self, sig: int) -> None:
+        """Observe a signal before asyncio cancellation can close the tunnel."""
+        if self._shutdown_task is not None:
+            # A second interrupt skips the best-effort notification wait.
+            self._shutdown_task.cancel()
+            if self._run_task is not None:
+                self._run_task.cancel()
+            return
+        intent = None
+        if sig == signal.SIGTERM and self._lifecycle_lock is not None:
+            intent = read_shutdown_request(
+                self._lifecycle_lock.shutdown_request_path(self._process_id),
+                self._process_id,
+                os.getpid(),
+            )
+        if intent is None:
+            intent = ShutdownIntent(
+                reason="host_interrupted_sigint" if sig == signal.SIGINT else "unknown",
+                action="signal",
+                initiator="unknown",
+                signal_name=(
+                    "SIGINT"
+                    if sig == signal.SIGINT
+                    else "SIGTERM"
+                    if sig == signal.SIGTERM
+                    else "SIGHUP"
+                ),
+            )
+        self._shutdown_intent = intent.model_copy(
+            update={
+                "host_id": self._identity.host_id,
+                "host_process_id": self._process_id,
+                "host_connection_id": self._connection_id,
+                "host_pid": os.getpid(),
+            }
+        )
+        self._shutdown_task = asyncio.create_task(self._notify_shutdown(), name="host-shutdown")
+
+    async def _notify_shutdown(self) -> None:
+        """Bound evidence delivery and acknowledgment, then allow normal teardown."""
+        intent = self._shutdown_intent
+        assert intent is not None
+        _logger.info(
+            "%s",
+            intent.category,
+            extra=debug_event("host_shutdown_requested", **intent.log_attrs()),
+        )
+        try:
+            async with asyncio.timeout(SHUTDOWN_NOTIFY_TIMEOUT_S):
+                snapshot = list(self._runners.items())
+                spawning = set(self._spawning_runner_ids)
+                runners = await asyncio.to_thread(
+                    lambda: [rid for rid, handle in snapshot if handle.proc.poll() is None]
+                )
+                # A process already dead before the signal remains a crash.
+                for runner_id, _handle in snapshot:
+                    if runner_id not in runners:
+                        await self._watch_runner(runner_id)
+                runners = sorted(set(runners) | spawning)
+                ws = self._ws
+                if ws is not None:
+                    await ws.send(encode_host_frame(HostShutdownFrame(intent, runners)))
+                    await self._shutdown_ack.wait()
+        except Exception:  # noqa: BLE001 — notification must not prevent shutdown
+            _logger.info(
+                "Host shutdown evidence delivery did not complete before teardown", exc_info=True
+            )
+        finally:
+            if self._run_task is not None and not self._tearing_down:
+                self._run_task.cancel()
+
+    def _install_shutdown_handlers(self) -> dict[int, Callable[..., object] | int | None]:
+        """Replace asyncio's late SIGINT cancellation, with a Windows fallback."""
+        loop = asyncio.get_running_loop()
+        previous: dict[int, Callable[..., object] | int | None] = {}
+        sigint_seen = False
+
+        def handle_signal(received: int, _frame: object) -> None:
+            nonlocal sigint_seen
+            if received == signal.SIGINT:
+                if sigint_seen:
+                    # Match asyncio's force escape even during synchronous cleanup.
+                    for installed_sig, saved_handler in previous.items():
+                        signal.signal(installed_sig, saved_handler)
+                    # asyncio may reset SIGINT before it cancels the host task.
+                    previous.clear()
+                    raise KeyboardInterrupt
+                sigint_seen = True
+            loop.call_soon_threadsafe(self._on_shutdown_signal, received)
+
+        for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+            if sig is None:
+                continue
+            try:
+                handler = signal.getsignal(sig)
+                signal.signal(sig, handle_signal)
+                previous[sig] = handler
+            except (ValueError, OSError):
+                # Embedded hosts may run outside the main thread.
+                continue
+        return previous
 
     def _tracked_runner_pids(self) -> set[int]:
         """Return child PIDs whose exit status still belongs to a process handle.
@@ -1780,6 +1901,8 @@ class HostProcess:
         )
 
     async def _handle_launch(self, frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
+        if self._shutdown_intent is not None:
+            return self._launch_failed(frame, "Host is shutting down")
         # Attribution must not move token validation ahead of the launch preflight.
         log_runner_id = (
             token_bound_runner_id(frame.binding_token) if frame.binding_token.strip() else None
@@ -1917,6 +2040,9 @@ class HostProcess:
         # abandoned fork would never be watched, stopped, or reaped, and the
         # zygote would retain its exit status forever. On cancellation we let
         # the spawn land and then tear that runner down.
+        if self._shutdown_intent is not None:
+            return self._launch_failed(frame, "Host is shutting down")
+        self._spawning_runner_ids.add(runner_id)
         with self._host_subprocess_op():
             spawn = asyncio.ensure_future(
                 asyncio.to_thread(self._spawn_runner_proc, env, _session_slug, workspace)
@@ -1936,6 +2062,8 @@ class HostProcess:
                     frame,
                     f"failed to spawn runner: {exc}",
                 )
+            finally:
+                self._spawning_runner_ids.discard(runner_id)
 
         if proc.poll() is not None:
             # The runner died before Popen returned — its actual error
@@ -2132,6 +2260,9 @@ class HostProcess:
                     # with "init_sys_streams: Bad file descriptor" — it never
                     # connects, so the session fails with "runner did not connect".
                     stdin=subprocess.DEVNULL,
+                    # Terminal Ctrl+C must reach the host before its runners.
+                    start_new_session=IS_POSIX,
+                    creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
                     stdout=log_fh,
                     stderr=log_fh,
                     **logging_kwargs,
@@ -2192,6 +2323,16 @@ class HostProcess:
                 error=f"unknown runner: {frame.runner_id}",
             )
         handle.stop_requested = True
+        if frame.shutdown_intent is not None:
+            _logger.info(
+                "Runner stop requested",
+                extra=debug_event(
+                    "runner_shutdown_requested",
+                    session_id=handle.session_id,
+                    runner_id=frame.runner_id,
+                    **frame.shutdown_intent.log_attrs(),
+                ),
+            )
         # The poll/terminate/wait round-trips are lock-free waitpid calls for a
         # direct-Popen runner, but blocking control-socket exchanges for a
         # zygote-forked one — run them off the loop so a wedged zygote can't
@@ -3922,6 +4063,8 @@ class HostProcess:
             authorization / outdated server, or a loopback server that
             kept refusing connections (the local server is gone).
         """
+        self._run_task = asyncio.current_task()
+        previous_signal_handlers = self._install_shutdown_handlers()
         # Reap orphaned harness/tool grandchildren that reparent here when a
         # runner dies (this host is PID 1 in a container, or a subreaper
         # otherwise). Without this they pile up as <defunct> zombies and can
@@ -4136,6 +4279,10 @@ class HostProcess:
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
+            self._tearing_down = True
+            if self._shutdown_task is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._shutdown_task
             model_options_prewarm_task = self._model_options_prewarm_task
             if model_options_prewarm_task is not None:
                 model_options_prewarm_task.cancel()
@@ -4203,6 +4350,8 @@ class HostProcess:
             # old-host/new-host handoff a deterministic startup-sweep barrier.
             if self._lifecycle_lock is not None:
                 self._lifecycle_lock.release()
+            for sig, handler in previous_signal_handlers.items():
+                signal.signal(sig, handler)
 
     def _on_resume_from_suspend(self, gap_s: float) -> None:
         """Force-drop the tunnel after a detected wake from system suspend.
@@ -4491,12 +4640,17 @@ class HostProcess:
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
             capabilities=list(HOST_CAPABILITIES),
+            process_id=self._process_id,
+            connection_id=uuid.uuid4().hex,
         )
         try:
             encoded_hello = encode_host_frame(hello)
         except Exception as exc:
             raise HostConnectError(f"Could not encode host.hello: {exc}") from exc
         await ws.send(encoded_hello)
+        self._connection_id = hello.connection_id
+        if self._lifecycle_lock is not None and self._connection_id is not None:
+            self._lifecycle_lock.publish_connection(self._process_id, self._connection_id)
         # A completed failed boot probe gets another best-effort chance only
         # after registration reaches the server. Keeping this out of the outer
         # connection-attempt loop avoids repeatedly spawning native probes while
@@ -4722,6 +4876,13 @@ class HostProcess:
             ignored.
         :returns: None.
         """
+        if isinstance(frame, HostShutdownAckFrame):
+            if (
+                self._shutdown_intent is not None
+                and frame.shutdown_id == self._shutdown_intent.shutdown_id
+            ):
+                self._shutdown_ack.set()
+            return
         if isinstance(frame, HostConnectionErrorFrame):
             # Defensive for direct callers; production handles this inline in
             # _serve_frames so detached request tasks cannot swallow it.

@@ -35,6 +35,7 @@ import contextlib
 import logging
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
@@ -117,6 +118,7 @@ class RunnerSession:
     ws_channels: dict[str, WSChannelState] = field(default_factory=dict)
     close_code: int | None = None
     close_reason: str | None = None
+    connection_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 @dataclass

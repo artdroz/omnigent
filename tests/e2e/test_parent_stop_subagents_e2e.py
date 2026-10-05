@@ -30,6 +30,8 @@ from dev.repro_env.runtime import write_model_config
 from omnigent.onboarding.ambient import CLAUDE_CODE_MANAGED_SETTINGS_PATHS
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.server.routes.sessions import RUNNER_DISCONNECT_GRACE_S
+from omnigent.server.shutdown_attribution import SessionScope, SessionShutdown
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests._helpers.server_runner import server_runner
 from tests._helpers.session import bundle_files, post_session_bundle
 from tests.e2e.conftest import get_mock_requests, set_fallback_mock_llm
@@ -253,6 +255,7 @@ def test_native_parent_teardown_preserves_child_outcome(
             )
 
         host = _wait(online_host, "real host registration")
+        store = SqlAlchemyConversationStore(stack.database_uri)
         spec = {
             "name": "native-teardown-parent",
             "prompt": "Delegate research to the worker using sys_session_send.",
@@ -331,6 +334,7 @@ def test_native_parent_teardown_preserves_child_outcome(
         assert before["external_session_id"] != parent["external_session_id"], (parent, before)
         with _Stream(stack.base_url, child_id) as stream:
             stopped_at = time.monotonic()
+            requested_at_ms = time.time_ns() // 1_000_000
             if action == "crash":
                 launched = re.search(
                     rf"Runner started: {re.escape(parent['runner_id'])} \(pid=(\d+)\)",
@@ -354,7 +358,12 @@ def test_native_parent_teardown_preserves_child_outcome(
             disconnected_at = time.monotonic()
             decisions = tuple(
                 f"Relay: runner transport lost for session={child_id} ({decision})"
-                for decision in ("intentional_stop", "failed_mid_turn", "idle_no_failure")
+                for decision in (
+                    "intentional_stop",
+                    "failed_mid_turn",
+                    "idle_no_failure",
+                    "superseded_lifecycle",
+                )
             )
 
             def disconnect_decided():
@@ -371,6 +380,10 @@ def test_native_parent_teardown_preserves_child_outcome(
                 max(0, RUNNER_DISCONNECT_GRACE_S + 5 - (time.monotonic() - disconnected_at))
             )
         events = list(stream.events)
+        shutdown_states = {
+            session_id: store.get_shutdown_state(session_id)
+            for session_id in (parent_id, child_id)
+        }
         evidence = {
             "commit": subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=_REPO, text=True
@@ -384,6 +397,7 @@ def test_native_parent_teardown_preserves_child_outcome(
             "runner_id": parent["runner_id"],
             "before": before,
             "events": events,
+            "shutdown_states": shutdown_states,
             "labels_after": _get(client, f"/v1/sessions/{child_id}/labels"),
             "elapsed_s": time.monotonic() - stopped_at,
             "offline_elapsed_s": time.monotonic() - disconnected_at,
@@ -412,5 +426,32 @@ def test_native_parent_teardown_preserves_child_outcome(
         after = _get(client, f"/v1/sessions/{child_id}")
         if action == "crash":
             assert after["status"] == "failed" and after["last_task_error"], after
+            for state in shutdown_states.values():
+                assert state is not None and not state.get("intent"), state
+            assert shutdown_states[child_id]["live_status"] == "failed", shutdown_states
         else:
             assert after["status"] == "idle" and after["last_task_error"] is None, after
+            # Native status callbacks can supersede a relay's observed scope.
+            # The offline sweep must still settle the exact persisted Stop.
+            shutdowns = []
+            for state in shutdown_states.values():
+                assert state is not None and state["settled"] is True, state
+                assert state["live_status"] == "idle", state
+                shutdown = SessionShutdown.model_validate_json(state["intent"])
+                assert shutdown.scope == SessionScope.model_validate_json(state["scope"]), state
+                assert shutdown.scope.runner_id == state["runner_id"] == parent["runner_id"]
+                assert shutdown.intent.requested and not shutdown.preserve_failure, state
+                assert shutdown.intent.reason == "user_stopped_session", state
+                assert shutdown.intent.action == (
+                    "stop_session" if action == "stop" else "archive"
+                )
+                assert shutdown.intent.host_id == host["host_id"], state
+                assert (
+                    requested_at_ms <= shutdown.intent.requested_at_ms <= shutdown.recorded_at_ms
+                )
+                shutdowns.append(shutdown)
+            assert shutdowns[0].intent.shutdown_id == shutdowns[1].intent.shutdown_id
+            assert (
+                shutdowns[0].scope.runner_connection_id == shutdowns[1].scope.runner_connection_id
+            )
+            assert shutdowns[0].scope.lifecycle_id != shutdowns[1].scope.lifecycle_id
