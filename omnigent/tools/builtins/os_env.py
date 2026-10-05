@@ -137,18 +137,11 @@ _OS_SHELL_SCHEMA: dict[str, Any] = {
 
 def unknown_shell_argument_error(args: dict[str, Any]) -> dict[str, Any] | None:
     """
-    Reject a ``sys_os_shell`` call that names arguments the tool
-    does not accept.
+    Return an error result when *args* names arguments ``sys_os_shell``
+    does not declare, else ``None``.
 
-    A misnamed optional argument (``timeout_seconds`` for
-    ``timeout``) would otherwise be dropped silently and the
-    120-second default applied.
-
-    :param args: Parsed tool-call arguments, e.g.
-        ``{"command": "ls", "timeout_seconds": 5}``.
-    :returns: An ``{"error": ...}`` result naming the unknown and
-        the accepted argument names, or ``None`` when every name
-        is accepted.
+    A misnamed optional argument such as ``timeout_seconds`` would
+    otherwise be dropped silently and the 120-second default applied.
     """
     accepted = _OS_SHELL_SCHEMA["properties"]
     unknown = sorted(name for name in args if name not in accepted)
