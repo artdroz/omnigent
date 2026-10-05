@@ -308,6 +308,19 @@ def test_recording_blockers_are_explicit_and_do_not_block_delivery() -> None:
     assert "no before-clip was recovered" in normalized
     assert "Do not block the fix or PR because footage is missing or rejected" in normalized
 
+    # Pin the final-review.md gate at its own source; the aggregate checks above
+    # could survive if only this entry point's Repro-attempt requirement vanished.
+    final_review_gate = " ".join(
+        (_RESOLVE_AGENT / "skills" / "resolve-drive-pr" / "final-review.md")
+        .read_text(encoding="utf-8")
+        .split()
+    )
+    assert (
+        "established after running any capture method the Repro bundle retained "
+        "for that surface" in final_review_gate
+    )
+    assert "keeping the inherited before-clip declared" in final_review_gate
+
 
 def test_resolve_drives_both_reviews_and_preserves_incomplete_outcomes() -> None:
     instructions = _normalized_resolve_instructions()
