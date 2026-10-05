@@ -116,6 +116,7 @@ function startHostDaemon(cliShim, serverUrl, logPath) {
     env: { ...process.env },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  const closed = new Promise((resolve) => child.once("close", resolve));
   let log = "";
   const out = fs.createWriteStream(logPath);
   const closeLog = () => {
@@ -127,7 +128,7 @@ function startHostDaemon(cliShim, serverUrl, logPath) {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      resolve({ child, connected, log });
+      resolve({ child, closed, connected, log });
     };
     const timer = setTimeout(() => finish(false), 60_000);
     const onData = (buf) => {
@@ -157,21 +158,12 @@ async function fetchHosts(serverUrl) {
   return body.hosts ?? [];
 }
 
-function stopDaemon(child) {
-  // SIGTERM first; SIGKILL if the daemon has not closed its stdio within 5 s.
-  // Resolve only after "close" so nothing is written under HOME after rmSync.
-  return new Promise((resolve) => {
-    if (child.exitCode !== null || child.signalCode !== null) {
-      resolve();
-      return;
-    }
-    const timer = setTimeout(() => child.kill("SIGKILL"), 5_000);
-    child.once("close", () => {
-      clearTimeout(timer);
-      resolve();
-    });
-    child.kill("SIGTERM");
-  });
+function stopDaemon({ child, closed }) {
+  // SIGTERM first, SIGKILL after 5 s; resolve only once "close" has fired so
+  // nothing is written under HOME after it is removed.
+  if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+  const escalate = setTimeout(() => child.kill("SIGKILL"), 5_000);
+  return closed.finally(() => clearTimeout(escalate));
 }
 
 async function waitForOnlineHost(serverUrl, timeoutMs = 20_000) {
@@ -233,15 +225,16 @@ async function settleAndSnapshot(window, recordDir, name, extra) {
 async function closeJourney(journey) {
   // Stop filming before the window goes away so the clip ends on the observed
   // state, then run every step even if one throws: a crashed app must not leak
-  // the daemon or the server into the next journey.
+  // the daemon or the server into the next journey. Failures are returned.
   let saved = [];
+  const failures = [];
   const steps = [
     () => journey.stopDisplayCapture?.(),
     () => journey.electronApp?.close(),
     () => {
       saved = saveRecording(journey.recordDir, journey.name);
     },
-    () => journey.child && stopDaemon(journey.child),
+    () => journey.daemon && stopDaemon(journey.daemon),
     () => journey.server?.close(),
     () => journey.userDataDir && fs.rmSync(journey.userDataDir, { recursive: true, force: true }),
     () => journey.home && fs.rmSync(journey.home, { recursive: true, force: true }),
@@ -254,11 +247,11 @@ async function closeJourney(journey) {
     try {
       await step();
     } catch (err) {
-      console.error("teardown step failed:", err);
+      failures.push(err);
     }
   }
   /* oxlint-enable no-await-in-loop */
-  return saved;
+  return { saved, failures };
 }
 
 describe("desktop shell — 'Use this machine' selects the local host", { skip: SKIP_REASON }, () => {
@@ -279,7 +272,7 @@ describe("desktop shell — 'Use this machine' selects the local host", { skip: 
     const recordDir = path.join(RECORD_ROOT, "run-on-this-machine");
     fs.mkdirSync(recordDir, { recursive: true });
     const journey = { recordDir, name: "run-on-this-machine" };
-    let saved;
+    let closed;
     try {
       // Each journey gets its own host registry.
       journey.server = await spawnServer(fs.mkdtempSync(path.join(tmpDir, "srv-connect-")));
@@ -325,16 +318,17 @@ describe("desktop shell — 'Use this machine' selects the local host", { skip: 
         `expected exactly one online host after the connect, got: ${JSON.stringify(hosts)}`,
       );
     } finally {
-      saved = await closeJourney(journey);
+      closed = await closeJourney(journey);
     }
-    assert.ok(saved.length > 0, "no desktop recording was produced");
+    assert.equal(closed.failures.length, 0, `teardown failed: ${closed.failures.join("; ")}`);
+    assert.ok(closed.saved.length > 0, "no desktop recording was produced");
   });
 
   it("auto-selects a local host daemon the user already started in a terminal", async () => {
     const recordDir = path.join(RECORD_ROOT, "manual-host");
     fs.mkdirSync(recordDir, { recursive: true });
     const journey = { recordDir, name: "manual-host" };
-    let saved;
+    let closed;
     try {
       journey.server = await spawnServer(fs.mkdtempSync(path.join(tmpDir, "srv-manual-")));
       Object.assign(journey, prepareProfile("manual", journey.server.serverUrl, cliShim));
@@ -344,7 +338,7 @@ describe("desktop shell — 'Use this machine' selects the local host", { skip: 
         journey.server.serverUrl,
         path.join(recordDir, "daemon.log"),
       );
-      journey.child = daemon.child;
+      journey.daemon = daemon;
       assert.ok(daemon.connected, `omnigent host did not connect:\n${daemon.log.slice(-2000)}`);
       await waitForOnlineHost(journey.server.serverUrl);
 
@@ -367,16 +361,17 @@ describe("desktop shell — 'Use this machine' selects the local host", { skip: 
         `host chip never picked the running local host — it reads ${JSON.stringify(outcome.label)}`,
       );
     } finally {
-      saved = await closeJourney(journey);
+      closed = await closeJourney(journey);
     }
-    assert.ok(saved.length > 0, "no desktop recording was produced");
+    assert.equal(closed.failures.length, 0, `teardown failed: ${closed.failures.join("; ")}`);
+    assert.ok(closed.saved.length > 0, "no desktop recording was produced");
   });
 
   it("recovers when the persisted last-host choice carries the legacy host_ prefix", async () => {
     const recordDir = path.join(RECORD_ROOT, "legacy-host-choice");
     fs.mkdirSync(recordDir, { recursive: true });
     const journey = { recordDir, name: "legacy-host-choice" };
-    let saved;
+    let closed;
     try {
       journey.server = await spawnServer(fs.mkdtempSync(path.join(tmpDir, "srv-legacy-")));
       Object.assign(journey, prepareProfile("legacy", journey.server.serverUrl, cliShim));
@@ -386,7 +381,7 @@ describe("desktop shell — 'Use this machine' selects the local host", { skip: 
         journey.server.serverUrl,
         path.join(recordDir, "daemon.log"),
       );
-      journey.child = daemon.child;
+      journey.daemon = daemon;
       assert.ok(daemon.connected, `omnigent host did not connect:\n${daemon.log.slice(-2000)}`);
       const { host_id: hostId } = await waitForOnlineHost(journey.server.serverUrl);
 
@@ -433,8 +428,9 @@ describe("desktop shell — 'Use this machine' selects the local host", { skip: 
           `${JSON.stringify(outcome.label)}`,
       );
     } finally {
-      saved = await closeJourney(journey);
+      closed = await closeJourney(journey);
     }
-    assert.ok(saved.length > 0, "no desktop recording was produced");
+    assert.equal(closed.failures.length, 0, `teardown failed: ${closed.failures.join("; ")}`);
+    assert.ok(closed.saved.length > 0, "no desktop recording was produced");
   });
 });
