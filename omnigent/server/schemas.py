@@ -253,8 +253,9 @@ class AgentObject(BaseModel):
         declares no MCP servers or when the bundle cannot be
         loaded.
     :param mcp_servers_editable: Whether the MCP list can be edited
-        through the session UI. Built-in template agents are read-only;
-        session-scoped uploaded agents are editable.
+        through the session UI by the authenticated caller. This requires
+        ownership of both the effective session and its session-scoped agent;
+        built-in template and native agents are read-only.
     :param policies: Guardrails policies declared on the agent.
         Each entry summarises the policy name, type, and
         phases. Empty list when the spec declares no policies
@@ -923,6 +924,9 @@ class ErrorDetail(BaseModel):
         Paired with ``title``.
     :param remediation: Optional concrete next step to fix it, e.g. a command
         to run. ``None`` when there is no single clear fix.
+    :param undelivered: ``True`` when the harness reports it never received the
+        message this turn carried (it failed before delivery), so the sender's
+        queued copy is the only record of it; absent otherwise.
     """
 
     code: str
@@ -930,6 +934,7 @@ class ErrorDetail(BaseModel):
     title: str | None = None
     cause: str | None = None
     remediation: str | None = None
+    undelivered: bool | None = None
 
 
 class ErrorResponse(BaseModel):
@@ -2065,12 +2070,20 @@ class SessionResponse(BaseModel):
         the same total the cost-budget policy gates on. Lets clients
         seed their cost indicator on resume without waiting for the
         next ``session.usage`` SSE event.
+        Also ``None`` when ``usage_included`` is ``False``.
     :param usage_by_model: Per-model breakdown of the same subtree usage,
         keyed by the raw harness model id, e.g.
         ``{"claude-sonnet-4-6": ModelUsage(input_tokens=12000, ...)}``.
         ``None`` when no per-model usage has been recorded (older sessions
         recorded before this field existed, or before the first turn). Lets
         the UI show which models a session spent its tokens / budget on.
+        Also ``None`` when ``usage_included`` is ``False``.
+    :param usage_included: ``False`` when the caller skipped usage aggregation
+        with ``include_usage=false``. Both usage fields are then unknown,
+        not zero or this session's own-only spend. Display clients can load
+        them with a separate ``GET /v1/sessions/{id}`` using
+        ``include_usage=true``, ``include_items=false``,
+        ``include_liveness=false``, and ``refresh_state=false``.
     :param last_task_error: Error details from the most recently
         failed task. Only present when ``status == "failed"`` and
         the task stored an error. Lets clients display the failure
@@ -2078,7 +2091,10 @@ class SessionResponse(BaseModel):
         ``response.error`` SSE event (which may have been emitted
         before the web client subscribed). Format mirrors the
         ``RetryErrorDetail`` SSE shape:
-        ``{"code": "executor_error", "message": "..."}``.
+        ``{"code": "executor_error", "message": "..."}``. A
+        ``runner_rejected_event`` failure also carries ``item_id``, the
+        persisted item the runner refused, so a web client whose POST
+        answer was lost can match the refusal to its own send.
         ``None`` in all other cases.
     :param external_session_id: Runtime-native session id this
         conversation wraps, e.g. a Claude Code session uuid for
@@ -2196,6 +2212,7 @@ class SessionResponse(BaseModel):
     last_total_tokens: int | None = None
     total_cost_usd: float | None = None
     usage_by_model: dict[str, ModelUsage] | None = None
+    usage_included: bool = True
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
@@ -2662,25 +2679,6 @@ class ReadStatePutRequest(BaseModel):
 
     last_seen: int
     unread: bool
-
-    model_config = ConfigDict(extra="forbid")
-
-
-class SessionSwitchAgentRequest(BaseModel):
-    """
-    Request body for ``POST /v1/sessions/{id}/switch-agent``.
-
-    Rebinds an existing session in place to a different agent/harness,
-    keeping the same session (transcript, comments, files, workspace).
-    Unlike fork, no new session is created.
-
-    :param agent_id: Built-in agent to switch the session to, e.g.
-        ``"ag_builtin_codex"``. Must be a built-in agent (one listed by
-        ``GET /v1/agents``) and different from the session's current
-        agent.
-    """
-
-    agent_id: str
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3314,28 +3312,19 @@ class SessionCodexApprovalModeEvent(_SSEEventBase):
 
 class SessionAgentChangedEvent(_SSEEventBase):
     """
-    Bound-agent change on a live session.
+    The session's bound agent changed.
 
-    Emitted by the switch-agent route after the session's agent binding
-    is rewritten in place. Connected clients re-derive their cached
-    session state (harness presentation labels, bound agent id/name)
-    from a fresh snapshot — the chat UI's native-vs-SDK message
-    lifecycle depends on those labels, so a stale cache drops the first
-    post-switch message (it reappears only when the transcript
-    round-trip lands).
+    Emitted after a session's MCP servers are edited (the agent's bundle
+    is rewritten). Connected clients re-derive their cached session state
+    (bound agent, harness presentation labels) from a fresh snapshot.
 
     :param type: Always ``"session.agent_changed"``.
     :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
-    :param agent_id: The session-scoped clone now bound to the session,
-        e.g. ``"ag_abc123"``.
-    :param agent_name: Display name of the agent the session now runs,
-        e.g. ``"claude-native-ui"``. Deliberately the clean target-agent
-        name — not the clone row's ``"… (switch ag_…)"`` disambiguation
-        name — because clients render it verbatim.
+    :param agent_id: The agent bound to the session, e.g. ``"ag_abc123"``.
+    :param agent_name: Display name of that agent, e.g. ``"claude-native-ui"``.
 
-    Category: **transient** (SSE-only). The switch is persisted on the
-    conversation row, so on reconnect clients read the new binding from
-    the session snapshot rather than from a replayed event.
+    Category: **transient** (SSE-only). The change is persisted, so on
+    reconnect clients read it from the session snapshot.
     """
 
     type: Literal["session.agent_changed"]
@@ -4962,6 +4951,8 @@ class ProjectOrderRequest(BaseModel):
     """Rank owned project IDs; unranked projects append in discovery order.
 
     Null selects alphabetical mode without erasing the remembered manual IDs.
+    The serialized preference must fit in 65,535 bytes after compression and
+    framing; lists below the 10,000-ID limit can still exceed this byte limit.
     """
 
     ordered_project_ids: (

@@ -88,7 +88,7 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
                     {
                         "path": "/work/repo",
                         "branch": "live-branch",
-                        "is_main": True,
+                        "is_main": False,
                         "detached": False,
                     }
                 ]
@@ -160,12 +160,19 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
         applied_family = context.evaluate("el => getComputedStyle(el).fontFamily")
         assert applied_family.split(",")[0].strip("\"' ") == font_family
     expect(bar.get_by_test_id("background-task-pill")).to_have_text("1")
-    expect(bar.get_by_test_id("subagent-task-pill")).to_have_count(0)
+    subagent = bar.get_by_test_id("subagent-task-pill")
+    expect(subagent).to_have_text("1")
+    expect(subagent).to_have_accessible_name("1 sub-agent: 1 active")
     expect(bar).to_contain_text("live-branch")
     expect(bar).not_to_contain_text("pr-head-not-checkout")
     bounds = bar.bounding_box()
     assert bounds is not None
-    status_ids = ("composer-pr-link", "composer-context-ring", "background-task-pill")
+    status_ids = (
+        "composer-pr-link",
+        "background-task-pill",
+        "subagent-task-pill",
+        "composer-context-ring",
+    )
     control_bounds = {}
     icon_bounds = {}
     for test_id in ("composer-workspace-dir", "composer-git-branch", *status_ids):
@@ -191,9 +198,16 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
     assert bounds["height"] == pytest.approx(37, abs=0.5)
     assert center_y == pytest.approx(bounds["y"] + 19, abs=0.5)
     trailing = control_bounds[status_ids[-1]]
+    # The docked tray's content inset matches the card's shared inset
+    # (1px border + 12px padding).
     assert trailing["x"] + trailing["width"] == pytest.approx(
-        bounds["x"] + bounds["width"] - 9, abs=0.5
+        bounds["x"] + bounds["width"] - 13, abs=0.5
     )
+    background = control_bounds["background-task-pill"]
+    subagent = control_bounds["subagent-task-pill"]
+    context_ring = control_bounds["composer-context-ring"]
+    assert background["x"] + background["width"] == pytest.approx(subagent["x"], abs=0.5)
+    assert subagent["x"] + subagent["width"] + 4 == pytest.approx(context_ring["x"], abs=0.5)
     # A label that would have to truncate collapses the whole bar to icons
     # instead — the full value stays in the title — and a bar with room shows
     # every label untruncated. Neither state may show an ellipsis.
@@ -242,11 +256,12 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
     ordered_icons = [
         (test_id, icon)
         for test_id in (
-            "composer-pr-link",
             "composer-workspace-dir",
             "composer-git-branch",
-            "composer-context-ring",
+            "composer-pr-link",
             "background-task-pill",
+            "subagent-task-pill",
+            "composer-context-ring",
         )
         for icon in icon_bounds[test_id]
     ]

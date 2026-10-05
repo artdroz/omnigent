@@ -174,6 +174,13 @@ import {
   type TerminalThemeMode,
 } from "@/lib/terminalThemePreferences";
 import {
+  canRememberTerminalClipboardPreference,
+  readTerminalClipboardPreference,
+  subscribeTerminalClipboardPreference,
+  writeTerminalClipboardPreference,
+  type TerminalClipboardPreference,
+} from "@/lib/terminalClipboardPreferences";
+import {
   readWorkspacePanelDefault,
   WORKSPACE_PANEL_DEFAULT,
   writeWorkspacePanelDefault,
@@ -239,15 +246,19 @@ import {
   getCliStatus,
   isElectronShell,
   resetCliPath,
+  supportsBrowser,
   type UpdateConfig,
   type UpdateMode,
   updateBridge,
 } from "@/lib/nativeBridge";
+import { readOpenLinksInApp, writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { cn } from "@/lib/utils";
 import {
   readBackgroundSessionTitlesEnabled,
   writeBackgroundSessionTitlesEnabled,
 } from "@/lib/backgroundSessionTitlesPreferences";
+import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
+import { ReviewImportsPanel } from "@/components/onboarding/HostImportReview";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -280,6 +291,16 @@ export function SettingsPage() {
   // `section` is a closed SettingsSectionId union (no PII / unbounded values).
   useOmnigentPageView(`settings.${section}`);
 
+  const pageWrapperSettings = useMemo(() => {
+    if (section === "harnesses") {
+      return {
+        maxWidthClassName: "max-w-4xl",
+        contentClassName: "px-8",
+      };
+    }
+    return undefined;
+  }, [section]);
+
   // Members / Policies are admin-only management surfaces that own their full
   // layout (their own PageScroll + admin gating), so they render directly —
   // NOT inside the shared section PageScroll below, which would nest two
@@ -302,9 +323,10 @@ export function SettingsPage() {
   }
 
   return (
-    <PageScroll contentClassName="px-8" extraBottom="2.5rem">
+    <PageScroll contentClassName="px-8" extraBottom="2.5rem" {...pageWrapperSettings}>
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
+      {section === "harnesses" && <SettingsHarnessesSection />}
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}
       {section === "shortcuts" && <ShortcutsSection />}
@@ -639,7 +661,7 @@ function ColorThemeControl() {
       title="Color theme"
       helper="Choose a preset, then tune it across light and dark mode."
     >
-      <div className="overflow-hidden rounded-xl border bg-card/55 shadow-xs">
+      <div className="overflow-hidden rounded-xl border bg-card/55">
         <div className="flex flex-col gap-3 border-b bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex min-w-0 items-center gap-3">
             <div className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm">
@@ -993,13 +1015,10 @@ function AppearanceSection() {
             </DialogHeader>
             <DialogFooter>
               <DialogClose asChild>
-                <Button variant="outline" size="sm">
-                  Cancel
-                </Button>
+                <Button variant="outline">Cancel</Button>
               </DialogClose>
               <Button
                 variant="default"
-                size="sm"
                 onClick={confirmResetAppearance}
                 data-testid="reset-appearance-confirm"
                 componentId="settings.appearance.reset"
@@ -1042,13 +1061,10 @@ function AppearanceSection() {
           )}
           <DialogFooter>
             <DialogClose asChild>
-              <Button variant="outline" size="sm">
-                Cancel
-              </Button>
+              <Button variant="outline">Cancel</Button>
             </DialogClose>
             <Button
               variant="default"
-              size="sm"
               data-testid="import-settings-choose-file"
               onClick={() => fileInputRef.current?.click()}
             >
@@ -1065,9 +1081,14 @@ function AppearanceSection() {
 function GitSection() {
   return (
     <Section title="Git" description="Configure how Omnigent works with Git.">
-      <div className="flex flex-col gap-8">
-        <AlwaysUseWorktreeControl />
-        <DefaultBaseBranchControl />
+      <div className="flex flex-col gap-3">
+        <h2 className="text-ui font-medium">Worktrees</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <AlwaysUseWorktreeControl />
+          <div className="mt-4 border-t border-border pt-4">
+            <DefaultBaseBranchControl />
+          </div>
+        </div>
       </div>
     </Section>
   );
@@ -1467,6 +1488,45 @@ function ComposerSendShortcutControl() {
   );
 }
 
+/**
+ * Where a plain click on a web link in chat content opens — desktop shells
+ * with the embedded browser only. Off keeps the current behavior (the
+ * default external browser); on routes the link into the conversation's
+ * in-app Browser tab. Modified clicks always stay external.
+ */
+function OpenLinksInAppControl() {
+  const [enabled, setEnabled] = useState(readOpenLinksInApp);
+  const labelId = useId();
+  const descriptionId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setEnabled(next);
+    writeOpenLinksInApp(next);
+  }, []);
+
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Open links in the in-app browser
+        </span>
+        <span id={descriptionId} className="text-ui text-muted-foreground">
+          Open web links from chat in this conversation&apos;s Browser tab instead of your default
+          browser. {MOD_KEY}+click always opens the external browser.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        aria-describedby={descriptionId}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="open-links-in-app-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.open_links_in_app"
+      />
+    </div>
+  );
+}
+
 function BackgroundSessionTitlesControl() {
   const [enabled, setEnabled] = useState(readBackgroundSessionTitlesEnabled);
   const labelId = useId();
@@ -1501,6 +1561,75 @@ function BackgroundSessionTitlesControl() {
   );
 }
 
+function TerminalClipboardControl() {
+  const labelId = useId();
+  const descriptionId = useId();
+  const canRemember = canRememberTerminalClipboardPreference();
+  const [preference, setPreference] = useState<TerminalClipboardPreference>(
+    readTerminalClipboardPreference,
+  );
+  const [saveFailed, setSaveFailed] = useState(false);
+
+  useEffect(
+    () =>
+      subscribeTerminalClipboardPreference((value) => {
+        setPreference(value);
+        setSaveFailed(false);
+      }),
+    [],
+  );
+
+  const update = (value: string) => {
+    if (!canRemember) return;
+    if (value !== "ask" && value !== "allow" && value !== "block") return;
+    const saved = writeTerminalClipboardPreference(value);
+    if (saved) setPreference(value);
+    setSaveFailed(!saved);
+  };
+
+  return (
+    <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <span id={labelId} className="text-ui font-medium">
+          Copying from terminals
+        </span>
+        <span id={descriptionId} className="text-sm text-muted-foreground">
+          {canRemember
+            ? "Controls copying text from all sessions and terminals on this server in this browser or app. Allowing copying also lets terminal programs silently replace your clipboard with text or commands you didn’t intend to paste."
+            : "This connection can’t remember clipboard permissions. You can still allow or block copying for each open terminal."}
+        </span>
+        {saveFailed && (
+          <span role="alert" className="text-sm text-destructive">
+            Couldn&apos;t save this preference in this browser or app. Your previous setting is
+            unchanged.
+          </span>
+        )}
+      </div>
+      <Select
+        value={preference}
+        disabled={!canRemember}
+        onValueChange={update}
+        componentId="settings.general.terminal_clipboard"
+        valueHasNoPii
+      >
+        <SelectTrigger
+          aria-labelledby={labelId}
+          aria-describedby={descriptionId}
+          data-testid="terminal-clipboard-preference-select"
+          className="w-48 shrink-0"
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="ask">Ask before copying</SelectItem>
+          <SelectItem value="allow">Allow copying</SelectItem>
+          <SelectItem value="block">Block copying</SelectItem>
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
 /** App-wide behavior settings. */
 function GeneralSection() {
   return (
@@ -1517,6 +1646,18 @@ function GeneralSection() {
         <div className="rounded-xl border border-border bg-card p-4">
           <BackgroundSessionTitlesControl />
         </div>
+        <h2 className="mt-3 text-ui font-medium">Terminal</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <TerminalClipboardControl />
+        </div>
+        {supportsBrowser() && (
+          <>
+            <h2 className="mt-3 text-ui font-medium">Links</h2>
+            <div className="rounded-xl border border-border bg-card p-4">
+              <OpenLinksInAppControl />
+            </div>
+          </>
+        )}
       </div>
     </Section>
   );
@@ -1962,7 +2103,7 @@ function StepperButton({
 function ShortcutsSection() {
   return (
     <Section title="Keyboard shortcuts" description="Speed up common actions with the keyboard.">
-      <KeyboardShortcutsList />
+      <KeyboardShortcutsList variant="settings" />
     </Section>
   );
 }
@@ -2495,7 +2636,21 @@ function ImportSection() {
       title="Import sessions"
       description="Pull local chats from a machine you're running into Omnigent. Sessions already imported are skipped."
     >
-      <ImportSessionsPanel />
+      <div className="flex flex-col gap-3">
+        <h2 className="text-ui font-medium">Import from a machine</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <ImportSessionsPanel />
+        </div>
+      </div>
+      <div className="mt-8 flex flex-col gap-3">
+        <h2 className="text-ui font-medium">Harness imports</h2>
+        <p className="-mt-2 text-ui text-muted-foreground">
+          See the logins, MCP servers, skills, and plugins each machine's harnesses carry over.
+        </p>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <ReviewImportsPanel />
+        </div>
+      </div>
     </Section>
   );
 }
@@ -2531,8 +2686,16 @@ function ArchivedSection() {
     }
   }, [project, projectNames, namesQuery.isSuccess, namesQuery.isFetching]);
 
-  // The visible list, filtered server-side via ?project= when one is picked.
-  const listQuery = useConversations("", true, undefined, project);
+  // Named projects need the owner-scoped "all" query, including archived rows.
+  // The unfiltered view can request only archives across all accessible sessions.
+  // Keep includeArchived for older servers that ignore visibility.
+  const listQuery = useConversations(
+    "",
+    true,
+    undefined,
+    project,
+    project === undefined ? "archived" : undefined,
+  );
   const archived = useMemo(
     () => (listQuery.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
     [listQuery.data],

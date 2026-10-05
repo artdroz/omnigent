@@ -1,3 +1,4 @@
+import type * as WorkspacePickerModule from "./WorkspacePicker";
 import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
 
 vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
@@ -39,6 +40,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import type { ReactNode } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
+import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -51,6 +53,7 @@ import { showToast } from "@/components/ui/toast";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 // A project-driven visit (`?project=` resolved to a first-class project id)
 // creates the session WITH `project_id`: the server files it atomically and
@@ -114,7 +117,8 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 }));
 // The file browser is heavy UI; a stub button stands in for a user selection —
 // deliberately re-picking the config workspace through the modal commit path.
-vi.mock("./WorkspacePicker", () => ({
+vi.mock("./WorkspacePicker", async (importOriginal) => ({
+  ...(await importOriginal<typeof WorkspacePickerModule>()),
   isNavigablePath: () => false,
   WorkspacePicker: (props: { onSelect: (path: string) => void }) => (
     <button
@@ -177,7 +181,7 @@ function agent(overrides: Partial<AvailableAgent> = {}): AvailableAgent {
     name: "hello_world",
     display_name: "Hello World",
     description: null,
-    harness: null,
+    harness: "claude-sdk",
     skills: [],
     ...overrides,
   };
@@ -243,7 +247,9 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}): {
   function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryClientProvider client={client}>
-        <CapabilitiesProvider info={info}>{children}</CapabilitiesProvider>
+        <CapabilitiesProvider info={info}>
+          <TooltipProvider>{children}</TooltipProvider>
+        </CapabilitiesProvider>
       </QueryClientProvider>
     );
   }
@@ -361,6 +367,10 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     expect(body.workspace).toBe(RECENT_WORKSPACE);
     expect(body.labels).toEqual({
       "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
+      ...composerContextToLabels({
+        workingDirectory: { kind: "selected", path: RECENT_WORKSPACE },
+        worktree: { kind: "none" },
+      }),
     });
   });
 
@@ -526,9 +536,15 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     await waitFor(() => expect(navigateMock).toHaveBeenCalled());
 
     // Atomic filing rides in the metadata part; the config-seeded workspace
-    // is omitted (server default-fill) and no born-filed label is stamped.
+    // is omitted from the launch fields but preserved in composer context.
     const [, metadata] = vi.mocked(createBundledSession).mock.calls[0];
-    expect(metadata).toEqual({ project_id: "proj_alpha" });
+    expect(metadata).toEqual({
+      project_id: "proj_alpha",
+      labels: composerContextToLabels({
+        workingDirectory: { kind: "selected", path: REPO },
+        worktree: { kind: "none" },
+      }),
+    });
     // The runner still launches with the explicit client-side workspace.
     expect(vi.mocked(launchRunner)).toHaveBeenCalledWith("host_1", "conv_new", REPO, undefined);
     expect(vi.mocked(moveConversationToProject)).not.toHaveBeenCalled();
