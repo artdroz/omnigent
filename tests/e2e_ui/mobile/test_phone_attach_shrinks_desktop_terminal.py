@@ -48,6 +48,7 @@ class _AttachObserver:
     urls: list[str] = field(default_factory=list)
     resizes: list[tuple[int, int]] = field(default_factory=list)
     received: bytearray = field(default_factory=bytearray)
+    _active: WebSocket | None = field(default=None, init=False)
 
     def watch(self, page: Page) -> None:
         page.on("websocket", self._on_websocket)
@@ -56,15 +57,17 @@ class _AttachObserver:
         if not _ATTACH_URL_RE.search(ws.url):
             return
         # A reattach opens a fresh socket with its own grid; drop the previous
-        # socket's captures so screen_lines() replays only the live connection.
+        # socket's captures and ignore its late frames so screen_lines() replays
+        # only the live connection even if the old socket overlaps the new one.
         self.urls.append(ws.url)
         self.resizes.clear()
         self.received.clear()
-        ws.on("framesent", self._on_sent)
-        ws.on("framereceived", self._on_received)
+        self._active = ws
+        ws.on("framesent", lambda payload: self._on_sent(ws, payload))
+        ws.on("framereceived", lambda payload: self._on_received(ws, payload))
 
-    def _on_sent(self, payload: str | bytes) -> None:
-        if isinstance(payload, bytes):
+    def _on_sent(self, ws: WebSocket, payload: str | bytes) -> None:
+        if ws is not self._active or isinstance(payload, bytes):
             return
         try:
             ctl = json.loads(payload)
@@ -73,8 +76,8 @@ class _AttachObserver:
         if isinstance(ctl, dict) and ctl.get("type") == "resize":
             self.resizes.append((int(ctl["cols"]), int(ctl["rows"])))
 
-    def _on_received(self, payload: str | bytes) -> None:
-        if isinstance(payload, bytes):
+    def _on_received(self, ws: WebSocket, payload: str | bytes) -> None:
+        if ws is self._active and isinstance(payload, bytes):
             self.received.extend(payload)
 
     @property
@@ -132,11 +135,16 @@ def _min_frame_width_over(page: Page, observer: _AttachObserver, *, settle_s: fl
     ``page.wait_for_timeout`` yields so received frames dispatch in the sync API.
     """
     deadline = time.monotonic() + settle_s
-    widths = [_drawn_frame_width(observer.screen_lines())]
-    while time.monotonic() < deadline:
+    widths: list[int] = []
+    while True:
+        # Skip samples while a reconnect has momentarily cleared the grid, so a
+        # mid-settle reattach can't trip the cols_rows assert with no verdict.
+        if observer.resizes:
+            widths.append(_drawn_frame_width(observer.screen_lines()))
+        if time.monotonic() >= deadline:
+            break
         page.wait_for_timeout(250)
-        widths.append(_drawn_frame_width(observer.screen_lines()))
-    return min(widths)
+    return min(widths, default=0)
 
 
 def _wait_for_resize(page: Page, observer: _AttachObserver, *, timeout_s: float) -> None:

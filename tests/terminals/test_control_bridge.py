@@ -1186,6 +1186,26 @@ async def _tmux_window_width(sock: Path, target: str) -> int:
     return int(out.decode().strip())
 
 
+async def _tmux_window_height(sock: Path, target: str) -> int:
+    tmux = shutil.which("tmux")
+    assert tmux
+    proc = await asyncio.create_subprocess_exec(
+        tmux,
+        "-S",
+        str(sock),
+        "display-message",
+        "-p",
+        "-t",
+        target,
+        "#{window_height}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    assert proc.returncode == 0, err.decode()
+    return int(out.decode().strip())
+
+
 async def _tmux_client_widths(sock: Path) -> list[int]:
     tmux = shutil.which("tmux")
     assert tmux
@@ -1261,14 +1281,19 @@ async def _wait_for_client_count(sock: Path, count: int) -> None:
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
 async def test_second_interactive_client_does_not_shrink_first_clients_pane() -> None:
-    """A second owner tab (a phone) attaching narrower leaves the desktop pane wide."""
+    """A second owner tab (a phone) attaching narrower leaves the desktop pane wide.
+
+    The two tabs use crossed dimensions -- a wide, short desktop and a narrow,
+    tall phone -- so ``largest`` must max columns and rows independently to a
+    160x40 shared window rather than tracking either client wholesale.
+    """
     sock, target = await _new_private_tmux("cat")
 
     desktop = _FakeWebSocket(
-        inbound=[{"type": "websocket.receive", "text": '{"type":"resize","cols":160,"rows":40}'}]
+        inbound=[{"type": "websocket.receive", "text": '{"type":"resize","cols":160,"rows":20}'}]
     )
     phone = _FakeWebSocket(
-        inbound=[{"type": "websocket.receive", "text": '{"type":"resize","cols":45,"rows":20}'}]
+        inbound=[{"type": "websocket.receive", "text": '{"type":"resize","cols":45,"rows":40}'}]
     )
 
     async def _attach(ws: _FakeWebSocket) -> None:
@@ -1288,6 +1313,7 @@ async def test_second_interactive_client_does_not_shrink_first_clients_pane() ->
         phone_task = asyncio.create_task(_attach(phone))
         await _wait_for_client_width(sock, 45)
         width_with_phone = await _tmux_window_width(sock, target)
+        height_with_phone = await _tmux_window_height(sock, target)
 
         # Detach the phone and wait for its bridge to exit, then for tmux to
         # drop the client. A hung detach fails here directly instead of as a
@@ -1300,6 +1326,10 @@ async def test_second_interactive_client_does_not_shrink_first_clients_pane() ->
         assert width_with_phone == 160, (
             f"desktop pane shrank to the phone's {width_with_phone} columns "
             "while the phone was attached"
+        )
+        assert height_with_phone == 40, (
+            f"shared window height did not grow to the phone's 40 rows "
+            f"(got {height_with_phone}); largest must max rows and columns independently"
         )
         assert width_after_phone_left == 160, (
             f"desktop pane did not stay at 160 columns after the phone left "
