@@ -375,6 +375,7 @@ async def test_owned_client_bypasses_proxy_env_for_loopback(
             pass
 
     httpd = socketserver.TCPServer(("127.0.0.1", 0), _Handler)
+    stub_port = httpd.server_address[1]
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
     probe = socket.socket()
@@ -382,23 +383,26 @@ async def test_owned_client_bypasses_proxy_env_for_loopback(
     dead_port = probe.getsockname()[1]
     probe.close()
     proxy = f"http://127.0.0.1:{dead_port}"
-    for var in (
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ):
-        monkeypatch.setenv(var, proxy)
-    monkeypatch.delenv("NO_PROXY", raising=False)
-    monkeypatch.delenv("no_proxy", raising=False)
 
-    client = OpenCodeClient(f"http://127.0.0.1:{httpd.server_address[1]}")
+    client = None
     try:
+        for var in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ):
+            monkeypatch.setenv(var, proxy)
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        monkeypatch.delenv("no_proxy", raising=False)
+
+        client = OpenCodeClient(f"http://127.0.0.1:{stub_port}")
         assert await client.list_models() == [{"id": "opencode-go/stub"}]
     finally:
-        await client.aclose()
+        if client is not None:
+            await client.aclose()
         httpd.shutdown()
         httpd.server_close()
 
