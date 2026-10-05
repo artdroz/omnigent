@@ -293,7 +293,12 @@ function registerBrowserIpc({
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
     const { conversationId, url, bounds } = args ?? {};
-    let { opts } = args ?? {};
+    const rendererOpts = args?.opts;
+    let opts = {
+      force: !!rendererOpts?.force,
+      agent: !!rendererOpts?.agent,
+      hostId: typeof rendererOpts?.hostId === "string" ? rendererOpts.hostId : null,
+    };
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
@@ -304,7 +309,6 @@ function registerBrowserIpc({
     };
     let preparedRelease = null;
     if (opts?.agent) {
-      g.registry.clearAgentOrigin(conversationId);
       try {
         opts = await prepareAgentNavigation(event, conversationId, url, opts, lifecycle);
         preparedRelease = opts?.releaseOwnedOrigin || null;

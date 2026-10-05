@@ -151,6 +151,7 @@ function createBrowserViewRegistry({
       // internal host slips through (SSRF via screenshot).
       agentNavLocked: false,
       agentOwnedOrigin: null,
+      expiredAgentOrigin: null,
       releaseAgentOrigin: null,
       // Design-mode listeners + webContents, set by browserIpc's enable handler
       // and cleared on disable/close (console-message forwarder + native-gesture
@@ -221,9 +222,6 @@ function createBrowserViewRegistry({
           return { action: "deny" };
         }
       }
-      if (entry.agentOwnedOrigin && parsed.origin !== entry.agentOwnedOrigin) {
-        clearAgentOrigin(entry.conversationId);
-      }
       try {
         wc.loadURL(url);
       } catch {
@@ -277,13 +275,7 @@ function createBrowserViewRegistry({
   function attachAgentNavGuard(conversationId, entry) {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
-    const guard = (event, targetUrl, isMainFrame = true) => {
-      let targetOrigin = null;
-      try {
-        targetOrigin = new URL(targetUrl).origin;
-      } catch {
-        /* policy below rejects malformed targets */
-      }
+    const guard = (event, targetUrl) => {
       const verdict = entry.agentNavLocked
         ? isAgentNavigationAllowed(targetUrl, entry.agentOwnedOrigin)
         : { ok: true };
@@ -300,9 +292,6 @@ function createBrowserViewRegistry({
         });
         return;
       }
-      if (isMainFrame && entry.agentOwnedOrigin && targetOrigin !== entry.agentOwnedOrigin) {
-        clearAgentOrigin(conversationId);
-      }
     };
     wc.on("will-navigate", guard);
     wc.on("will-redirect", guard);
@@ -310,7 +299,29 @@ function createBrowserViewRegistry({
     // too. Older Electron may not emit this event — harmless if it never fires.
     wc.on("will-frame-navigate", (event) => {
       // will-frame-navigate passes a single event whose `.url` is the target.
-      guard(event, event && event.url, !!event?.isMainFrame);
+      guard(event, event && event.url);
+    });
+    wc.on("did-start-navigation", (_event, targetUrl, isInPlace, isMainFrame) => {
+      let targetOrigin = null;
+      try {
+        targetOrigin = new URL(targetUrl).origin;
+      } catch {
+        /* malformed targets cannot match an expired origin */
+      }
+      if (!isInPlace && isMainFrame && targetOrigin === entry.expiredAgentOrigin) {
+        close(conversationId, "preview-expired");
+      }
+    });
+    wc.on("did-navigate", (_event, targetUrl) => {
+      let targetOrigin = null;
+      try {
+        targetOrigin = new URL(targetUrl).origin;
+      } catch {
+        /* non-web committed navigation */
+      }
+      if (entry.agentOwnedOrigin && targetOrigin !== entry.agentOwnedOrigin) {
+        clearAgentOrigin(conversationId);
+      }
     });
   }
 
@@ -335,15 +346,6 @@ function createBrowserViewRegistry({
     const result = getOrCreate(conversationId);
     if (!result.ok) return result;
     const { entry, created } = result;
-    if (url && entry.agentOwnedOrigin) {
-      let targetOrigin = null;
-      try {
-        targetOrigin = new URL(url).origin;
-      } catch {
-        /* malformed target is handled by the policy/load below */
-      }
-      if (targetOrigin !== entry.agentOwnedOrigin) clearAgentOrigin(conversationId);
-    }
     // Latch who drives THIS navigation so the will-navigate/will-redirect guard
     // enforces the allowlist on an agent nav's whole redirect chain, and leaves
     // user-typed URL-bar nav permissive. Set only when a url is actually issued.
@@ -351,6 +353,7 @@ function createBrowserViewRegistry({
     if (opts?.agent && opts.ownedOrigin) {
       entry.releaseAgentOrigin?.();
       entry.agentOwnedOrigin = opts.ownedOrigin;
+      entry.expiredAgentOrigin = null;
       entry.releaseAgentOrigin = opts.releaseOwnedOrigin || null;
     }
     if (bounds) entry.boundsController.setRendererBounds(bounds);
@@ -507,12 +510,18 @@ function createBrowserViewRegistry({
     }
   }
 
-  function clearAgentOrigin(conversationId) {
+  function clearAgentOrigin(conversationId, blank = false) {
     const entry = entries.get(conversationId);
     if (!entry) return;
     entry.releaseAgentOrigin?.();
+    entry.expiredAgentOrigin = entry.agentOwnedOrigin;
     entry.agentOwnedOrigin = null;
     entry.releaseAgentOrigin = null;
+    try {
+      if (blank) entry.view.webContents.loadURL("about:blank");
+    } catch {
+      /* view destroyed */
+    }
   }
 
   return {

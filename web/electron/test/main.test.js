@@ -1510,4 +1510,11 @@ describe("browser-view teardown on server change (src/main.js)", () => {
       ].join(" "),
     );
   });
+
+  it("releases every registry before the forced app-exit fallback can run", () => {
+    assert.match(
+      liveCode,
+      /app\.on\("before-quit"[\s\S]{0,500}browserRegistry\?\.closeAll\("app-quit"\)[\s\S]{0,700}app\.exit\(0\)/,
+    );
+  });
 });

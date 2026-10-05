@@ -307,7 +307,7 @@ describe("browserIpc — url live-tracking", () => {
       opts: { agent: true, hostId: "host_arca" },
     });
     assert.equal(result.ok, true);
-    assert.deepEqual(ok.registry.cleared, ["conv_arca"]);
+    assert.deepEqual(ok.registry.cleared, []);
     assert.deepEqual(ok.registry.opened[0].opts, { ...prepared, intentToken: 1 });
     assert.equal(calls[0].opts.hostId, "host_arca");
 
@@ -397,6 +397,28 @@ describe("browserIpc — url live-tracking", () => {
     const staleResult = await pending;
     assert.equal(staleResult.ok, false);
     assert.equal(releases, 2);
+  });
+
+  it("strips renderer-supplied ownership and private intent fields", async () => {
+    const { ipcMain, registry, event } = setup();
+    await ipcMain.invoke("omnigent:browser-open-or-navigate", event, {
+      conversationId: "conv_1",
+      url: "https://example.com",
+      opts: {
+        force: true,
+        agent: false,
+        hostId: "host_arca",
+        ownedOrigin: "http://169.254.169.254",
+        releaseOwnedOrigin: () => {},
+        intentToken: 999,
+      },
+    });
+    assert.deepEqual(registry.opened[0].opts, {
+      force: true,
+      agent: false,
+      hostId: "host_arca",
+      intentToken: 1,
+    });
   });
 });
 

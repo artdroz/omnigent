@@ -297,7 +297,9 @@ function makeEventCapturingRegistry() {
           this.prevented = true;
         },
       };
-      handlers[event](ev, targetUrl);
+      if (event === "will-redirect" || event === "did-start-navigation") {
+        handlers[event](ev, targetUrl, false, isMainFrame);
+      } else handlers[event](ev, targetUrl);
       return ev;
     },
     fireContextMenu: (params) => handlers["context-menu"]({}, params),
@@ -318,6 +320,7 @@ describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every h
     assert.equal(fire("will-frame-navigate", "http://localhost:5173/frame").prevented, false);
     assert.deepEqual(windowOpen("http://localhost:5173/popup"), { action: "deny" });
     assert.equal(fire("will-navigate", "https://example.com/away").prevented, false);
+    fire("did-navigate", "https://example.com/away");
     assert.equal(releases, 1);
     assert.equal(fire("will-navigate", "http://localhost:5173/stale").prevented, true);
   });
@@ -346,10 +349,27 @@ describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every h
       fire("will-frame-navigate", "https://cdn.example.com/frame", false).prevented,
       false,
     );
+    assert.equal(fire("will-redirect", "https://cdn.example.com/redirect", false).prevented, false);
     assert.equal(fire("will-navigate", "http://10.0.0.5/private").prevented, true);
     assert.equal(releases, 0);
     assert.equal(fire("will-navigate", "https://example.com/away").prevented, false);
+    fire("did-navigate", "https://example.com/away");
     assert.equal(releases, 1);
+  });
+
+  it("blanks a released preview and closes a stale history reload", () => {
+    const { registry, fire, loaded } = makeEventCapturingRegistry();
+    let releases = 0;
+    registry.openOrNavigate("conv_1", "http://localhost:5173", undefined, {
+      agent: true,
+      ownedOrigin: "http://localhost:5173",
+      releaseOwnedOrigin: () => (releases += 1),
+    });
+    registry.clearAgentOrigin("conv_1", true);
+    assert.equal(releases, 1);
+    assert.equal(loaded.at(-1), "about:blank");
+    fire("did-start-navigation", "http://localhost:5173/from-history");
+    assert.equal(registry.has("conv_1"), false);
   });
 
   it("blocks an agent-locked will-redirect to the cloud-metadata IP", () => {

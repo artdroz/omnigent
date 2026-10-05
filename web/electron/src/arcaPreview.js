@@ -9,6 +9,7 @@ const { normalizeSafeServerUrl, resolveArcaPath } = require("./arca");
 const { WORKSPACE_UI_PATH } = require("./url");
 
 const PREPARE_TIMEOUT_MS = 25_000;
+const OUTPUT_LIMIT = 8_192;
 const WORKSPACE_API_PATHS = new Set(["/api/2.0/omnigent", "/api/2.0/omnigents"]);
 
 function loopbackPreview(url) {
@@ -42,7 +43,10 @@ function sameServer(left, right) {
   const a = serverIdentity(left);
   const b = serverIdentity(right);
   if (!a || !b || a.base !== b.base) return false;
-  return !a.workspace || !b.workspace || a.workspace === b.workspace;
+  // Status records normally omit `?o=` because the CLI stores its API base
+  // without query state; the scoped `--server` command supplies that selector.
+  // If a record does carry one, it must exactly match the requested workspace.
+  return !a.workspace || (!!b.workspace && a.workspace === b.workspace);
 }
 
 function parseStatusJson(stdout) {
@@ -100,8 +104,8 @@ function run(file, args, { spawnFn, deadline, onChild }) {
       Math.max(0, deadline - Date.now()),
     );
     timer.unref?.();
-    child.stdout?.on("data", (chunk) => (stdout += String(chunk)));
-    child.stderr?.on("data", (chunk) => (stderr += String(chunk)));
+    child.stdout?.on("data", (chunk) => (stdout = (stdout + String(chunk)).slice(-OUTPUT_LIMIT)));
+    child.stderr?.on("data", (chunk) => (stderr = (stderr + String(chunk)).slice(-OUTPUT_LIMIT)));
     child.on("error", (error) => finish(error));
     child.on("exit", (code) => finish(null, code));
   });
@@ -200,6 +204,7 @@ function createArcaPreviewManager({
         ["ssh", "-M", "-S", socketPath, "-o", "ClearAllForwardings=yes", "-N"],
         { stdio: ["ignore", "ignore", "pipe"], detached: true },
       );
+      master.stderr?.resume?.();
       state.child = master;
       let rejectMaster;
       const masterExit = new Promise((_, reject) => {
@@ -211,36 +216,48 @@ function createArcaPreviewManager({
       });
       state.cancel = () => rejectMaster(new Error("preview was cancelled"));
       await Promise.race([waitForSocket(socketPath, deadline, socketReady), masterExit]);
-      const spec = `${preview.host}:${preview.port}:${preview.host}:${preview.port}`;
-      const acknowledged = await run(
-        arcaPath,
-        [
-          "ssh",
-          "-F",
-          "/dev/null",
-          "-S",
-          socketPath,
-          "-O",
-          "forward",
-          "-o",
-          "ExitOnForwardFailure=yes",
-          "-L",
-          spec,
-        ],
-        {
-          spawnFn,
-          deadline,
-          onChild: (child, cancel) => {
-            state.cancel = () => {
-              terminate(child);
-              cancel();
-            };
-          },
-        },
-      );
-      if (acknowledged.code !== 0)
-        throw new Error(acknowledged.stderr.trim() || "Arca rejected the localhost forward");
-      if (owned.get(conversationId)?.token !== token) throw new Error("preview was superseded");
+      const bindHosts = preview.host === "localhost" ? ["127.0.0.1", "[::1]"] : [preview.host];
+      for (const bindHost of bindHosts) {
+        const spec = `${bindHost}:${preview.port}:${preview.host}:${preview.port}`;
+        // Each exact family is acknowledged independently; either failure
+        // tears down the master and therefore rolls back the other forward.
+        // eslint-disable-next-line no-await-in-loop
+        const acknowledged = await Promise.race([
+          run(
+            arcaPath,
+            [
+              "ssh",
+              "-F",
+              "/dev/null",
+              "-S",
+              socketPath,
+              "-O",
+              "forward",
+              "-o",
+              "ExitOnForwardFailure=yes",
+              "-L",
+              spec,
+            ],
+            {
+              spawnFn,
+              deadline,
+              onChild: (child, cancel) => {
+                state.cancel = () => {
+                  terminate(child);
+                  cancel();
+                };
+              },
+            },
+          ),
+          masterExit,
+        ]);
+        if (acknowledged.code !== 0) {
+          throw new Error(acknowledged.stderr.trim() || "Arca rejected the localhost forward");
+        }
+        if (owned.get(conversationId)?.token !== token) {
+          throw new Error("preview was superseded");
+        }
+      }
       state.child = master;
       state.cancel = null;
       master.on("exit", () => {
@@ -263,7 +280,5 @@ module.exports = {
   createArcaPreviewManager,
   loopbackPreview,
   parseStatusJson,
-  serverIdentity,
   sameServer,
-  verifyArcaHost,
 };

@@ -14,6 +14,7 @@ function child() {
   const value = new EventEmitter();
   value.stdout = new EventEmitter();
   value.stderr = new EventEmitter();
+  value.stderr.resume = () => (value.stderr.resumed = true);
   value.killed = false;
   value.kill = () => {
     value.killed = true;
@@ -21,9 +22,14 @@ function child() {
   return value;
 }
 
-function successfulSpawner({ hostId = "host_arca", serverUrl = "https://srv.example.com/" } = {}) {
+function successfulSpawner({
+  hostId = "host_arca",
+  serverUrl = "https://srv.example.com/",
+  failForwardIndex = 0,
+} = {}) {
   const calls = [];
   const children = [];
+  let forwardIndex = 0;
   const spawn = (file, args) => {
     const proc = child();
     calls.push({ file, args });
@@ -41,7 +47,13 @@ function successfulSpawner({ hostId = "host_arca", serverUrl = "https://srv.exam
         proc.emit("exit", 0);
       });
     } else if (args.includes("-O")) {
-      queueMicrotask(() => proc.emit("exit", 0));
+      forwardIndex += 1;
+      queueMicrotask(() => {
+        if (forwardIndex === failForwardIndex) {
+          proc.stderr.emit("data", "bind [::1]:5173: Address already in use\n");
+          proc.emit("exit", 255);
+        } else proc.emit("exit", 0);
+      });
     }
     return proc;
   };
@@ -71,22 +83,22 @@ describe("Arca localhost preview URL", () => {
   it("matches workspace UI and API mounts without relaxing host or explicit selectors", () => {
     assert.equal(
       sameServer(
-        "https://acme.cloud.databricks.com/omnigent?o=123",
         "https://acme.cloud.databricks.com/api/2.0/omnigent",
+        "https://acme.cloud.databricks.com/omnigent?o=123",
       ),
       true,
     );
     assert.equal(
       sameServer(
-        "https://acme.cloud.databricks.com/omnigent?o=123",
         "https://acme.cloud.databricks.com/api/2.0/omnigent?o=456",
+        "https://acme.cloud.databricks.com/omnigent?o=123",
       ),
       false,
     );
     assert.equal(
       sameServer(
-        "https://acme.cloud.databricks.com/omnigent",
         "https://other.cloud.databricks.com/api/2.0/omnigent",
+        "https://acme.cloud.databricks.com/omnigent",
       ),
       false,
     );
@@ -119,11 +131,20 @@ describe("Arca preview manager", () => {
     const forwards = fake.calls.filter((call) => call.args.includes("-L"));
     assert.deepEqual(
       forwards.map((call) => call.args[call.args.indexOf("-L") + 1]),
-      ["localhost:5173:localhost:5173", "localhost:7331:localhost:7331"],
+      [
+        "127.0.0.1:5173:localhost:5173",
+        "[::1]:5173:localhost:5173",
+        "127.0.0.1:7331:localhost:7331",
+        "[::1]:7331:localhost:7331",
+      ],
     );
     assert.ok(forwards.every((call) => call.args.includes("/dev/null")));
     const masters = fake.calls.filter((call) => call.args.includes("-M"));
     assert.ok(masters.every((call) => call.args.includes("ClearAllForwardings=yes")));
+    assert.equal(
+      fake.children[fake.calls.findIndex((call) => call.args.includes("-M"))].stderr.resumed,
+      true,
+    );
   });
 
   it("rejects a different, offline, or unknown requesting host", async () => {
@@ -195,6 +216,26 @@ describe("Arca preview manager", () => {
     );
   });
 
+  it("rolls back both localhost families when the second exact forward fails", async () => {
+    const fake = successfulSpawner({ failForwardIndex: 2 });
+    const manager = createArcaPreviewManager({
+      resolveArcaPathFn: () => "/arca",
+      spawnFn: fake.spawn,
+      socketReady: () => true,
+    });
+    await assert.rejects(
+      manager.prepare({
+        conversationId: "dual",
+        url: "http://localhost:5173",
+        hostId: "host_arca",
+        serverUrl: "https://srv.example.com",
+      }),
+      /Address already in use/,
+    );
+    const masterIndex = fake.calls.findIndex((call) => call.args.includes("-M"));
+    assert.equal(fake.children[masterIndex].killed, true);
+  });
+
   it("cancels pending and active work, and reports an unexpected forward exit", async () => {
     const pending = child();
     const exits = [];
@@ -232,7 +273,7 @@ describe("Arca preview manager", () => {
       hostId: "host_arca",
       serverUrl: "https://srv.example.com",
     });
-    fake.children.at(-2).emit("exit", 1);
+    fake.children[fake.calls.findIndex((call) => call.args.includes("-M"))].emit("exit", 1);
     assert.deepEqual(exits, ["live"]);
     owned.release();
   });
@@ -254,5 +295,92 @@ describe("Arca preview manager", () => {
       /timed out preparing/,
     );
     assert.equal(proc.killed, true);
+  });
+
+  it("bounds captured command output", async () => {
+    const proc = child();
+    const manager = createArcaPreviewManager({
+      resolveArcaPathFn: () => "/arca",
+      spawnFn: () => {
+        queueMicrotask(() => {
+          proc.stderr.emit("data", "x".repeat(20_000));
+          proc.emit("exit", 1);
+        });
+        return proc;
+      },
+    });
+    await assert.rejects(
+      manager.prepare({
+        conversationId: "noisy",
+        url: "http://localhost:5173",
+        hostId: "host_arca",
+        serverUrl: "https://srv.example.com",
+      }),
+      (error) => error.message.length <= 8_192,
+    );
+  });
+
+  it("directly settles cancellation while waiting for the owned control socket", async () => {
+    const fake = successfulSpawner();
+    const manager = createArcaPreviewManager({
+      resolveArcaPathFn: () => "/arca",
+      spawnFn: fake.spawn,
+      socketReady: () => false,
+    });
+    const pending = manager.prepare({
+      conversationId: "socket-wait",
+      url: "http://localhost:5173",
+      hostId: "host_arca",
+      serverUrl: "https://srv.example.com",
+    });
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    manager.release("socket-wait");
+    await assert.rejects(pending, /cancelled/);
+  });
+
+  it("fails immediately when the control master exits during a forward request", async () => {
+    let master;
+    const spawnFn = (_file, args) => {
+      const proc = child();
+      if (args.includes("status")) {
+        queueMicrotask(() => {
+          proc.stdout.emit(
+            "data",
+            JSON.stringify({
+              daemons: [
+                {
+                  host_id: "host_arca",
+                  server_url: "https://srv.example.com",
+                  process: "online",
+                  host_status: "online",
+                },
+              ],
+            }),
+          );
+          proc.emit("exit", 0);
+        });
+      } else if (args.includes("-M")) {
+        master = proc;
+        setImmediate(() => proc.emit("exit", 9));
+      }
+      return proc;
+    };
+    const manager = createArcaPreviewManager({
+      resolveArcaPathFn: () => "/arca",
+      spawnFn,
+      socketReady: () => true,
+    });
+    await assert.rejects(
+      manager.prepare({
+        conversationId: "master-exit",
+        url: "http://localhost:5173",
+        hostId: "host_arca",
+        serverUrl: "https://srv.example.com",
+      }),
+      /Arca preview exited \(9\)/,
+    );
+    assert.equal(master.killed, true);
   });
 });

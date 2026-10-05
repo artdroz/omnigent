@@ -3499,7 +3499,6 @@ function registerIpc() {
       const preview = loopbackPreview(url);
       if (!registry) throw new Error("no browser registry for this window");
       if (!preview) {
-        registry.arcaPreview.release(conversationId);
         return opts;
       }
       const serverUrl = senderServerUrl(event);
@@ -3511,6 +3510,7 @@ function registerIpc() {
         throw new Error("Arca localhost previews require a managed Databricks server");
       }
       lifecycle.onCancel(() => registry.arcaPreview.release(conversationId));
+      registry.clearAgentOrigin(conversationId, true);
       const owned = await registry.arcaPreview.prepare({
         conversationId,
         url,
@@ -3976,6 +3976,7 @@ if (!gotLock) {
     event.preventDefault();
     if (quitCleanupStarted) return;
     quitCleanupStarted = true;
+    for (const state of windows.values()) state.browserRegistry?.closeAll("app-quit");
 
     // unref'd so the cap itself can't hold the event loop open; app.exit()
     // bypasses before-quit/will-quit, so it's the guaranteed way out when
