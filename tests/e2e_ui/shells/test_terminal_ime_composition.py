@@ -1,6 +1,6 @@
 """E2E: the terminal pane must honour IME composition.
 
-Two defects can bite the embedded terminal's input path:
+Three defects can bite the embedded terminal's input path:
 
 1. **Shift+Enter is claimed mid-composition, dropping the composed text.**
    ``terminalKeyEventPayload`` (``web/src/components/blocks/TerminalSession.ts``)
@@ -18,12 +18,22 @@ Two defects can bite the embedded terminal's input path:
    every inbound frame now goes through xterm's ordered public write queue,
    the path its composition handling was built against.
 
-Both journeys are driven here without a real IME: dispatching
+3. **A Shift+ASCII run mid-composition makes the committed prefix and the
+   growing preedit re-send to the PTY on every subsequent update.** Because
+   ``terminalKeyEventPayload`` returns null for a composing keydown, the
+   Shift+letter reaches xterm's ``CompositionHelper.keydown``, which
+   ``_finalizeComposition(false)``’s and clears ``_isComposing`` without a
+   fresh ``compositionstart``. ``start`` stays pinned while the textarea keeps
+   growing, so each later keyCode-229 update re-emits the whole buffer and the
+   in-flight (fullwidth, in a fullwidth-latin IME mode) romaji consonants leak
+   straight to the PTY instead of staying in the preedit.
+
+The journeys are driven here without a real IME: dispatching
 ``compositionstart`` / ``compositionupdate`` at ``term.textarea`` puts
-xterm's ``CompositionHelper`` into a genuine composing
-state (its listeners do not check ``isTrusted``), and the observable contract
-is read off the attach WebSocket's sent/received frames plus xterm's
-``.composition-view`` preedit overlay.
+xterm's ``CompositionHelper`` into a genuine composing state (its listeners
+do not check ``isTrusted``), and the observable contract is read off the
+attach WebSocket's sent/received frames plus xterm's ``.composition-view``
+preedit overlay.
 
 Like the rest of this directory, the shell is user-created from the workspace
 rail's "+" menu — no LLM turn is involved.
@@ -248,3 +258,171 @@ def test_inbound_output_leaves_preedit_intact(
     expect(composition_view).to_have_class(re.compile(r"\bactive\b"))
     expect(composition_view).to_have_text(COMPOSED_TEXT)
     expect(terminal_view).to_have_attribute("data-state", "connected")
+
+
+# The kana tail converted after the Shift-typed leading ASCII "A". A
+# fullwidth-latin IME mode shows unconverted consonants as fullwidth latin
+# (ｄ, ｙ, ｓ) in the preedit until each kana converts.
+_SHIFT_ASCII_PREEDITS = [
+    "A", "Aｄ", "Aで", "Aでｙ", "Aでよ", "Aでよｉ",
+    "Aでよい", "Aでよいｄ", "Aでよいで", "Aでよいでｓ", "Aでよいです",
+]
+_SHIFT_ASCII_CODES = [
+    "KeyA", "KeyD", "KeyE", "KeyY", "KeyO", "KeyI",
+    "KeyI", "KeyD", "KeyE", "KeyS", "KeyU",
+]
+_COMMITTED_TAIL = "でよいです"
+
+
+def _fullwidth_latin(text: str) -> list[str]:
+    return [c for c in text if 0xFF01 <= ord(c) <= 0xFF5E]
+
+
+def _drive_shift_ascii_run(textarea, preedits: list[str], codes: list[str]) -> None:
+    """Replay a Shift+ASCII-run-mid-composition gesture at ``term.textarea``.
+
+    A ``compositionstart`` opens the preedit; a Shift+letter keydown carrying
+    the real keyCode (65) and ``isComposing`` arrives mid-composition; the user
+    returns to kana conversion, each romaji keystroke a keyCode-229 keydown with
+    the preedit growing; a ``compositionend`` commits. No fresh
+    ``compositionstart`` fires after the Shift+letter, mirroring a native IME.
+    """
+    textarea.evaluate(
+        """(ta, args) => {
+          const [preedits, codes] = args;
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          const upd = (t) => {
+            ta.value = t;
+            ta.dispatchEvent(new CompositionEvent("compositionupdate", { data: t, bubbles: true }));
+          };
+          const kd = (o) =>
+            ta.dispatchEvent(new KeyboardEvent("keydown", Object.assign({ bubbles: true, cancelable: true }, o)));
+          window.__imeDone = (async () => {
+            ta.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+            upd(preedits[0]);
+            await sleep(90);
+            kd({ key: "A", code: "KeyA", keyCode: 65, shiftKey: true, isComposing: true });
+            await sleep(90);
+            for (let i = 1; i < preedits.length; i++) {
+              kd({ key: "Process", code: codes[i], keyCode: 229, isComposing: true });
+              upd(preedits[i]);
+              await sleep(90);
+            }
+            kd({ key: "Process", code: "Enter", keyCode: 229, isComposing: true });
+            ta.value = preedits[preedits.length - 1];
+            ta.dispatchEvent(new CompositionEvent("compositionend", { data: ta.value, bubbles: true }));
+          })();
+        }""",
+        [preedits, codes],
+    )
+    textarea.page.evaluate("() => window.__imeDone")
+
+
+def test_shift_ascii_run_mid_composition_does_not_resend_preedit(
+    page: Page, terminal_session: tuple[str, str]
+) -> None:
+    """A Shift+ASCII run mid-composition must not re-send the preedit.
+
+    Journey: open a shell → focus the terminal → begin an IME composition and
+    Shift-type a leading ASCII "A" mid-composition → return to kana conversion
+    and convert the tail ``でよいです`` → commit.
+
+    Expected: the PTY receives the committed tail exactly once and no fullwidth
+    romaji consonant ever leaks out of the preedit.
+
+    Actual (the bug): the Shift+letter finalizes the composition without a fresh
+    ``compositionstart``, so every later update re-emits the committed prefix
+    plus the growing preedit and the fullwidth consonants leak to the PTY —
+    ``Aでよいです`` arrives as ``AｄAでｙAでよいｄAでよいでｓAでよいですAでよいです``.
+    """
+    base_url, session_id = terminal_session
+
+    sent, _received = _capture_attach_frames(page)
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_new_shell(page)
+    terminal_view = _connected_terminal(page)
+
+    textarea = terminal_view.locator("textarea.xterm-helper-textarea")
+    textarea.focus()
+
+    page.keyboard.type("q")
+    assert _wait_for_sent_bytes(page, sent, b"q", timeout_s=10), (
+        f"attach WebSocket frame capture saw no keystroke frame; sent so far: {b''.join(sent)!r}"
+    )
+
+    baseline = len(sent)
+    _drive_shift_ascii_run(textarea, _SHIFT_ASCII_PREEDITS, _SHIFT_ASCII_CODES)
+    page.wait_for_timeout(500)
+
+    decoded = b"".join(sent[baseline:]).decode("utf-8", "replace")
+    assert _COMMITTED_TAIL in decoded, (
+        f"the converted kana never reached the PTY; sent after focus: {decoded!r}"
+    )
+    assert decoded.count(_COMMITTED_TAIL) == 1, (
+        "the committed prefix/preedit was re-sent to the PTY on composition updates: "
+        f"{_COMMITTED_TAIL!r} appears {decoded.count(_COMMITTED_TAIL)} times in {decoded!r}"
+    )
+    assert not _fullwidth_latin(decoded), (
+        "fullwidth romaji consonants leaked out of the preedit to the PTY: "
+        f"{_fullwidth_latin(decoded)} in {decoded!r}"
+    )
+
+
+def test_kana_conversion_without_shift_ascii_sends_once(
+    page: Page, terminal_session: tuple[str, str]
+) -> None:
+    """Control: the same kana conversion with no Shift+ASCII run sends once.
+
+    Pins the trigger to the Shift+ASCII-mid-composition step: an ordinary
+    composition of ``でよいです`` must reach the PTY exactly once with no
+    fullwidth leak, so the failing scenario above cannot be blamed on IME
+    composition itself.
+    """
+    base_url, session_id = terminal_session
+
+    sent, _received = _capture_attach_frames(page)
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_new_shell(page)
+    terminal_view = _connected_terminal(page)
+
+    textarea = terminal_view.locator("textarea.xterm-helper-textarea")
+    textarea.focus()
+
+    page.keyboard.type("q")
+    assert _wait_for_sent_bytes(page, sent, b"q", timeout_s=10)
+
+    baseline = len(sent)
+    preedits = ["で", "でよ", "でよい", "でよいで", "でよいです"]
+    codes = ["KeyD", "KeyO", "KeyI", "KeyE", "KeyU"]
+    textarea.evaluate(
+        """(ta, args) => {
+          const [preedits, codes] = args;
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          const upd = (t) => {
+            ta.value = t;
+            ta.dispatchEvent(new CompositionEvent("compositionupdate", { data: t, bubbles: true }));
+          };
+          const kd = (o) =>
+            ta.dispatchEvent(new KeyboardEvent("keydown", Object.assign({ bubbles: true, cancelable: true }, o)));
+          window.__imeDone = (async () => {
+            ta.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+            for (let i = 0; i < preedits.length; i++) {
+              kd({ key: "Process", code: codes[i], keyCode: 229, isComposing: true });
+              upd(preedits[i]);
+              await sleep(90);
+            }
+            kd({ key: "Process", code: "Enter", keyCode: 229, isComposing: true });
+            ta.value = preedits[preedits.length - 1];
+            ta.dispatchEvent(new CompositionEvent("compositionend", { data: ta.value, bubbles: true }));
+          })();
+        }""",
+        [preedits, codes],
+    )
+    page.evaluate("() => window.__imeDone")
+    page.wait_for_timeout(500)
+
+    decoded = b"".join(sent[baseline:]).decode("utf-8", "replace")
+    assert decoded.count(_COMMITTED_TAIL) == 1, (
+        f"{_COMMITTED_TAIL!r} should be sent exactly once; got {decoded!r}"
+    )
+    assert not _fullwidth_latin(decoded), f"unexpected fullwidth leak: {decoded!r}"
