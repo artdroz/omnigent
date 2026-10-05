@@ -1,25 +1,15 @@
-"""E2E regression test: the web UI's Codex skill menu omits ``~/.agents/skills``.
+"""E2E regression: the Codex web skills menu must list shared ``~/.agents/skills``.
 
-For a codex-family session the web composer's slash-command menu is fed by
-``GET /v1/skills?session_id={id}`` (``resolve_session_skills`` →
-``resolve_harness_skills`` → the Codex ``codex_host_skills`` provider), which
-draws from the same source list ``codex_skill_sources`` the executor symlinks
-into ``$CODEX_HOME/skills/``. The Codex CLI itself loads skills from the shared
-``~/.agents/skills`` directory, but that source list omitted it — so the menu
-dropped the ``~/.agents/skills`` commands the Codex terminal can invoke while
-still listing the Codex host-dir ones.
+A codex-family session's web composer menu is fed by ``GET /v1/skills``
+(``resolve_harness_skills`` → the Codex ``codex_host_skills`` provider), which
+draws from the same ``codex_skill_sources`` list the executor symlinks into
+``$CODEX_HOME/skills/``. The Codex CLI loads skills from ``~/.agents/skills``,
+but that list omitted it, so the menu dropped commands the terminal can run.
 
-These tests assert the FIXED parity contract — the codex-family web menu lists
-the shared ``~/.agents/skills`` skills alongside the Codex host-dir skills,
-including when a custom ``$CODEX_HOME`` moves the host dir — so they FAIL on the
-broken build and PASS once the shared dir joins the source list. This exercises
-the real host menu-resolution path (``HostSkillDiscovery`` →
-``skill_source_context_from_env`` → ``resolve_harness_skills``) that feeds the
-web composer, so no browser or live Codex host is needed.
-
-Usage::
-
-    pytest tests/e2e/test_codex_terminal_web_skills_parity_e2e.py -v
+The tests drive the real resolver (``HostSkillDiscovery`` →
+``resolve_harness_skills``) that feeds the composer menu, so they need no
+browser or live host: they fail on the broken build and pass once the shared
+dir joins the source list, including under a custom ``$CODEX_HOME``.
 """
 
 from __future__ import annotations
@@ -38,12 +28,7 @@ _CUSTOM_HOME_SKILL = "custom-codex-skill"
 
 
 def _seed_skill(skills_dir: Path, name: str, description: str) -> None:
-    """Write a minimal ``<skills_dir>/<name>/SKILL.md`` with valid frontmatter.
-
-    :param skills_dir: The ``skills`` directory to populate.
-    :param name: Frontmatter skill name (matches its directory name).
-    :param description: One-line human description.
-    """
+    """Write a minimal ``<skills_dir>/<name>/SKILL.md`` with valid frontmatter."""
     skill = skills_dir / name
     skill.mkdir(parents=True)
     (skill / "SKILL.md").write_text(
@@ -52,11 +37,10 @@ def _seed_skill(skills_dir: Path, name: str, description: str) -> None:
 
 
 def _menu_names(harness: str, workspace: Path) -> list[str]:
-    """Read the web composer's menu catalog on the host, independent of launch.
+    """Resolve the skill names the web composer menu would list for ``harness``.
 
-    :param harness: The session's harness id, e.g. ``"codex-native"``.
-    :param workspace: Session workspace (the discovery root the frame carries).
-    :returns: The skill names the menu would list.
+    Uses the in-process ``HostSkillDiscovery`` path behind ``GET /v1/skills``,
+    with a bundle fetch that must never fire for directory discovery.
     """
 
     def unexpected_bundle(_: HostSkillsFrame) -> httpx.Response:
