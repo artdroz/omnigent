@@ -385,6 +385,7 @@ function arcaAutoConnectFeatureEnabled() {
 
 /** Launch-prompt tuning knob: warn only within this window of shutdown. */
 const ARCA_LAUNCH_PROMPT_MAX_LEAD_MS = 8 * 60 * 60 * 1000;
+let arcaPromptNotification = null;
 
 /** Format the local shutdown time, adding the weekday when it is not today. */
 function arcaShutdownTime(shutdownAt, now, alwaysWeekday = false) {
@@ -408,14 +409,28 @@ function arcaDialogWindow() {
   return [...windows.keys()].find((win) => !win.isDestroyed()) ?? null;
 }
 
+/** Keep a prompt notification alive until it closes or is replaced. */
+function showArcaPromptNotification(options, onClick) {
+  arcaPromptNotification?.close();
+  const notification = new Notification(options);
+  arcaPromptNotification = notification;
+  notification.on("close", () => {
+    if (arcaPromptNotification === notification) arcaPromptNotification = null;
+  });
+  if (onClick) notification.on("click", onClick);
+  notification.show();
+  return notification;
+}
+
 /** Ask whether to extend an Arca instance near its shutdown time. */
 async function promptArcaShutdown({ kind, shutdownAt, now, modes }) {
+  let notification = null;
   try {
     const { time, isToday } = arcaShutdownTime(shutdownAt, now);
     const remaining = shutdownAt - now;
     const message =
       kind === "launch"
-        ? `Arca shuts down at ${time}`
+        ? `Arca can shut down after ${time}`
         : remaining <= 0
           ? "Arca can shut down any time now"
           : remaining < 50 * 60 * 1000
@@ -443,45 +458,55 @@ async function promptArcaShutdown({ kind, shutdownAt, now, modes }) {
       checkboxChecked: false,
     };
     const win = arcaDialogWindow();
+    if (!win) {
+      if (Notification.isSupported()) {
+        showArcaPromptNotification({
+          title: message,
+          body: "Run `arca extend overnight` in a terminal to keep it running.",
+        });
+      }
+      return { mode: null };
+    }
     const focused = BrowserWindow.getFocusedWindow();
     if (
       (!focused || !windows.has(focused) || focused.isDestroyed()) &&
       Notification.isSupported()
     ) {
       try {
-        const notification = new Notification({
-          title: message,
-          body: "Open Omnigent to keep your Arca instance running.",
-        });
-        notification.on("click", () => {
-          const target = win && !win.isDestroyed() ? win : arcaDialogWindow();
-          if (!target) return;
-          if (target.isMinimized()) target.restore();
-          target.focus();
-        });
-        notification.show();
+        notification = showArcaPromptNotification(
+          { title: message, body: "Open Omnigent to keep your Arca instance running." },
+          () => {
+            const target = !win.isDestroyed() ? win : arcaDialogWindow();
+            if (!target) return;
+            if (target.isMinimized()) target.restore();
+            target.focus();
+          },
+        );
       } catch (error) {
         console.log(`[omnigent] arca shutdown: notification failed: ${error}`);
       }
     }
-    const { response, checkboxChecked } = win
-      ? await dialog.showMessageBox(win, options)
-      : await dialog.showMessageBox(options);
+    const { response, checkboxChecked } = await dialog.showMessageBox(win, options);
     if (checkboxChecked) {
       const settings = loadSettings();
       settings.arca_shutdown_prompts = false;
       saveSettings(settings);
-      return { mode: null };
     }
     return { mode: modes[response] ?? null };
   } catch (error) {
     console.log(`[omnigent] arca shutdown: prompt failed: ${error}`);
     return { mode: null };
+  } finally {
+    try {
+      notification?.close();
+    } catch (error) {
+      console.log(`[omnigent] arca shutdown: closing notification failed: ${error}`);
+    }
   }
 }
 
 /** Show the outcome of an Arca extension request. */
-function reportArcaExtendResult(result) {
+async function reportArcaExtendResult(result) {
   try {
     if (result.ok) {
       if (!Notification.isSupported()) return;
@@ -499,13 +524,19 @@ function reportArcaExtendResult(result) {
       buttons: ["OK"],
     };
     const win = arcaDialogWindow();
-    void (win ? dialog.showMessageBox(win, options) : dialog.showMessageBox(options)).catch(
-      (error) => console.log(`[omnigent] arca shutdown: result dialog failed: ${error}`),
-    );
+    if (!win) {
+      if (Notification.isSupported()) {
+        new Notification({ title: "Couldn't extend Arca", body: result.error }).show();
+      }
+      return;
+    }
+    await dialog.showMessageBox(win, options);
   } catch (error) {
     console.log(`[omnigent] arca shutdown: result failed: ${error}`);
   }
 }
+
+let arcaResumeListenerRegistered = false;
 
 /** Launch-time Arca auto-connect, behind the feature flag above. */
 const arcaAutoConnect = createArcaAutoConnect({
@@ -525,7 +556,12 @@ const arcaAutoConnect = createArcaAutoConnect({
     }
   },
   onStatus: (_origin, status) => {
-    if (status.state === "online") arcaShutdownWatch.start();
+    if (status.state !== "online") return;
+    if (!arcaResumeListenerRegistered) {
+      powerMonitor.on("resume", () => arcaShutdownWatch.onResume());
+      arcaResumeListenerRegistered = true;
+    }
+    arcaShutdownWatch.start();
   },
   log: (message) => console.log(`[omnigent] ${message}`),
 });
@@ -538,7 +574,7 @@ const arcaShutdownWatch = createArcaShutdownWatch({
   prompt: promptArcaShutdown,
   onExtendResult: reportArcaExtendResult,
   log: (message) => console.log(`[omnigent] ${message}`),
-  options: { finalLeadMs: 60 * 60 * 1000, launchMaxLeadMs: ARCA_LAUNCH_PROMPT_MAX_LEAD_MS },
+  options: { launchMaxLeadMs: ARCA_LAUNCH_PROMPT_MAX_LEAD_MS },
 });
 
 /**
@@ -5111,7 +5147,6 @@ if (!gotLock) {
   });
 
   app.whenReady().then(() => {
-    powerMonitor.on("resume", () => arcaShutdownWatch.onResume());
     // App User Model ID so Windows attributes notifications/taskbar correctly.
     if (process.platform === "win32")
       app.setAppUserModelId(isDevBuild ? DEV_DOMAIN : "ai.omnigent.desktop");
