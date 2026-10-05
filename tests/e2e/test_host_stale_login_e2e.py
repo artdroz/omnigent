@@ -71,8 +71,6 @@ _RUNNER_TIMEOUT_S = 60.0
 # Short stand-in for a multi-hour login lifetime that lapses mid-session; long
 # enough for the baseline runner to settle before the token expires.
 _LOGIN_TTL_S = 90.0
-# Host liveness TTL is 90 s; a host that reacted to the rejection would leave "online" inside it.
-_HOST_REACTION_WINDOW_S = 60.0
 
 
 @dataclass
@@ -96,6 +94,7 @@ class StaleLoginRig:
     server_proc: subprocess.Popen[bytes]
     host_proc: subprocess.Popen[bytes] | None = None
     host_stderr_fh: IO[str] | None = None
+    server_log_fh: IO[str] | None = None
     login_expires_at: float = 0.0
 
     @property
@@ -148,8 +147,17 @@ class StaleLoginRig:
         env = {
             key: value
             for key, value in os.environ.items()
+            # Exclude DATABRICKS_* so the runner cannot fall back to SDK OAuth
+            # and mask the expired stored login this test depends on.
             if not key.startswith(
-                ("OMNIGENT_RUNNER", "OMNIGENT_PROCESS", "OMNIGENT_HOST", "OPENAI_", "ANTHROPIC_")
+                (
+                    "OMNIGENT_RUNNER",
+                    "OMNIGENT_PROCESS",
+                    "OMNIGENT_HOST",
+                    "OPENAI_",
+                    "ANTHROPIC_",
+                    "DATABRICKS_",
+                )
             )
         }
         for key in (
@@ -198,6 +206,9 @@ class StaleLoginRig:
     def shutdown(self) -> None:
         self.stop_host()
         _terminate(self.server_proc)
+        if self.server_log_fh is not None:
+            self.server_log_fh.close()
+            self.server_log_fh = None
         self.edge.stop()
 
     def host_record(self, client: httpx.Client) -> dict | None:
@@ -413,6 +424,7 @@ def boot_rig(root: Path, mock_llm_url: str) -> StaleLoginRig:
         host_log=root / "host-daemon.log",
         host_stderr=root / "host-stderr.log",
         server_log=server_log,
+        server_log_fh=server_handle,
         admin_token=admin_token,
         account_generation=claims.get("account_generation"),
         server_proc=server_proc,
@@ -458,43 +470,12 @@ def test_host_stops_reporting_online_once_runner_login_is_rejected(
         )
 
         _, launch = rig.launch_session(client)
-        if launch.status_code != 200:
-            # Once the stored login lapsed the server refuses the launch up
-            # front with an actionable re-login error, not a doomed runner.
-            assert launch.status_code == 503, launch.text
-            error = launch.json().get("error", {})
-            assert error.get("code") == "host_login_expired", launch.text
-            assert "login" in (error.get("message") or "").lower(), launch.text
-            return
-        runner_id = launch.json()["runner_id"]
-        failed = rig.wait_runner_settled(client, runner_id)
-        assert failed.get("online") is False and failed.get("error"), (
-            f"runner neither connected nor reported dead: {failed}\n{rig.host_log_tail()}"
-        )
-        assert "401" in failed["error"], failed["error"]
-        token_rejections = rig.edge.rejections(f"/v1/runners/{runner_id}/token")
-        tunnel_rejections = rig.edge.rejections(f"/v1/runners/{runner_id}/tunnel")
-        assert token_rejections and tunnel_rejections, rig.edge_summary()
-
-        deadline = time.monotonic() + _HOST_REACTION_WINDOW_S
-        observed = []
-        while time.monotonic() < deadline:
-            record = rig.host_record(client)
-            observed.append(record["status"] if record else None)
-            if record is None or record["status"] != "online":
-                break
-            time.sleep(5.0)
-        _, second = rig.launch_session(client)
-        second_status = (
-            rig.wait_runner_settled(client, second.json()["runner_id"])
-            if second.status_code == 200
-            else {"launch_status": second.status_code, "body": second.text}
-        )
-
-    assert observed[-1] != "online" or second.status_code != 200, (
-        f"host still reported {observed[-1]!r} for {_HOST_REACTION_WINDOW_S:.0f}s after its "
-        f"runner was rejected with HTTP 401 ({len(token_rejections)} token / "
-        f"{len(tunnel_rejections)} tunnel rejections), and a further launch was accepted "
-        f"(HTTP {second.status_code}) and ended as {second_status}\n"
-        f"host statuses observed: {observed}\nedge:\n{rig.edge_summary()}\n{rig.host_log_tail()}"
-    )
+        # Once the stored login lapsed the server refuses the launch up front
+        # with an actionable re-login error instead of accepting a runner that
+        # would be rejected (HTTP 401) on its token endpoint and exit.
+        assert launch.status_code == 503, launch.text
+        error = launch.json().get("error", {})
+        assert error.get("code") == "host_login_expired", launch.text
+        assert "login" in (error.get("message") or "").lower(), launch.text
+        # No runner was spawned, so the edge saw no runner-token rejection.
+        assert not rig.edge.rejections("/token"), rig.edge_summary()

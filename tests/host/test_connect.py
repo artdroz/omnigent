@@ -77,7 +77,11 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
-from omnigent.host.identity import HOST_TOKEN_ENV_VAR, HostIdentity
+from omnigent.host.identity import (
+    HOST_AUTH_REQUIRED_HEADER,
+    HOST_TOKEN_ENV_VAR,
+    HostIdentity,
+)
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteUnavailable
 from omnigent.runner.identity import (
@@ -1021,11 +1025,11 @@ async def test_handle_launch_refuses_when_host_login_expired(
     host = _make_host_process()
     workspace = tmp_path / "project"
     workspace.mkdir()
-    # Non-managed host whose live tunnel authenticated with a bearer (so the server
-    # requires auth); its stored login now reads EXPIRED with nothing to refresh, so
-    # every runner it spawns would be rejected (HTTP 401).
+    # Non-managed host connected to an auth-required server; its stored login now
+    # reads EXPIRED with nothing to refresh, so every runner it spawns would be
+    # rejected (HTTP 401).
     monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
-    host._connected_with_bearer = True
+    host._server_requires_auth = True
     monkeypatch.setattr(host, "_current_auth_token", lambda *, initialize: None)
     monkeypatch.setattr(
         "omnigent.cli_auth.stored_token_status",
@@ -1057,7 +1061,7 @@ async def test_handle_launch_refuses_when_host_login_expired(
 
 
 @pytest.mark.parametrize(
-    ("bearer", "stored_status", "managed", "connected_with_bearer", "refresh_result"),
+    ("bearer", "stored_status", "managed", "server_requires_auth", "refresh_result"),
     [
         # A warm bearer still works even if the on-disk login reads expired.
         ("warm-bearer", "expired", False, True, None),
@@ -1082,7 +1086,7 @@ async def test_handle_launch_proceeds_when_login_is_not_expired(
     bearer: str | None,
     stored_status: str,
     managed: bool,
-    connected_with_bearer: bool,
+    server_requires_auth: bool,
     refresh_result: str | None,
 ) -> None:
     """Refuse only a non-managed host that needs a bearer it can neither hold nor renew.
@@ -1100,7 +1104,7 @@ async def test_handle_launch_proceeds_when_login_is_not_expired(
     monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
     if managed:
         monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "managed-launch-token")
-    host._connected_with_bearer = connected_with_bearer
+    host._server_requires_auth = server_requires_auth
     monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: bearer)
     monkeypatch.setattr(
         "omnigent.cli_auth.stored_token_status",
@@ -1129,6 +1133,121 @@ async def test_handle_launch_proceeds_when_login_is_not_expired(
     # Reached the spawn (our injected OSError surfaces), not the login refusal.
     assert "spawn blocked for test" in (result.error or "")
     assert result.error_code != HOST_LOGIN_EXPIRED_ERROR_CODE
+
+
+async def test_build_connect_headers_does_not_reset_server_requires_auth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-expiry header rebuild must not re-enable doomed launches.
+
+    The tunnel records whether the server requires auth once, at the accepted
+    upgrade. ``_build_connect_headers`` is reused for ordinary HTTP calls such
+    as the skill-bundle fetch; rebuilding headers after the login lapses (no
+    bearer) must leave that admission state untouched so the next launch still
+    refuses instead of spawning a runner that would be rejected (HTTP 401).
+    """
+    host = _make_host_process()
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
+    host._server_requires_auth = True
+    monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
+
+    # Mirrors what _fetch_skill_bundle does after the login lapses.
+    headers = host._build_connect_headers()
+
+    assert "Authorization" not in headers
+    assert host._server_requires_auth is True
+
+    monkeypatch.setattr("omnigent.cli_auth.stored_token_status", lambda server_url: "expired")
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda server_url: None)
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    frame = HostLaunchRunnerFrame(
+        request_id="req_after_skill_fetch",
+        binding_token="token_after_fetch",
+        workspace=str(workspace),
+        harness=None,
+    )
+    result = await host._handle_launch(frame)
+
+    assert isinstance(result, HostLaunchRunnerResultFrame)
+    assert result.status == "failed"
+    assert result.error_code == HOST_LOGIN_EXPIRED_ERROR_CODE
+    assert host._runners == {}
+
+
+async def test_handle_launch_delivers_refreshed_token_to_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An expired-but-refreshable login hands the renewed bearer to the runner.
+
+    Mirroring the runner's own auth factory, the host renews a login that still
+    refreshes rather than refusing, and injects the fresh token so the spawned
+    runner authenticates with it instead of being rejected (HTTP 401).
+    """
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
+    host._server_requires_auth = True
+    monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
+    monkeypatch.setattr("omnigent.cli_auth.stored_token_status", lambda server_url: "expired")
+    monkeypatch.setattr(
+        "omnigent.cli_auth.refresh_stored_token", lambda server_url: "refreshed-token"
+    )
+
+    captured: dict[str, str] = {}
+
+    def _capture_env(env: dict[str, str], *_args: object) -> tuple[object, Path]:
+        captured.update(env)
+        raise OSError(errno.EACCES, "spawn blocked for test")
+
+    monkeypatch.setattr(host, "_spawn_runner_proc", _capture_env)
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_refresh",
+        binding_token="token_refresh",
+        workspace=str(workspace),
+        harness=None,
+    )
+    result = await host._handle_launch(frame)
+
+    assert isinstance(result, HostLaunchRunnerResultFrame)
+    assert result.status == "failed"
+    # Reached the spawn, not the login refusal, and carried the renewed bearer.
+    assert result.error_code != HOST_LOGIN_EXPIRED_ERROR_CODE
+    assert captured.get(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR) == "refreshed-token"
+
+
+@pytest.mark.parametrize(
+    ("signalled", "has_bearer", "expected"),
+    [
+        # Server states it requires auth, regardless of what we sent.
+        ("1", False, True),
+        # Server states auth is disabled; a stale bearer still attached at connect
+        # must not be mistaken for a server that requires it.
+        ("0", True, False),
+        # Older server omits the signal: fall back to the bearer we presented.
+        (None, True, True),
+        # Older server reached unauthenticated: it does not require auth.
+        (None, False, False),
+    ],
+)
+def test_auth_required_from_handshake(
+    signalled: str | None,
+    has_bearer: bool,
+    expected: bool,
+) -> None:
+    """Prefer the server's handshake signal; fall back to the bearer sent."""
+    host = _make_host_process()
+    response_headers = Headers()
+    if signalled is not None:
+        response_headers[HOST_AUTH_REQUIRED_HEADER] = signalled
+    ws = SimpleNamespace(response=SimpleNamespace(headers=response_headers))
+    headers = {"Authorization": "Bearer token"} if has_bearer else {}
+
+    assert host._auth_required_from_handshake(ws, headers) is expected  # type: ignore[arg-type]
 
 
 async def test_handle_launch_native_cursor_message_points_at_cursor_installer(

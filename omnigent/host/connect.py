@@ -126,6 +126,7 @@ from omnigent.host.git_worktree import (
     remove_worktree,
 )
 from omnigent.host.identity import (
+    HOST_AUTH_REQUIRED_HEADER,
     HOST_TOKEN_ENV_VAR,
     HostIdentity,
     load_or_create_host_identity,
@@ -1143,10 +1144,12 @@ class HostProcess:
         # to retry credential discovery.
         self._auth_token_factory: Callable[[], str | None] | None = None
         self._auth_token_factory_resolved = False
-        # Whether the live tunnel presented a bearer the server accepted, i.e. the
-        # server required authentication. An auth-disabled server admits the host
-        # unauthenticated (False), so a stale stored login still permits launches.
-        self._connected_with_bearer = False
+        # Whether the server requires authentication, learned from the live
+        # tunnel's handshake. An auth-disabled server reports False, so a stale
+        # stored login still permits launches; an auth-required server reports
+        # True, so launches refuse once the login can no longer be renewed. None
+        # until the first upgrade records it.
+        self._server_requires_auth: bool | None = None
         # This host's owning user, resolved once after the first accepted tunnel
         # upgrade (GET /v1/me). Injected into every runner it spawns and published
         # to OMNIGENT_USER_ID so host/runner debug-log rows carry it. None until
@@ -1877,10 +1880,10 @@ class HostProcess:
                 refreshed = await asyncio.to_thread(refresh_stored_token, self._server_url)
                 if refreshed is not None:
                     initial_auth_token = refreshed
-                elif self._connected_with_bearer:
-                    # The server required a bearer to admit this host and it can no
+                elif self._server_requires_auth:
+                    # The server requires authentication and the login can no
                     # longer be renewed, so every runner is rejected (HTTP 401). An
-                    # obsolete record for an auth-disabled server still launches.
+                    # auth-disabled server reports otherwise and still launches.
                     return self._launch_failed(
                         frame,
                         (
@@ -4345,6 +4348,11 @@ class HostProcess:
         self._refused_streak = 0
         self._transient_404_streak = 0
         self._conn_upgrade_accepted = True
+        # Record whether this server requires auth from the accepted tunnel's own
+        # handshake, so a later HTTP request that reuses the header builder can
+        # never flip it. Older servers omit the signal; fall back to whether this
+        # connection presented a bearer.
+        self._server_requires_auth = self._auth_required_from_handshake(ws, headers)
         # A completed upgrade proves the endpoint healthy — the next drop's
         # prompt reconnect is wanted again.
         self._recycle_streak = 0
@@ -4454,10 +4462,26 @@ class HostProcess:
             headers[MANAGED_HOST_TOKEN_HEADER] = managed_token
             return headers
         token = self._current_auth_token()
-        self._connected_with_bearer = bool(token)
         if token:
             headers["Authorization"] = f"Bearer {token}"
         return headers
+
+    def _auth_required_from_handshake(
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+        headers: dict[str, str],
+    ) -> bool:
+        """Whether this server requires authentication for the tunnel.
+
+        Reads the signal the server sends on the accepted upgrade. Older
+        servers omit it, so fall back to whether this connection presented a
+        bearer.
+        """
+        response = getattr(ws, "response", None)
+        signalled = response.headers.get(HOST_AUTH_REQUIRED_HEADER) if response else None
+        if signalled is not None:
+            return signalled == "1"
+        return "Authorization" in headers
 
     def _current_auth_token(self, *, initialize: bool = True) -> str | None:
         """Return a bearer from the host's retained refreshable auth context.

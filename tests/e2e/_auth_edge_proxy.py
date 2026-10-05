@@ -29,6 +29,7 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from websockets.asyncio.client import connect as ws_connect
 
+from omnigent.host.identity import HOST_AUTH_REQUIRED_HEADER
 from tests._helpers.live_server import find_free_port
 
 _HOP_BY_HOP = frozenset(
@@ -266,7 +267,20 @@ class AuthEdgeProxy:
             )
             return
         self._record("WS", path, 101, authorized)
-        await websocket.accept()
+        # Relay the server's auth-mode signal to the host, as a real front
+        # door forwards the upgrade response headers it receives upstream.
+        upstream_response = upstream.response
+        signalled = (
+            upstream_response.headers.get(HOST_AUTH_REQUIRED_HEADER)
+            if upstream_response is not None
+            else None
+        )
+        accept_headers = (
+            [(HOST_AUTH_REQUIRED_HEADER.encode(), signalled.encode())]
+            if signalled is not None
+            else []
+        )
+        await websocket.accept(headers=accept_headers)
 
         async def client_to_upstream() -> None:
             try:
