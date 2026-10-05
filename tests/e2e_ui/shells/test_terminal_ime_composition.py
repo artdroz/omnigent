@@ -264,58 +264,100 @@ def test_inbound_output_leaves_preedit_intact(
 # fullwidth-latin IME mode shows unconverted consonants as fullwidth latin
 # (ｄ, ｙ, ｓ) in the preedit until each kana converts.
 _SHIFT_ASCII_PREEDITS = [
-    "A", "Aｄ", "Aで", "Aでｙ", "Aでよ", "Aでよｉ",
-    "Aでよい", "Aでよいｄ", "Aでよいで", "Aでよいでｓ", "Aでよいです",
+    "A",
+    "Aｄ",
+    "Aで",
+    "Aでｙ",
+    "Aでよ",
+    "Aでよｉ",
+    "Aでよい",
+    "Aでよいｄ",
+    "Aでよいで",
+    "Aでよいでｓ",
+    "Aでよいです",
 ]
 _SHIFT_ASCII_CODES = [
-    "KeyA", "KeyD", "KeyE", "KeyY", "KeyO", "KeyI",
-    "KeyI", "KeyD", "KeyE", "KeyS", "KeyU",
+    "KeyA",
+    "KeyD",
+    "KeyE",
+    "KeyY",
+    "KeyO",
+    "KeyI",
+    "KeyI",
+    "KeyD",
+    "KeyE",
+    "KeyS",
+    "KeyU",
 ]
 _COMMITTED_TAIL = "でよいです"
+_COMMITTED_LINE = "A" + _COMMITTED_TAIL
 
 
 def _fullwidth_latin(text: str) -> list[str]:
     return [c for c in text if 0xFF01 <= ord(c) <= 0xFF5E]
 
 
-def _drive_shift_ascii_run(textarea, preedits: list[str], codes: list[str]) -> None:
-    """Replay a Shift+ASCII-run-mid-composition gesture at ``term.textarea``.
+def _drive_composition(
+    textarea, preedits: list[str], codes: list[str], *, shift_ascii_first: bool
+) -> bool:
+    """Replay an IME composition at ``term.textarea`` without a real IME.
 
-    A ``compositionstart`` opens the preedit; a Shift+letter keydown carrying
-    the real keyCode (65) and ``isComposing`` arrives mid-composition; the user
-    returns to kana conversion, each romaji keystroke a keyCode-229 keydown with
-    the preedit growing; a ``compositionend`` commits. No fresh
-    ``compositionstart`` fires after the Shift+letter, mirroring a native IME.
+    A ``compositionstart`` opens the preedit. With *shift_ascii_first*, the
+    first preedit is a Shift-typed ASCII letter whose keydown carries the real
+    keyCode (65) and ``isComposing`` — the mid-composition gesture under test.
+    Every other keystroke is a keyCode-229 keydown with the preedit growing, and
+    a ``compositionend`` commits. No fresh ``compositionstart`` fires after the
+    Shift+letter, mirroring a native IME.
+
+    :returns: Whether every keydown stayed uncanceled (``dispatchEvent`` returned
+        ``true``). The IME must keep receiving the keys it owns, so the terminal
+        may claim them from xterm but never ``preventDefault()`` them.
     """
-    textarea.evaluate(
+    return textarea.evaluate(
         """(ta, args) => {
-          const [preedits, codes] = args;
+          const [preedits, codes, shiftAsciiFirst] = args;
           const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
           const upd = (t) => {
             ta.value = t;
-            ta.dispatchEvent(new CompositionEvent("compositionupdate", { data: t, bubbles: true }));
+            ta.dispatchEvent(
+              new CompositionEvent("compositionupdate", { data: t, bubbles: true })
+            );
           };
           const kd = (o) =>
-            ta.dispatchEvent(new KeyboardEvent("keydown", Object.assign({ bubbles: true, cancelable: true }, o)));
+            ta.dispatchEvent(
+              new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...o })
+            );
           window.__imeDone = (async () => {
+            let uncanceled = true;
             ta.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
-            upd(preedits[0]);
-            await sleep(90);
-            kd({ key: "A", code: "KeyA", keyCode: 65, shiftKey: true, isComposing: true });
-            await sleep(90);
-            for (let i = 1; i < preedits.length; i++) {
-              kd({ key: "Process", code: codes[i], keyCode: 229, isComposing: true });
+            let i = 0;
+            if (shiftAsciiFirst) {
+              upd(preedits[0]);
+              await sleep(90);
+              uncanceled &&= kd({
+                key: preedits[0], code: codes[0], keyCode: 65, shiftKey: true, isComposing: true,
+              });
+              await sleep(90);
+              i = 1;
+            }
+            for (; i < preedits.length; i++) {
+              uncanceled &&= kd({
+                key: "Process", code: codes[i], keyCode: 229, isComposing: true,
+              });
               upd(preedits[i]);
               await sleep(90);
             }
-            kd({ key: "Process", code: "Enter", keyCode: 229, isComposing: true });
+            uncanceled &&= kd({ key: "Process", code: "Enter", keyCode: 229, isComposing: true });
             ta.value = preedits[preedits.length - 1];
-            ta.dispatchEvent(new CompositionEvent("compositionend", { data: ta.value, bubbles: true }));
+            ta.dispatchEvent(
+              new CompositionEvent("compositionend", { data: ta.value, bubbles: true })
+            );
+            return uncanceled;
           })();
+          return window.__imeDone;
         }""",
-        [preedits, codes],
+        [preedits, codes, shift_ascii_first],
     )
-    textarea.page.evaluate("() => window.__imeDone")
 
 
 def test_shift_ascii_run_mid_composition_does_not_resend_preedit(
@@ -327,8 +369,9 @@ def test_shift_ascii_run_mid_composition_does_not_resend_preedit(
     Shift-type a leading ASCII "A" mid-composition → return to kana conversion
     and convert the tail ``でよいです`` → commit.
 
-    Expected: the PTY receives the committed tail exactly once and no fullwidth
-    romaji consonant ever leaks out of the preedit.
+    Expected: the PTY receives the committed line ``Aでよいです`` exactly once,
+    no fullwidth romaji consonant ever leaks out of the preedit, and the keys
+    the IME owns are never ``preventDefault()``-ed away from it.
 
     Actual (the bug): the Shift+letter finalizes the composition without a fresh
     ``compositionstart``, so every later update re-emits the committed prefix
@@ -351,16 +394,23 @@ def test_shift_ascii_run_mid_composition_does_not_resend_preedit(
     )
 
     baseline = len(sent)
-    _drive_shift_ascii_run(textarea, _SHIFT_ASCII_PREEDITS, _SHIFT_ASCII_CODES)
+    uncanceled = _drive_composition(
+        textarea, _SHIFT_ASCII_PREEDITS, _SHIFT_ASCII_CODES, shift_ascii_first=True
+    )
+    assert uncanceled, "a composing keydown was preventDefault()-ed away from the IME"
+    assert _wait_for_sent_bytes(page, sent, _COMMITTED_TAIL.encode("utf-8"), timeout_s=10), (
+        f"the converted kana never reached the PTY; sent: {b''.join(sent[baseline:])!r}"
+    )
+    # Grace period so any erroneous re-sends after the commit are captured too.
     page.wait_for_timeout(500)
 
     decoded = b"".join(sent[baseline:]).decode("utf-8", "replace")
-    assert _COMMITTED_TAIL in decoded, (
-        f"the converted kana never reached the PTY; sent after focus: {decoded!r}"
-    )
     assert decoded.count(_COMMITTED_TAIL) == 1, (
         "the committed prefix/preedit was re-sent to the PTY on composition updates: "
         f"{_COMMITTED_TAIL!r} appears {decoded.count(_COMMITTED_TAIL)} times in {decoded!r}"
+    )
+    assert decoded.count(_COMMITTED_LINE) == 1 and decoded.count("A") == 1, (
+        f"the PTY must receive {_COMMITTED_LINE!r} exactly once; got {decoded!r}"
     )
     assert not _fullwidth_latin(decoded), (
         "fullwidth romaji consonants leaked out of the preedit to the PTY: "
@@ -389,36 +439,19 @@ def test_kana_conversion_without_shift_ascii_sends_once(
     textarea.focus()
 
     page.keyboard.type("q")
-    assert _wait_for_sent_bytes(page, sent, b"q", timeout_s=10)
+    assert _wait_for_sent_bytes(page, sent, b"q", timeout_s=10), (
+        f"attach WebSocket frame capture saw no keystroke frame; sent so far: {b''.join(sent)!r}"
+    )
 
     baseline = len(sent)
     preedits = ["で", "でよ", "でよい", "でよいで", "でよいです"]
     codes = ["KeyD", "KeyO", "KeyI", "KeyE", "KeyU"]
-    textarea.evaluate(
-        """(ta, args) => {
-          const [preedits, codes] = args;
-          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-          const upd = (t) => {
-            ta.value = t;
-            ta.dispatchEvent(new CompositionEvent("compositionupdate", { data: t, bubbles: true }));
-          };
-          const kd = (o) =>
-            ta.dispatchEvent(new KeyboardEvent("keydown", Object.assign({ bubbles: true, cancelable: true }, o)));
-          window.__imeDone = (async () => {
-            ta.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
-            for (let i = 0; i < preedits.length; i++) {
-              kd({ key: "Process", code: codes[i], keyCode: 229, isComposing: true });
-              upd(preedits[i]);
-              await sleep(90);
-            }
-            kd({ key: "Process", code: "Enter", keyCode: 229, isComposing: true });
-            ta.value = preedits[preedits.length - 1];
-            ta.dispatchEvent(new CompositionEvent("compositionend", { data: ta.value, bubbles: true }));
-          })();
-        }""",
-        [preedits, codes],
+    assert _drive_composition(textarea, preedits, codes, shift_ascii_first=False), (
+        "a composing keydown was preventDefault()-ed away from the IME"
     )
-    page.evaluate("() => window.__imeDone")
+    assert _wait_for_sent_bytes(page, sent, _COMMITTED_TAIL.encode("utf-8"), timeout_s=10), (
+        f"the converted kana never reached the PTY; sent: {b''.join(sent[baseline:])!r}"
+    )
     page.wait_for_timeout(500)
 
     decoded = b"".join(sent[baseline:]).decode("utf-8", "replace")

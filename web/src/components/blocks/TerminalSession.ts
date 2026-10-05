@@ -248,24 +248,17 @@ export const CMD_RIGHT_LINE_END = "\x05"; // Ctrl-E: cursor to line end
 /**
  * True when an in-flight IME composition owns *event*'s printable key.
  *
- * Mid-composition, a printable key (a Shift-typed ASCII run, a kana, a
- * candidate-cycling space) is preedit input: the IME integrates it into the
- * conversion and fires no fresh ``compositionstart``. xterm's
- * CompositionHelper instead finalizes the composition on any keydown that is
- * not keyCode 229 or a modifier — its commit-before-Enter path — which sends
- * the preedit to the PTY early and marks the composition over while the IME
- * keeps composing. Every later keyCode-229 keydown then diffs a stale
- * textarea and re-sends the committed prefix plus the growing preedit on
- * each update. Claiming these keys away from xterm keeps the composition
- * alive so it is committed exactly once, by ``compositionend``.
- *
- * Functional keys (Enter, Escape) and Ctrl/Meta/Alt chords stay on xterm's
- * default path: finalizing before Enter acts is deliberate there, and
- * keyCode 229 keeps xterm's own continue-composing handling.
+ * xterm runs the custom key handler before its CompositionHelper, which
+ * finalizes a composition on any keydown other than keyCode 229 or a bare
+ * modifier. A Shift-typed letter mid-conversion would therefore commit the
+ * preedit early, and every later update would re-send the stale textarea.
+ * Claiming the key (return ``false`` to xterm, no ``preventDefault``) leaves
+ * it to the IME, so the line is committed once at ``compositionend``.
+ * Enter/Escape, Ctrl/Meta/Alt chords, and keyCode-229 keydowns stay on
+ * xterm's default path.
  *
  * :param event: Browser keyboard event from xterm's custom key handler.
- * :returns: ``true`` when the handler must claim the event for the IME
- *     (return ``false`` to xterm without ``preventDefault``).
+ * :returns: ``true`` when the handler must claim the event for the IME.
  */
 export function compositionOwnsKeyEvent(event: KeyboardEvent): boolean {
   return (
