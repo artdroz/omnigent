@@ -26,6 +26,7 @@ from types import SimpleNamespace
 from typing import Any, TextIO
 from unittest.mock import Mock
 
+import httpx
 import pytest
 
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
@@ -11206,37 +11207,62 @@ _PRE_TOOL_USE_PAYLOAD: dict[str, object] = {
 }
 
 
-class _ScriptedPolicyClient:
-    """Fake runner policy client with a scripted body or failure.
+_USER_PROMPT_SUBMIT_PAYLOAD: dict[str, object] = {
+    "hook_event_name": "UserPromptSubmit",
+    "prompt": "hello",
+}
 
-    :param body: JSON body for every response, or ``None`` to raise.
+
+class _ScriptedPolicyClient:
+    """Fake runner policy client replaying one scripted step per POST.
+
+    :param steps: Replayed in order, the last one repeating: a dict body
+        answers 200, an int answers that status with an empty body, an
+        exception is raised, and ``None`` raises a connection failure.
     """
 
-    def __init__(self, body: dict[str, object] | None) -> None:
-        """Store the script.
-
-        :param body: Response payload; ``None`` makes every call raise.
-        """
-        self.body = body
+    def __init__(self, *steps: dict[str, object] | int | BaseException | None) -> None:
+        self.steps = list(steps)
         self.calls = 0
 
     async def post(self, url: str, json: dict[str, object] | None = None) -> SimpleNamespace:
-        """Return the scripted verdict or raise a transport error.
+        """Replay the next step as a minimal httpx-Response-shaped namespace.
 
         :param url: Evaluate path (ignored).
         :param json: Forwarded EvaluationRequest (ignored).
-        :returns: Minimal httpx-Response-shaped namespace.
+        :returns: Response namespace, or raises the scripted failure.
         """
         import json as _json
 
         del url, json
+        step = self.steps[min(self.calls, len(self.steps) - 1)]
         self.calls += 1
-        if self.body is None:
+        if step is None:
             raise ConnectionError("scripted transport failure")
-        raw = _json.dumps(self.body).encode("utf-8")
+        if isinstance(step, BaseException):
+            raise step
+        if isinstance(step, int):
+            return SimpleNamespace(status_code=step, content=b"", headers={})
+        raw = _json.dumps(step).encode("utf-8")
         return SimpleNamespace(
             status_code=200, content=raw, headers={"Content-Type": "application/json"}
         )
+
+
+def _fast_evaluate_retries(monkeypatch: pytest.MonkeyPatch, *, budget_s: float) -> None:
+    """Shrink the relay's transient retry budget so a test spends milliseconds."""
+    from omnigent.native import native_policy_hook
+
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", budget_s)
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S", 0.01)
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_MAX_BACKOFF_S", 0.01)
+
+
+def _resolver_connect_error() -> httpx.ConnectError:
+    """The error httpx raises when the server hostname does not resolve."""
+    err = httpx.ConnectError("[Errno -2] Name or service not known")
+    err.__cause__ = socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+    return err
 
 
 def _hook_relay(tmp_path, monkeypatch, client):
@@ -11334,6 +11360,7 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Upstream failure asks for PreToolUse approval and stays open for PostToolUse."""
+    _fast_evaluate_retries(monkeypatch, budget_s=0.0)
     client = _ScriptedPolicyClient(None)
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
@@ -11345,6 +11372,9 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
         )
         output = json.loads(body)
         assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+        reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "could not connect to the Omnigent server" in reason, reason
+        assert "scripted transport failure" not in reason, reason
 
         post_body = await asyncio.to_thread(
             _relay_request_raw,
@@ -11353,6 +11383,113 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
             {**_PRE_TOOL_USE_PAYLOAD, "hook_event_name": "PostToolUse", "tool_output": "x"},
         )
         assert post_body == "", "PostToolUse must fail open (tool already ran)"
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_retries_connect_failures_within_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server lookup that fails briefly and then recovers yields the real verdict.
+
+    The prompt must not be dropped while the transient budget still has time
+    left, however many quick attempts the blip swallows.
+    """
+    _fast_evaluate_retries(monkeypatch, budget_s=5.0)
+    client = _ScriptedPolicyClient(
+        _resolver_connect_error(),
+        _resolver_connect_error(),
+        _resolver_connect_error(),
+        {"result": "POLICY_ACTION_ALLOW"},
+    )
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _USER_PROMPT_SUBMIT_PAYLOAD,
+        )
+        assert body == "", f"recovered lookup must let the prompt through, got {body!r}"
+        assert client.calls == 4
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_names_resolver_failure_without_errno(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sustained resolver failure blocks the prompt with a readable reason.
+
+    The block reason names the condition and the retry instead of the raw
+    ``[Errno ...]`` text the transport error stringifies to.
+    """
+    _fast_evaluate_retries(monkeypatch, budget_s=0.0)
+    client = _ScriptedPolicyClient(_resolver_connect_error())
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _USER_PROMPT_SUBMIT_PAYLOAD,
+        )
+        output = json.loads(body)
+        assert output["decision"] == "block"
+        reason = output["reason"]
+        assert "failing closed for this request" in reason, reason
+        assert "could not resolve the Omnigent server hostname" in reason, reason
+        assert "retried for" in reason, reason
+        assert "[Errno" not in reason, reason
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_reparks_a_held_poll_the_gateway_severed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 5xx after the held-poll floor re-POSTs the same id without spending budget."""
+    from omnigent.native import native_policy_hook
+
+    _fast_evaluate_retries(monkeypatch, budget_s=0.0)
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_HELD_POLL_FLOOR_S", 0.0)
+    client = _ScriptedPolicyClient(504, {"result": "POLICY_ACTION_ALLOW"})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _PRE_TOOL_USE_PAYLOAD,
+        )
+        assert body == "", f"re-parked poll must answer the verdict, got {body!r}"
+        assert client.calls == 2
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_treats_4xx_as_final(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A client error will not succeed on retry, so it fails closed at once."""
+    _fast_evaluate_retries(monkeypatch, budget_s=5.0)
+    client = _ScriptedPolicyClient(404)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _PRE_TOOL_USE_PAYLOAD,
+        )
+        output = json.loads(body)
+        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+        assert "HTTP 404" in output["hookSpecificOutput"]["permissionDecisionReason"]
+        assert client.calls == 1
     finally:
         relay.close()
 
