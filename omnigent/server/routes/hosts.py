@@ -1097,10 +1097,9 @@ def create_hosts_router(
                 workspace,
             )
             if refusal_code == HOST_LOGIN_EXPIRED_ERROR_CODE:
-                # Map the refusal to an actionable 503 (re-login on the host)
-                # rather than the generic 502. The message is authored
-                # server-side, not echoed from the host, so host log text
-                # cannot leak.
+                # Map to an actionable 503 (re-login on the host), not the generic
+                # 502. The message is authored server-side, not echoed from the
+                # host, so untrusted host log text cannot leak.
                 raise OmnigentError(
                     host_login_expired_message(),
                     code=ErrorCode.HOST_LOGIN_EXPIRED,

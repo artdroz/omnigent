@@ -2387,10 +2387,9 @@ def register_events_routes(
                         # re-login command rather than echoing host text.
                         host_error = _host_login_expired_message()
                     if host_error_code is not None:
-                        # No runner can connect after a safe categorical refusal.
-                        # Consume the message and record the actionable reason
-                        # instead of waiting into a generic unavailable response.
-                        # The binding stays for a later retry.
+                        # No runner can connect after a safe categorical refusal, so
+                        # record the actionable reason instead of waiting into a
+                        # generic unavailable response. The binding stays for retry.
                         item_id = await _persist_host_launch_failure_turn(
                             session_id,
                             conv,

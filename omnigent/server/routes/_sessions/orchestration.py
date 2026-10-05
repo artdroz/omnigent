@@ -4306,6 +4306,8 @@ async def ensure_runner_connected(
             else:
                 _refusal_message = launch_attempt.error or ""
             if _refusal_code is not None and raise_host_refusal:
+                # Keys cover classify_launch_refusal's full categorical domain, so a
+                # non-None _refusal_code is always present in both maps below.
                 _refusal_error_codes = {
                     _HARNESS_NOT_CONFIGURED_ERROR_CODE: ErrorCode.HARNESS_NOT_CONFIGURED,
                     _WORKSPACE_MISSING_ERROR_CODE: ErrorCode.WORKSPACE_MISSING,

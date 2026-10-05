@@ -1143,6 +1143,10 @@ class HostProcess:
         # to retry credential discovery.
         self._auth_token_factory: Callable[[], str | None] | None = None
         self._auth_token_factory_resolved = False
+        # Whether the live tunnel presented a bearer the server accepted, i.e. the
+        # server required authentication. An auth-disabled server admits the host
+        # unauthenticated (False), so a stale stored login still permits launches.
+        self._connected_with_bearer = False
         # This host's owning user, resolved once after the first accepted tunnel
         # upgrade (GET /v1/me). Injected into every runner it spawns and published
         # to OMNIGENT_USER_ID so host/runner debug-log rows carry it. None until
@@ -1862,22 +1866,30 @@ class HostProcess:
         )
         if initial_auth_token is None and not os.environ.get(HOST_TOKEN_ENV_VAR):
             # The tunnel outlives its login, so a runner spawned after it lapses
-            # is rejected (HTTP 401) and exits. Managed hosts read None here yet
-            # launch via delegated auth, so only an expired stored login refuses.
-            from omnigent.cli_auth import stored_token_status
+            # is rejected (HTTP 401) and exits. Managed hosts read None here but set
+            # HOST_TOKEN_ENV_VAR and launch via delegated auth, so they are excluded.
+            from omnigent.cli_auth import refresh_stored_token, stored_token_status
 
             if await asyncio.to_thread(stored_token_status, self._server_url) == "expired":
-                from omnigent.cli_invocation import cli_invocation
-
-                return self._launch_failed(
-                    frame,
-                    (
-                        f"host {self._identity.name!r} stored login has expired — "
-                        f"run `{cli_invocation()} login` on the host machine to "
-                        "restore session launches"
-                    ),
-                    error_code=HOST_LOGIN_EXPIRED_ERROR_CODE,
-                )
+                # Mirror the runner's own auth factory: an expired login that still
+                # refreshes is not genuinely lapsed, so recover the bearer here and
+                # launch with it instead of refusing a session that would connect.
+                refreshed = await asyncio.to_thread(refresh_stored_token, self._server_url)
+                if refreshed is not None:
+                    initial_auth_token = refreshed
+                elif self._connected_with_bearer:
+                    # The server required a bearer to admit this host and it can no
+                    # longer be renewed, so every runner is rejected (HTTP 401). An
+                    # obsolete record for an auth-disabled server still launches.
+                    return self._launch_failed(
+                        frame,
+                        (
+                            f"host {self._identity.name!r} stored login has expired — "
+                            f"run `{cli_invocation()} login` on the host machine to "
+                            "restore session launches"
+                        ),
+                        error_code=HOST_LOGIN_EXPIRED_ERROR_CODE,
+                    )
         env = _build_runner_env(
             os.environ,
             server_url=self._server_url,
@@ -4442,6 +4454,7 @@ class HostProcess:
             headers[MANAGED_HOST_TOKEN_HEADER] = managed_token
             return headers
         token = self._current_auth_token()
+        self._connected_with_bearer = bool(token)
         if token:
             headers["Authorization"] = f"Bearer {token}"
         return headers

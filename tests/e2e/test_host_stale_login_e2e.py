@@ -27,6 +27,7 @@ import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import IO
 
 import httpx
 import jwt
@@ -94,6 +95,7 @@ class StaleLoginRig:
     account_generation: str | None
     server_proc: subprocess.Popen[bytes]
     host_proc: subprocess.Popen[bytes] | None = None
+    host_stderr_fh: IO[str] | None = None
     login_expires_at: float = 0.0
 
     @property
@@ -173,7 +175,8 @@ class StaleLoginRig:
 
     def start_host(self) -> None:
         """Run the real host daemon (`omnigent host --server <edge>`) against the edge."""
-        stderr = open(self.host_stderr, "a")  # noqa: SIM115 — lives for the Popen
+        stderr = open(self.host_stderr, "a")  # noqa: SIM115 — closed in stop_host
+        self.host_stderr_fh = stderr
         self.host_proc = subprocess.Popen(
             [runner_executable(), "-m", "omnigent.host._daemon_entry", "--server", self.url],
             env=self._host_env(),
@@ -188,6 +191,9 @@ class StaleLoginRig:
     def stop_host(self) -> None:
         _terminate(self.host_proc)
         self.host_proc = None
+        if self.host_stderr_fh is not None:
+            self.host_stderr_fh.close()
+            self.host_stderr_fh = None
 
     def shutdown(self) -> None:
         self.stop_host()

@@ -203,13 +203,10 @@ class ErrorCode:
         exists on the selected host (HTTP 410). Retrying cannot recreate
         deleted workspace state; the user must start a session in a valid
         workspace.
-    :cvar HOST_LOGIN_EXPIRED: The selected host's own stored login has
-        expired, so no runner it spawns can authenticate — each is rejected
-        (HTTP 401) and exits (the host refused the launch with the
-        ``host_login_expired`` error code). HTTP 503: the host cannot serve
-        launches until its operator re-runs ``omnigent login`` on the host
-        machine, so the client should surface a re-login affordance rather
-        than retry blindly. A host/config state, not a server fault.
+    :cvar HOST_LOGIN_EXPIRED: The selected host's own stored login expired, so
+        every runner it spawns is rejected (HTTP 401) and exits. HTTP 503: a
+        host/config state, not a server fault — the operator must re-run
+        ``omnigent login`` on the host, so clients surface a re-login affordance.
     :cvar SESSION_AGENT_MISSING: The session's bound agent no longer
         resolves — its stored bundle was deleted or rebound out from under
         an active session (HTTP 410). A session-lifecycle condition, not a

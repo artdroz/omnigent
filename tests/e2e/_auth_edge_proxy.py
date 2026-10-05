@@ -66,6 +66,17 @@ _UNAUTHORIZED_BODY = {"error": "Invalid Token"}
 _UNGATED_V1 = frozenset({"/v1/me", "/v1/info"})
 
 
+def _sendable_close_code(code: int | None) -> int:
+    """Clamp a relayed WebSocket close code to one the peer accepts.
+
+    1005/1006/1015 are reserved sentinels the stack sets internally and never
+    sends on the wire; relaying one raises, so fall back to a normal 1000 close.
+    """
+    if code is None or not (1000 <= code < 5000) or code in (1005, 1006, 1015):
+        return 1000
+    return code
+
+
 @dataclass
 class EdgeRequest:
     """One request seen by the edge.
@@ -262,7 +273,7 @@ class AuthEdgeProxy:
                 while True:
                     message = await websocket.receive()
                     if message["type"] == "websocket.disconnect":
-                        await upstream.close(code=message.get("code") or 1000)
+                        await upstream.close(code=_sendable_close_code(message.get("code")))
                         return
                     if message.get("text") is not None:
                         await upstream.send(message["text"])
@@ -282,9 +293,8 @@ class AuthEdgeProxy:
             except websockets.exceptions.ConnectionClosed:
                 pass
             finally:
-                code = upstream.close_code if upstream.close_code is not None else 1000
                 with contextlib.suppress(Exception):
-                    await websocket.close(code=code if 1000 <= code < 5000 else 1000)
+                    await websocket.close(code=_sendable_close_code(upstream.close_code))
 
         pumps = [
             asyncio.create_task(client_to_upstream()),

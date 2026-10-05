@@ -1021,11 +1021,19 @@ async def test_handle_launch_refuses_when_host_login_expired(
     host = _make_host_process()
     workspace = tmp_path / "project"
     workspace.mkdir()
-    # No warm bearer, and this server's stored login reads EXPIRED.
+    # Non-managed host whose live tunnel authenticated with a bearer (so the server
+    # requires auth); its stored login now reads EXPIRED with nothing to refresh, so
+    # every runner it spawns would be rejected (HTTP 401).
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
+    host._connected_with_bearer = True
     monkeypatch.setattr(host, "_current_auth_token", lambda *, initialize: None)
     monkeypatch.setattr(
         "omnigent.cli_auth.stored_token_status",
         lambda server_url: "expired",
+    )
+    monkeypatch.setattr(
+        "omnigent.cli_auth.refresh_stored_token",
+        lambda server_url: None,
     )
 
     frame = HostLaunchRunnerFrame(
@@ -1049,17 +1057,23 @@ async def test_handle_launch_refuses_when_host_login_expired(
 
 
 @pytest.mark.parametrize(
-    ("bearer", "stored_status", "managed"),
+    ("bearer", "stored_status", "managed", "connected_with_bearer", "refresh_result"),
     [
         # A warm bearer still works even if the on-disk login reads expired.
-        ("warm-bearer", "expired", False),
+        ("warm-bearer", "expired", False, True, None),
         # No stored login at all (managed pointer / never logged in).
-        (None, "absent", False),
+        (None, "absent", False, False, None),
         # A healthy stored login.
-        (None, "ok", False),
+        (None, "ok", False, True, None),
         # Managed host: it launches via its delegated token, so `_current_auth_token`
         # reads None by design and a stale local login entry must be ignored.
-        (None, "expired", True),
+        (None, "expired", True, True, None),
+        # Expired but refreshable: the runner's auth factory would renew it, so the
+        # host recovers the bearer here instead of refusing.
+        (None, "expired", False, True, "refreshed-token"),
+        # Expired record left over for an auth-disabled server that admitted this
+        # host with no bearer; the runner needs none either, so launches continue.
+        (None, "expired", False, False, None),
     ],
 )
 async def test_handle_launch_proceeds_when_login_is_not_expired(
@@ -1068,23 +1082,33 @@ async def test_handle_launch_proceeds_when_login_is_not_expired(
     bearer: str | None,
     stored_status: str,
     managed: bool,
+    connected_with_bearer: bool,
+    refresh_result: str | None,
 ) -> None:
-    """Only a non-managed host with no warm bearer AND an expired stored login refuses.
+    """Refuse only a non-managed host that needs a bearer it can neither hold nor renew.
 
     Every other combination must get past the stored-login-expired guard to the
-    spawn (forced here to a benign OSError) instead of tripping the refusal: a
-    warm bearer, an ``absent``/``ok`` stored login, or a managed host whose
-    delegated launch token makes ``_current_auth_token`` read None by design.
+    spawn (forced here to a benign OSError) instead of tripping the refusal: a warm
+    bearer, an ``absent``/``ok`` stored login, a managed host whose delegated launch
+    token makes ``_current_auth_token`` read None by design, an expired login that
+    still refreshes, or an obsolete record for an auth-disabled server that admitted
+    the host unauthenticated.
     """
     host = _make_host_process()
     workspace = tmp_path / "project"
     workspace.mkdir()
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
     if managed:
         monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "managed-launch-token")
+    host._connected_with_bearer = connected_with_bearer
     monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: bearer)
     monkeypatch.setattr(
         "omnigent.cli_auth.stored_token_status",
         lambda server_url: stored_status,
+    )
+    monkeypatch.setattr(
+        "omnigent.cli_auth.refresh_stored_token",
+        lambda server_url: refresh_result,
     )
 
     def _spawn_blocked(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
