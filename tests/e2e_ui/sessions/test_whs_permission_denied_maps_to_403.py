@@ -20,7 +20,6 @@ Run::
 
 from __future__ import annotations
 
-import socket
 import threading
 import time
 from collections.abc import Iterator
@@ -45,6 +44,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (  # noqa: E402
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore  # noqa: E402
+from tests.e2e_ui.conftest import _find_free_port  # noqa: E402
 
 # The details a proxied HTTP 403 surfaces with on the gRPC channel, and the WHS listing RPC.
 _WHS_403_DETAILS = "Received http2 header with status: 403"
@@ -171,9 +171,7 @@ def whs_403_server(built_spa: None, tmp_path: Path) -> Iterator[str]:
             agent_cache=agent_cache,
         )
 
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
+        port = _find_free_port()
         config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
         server = uvicorn.Server(config)
         thread = threading.Thread(target=server.run, daemon=True)

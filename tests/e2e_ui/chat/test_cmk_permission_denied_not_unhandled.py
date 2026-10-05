@@ -103,7 +103,9 @@ def _stop(proc: subprocess.Popen[bytes]) -> None:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.wait(timeout=5)
+        # Teardown must reach the next process even if this one will not reap.
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
 
 
 def _wait_until_routable(
