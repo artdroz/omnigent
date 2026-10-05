@@ -104,6 +104,21 @@ def _models_for(harness: str | None) -> list[str] | None:
     return list(models) if models is not None else None
 
 
+def _catalog_response_client(workers: dict[str, list[dict[str, Any]]]) -> MagicMock:
+    """Runner client whose ``/models`` response lists *workers*' model entries by worker name."""
+    response = MagicMock()
+    response.json.return_value = {
+        "workers": {
+            worker: {"source": "catalog", "verified": True, "models": entries, "note": ""}
+            for worker, entries in workers.items()
+        }
+    }
+    response.raise_for_status = MagicMock()
+    client = MagicMock()
+    client.get = AsyncMock(return_value=response)
+    return client
+
+
 def _catalog_client() -> MagicMock:
     workers = {
         "claude_code": _TEST_MODELS["claude-sdk"],
@@ -111,8 +126,7 @@ def _catalog_client() -> MagicMock:
         "pi": _TEST_MODELS["pi"],
         "self": _TEST_MODELS["claude-sdk"],
     }
-    response = MagicMock()
-    catalog_workers: dict[str, dict[str, Any]] = {}
+    catalog_workers: dict[str, list[dict[str, Any]]] = {}
     for worker, models in workers.items():
         entries: list[dict[str, Any]] = []
         for model in models:
@@ -126,17 +140,8 @@ def _catalog_client() -> MagicMock:
                         wire_apis=["openai-chat", "openai-responses"],
                     )
             entries.append(entry)
-        catalog_workers[worker] = {
-            "source": "catalog",
-            "verified": True,
-            "models": entries,
-            "note": "",
-        }
-    response.json.return_value = {"workers": catalog_workers}
-    response.raise_for_status = MagicMock()
-    client = MagicMock()
-    client.get = AsyncMock(return_value=response)
-    return client
+        catalog_workers[worker] = entries
+    return _catalog_response_client(catalog_workers)
 
 
 # ── test catalog fixtures ───────────────────────────────────────────
@@ -745,22 +750,9 @@ _GEMINI_3X = "system.ai.gemini-3-5-flash"
 
 def _workers_catalog_client(workers: dict[str, list[str]]) -> MagicMock:
     """Runner catalog listing *workers*' model ids, keyed by worker name."""
-    response = MagicMock()
-    response.json.return_value = {
-        "workers": {
-            worker: {
-                "source": "catalog",
-                "verified": True,
-                "models": [{"id": model} for model in models],
-                "note": "",
-            }
-            for worker, models in workers.items()
-        }
-    }
-    response.raise_for_status = MagicMock()
-    client = MagicMock()
-    client.get = AsyncMock(return_value=response)
-    return client
+    return _catalog_response_client(
+        {worker: [{"id": model} for model in models] for worker, models in workers.items()}
+    )
 
 
 def _gemini_catalog_client() -> MagicMock:
