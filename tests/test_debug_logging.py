@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -13,6 +15,7 @@ import httpx
 import pytest
 
 from omnigent import debug_logging as dl
+from omnigent.debug_log_spool import DebugLogSpool, DeliveryResult
 
 _INSERT_URL = (
     "https://3272836215725701.zerobus.us-west-2.cloud.databricks.com"
@@ -27,6 +30,12 @@ def _configured_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(dl.CLIENT_SECRET_ENV_VAR, "secret")
     monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://ws.cloud.databricks.com/")
     monkeypatch.setenv(dl.ENDPOINT_ENV_VAR, _INSERT_URL)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_spool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep ZeroBus handlers' default spool out of the shared test data dir."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
 
 
 @pytest.fixture(autouse=True)
@@ -1301,3 +1310,666 @@ def test_close_wakes_idle_worker_promptly() -> None:
     started = time.monotonic()
     sink.close(timeout=5.0)
     assert time.monotonic() - started < dl._FLUSH_INTERVAL_S / 2
+
+
+# ── spooled delivery ────────────────────────────────────────────────────────
+
+
+def _record(msg: str, level: int = logging.INFO) -> logging.LogRecord:
+    return logging.LogRecord("omnigent.test", level, __file__, 1, msg, (), None)
+
+
+def _spool_messages(spool: DebugLogSpool) -> list[str]:
+    messages: list[str] = []
+    for path in sorted(spool.directory.glob("*.jsonl")):
+        for line in path.read_text().splitlines():
+            messages.append(json.loads(line)["row"]["message"])
+    return messages
+
+
+def test_close_waits_on_a_hung_post_only_up_to_the_network_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hung upload delays close() by the budget at most; queued rows survive."""
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl, "_CLOSE_NETWORK_BUDGET_S", 0.3)
+    spool = DebugLogSpool(tmp_path / "spool", "https://zerobus.example/insert")
+    in_flight = threading.Event()
+    release = threading.Event()
+
+    def send(batch: list[dl.DebugLogRow]) -> DeliveryResult:
+        in_flight.set()
+        release.wait(timeout=10)
+        return "delivered"
+
+    sink = dl.DebugLogHandler("host", send, spool=spool)
+    try:
+        sink.emit(_record("first"))
+        assert in_flight.wait(timeout=2)
+        for i in range(250):
+            sink.emit(_record(f"row {i}"))
+        sink.emit(_record("CRASH ROW", logging.CRITICAL))
+
+        started = time.monotonic()
+        sink.close()
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+
+    assert 0.25 <= elapsed < 0.3 + dl._SPOOL_DUMP_BUDGET_S + 0.2
+    spooled = _spool_messages(spool)
+    # The in-flight batch is never spooled: it may still land, never twice.
+    assert "first" not in spooled
+    assert spooled == [f"row {i}" for i in range(250)] + ["CRASH ROW"]
+
+
+def test_close_delivers_the_queue_live_when_the_network_is_healthy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    spool = DebugLogSpool(tmp_path / "spool", "https://zerobus.example/insert")
+    delivered: list[str] = []
+    gate = threading.Event()
+
+    def send(batch: list[dl.DebugLogRow]) -> DeliveryResult:
+        gate.wait(timeout=5)  # hold the worker so the queue backs up first
+        delivered.extend(str(r["message"]) for r in batch)
+        return "delivered"
+
+    sink = dl.DebugLogHandler("host", send, spool=spool)
+    sink.emit(_record("first"))
+    for i in range(250):
+        sink.emit(_record(f"row {i}"))
+    gate.set()
+    sink.close()
+
+    assert delivered == ["first"] + [f"row {i}" for i in range(250)]
+    assert _spool_messages(spool) == []
+
+
+def test_close_splits_rows_between_live_and_spool_without_overlap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rows sent before the deadline aren't spooled; the rest are; none twice."""
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl, "_CLOSE_NETWORK_BUDGET_S", 0.5)
+    spool = DebugLogSpool(tmp_path / "spool", "https://zerobus.example/insert")
+    delivered: list[str] = []
+    gate = threading.Event()
+
+    def slow_send(batch: list[dl.DebugLogRow]) -> DeliveryResult:
+        gate.wait(timeout=5)
+        time.sleep(0.15)
+        delivered.extend(str(r["message"]) for r in batch)
+        return "delivered"
+
+    sink = dl.DebugLogHandler("host", slow_send, spool=spool)
+    expected = [f"row {i}" for i in range(1000)]
+    for message in expected:
+        sink.emit(_record(message))
+    worker = sink._thread
+    gate.set()
+    started = time.monotonic()
+    sink.close()
+    assert time.monotonic() - started < 0.5 + dl._SPOOL_DUMP_BUDGET_S + 0.2
+    worker.join(timeout=5)  # let an abandoned in-flight POST finish
+
+    spooled = _spool_messages(spool)
+    assert delivered and spooled, "expected both live delivery and a spooled remainder"
+    assert not set(delivered) & set(spooled)
+    assert sorted(delivered + spooled) == sorted(expected)
+
+
+def test_failed_batches_spool_and_a_later_handler_replays_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl, "_REPLAY_MIN_UPTIME_S", 0.0)
+    spool_dir = tmp_path / "spool"
+    failed_once = threading.Event()
+
+    def failing(batch: list[dl.DebugLogRow]) -> DeliveryResult:
+        failed_once.set()
+        return "failed"
+
+    sink = dl.DebugLogHandler(
+        "host", failing, spool=DebugLogSpool(spool_dir, "https://zerobus.example/insert")
+    )
+    sink.emit(_record("offline row"))
+    assert failed_once.wait(timeout=2)
+    sink.close()
+
+    delivered: list[dl.DebugLogRow] = []
+    got = threading.Event()
+
+    def working(batch: list[dl.DebugLogRow]) -> DeliveryResult:
+        delivered.extend(batch)
+        got.set()
+        return "delivered"
+
+    later = dl.DebugLogHandler(
+        "host", working, spool=DebugLogSpool(spool_dir, "https://zerobus.example/insert")
+    )
+    try:
+        assert got.wait(timeout=5)
+    finally:
+        later.close()
+    assert [r["message"] for r in delivered] == ["offline row"]
+    attrs = delivered[0]["attributes"]
+    assert isinstance(attrs, dict) and attrs["spooled"] == "true"
+    assert list(spool_dir.glob("*.jsonl")) == []
+
+
+class _InsertClient:
+    """Fake httpx client: mints a token, answers inserts from a script."""
+
+    def __init__(self, outcomes: list[object]) -> None:
+        self._outcomes = outcomes
+        self.inserts = 0
+
+    def post(self, url: str, **_: object) -> httpx.Response:
+        if url.endswith("/oidc/v1/token"):
+            return httpx.Response(200, json={"access_token": "token", "expires_in": 3600})
+        self.inserts += 1
+        outcome = self._outcomes[min(self.inserts, len(self._outcomes)) - 1]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        assert isinstance(outcome, int)
+        return httpx.Response(outcome)
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "expected", "inserts"),
+    [
+        ([200], "delivered", 1),
+        # The request may have landed: never resend it.
+        ([httpx.ReadTimeout("slow")], "unknown", 1),
+        ([httpx.RemoteProtocolError("reset")], "unknown", 1),
+        # Never sent: safe to retry, then spool.
+        ([httpx.ConnectError("offline")], "failed", 3),
+        ([httpx.ConnectError("blip"), 200], "delivered", 2),
+        ([503], "failed", 3),
+        ([429, 200], "delivered", 2),
+        # Permanently refused: dropping beats replaying it forever.
+        ([400], "rejected", 1),
+        ([413], "rejected", 1),
+    ],
+)
+def test_post_classifies_outcomes_for_at_most_once(
+    _configured_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    outcomes: list[object],
+    expected: str,
+    inserts: int,
+) -> None:
+    monkeypatch.setattr(dl.time, "sleep", lambda _s: None)
+    config = dl.config_from_env()
+    assert config is not None
+    client = _InsertClient(outcomes)
+    sink = object.__new__(dl.ZerobusLogHandler)
+    sink._config = config
+    sink._client = client  # type: ignore[assignment]
+    sink._tokens = dl._TokenSource(config, client)  # type: ignore[arg-type]
+    sink._delivered_any = False
+
+    assert sink._post([{"message": "m"}]) == expected
+    assert client.inserts == inserts
+
+
+def test_backoff_coalesces_rows_and_close_keeps_the_workers_partial_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """During an outage rows fill whole spool files; close() still keeps them."""
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    spool = DebugLogSpool(tmp_path / "spool", "https://zerobus.example/insert")
+    failed = threading.Event()
+
+    def failing(batch: list[dl.DebugLogRow]) -> DeliveryResult:
+        failed.set()
+        return "failed"
+
+    sink = dl.DebugLogHandler("host", failing, spool=spool)
+    sink.emit(_record("trigger"))
+    assert failed.wait(timeout=2)
+    time.sleep(0.05)  # the worker is now backing off (5s), filling a batch locally
+    for i in range(30):
+        sink.emit(_record(f"offline {i}"))
+        time.sleep(0.002)
+    # A slow disk: the worker's spool write outlasts close()'s 0.1s grace.
+    real_write = spool.write
+
+    def slow_write(rows: list[dl.DebugLogRow], **kwargs: object) -> int:
+        time.sleep(0.25)
+        return real_write(rows, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(spool, "write", slow_write)
+    worker = sink._thread
+    sink.close()
+    # close() waited for local work, so exiting now would not lose the batch.
+    assert not worker.is_alive()
+
+    files = sorted(spool.directory.glob("*.jsonl"))
+    assert _spool_messages(spool) == ["trigger"] + [f"offline {i}" for i in range(30)]
+    # One file for the failed batch, one for the backoff batch: not 31 files.
+    assert len(files) <= 3
+
+
+def test_post_with_spent_deadline_sends_nothing(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = dl.config_from_env()
+    assert config is not None
+    client = _InsertClient([200])
+    sink = object.__new__(dl.ZerobusLogHandler)
+    sink._config = config
+    sink._client = client  # type: ignore[assignment]
+    sink._tokens = dl._TokenSource(config, client)  # type: ignore[arg-type]
+    sink._delivered_any = False
+
+    assert sink._post([{"message": "m"}], deadline=time.monotonic() - 1) == "failed"
+    assert client.inserts == 0
+
+
+def test_bounded_token_mint_skips_unresolved_secret_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The secret command is an unbounded subprocess; never run it at shutdown."""
+    monkeypatch.setenv(dl.CLIENT_ID_ENV_VAR, "cid")
+    monkeypatch.setenv(dl.CLIENT_SECRET_COMMAND_ENV_VAR, "credential-helper")
+    monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://ws.cloud.databricks.com")
+    monkeypatch.setenv(dl.ENDPOINT_ENV_VAR, _INSERT_URL)
+    config = dl.config_from_env()
+    assert config is not None
+    ran: list[object] = []
+    monkeypatch.setattr(dl.subprocess, "run", lambda *a, **k: ran.append(a))
+    tokens = dl._TokenSource(config, _InsertClient([200]))  # type: ignore[arg-type]
+
+    assert tokens.token(deadline=time.monotonic() + 1) is None
+    assert ran == []
+
+
+def test_post_timeout_is_cut_to_the_deadline(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = dl.config_from_env()
+    assert config is not None
+    timeouts: list[float] = []
+
+    class Client(_InsertClient):
+        def post(self, url: str, **kwargs: object) -> httpx.Response:
+            if not url.endswith("/oidc/v1/token"):
+                timeouts.append(float(kwargs["timeout"]))  # type: ignore[arg-type]
+            return super().post(url, **kwargs)
+
+    client = Client([200])
+    sink = object.__new__(dl.ZerobusLogHandler)
+    sink._config = config
+    sink._client = client  # type: ignore[assignment]
+    sink._tokens = dl._TokenSource(config, client)  # type: ignore[arg-type]
+    sink._delivered_any = False
+
+    assert sink._post([{"message": "m"}], deadline=time.monotonic() + 0.5) == "delivered"
+    assert len(timeouts) == 1 and 0 < timeouts[0] <= 0.5
+
+
+class _SlowMintZerobus:
+    """Fake httpx client whose token mint blocks until released."""
+
+    def __init__(self) -> None:
+        self.minting = threading.Event()
+        self.release_mint = threading.Event()
+        self.inserted: list[str] = []
+        self.mints = 0
+
+    def post(self, url: str, **kwargs: object) -> httpx.Response:
+        if url.endswith("/oidc/v1/token"):
+            self.mints += 1
+            self.minting.set()
+            self.release_mint.wait(timeout=10)
+            return httpx.Response(200, json={"access_token": "t", "expires_in": 3600})
+        self.inserted.extend(r["message"] for r in json.loads(str(kwargs["content"])))
+        return httpx.Response(200)
+
+    def close(self) -> None:
+        pass
+
+
+def _slow_mint_sink(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, client: _SlowMintZerobus
+) -> tuple[dl.ZerobusLogHandler, DebugLogSpool]:
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl.httpx, "Client", lambda **_: client)
+    config = dl.config_from_env()
+    assert config is not None
+    spool = DebugLogSpool(tmp_path / "spool", config.insert_url)
+    return dl.ZerobusLogHandler(config, "host", spool=spool), spool
+
+
+def test_batch_waiting_on_a_slow_mint_is_spooled_not_lost(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Nothing went out yet, so close() takes the batch back and spools it."""
+    monkeypatch.setattr(dl, "_CLOSE_NETWORK_BUDGET_S", 0.3)
+    client = _SlowMintZerobus()
+    sink, spool = _slow_mint_sink(monkeypatch, tmp_path, client)
+    worker = sink._thread
+    try:
+        sink.emit(_record("waiting on token"))
+        assert client.minting.wait(timeout=2)
+        started = time.monotonic()
+        sink.close()
+        assert time.monotonic() - started < 0.3 + dl._SPOOL_DUMP_BUDGET_S + 0.2
+        assert _spool_messages(spool) == ["waiting on token"]
+    finally:
+        client.release_mint.set()
+    worker.join(timeout=5)
+    # The worker finished its mint after close() took the batch: it never sends it.
+    assert client.inserted == []
+
+
+def test_send_whose_mint_finishes_after_close_began_goes_out_once(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A pre-close send isn't started late; the bounded drain sends it instead."""
+    client = _SlowMintZerobus()
+    sink, spool = _slow_mint_sink(monkeypatch, tmp_path, client)
+    sink.emit(_record("row"))
+    assert client.minting.wait(timeout=2)
+    threading.Timer(0.2, client.release_mint.set).start()
+    sink.close()
+
+    assert client.inserted == ["row"]
+    assert _spool_messages(spool) == []
+
+
+def test_close_returns_even_if_the_spool_disk_hangs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl, "_CLOSE_NETWORK_BUDGET_S", 0.2)
+    spool = DebugLogSpool(tmp_path / "spool", "https://zerobus.example/insert")
+    hang = threading.Event()
+    monkeypatch.setattr(spool, "write", lambda rows, **kw: hang.wait(30) or 0)
+    in_flight = threading.Event()
+
+    def send(batch: list[dl.DebugLogRow]) -> DeliveryResult:
+        in_flight.set()
+        hang.wait(30)
+        return "delivered"
+
+    sink = dl.DebugLogHandler("host", send, spool=spool)
+    try:
+        sink.emit(_record("first"))
+        assert in_flight.wait(timeout=2)
+        for i in range(10):
+            sink.emit(_record(f"row {i}"))
+        started = time.monotonic()
+        sink.close(timeout=1.0)
+        assert time.monotonic() - started < 1.0 + 0.2
+    finally:
+        hang.set()
+
+
+def test_replay_waits_for_minimum_uptime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl, "_REPLAY_MIN_UPTIME_S", 0.5)
+    spool = DebugLogSpool(tmp_path / "spool", "https://zerobus.example/insert")
+    spool.write([{"message": "left by a previous process", "attributes": {}}])
+    delivered: list[dl.DebugLogRow] = []
+
+    def send(batch: list[dl.DebugLogRow]) -> DeliveryResult:
+        delivered.extend(batch)
+        return "delivered"
+
+    sink = dl.DebugLogHandler("host", send, spool=spool)
+    try:
+        time.sleep(0.25)
+        assert delivered == []  # too young to replay
+        deadline = time.monotonic() + 3
+        while not delivered and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert [r["message"] for r in delivered] == ["left by a previous process"]
+    finally:
+        sink.close()
+
+
+def test_early_failure_does_not_pull_replay_before_minimum_uptime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A short failure backoff must not bypass the replay uptime floor."""
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl, "_REPLAY_MIN_UPTIME_S", 0.6)
+    monkeypatch.setattr(dl, "_FAILURE_BACKOFF_MIN_S", 0.05)
+    spool = DebugLogSpool(tmp_path / "spool", "https://zerobus.example/insert")
+    started = time.monotonic()
+    replayed_at: list[float] = []
+    first = threading.Event()
+
+    def send(batch: list[dl.DebugLogRow]) -> DeliveryResult:
+        if not first.is_set():
+            first.set()
+            return "failed"  # spooled, with a 0.05s backoff
+        if any(
+            isinstance(r.get("attributes"), dict) and r["attributes"].get("spooled") == "true"
+            for r in batch
+        ):
+            replayed_at.append(time.monotonic() - started)
+        return "delivered"
+
+    sink = dl.DebugLogHandler("host", send, spool=spool)
+    try:
+        sink.emit(_record("early row"))
+        deadline = time.monotonic() + 3
+        while not replayed_at and time.monotonic() < deadline:
+            time.sleep(0.02)
+    finally:
+        sink.close()
+
+    assert replayed_at, "the spooled row should be replayed once the floor passes"
+    assert replayed_at[0] >= 0.55, f"replayed after {replayed_at[0]:.2f}s"
+
+
+_ATEXIT_CHILD = """
+import logging, sys, time
+from pathlib import Path
+from omnigent import debug_logging as dl
+from omnigent.debug_log_spool import DebugLogSpool
+
+dl._CLOSE_NETWORK_BUDGET_S = 0.2
+dl.DebugLogHandler._FLUSH_WAIT = 0.01
+spool = DebugLogSpool(Path(sys.argv[1]), "https://zerobus.example/insert")
+uploading = False
+
+def hung_send(batch):
+    global uploading
+    uploading = True
+    time.sleep(3600)
+
+sink = dl.DebugLogHandler("host", hung_send, spool=spool)
+log = logging.getLogger("atexit.child")
+log.setLevel(logging.INFO)
+log.propagate = False
+log.addHandler(sink)
+log.info("in flight")
+while not uploading:
+    time.sleep(0.01)
+for i in range(3):
+    log.info("queued %d", i)
+# Return normally: the atexit close must still spool, during interpreter shutdown.
+"""
+
+
+def test_atexit_close_spools_during_interpreter_shutdown(tmp_path: Path) -> None:
+    """Python 3.12 forbids starting threads in atexit; the spool write must still land."""
+    spool_dir = tmp_path / "spool"
+    proc = subprocess.run(
+        [sys.executable, "-c", _ATEXIT_CHILD, str(spool_dir)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "can't create new thread" not in proc.stderr
+    spool = DebugLogSpool(spool_dir, "https://zerobus.example/insert")
+    assert _spool_messages(spool) == ["queued 0", "queued 1", "queued 2"]
+
+
+def test_spool_warning_during_close_does_not_revive_the_uploader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The spool writer's own diagnostics must not restart a closing sink."""
+    from omnigent import debug_log_spool as sp
+
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl, "_CLOSE_NETWORK_BUDGET_S", 0.2)
+    monkeypatch.setattr(dl, "_diag_last", {})
+    monkeypatch.setattr(sp, "MAX_FILES", 1)  # the close-time write must prune
+    spool = DebugLogSpool(tmp_path / "spool", "https://zerobus.example/insert")
+    spool.write([{"message": "old", "attributes": {}}])
+    in_flight = threading.Event()
+    release = threading.Event()
+
+    def send(batch: list[dl.DebugLogRow]) -> DeliveryResult:
+        in_flight.set()
+        release.wait(timeout=10)
+        return "delivered"
+
+    sink = dl.DebugLogHandler("host", send, spool=spool)
+    owner = logging.getLogger("omnigent")  # where the spool warning propagates
+    owner.addHandler(sink)
+    try:
+        sink.emit(_record("first"))
+        assert in_flight.wait(timeout=2)
+        sink.emit(_record("queued"))
+        worker, work_queue = sink._thread, sink._queue
+        sink.close()
+        assert sink.closed
+        assert sink._thread is worker, "a spool warning revived the uploader"
+        assert sink._queue is work_queue
+        assert _spool_messages(spool) == ["queued"]
+    finally:
+        release.set()
+        owner.removeHandler(sink)
+
+
+def test_replay_reverts_its_claim_during_the_retry_backoff(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The ZeroBus sender reverts a replay file to ready after a connect error."""
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl, "_REPLAY_MIN_UPTIME_S", 0.0)
+    config = dl.config_from_env()
+    assert config is not None
+    spool = DebugLogSpool(tmp_path / "spool", config.insert_url)
+    spool.write([{"message": "spooled earlier", "attributes": {}}])
+
+    class _Offline(_InsertClient):
+        def post(self, url: str, **kwargs: object) -> httpx.Response:
+            if url.endswith("/oidc/v1/token"):
+                return super().post(url, **kwargs)
+            raise httpx.ConnectError("offline")
+
+    in_backoff = threading.Event()
+    leave_backoff = threading.Event()
+    seen: list[list[str]] = []
+
+    def _observing_sleep(_seconds: float, _deadline: float | None) -> None:
+        if not in_backoff.is_set():
+            seen.append(
+                sorted(p.suffix for p in spool.directory.glob("*.*") if p.suffix != ".lock")
+            )
+            in_backoff.set()
+            leave_backoff.wait(timeout=5)
+
+    monkeypatch.setattr(dl, "_bounded_sleep", _observing_sleep)
+    monkeypatch.setattr(dl.httpx, "Client", lambda **_: _Offline([200]))
+    sink = dl.ZerobusLogHandler(config, "host", spool=spool)
+    try:
+        assert in_backoff.wait(timeout=5)
+        assert seen == [[".jsonl"]], "the file stayed claimed through the backoff"
+    finally:
+        leave_backoff.set()
+        sink.close()
+
+
+def test_mint_that_uses_up_the_budget_does_not_start_the_insert(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = dl.config_from_env()
+    assert config is not None
+
+    class _SlowMint(_InsertClient):
+        def post(self, url: str, **kwargs: object) -> httpx.Response:
+            if url.endswith("/oidc/v1/token"):
+                time.sleep(0.2)
+            return super().post(url, **kwargs)
+
+    client = _SlowMint([200])
+    sink = object.__new__(dl.ZerobusLogHandler)
+    sink._config = config
+    sink._client = client  # type: ignore[assignment]
+    sink._tokens = dl._TokenSource(config, client)  # type: ignore[arg-type]
+    sink._delivered_any = False
+    began: list[bool] = []
+
+    result = sink._post(
+        [{"message": "m"}],
+        deadline=time.monotonic() + 0.25,
+        begin_send=lambda: began.append(True) or True,
+    )
+
+    assert result == "failed"  # unsent, so the caller may spool it
+    assert began == []
+    assert client.inserts == 0
+
+
+def test_close_waits_for_worker_owned_spool_after_inflight_post_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A POST returning mid-close hands the worker the queue; close() waits for its write."""
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl, "_CLOSE_NETWORK_BUDGET_S", 0.2)
+    spool = DebugLogSpool(tmp_path / "spool", "https://zerobus.example/insert")
+    in_flight, release_post, worker_writing = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    def send(batch: list[dl.DebugLogRow]) -> DeliveryResult:
+        in_flight.set()
+        release_post.wait(timeout=10)
+        return "delivered"
+
+    real_write = spool.write
+
+    def slow_worker_write(rows: list[dl.DebugLogRow], **kwargs: object) -> int:
+        if threading.current_thread().name == "omnigent-debug-log":
+            worker_writing.set()
+            time.sleep(0.3)
+        return real_write(rows, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(spool, "write", slow_worker_write)
+    real_drain = dl._drain_queue
+
+    def drain_after_post_returns(work_queue: object) -> list[dl.DebugLogRow]:
+        if threading.current_thread() is threading.main_thread():
+            release_post.set()  # the in-flight POST returns now...
+            assert worker_writing.wait(timeout=5)  # ...and the worker spools the queue
+        return real_drain(work_queue)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(dl, "_drain_queue", drain_after_post_returns)
+    sink = dl.DebugLogHandler("host", send, spool=spool)
+    try:
+        sink.emit(_record("first"))
+        assert in_flight.wait(timeout=2)
+        for i in range(3):
+            sink.emit(_record(f"queued {i}"))
+        sink.close()
+        # Checked right as close() returns: an exit here must not lose them.
+        assert _spool_messages(spool) == ["queued 0", "queued 1", "queued 2"]
+    finally:
+        release_post.set()
