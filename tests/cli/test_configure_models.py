@@ -1540,14 +1540,23 @@ def test_databricks_drift_notice_names_the_default_profile(tmp_path, monkeypatch
     )
 
 
-def test_databricks_drift_notice_silent_when_in_sync(tmp_path, monkeypatch) -> None:
-    """No warning when ucode's current workspace matches the configured profile."""
+def test_databricks_drift_notice_silent_when_any_profile_matches(tmp_path, monkeypatch) -> None:
+    """No warning when ucode's current workspace matches a configured profile,
+    even though another configured profile points elsewhere."""
     from omnigent.cli_config import _databricks_workspace_drift_notice
 
     _seed_ucode_and_databrickscfg(
-        tmp_path, monkeypatch, cfg_profiles={"ai_devtools": _WS_A}, ucode_current=_WS_A
+        tmp_path,
+        monkeypatch,
+        cfg_profiles={"staging": _WS_C, "ai_devtools": _WS_A},
+        ucode_current=_WS_A,
     )
-    config = {"providers": {"databricks": {"kind": "databricks", "profile": "ai_devtools"}}}
+    config = {
+        "providers": {
+            "staging": {"kind": "databricks", "profile": "staging"},
+            "databricks": {"kind": "databricks", "default": True, "profile": "ai_devtools"},
+        }
+    }
 
     assert _databricks_workspace_drift_notice(config) is None
 
