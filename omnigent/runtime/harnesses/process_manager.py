@@ -47,6 +47,7 @@ from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._harness_zygote_client import (
     HarnessZygoteClient,
+    ZygoteHarnessProc,
     ZygoteHarnessUnavailable,
 )
 from omnigent.runtime.harnesses.paths import (
@@ -532,12 +533,12 @@ def _build_harness_spawn_env(env: dict[str, str] | None) -> dict[str, str]:
     return strip_runner_auth_secrets(merged)
 
 
-async def _stop_process(process: asyncio.subprocess.Process | Any) -> None:
+async def _stop_process(process: asyncio.subprocess.Process | ZygoteHarnessProc) -> None:
     """
     Terminate ``process`` and its tree, escalating to a kill after
     ``_RELEASE_GRACE_S``. Cancellation during the grace wait escalates
-    at once and still reaps the corpse before re-raising, so a cancelled
-    teardown cannot abandon a live process that nothing tracks any more.
+    at once and reaps the corpse (bounded) before re-raising; a repeated
+    cancellation interrupts only that reap wait, after the kill is sent.
 
     :param process: The subprocess handle; a no-op if it already exited.
     """
@@ -552,12 +553,19 @@ async def _stop_process(process: asyncio.subprocess.Process | Any) -> None:
     except BaseException as exc:
         # Grace expired, the process vanished mid-teardown, or the caller was
         # cancelled: force-kill best-effort (an already-gone process is done).
+        if isinstance(exc, Exception):
+            _logger.warning(
+                "harness process %s did not stop after SIGTERM (%r); escalating to SIGKILL",
+                process.pid,
+                exc,
+            )
         with contextlib.suppress(Exception):
             _proc.kill_tree(process)
         # Shield the corpse-wait so a repeated cancellation interrupts only
-        # this await, not the reap; the kill has already been sent.
+        # this await, not the reap, and bound it so a kill that never landed
+        # cannot wedge teardown; the transport close below kills again.
         with contextlib.suppress(Exception):
-            await asyncio.shield(process.wait())
+            await asyncio.wait_for(asyncio.shield(process.wait()), timeout=_RELEASE_GRACE_S)
         if not isinstance(exc, Exception):
             raise
 
@@ -1445,9 +1453,9 @@ class HarnessProcessManager:
         ``client.aclose()`` raise (a broken transport, a wedged client)
         that skipped the kill would otherwise leak an *un-tracked*
         subprocess. ``CancelledError`` still propagates to the caller,
-        but only after the process is killed and reaped and its
-        transport and socket are released: the retired process has no
-        other owner left.
+        but only after the process is killed and its transport and
+        socket are released (a single cancellation also waits for the
+        reap): the retired process has no other owner left.
 
         :param entry: The bookkeeping record to tear down.
         """

@@ -620,6 +620,45 @@ async def test_release_cancelled_twice_still_kills_subprocess_and_removes_socket
         await manager.shutdown()
 
 
+async def test_release_completes_when_forced_kill_fails(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing kill_tree must not wedge release() on an unbounded reap wait.
+
+    The reap wait is bounded, and closing the subprocess transport kills the
+    child again, so teardown still ends with the child gone and the socket removed.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    monkeypatch.setattr(pm_mod, "_RELEASE_GRACE_S", 0.2)
+
+    def _kill_tree_fails(process: object) -> None:
+        raise RuntimeError("simulated kill_tree failure")
+
+    monkeypatch.setattr(pm_mod._proc, "kill_tree", _kill_tree_fails)
+
+    await manager.start()
+    pid: int | None = None
+    try:
+        client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        pid = (await client.get("/pid")).json()["pid"]
+        assert (await client.get("/ignore-sigterm")).json()["status"] == "sigterm_ignored"
+        socket_path = manager.instance_dir / "conv-conv_a.sock"
+        assert socket_path.exists()
+
+        await asyncio.wait_for(manager.release("conv_a"), timeout=5.0)
+
+        assert not manager.has_session("conv_a")
+        assert await _pid_exits(pid, timeout_s=3.0), "subprocess survived a failed forced kill"
+        assert not socket_path.exists(), "socket file left behind after a failed forced kill"
+    finally:
+        if pid is not None and _pid_alive(pid):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        await manager.shutdown()
+
+
 @pytest.mark.parametrize("response_id", [None, "resp_crashed"])
 async def test_get_client_respawns_after_crash(
     manager: HarnessProcessManager,
