@@ -113,6 +113,7 @@ function makeRegistry(conversationId, webContents) {
   const suppressedCalls = []; // booleans passed to setSuppressed, in order
   const opened = [];
   const cleared = [];
+  let intent = 0;
   return {
     get: (id) => entries.get(id) ?? null,
     has: (id) => entries.has(id),
@@ -130,6 +131,9 @@ function makeRegistry(conversationId, webContents) {
     },
     close: () => ({ ok: true, removed: true }),
     clearAgentOrigin: (id) => cleared.push(id),
+    beginNavigation: () => ++intent,
+    bindNavigationCancel: (_id, token) => token === intent,
+    isNavigationCurrent: (_id, token) => token === intent,
     suppressedCalls,
     opened,
     cleared,
@@ -304,7 +308,7 @@ describe("browserIpc — url live-tracking", () => {
     });
     assert.equal(result.ok, true);
     assert.deepEqual(ok.registry.cleared, ["conv_arca"]);
-    assert.equal(ok.registry.opened[0].opts, prepared);
+    assert.deepEqual(ok.registry.opened[0].opts, { ...prepared, intentToken: 1 });
     assert.equal(calls[0].opts.hostId, "host_arca");
 
     const failed = setup({
@@ -352,6 +356,47 @@ describe("browserIpc — url live-tracking", () => {
     assert.equal(sent.filter((s) => s.channel === "browser-url-changed").length, 0);
     wc.emit("did-navigate-in-page", "https://example.com/#main", true); // main frame → emits
     assert.equal(sent.filter((s) => s.channel === "browser-url-changed").length, 1);
+  });
+
+  it("releases prepared ownership when admission fails or the intent is superseded", async () => {
+    let releases = 0;
+    const failed = setup({
+      prepareAgentNavigation: async () => ({
+        agent: true,
+        ownedOrigin: "http://localhost:5173",
+        releaseOwnedOrigin: () => (releases += 1),
+      }),
+    });
+    failed.registry.openOrNavigate = () => ({ ok: false, error: "browser view cap reached" });
+    const rejected = await failed.ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      failed.event,
+      {
+        conversationId: "conv_arca",
+        url: "http://localhost:5173",
+        opts: { agent: true },
+      },
+    );
+    assert.equal(rejected.ok, false);
+    assert.equal(releases, 1);
+
+    let resolvePrepare;
+    const stale = setup({
+      prepareAgentNavigation: () =>
+        new Promise((resolve) => {
+          resolvePrepare = resolve;
+        }),
+    });
+    const pending = stale.ipcMain.invoke("omnigent:browser-open-or-navigate", stale.event, {
+      conversationId: "conv_arca",
+      url: "http://localhost:5173",
+      opts: { agent: true },
+    });
+    stale.registry.beginNavigation("conv_arca");
+    resolvePrepare({ agent: true, releaseOwnedOrigin: () => (releases += 1) });
+    const staleResult = await pending;
+    assert.equal(staleResult.ok, false);
+    assert.equal(releases, 2);
   });
 });
 

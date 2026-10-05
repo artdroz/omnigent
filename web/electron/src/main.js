@@ -3494,7 +3494,7 @@ function registerIpc() {
     ipcMain,
     isPinnedOriginSender,
     getRegistryForEvent: browserRegistryForSender,
-    prepareAgentNavigation: async (event, conversationId, url, opts) => {
+    prepareAgentNavigation: async (event, conversationId, url, opts, lifecycle) => {
       const registry = browserRegistryForSender(event);
       const preview = loopbackPreview(url);
       if (!registry) throw new Error("no browser registry for this window");
@@ -3510,12 +3510,21 @@ function registerIpc() {
       ) {
         throw new Error("Arca localhost previews require a managed Databricks server");
       }
+      lifecycle.onCancel(() => registry.arcaPreview.release(conversationId));
       const owned = await registry.arcaPreview.prepare({
         conversationId,
         url,
         hostId: opts.hostId,
         serverUrl,
       });
+      if (
+        browserRegistryForSender(event) !== registry ||
+        senderServerUrl(event) !== serverUrl ||
+        !lifecycle.onCancel(owned.release)
+      ) {
+        owned.release();
+        throw new Error("preview navigation was superseded");
+      }
       return { ...opts, ownedOrigin: owned.origin, releaseOwnedOrigin: owned.release };
     },
   });

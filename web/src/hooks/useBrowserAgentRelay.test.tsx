@@ -1,4 +1,6 @@
 import { renderHook } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // supportsBrowser gates the whole relay; force it true so the hook registers.
@@ -11,22 +13,50 @@ vi.mock("@/lib/nativeBridge", () => ({
 // script the claim response and inspect the result POST body.
 const authenticatedFetch = vi.fn();
 const sessionHosts = new Map<string, string>();
-const resolveSessionHost = vi.fn(async (id: string) => {
-  if (id === "conv_background_A") sessionHosts.set(id, "host_arca");
-});
+const sessionParents = new Map<string, string>();
+const sessionSnapshots = new Map<
+  string,
+  { id: string; hostId: string | null; parentSessionId: string | null }
+>();
+const getSessionSlim = vi.fn(async (id: string) => sessionSnapshots.get(id)!);
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: (...args: unknown[]) => authenticatedFetch(...args),
-  resolveSessionHost: (id: string) => resolveSessionHost(id),
 }));
 vi.mock("@/lib/sessionHost", () => ({
-  getSessionHost: (id: string) => sessionHosts.get(id) ?? null,
+  getSessionHost: (id: string) => {
+    const visited = new Set<string>();
+    let currentId = id;
+    while (!visited.has(currentId)) {
+      visited.add(currentId);
+      const host = sessionHosts.get(currentId);
+      if (host) return host;
+      const parent = sessionParents.get(currentId);
+      if (!parent) return null;
+      currentId = parent;
+    }
+    return null;
+  },
+  setSessionHost: (id: string, host: string | null) =>
+    host ? sessionHosts.set(id, host) : sessionHosts.delete(id),
+  setSessionParent: (id: string, parent: string | null) =>
+    parent ? sessionParents.set(id, parent) : sessionParents.delete(id),
 }));
+vi.mock("@/lib/sessionsApi", () => ({ getSessionSlim: (id: string) => getSessionSlim(id) }));
 
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { useBrowserAgentRelay } from "./useBrowserAgentRelay";
 
 const CONV = "conv_relay";
+
+function renderRelay(conversationId: string) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return renderHook(() => useBrowserAgentRelay(conversationId), {
+    wrapper: ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  });
+}
 
 /** Build a `browser.action_request` event for the bus. */
 function actionEvent(
@@ -69,7 +99,7 @@ async function runAction(
   opts: { expectResult?: boolean; source?: string } = {},
 ): Promise<void> {
   const { expectResult = true, source = CONV } = opts;
-  renderHook(() => useBrowserAgentRelay(CONV));
+  renderRelay(CONV);
   emitBrowserActionRequest(evt, source);
   if (expectResult) {
     await vi.waitFor(() => {
@@ -105,6 +135,8 @@ function postedResult(): Record<string, unknown> {
 beforeEach(() => {
   authenticatedFetch.mockReset();
   sessionHosts.clear();
+  sessionParents.clear();
+  sessionSnapshots.clear();
 });
 
 afterEach(() => {
@@ -177,7 +209,7 @@ describe("useBrowserAgentRelay — claim-first protocol", () => {
     const bridge = installBridge();
     authenticatedFetch.mockResolvedValueOnce(WON).mockResolvedValueOnce(jsonResponse({}));
 
-    renderHook(() => useBrowserAgentRelay(VISIBLE));
+    renderRelay(VISIBLE);
     emitBrowserActionRequest(actionEvent("navigate", { url: "https://a" }), BACKGROUND);
 
     await vi.waitFor(() => {
@@ -198,15 +230,43 @@ describe("useBrowserAgentRelay — claim-first protocol", () => {
     expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(BACKGROUND, "https://a", undefined, {
       force: true,
       agent: true,
-      hostId: "host_arca",
+      hostId: null,
     });
-    expect(resolveSessionHost).toHaveBeenCalledWith(BACKGROUND);
+    expect(getSessionSlim).not.toHaveBeenCalled();
     const resultUrl = String(
       authenticatedFetch.mock.calls.find((c) =>
         String(c[0]).includes("/browser/action_result/"),
       )![0],
     );
     expect(resultUrl).toContain(`/v1/sessions/${BACKGROUND}/browser/action_result/`);
+  });
+
+  it("loads a cold delivering child's ancestor host only for a loopback preview", async () => {
+    sessionSnapshots.set("cold_child", {
+      id: "cold_child",
+      hostId: null,
+      parentSessionId: "cold_parent",
+    });
+    sessionSnapshots.set("cold_parent", {
+      id: "cold_parent",
+      hostId: "host_arca",
+      parentSessionId: null,
+    });
+    const bridge = installBridge();
+    authenticatedFetch.mockResolvedValueOnce(WON).mockResolvedValueOnce(jsonResponse({}));
+    renderRelay("visible_chat");
+    emitBrowserActionRequest(
+      actionEvent("navigate", { url: "http://localhost:5173/app" }),
+      "cold_child",
+    );
+    await vi.waitFor(() => expect(bridge.browserOpenOrNavigate).toHaveBeenCalled());
+    expect(getSessionSlim.mock.calls.map((call) => call[0])).toEqual(["cold_child", "cold_parent"]);
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+      "cold_child",
+      "http://localhost:5173/app",
+      undefined,
+      { force: true, agent: true, hostId: "host_arca" },
+    );
   });
 });
 
@@ -360,7 +420,7 @@ describe("useBrowserAgentRelay — result POST resilience", () => {
       .mockResolvedValueOnce(WON)
       .mockRejectedValueOnce(new Error("result POST network error"));
 
-    renderHook(() => useBrowserAgentRelay(CONV));
+    renderRelay(CONV);
     emitBrowserActionRequest(actionEvent("screenshot"), CONV);
 
     await vi.waitFor(() => {
@@ -377,7 +437,7 @@ describe("useBrowserAgentRelay — result POST resilience", () => {
     // absent — getBrowserDesktop() returns null, so the handler bails before claim.
     (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = undefined;
 
-    renderHook(() => useBrowserAgentRelay(CONV));
+    renderRelay(CONV);
     emitBrowserActionRequest(actionEvent("screenshot"), CONV);
     await Promise.resolve();
     await Promise.resolve();

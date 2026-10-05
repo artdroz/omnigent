@@ -297,15 +297,37 @@ function registerBrowserIpc({
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
+    const intentToken = g.registry.beginNavigation(conversationId);
+    const lifecycle = {
+      intentToken,
+      onCancel: (cancel) => g.registry.bindNavigationCancel(conversationId, intentToken, cancel),
+    };
+    let preparedRelease = null;
     if (opts?.agent) {
       g.registry.clearAgentOrigin(conversationId);
       try {
-        opts = await prepareAgentNavigation(event, conversationId, url, opts);
+        opts = await prepareAgentNavigation(event, conversationId, url, opts, lifecycle);
+        preparedRelease = opts?.releaseOwnedOrigin || null;
       } catch (error) {
         return { ok: false, created: false, error: error.message || String(error) };
       }
     }
-    const r = g.registry.openOrNavigate(conversationId, url, bounds, opts);
+    if (
+      !g.registry.isNavigationCurrent(conversationId, intentToken) ||
+      !isPinnedOriginSender(event) ||
+      getRegistryForEvent(event) !== g.registry
+    ) {
+      preparedRelease?.();
+      return { ok: false, created: false, error: "navigation was superseded" };
+    }
+    let r;
+    try {
+      r = g.registry.openOrNavigate(conversationId, url, bounds, { ...opts, intentToken });
+    } catch (error) {
+      preparedRelease?.();
+      return { ok: false, created: false, error: error.message || String(error) };
+    }
+    if (!r.ok) preparedRelease?.();
     // On first creation, wire nav listeners here (not in the registry factory,
     // which stays Electron-free) so the URL bar can live-track the real url.
     if (r.ok && r.created && r.entry) {

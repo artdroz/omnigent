@@ -7,6 +7,7 @@ const {
   createArcaPreviewManager,
   loopbackPreview,
   parseStatusJson,
+  sameServer,
 } = require("../src/arcaPreview");
 
 function child() {
@@ -39,11 +40,8 @@ function successfulSpawner({ hostId = "host_arca", serverUrl = "https://srv.exam
         );
         proc.emit("exit", 0);
       });
-    } else {
-      const port = args[args.indexOf("-L") + 1].split(":")[1];
-      queueMicrotask(() =>
-        proc.stderr.emit("data", `debug1: Local forwarding listening on 127.0.0.1 port ${port}.\n`),
-      );
+    } else if (args.includes("-O")) {
+      queueMicrotask(() => proc.emit("exit", 0));
     }
     return proc;
   };
@@ -69,6 +67,30 @@ describe("Arca localhost preview URL", () => {
   it("parses status JSON after Arca startup notices", () => {
     assert.deepEqual(parseStatusJson('Starting Arca…\n{"daemons":[]}'), { daemons: [] });
   });
+
+  it("matches workspace UI and API mounts without relaxing host or explicit selectors", () => {
+    assert.equal(
+      sameServer(
+        "https://acme.cloud.databricks.com/omnigent?o=123",
+        "https://acme.cloud.databricks.com/api/2.0/omnigent",
+      ),
+      true,
+    );
+    assert.equal(
+      sameServer(
+        "https://acme.cloud.databricks.com/omnigent?o=123",
+        "https://acme.cloud.databricks.com/api/2.0/omnigent?o=456",
+      ),
+      false,
+    );
+    assert.equal(
+      sameServer(
+        "https://acme.cloud.databricks.com/omnigent",
+        "https://other.cloud.databricks.com/api/2.0/omnigent",
+      ),
+      false,
+    );
+  });
 });
 
 describe("Arca preview manager", () => {
@@ -77,6 +99,7 @@ describe("Arca preview manager", () => {
     const manager = createArcaPreviewManager({
       resolveArcaPathFn: () => "/usr/local/bin/arca",
       spawnFn: fake.spawn,
+      socketReady: () => true,
     });
     const first = await manager.prepare({
       conversationId: "a",
@@ -98,7 +121,9 @@ describe("Arca preview manager", () => {
       forwards.map((call) => call.args[call.args.indexOf("-L") + 1]),
       ["localhost:5173:localhost:5173", "localhost:7331:localhost:7331"],
     );
-    assert.ok(forwards.every((call) => call.args.includes("ClearAllForwardings=no")));
+    assert.ok(forwards.every((call) => call.args.includes("/dev/null")));
+    const masters = fake.calls.filter((call) => call.args.includes("-M"));
+    assert.ok(masters.every((call) => call.args.includes("ClearAllForwardings=yes")));
   });
 
   it("rejects a different, offline, or unknown requesting host", async () => {
@@ -106,6 +131,7 @@ describe("Arca preview manager", () => {
     const manager = createArcaPreviewManager({
       resolveArcaPathFn: () => "/arca",
       spawnFn: fake.spawn,
+      socketReady: () => true,
     });
     await assert.rejects(
       manager.prepare({
@@ -146,14 +172,18 @@ describe("Arca preview manager", () => {
             }),
           );
           proc.emit("exit", 0);
-        } else {
+        } else if (args.includes("-O")) {
           proc.stderr.emit("data", "bind [127.0.0.1]:5173: Address already in use\n");
           proc.emit("exit", 255);
         }
       });
       return proc;
     };
-    const manager = createArcaPreviewManager({ resolveArcaPathFn: () => "/arca", spawnFn: spawn });
+    const manager = createArcaPreviewManager({
+      resolveArcaPathFn: () => "/arca",
+      spawnFn: spawn,
+      socketReady: () => true,
+    });
     await assert.rejects(
       manager.prepare({
         conversationId: "a",
@@ -187,12 +217,13 @@ describe("Arca preview manager", () => {
     await manager.prepare({ conversationId: "a", url: "https://example.com" });
     assert.equal(pending.killed, true);
     pending.emit("exit", null);
-    await assert.rejects(attempt, /could not read Arca host status|superseded/);
+    await assert.rejects(attempt, /cancelled|superseded/);
 
     const fake = successfulSpawner();
     const active = createArcaPreviewManager({
       resolveArcaPathFn: () => "/arca",
       spawnFn: fake.spawn,
+      socketReady: () => true,
       onExit: (id) => exits.push(id),
     });
     const owned = await active.prepare({
@@ -201,8 +232,27 @@ describe("Arca preview manager", () => {
       hostId: "host_arca",
       serverUrl: "https://srv.example.com",
     });
-    fake.children.at(-1).emit("exit", 1);
+    fake.children.at(-2).emit("exit", 1);
     assert.deepEqual(exits, ["live"]);
     owned.release();
+  });
+
+  it("settles a preparation deadline and terminates the owned status process", async () => {
+    const proc = child();
+    const manager = createArcaPreviewManager({
+      resolveArcaPathFn: () => "/arca",
+      spawnFn: () => proc,
+      timeoutMs: 5,
+    });
+    await assert.rejects(
+      manager.prepare({
+        conversationId: "slow",
+        url: "http://localhost:5173",
+        hostId: "host_arca",
+        serverUrl: "https://srv.example.com",
+      }),
+      /timed out preparing/,
+    );
+    assert.equal(proc.killed, true);
   });
 });

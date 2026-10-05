@@ -72,12 +72,35 @@ function createBrowserViewRegistry({
   partitionScope = `w${++registrySeq}`,
 } = {}) {
   const entries = new Map(); // conversationId -> BrowserViewEntry
+  const intents = new Map(); // conversationId -> pending/current navigation
+  let intentSequence = 0;
   let activeConversationId = null;
   // When true, the active view is hidden in place (setVisible(false)) so DOM
   // overlays (dialogs, menus, tooltips, toasts) aren't covered by the native
   // layer, which always paints above the renderer regardless of z-index. Sticky
   // across attaches: a view that becomes active while suppressed stays hidden.
   let overlaySuppressed = false;
+
+  function beginNavigation(conversationId) {
+    intents.get(conversationId)?.cancel?.();
+    const intent = { token: ++intentSequence, cancel: null };
+    intents.set(conversationId, intent);
+    return intent.token;
+  }
+
+  function bindNavigationCancel(conversationId, token, cancel) {
+    const intent = intents.get(conversationId);
+    if (!intent || intent.token !== token) {
+      cancel?.();
+      return false;
+    }
+    intent.cancel = cancel;
+    return true;
+  }
+
+  function isNavigationCurrent(conversationId, token) {
+    return intents.get(conversationId)?.token === token;
+  }
 
   // Apply the current suppress flag to the active view (no-op with none active).
   function applyActiveVisibility() {
@@ -187,11 +210,6 @@ function createBrowserViewRegistry({
       if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
         return { action: "deny" };
       }
-      if (entry.agentOwnedOrigin && parsed.origin !== entry.agentOwnedOrigin) {
-        entry.releaseAgentOrigin?.();
-        entry.agentOwnedOrigin = null;
-        entry.releaseAgentOrigin = null;
-      }
       if (entry.agentNavLocked) {
         const verdict = isAgentNavigationAllowed(url, entry.agentOwnedOrigin);
         if (!verdict.ok) {
@@ -202,6 +220,9 @@ function createBrowserViewRegistry({
           });
           return { action: "deny" };
         }
+      }
+      if (entry.agentOwnedOrigin && parsed.origin !== entry.agentOwnedOrigin) {
+        clearAgentOrigin(entry.conversationId);
       }
       try {
         wc.loadURL(url);
@@ -256,20 +277,16 @@ function createBrowserViewRegistry({
   function attachAgentNavGuard(conversationId, entry) {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
-    const guard = (event, targetUrl) => {
+    const guard = (event, targetUrl, isMainFrame = true) => {
       let targetOrigin = null;
       try {
         targetOrigin = new URL(targetUrl).origin;
       } catch {
         /* policy below rejects malformed targets */
       }
-      if (entry.agentOwnedOrigin && targetOrigin !== entry.agentOwnedOrigin) {
-        entry.releaseAgentOrigin?.();
-        entry.agentOwnedOrigin = null;
-        entry.releaseAgentOrigin = null;
-      }
-      if (!entry.agentNavLocked) return; // user-driven nav: permissive
-      const verdict = isAgentNavigationAllowed(targetUrl, entry.agentOwnedOrigin);
+      const verdict = entry.agentNavLocked
+        ? isAgentNavigationAllowed(targetUrl, entry.agentOwnedOrigin)
+        : { ok: true };
       if (!verdict.ok) {
         try {
           event.preventDefault();
@@ -281,6 +298,10 @@ function createBrowserViewRegistry({
           url: targetUrl,
           error: verdict.error,
         });
+        return;
+      }
+      if (isMainFrame && entry.agentOwnedOrigin && targetOrigin !== entry.agentOwnedOrigin) {
+        clearAgentOrigin(conversationId);
       }
     };
     wc.on("will-navigate", guard);
@@ -289,11 +310,16 @@ function createBrowserViewRegistry({
     // too. Older Electron may not emit this event — harmless if it never fires.
     wc.on("will-frame-navigate", (event) => {
       // will-frame-navigate passes a single event whose `.url` is the target.
-      guard(event, event && event.url);
+      guard(event, event && event.url, !!event?.isMainFrame);
     });
   }
 
   function openOrNavigate(conversationId, url, bounds, opts) {
+    const intentToken = opts?.intentToken;
+    if (intentToken == null) beginNavigation(conversationId);
+    else if (!isNavigationCurrent(conversationId, intentToken)) {
+      return { ok: false, error: "navigation was superseded" };
+    }
     const force = !!(opts && opts.force);
     // Agent-driven nav (opts.agent) is gated by an allowlist (see
     // browserUrlPolicy) so the model can't point the view at file:// /
@@ -426,6 +452,9 @@ function createBrowserViewRegistry({
   }
 
   function close(conversationId, reason) {
+    const intent = intents.get(conversationId);
+    intents.delete(conversationId);
+    intent?.cancel?.();
     const entry = entries.get(conversationId);
     if (!entry) return { ok: true, removed: false };
     if (activeConversationId === conversationId) {
@@ -470,6 +499,9 @@ function createBrowserViewRegistry({
   }
 
   function closeAll(reason) {
+    for (const conversationId of [...intents.keys()]) {
+      if (!entries.has(conversationId)) close(conversationId, reason);
+    }
     for (const conversationId of [...entries.keys()]) {
       close(conversationId, reason);
     }
@@ -493,6 +525,9 @@ function createBrowserViewRegistry({
     close,
     closeAll,
     clearAgentOrigin,
+    beginNavigation,
+    bindNavigationCancel,
+    isNavigationCurrent,
     // Introspection
     activeConversationId: () => activeConversationId,
     isSuppressed: () => overlaySuppressed,

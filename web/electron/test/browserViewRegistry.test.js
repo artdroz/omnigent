@@ -288,9 +288,10 @@ function makeEventCapturingRegistry() {
     externalOpens,
     menus,
     copyCalls: () => copyCalls,
-    fire: (event, targetUrl) => {
+    fire: (event, targetUrl, isMainFrame = true) => {
       const ev = {
         url: targetUrl,
+        isMainFrame,
         prevented: false,
         preventDefault() {
           this.prevented = true;
@@ -330,6 +331,24 @@ describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every h
       releaseOwnedOrigin: () => (releases += 1),
     });
     registry.close("conv_1", "user");
+    assert.equal(releases, 1);
+  });
+
+  it("keeps the preview for external subframes and rejected top-level targets", () => {
+    const { registry, fire } = makeEventCapturingRegistry();
+    let releases = 0;
+    registry.openOrNavigate("conv_1", "http://localhost:5173", undefined, {
+      agent: true,
+      ownedOrigin: "http://localhost:5173",
+      releaseOwnedOrigin: () => (releases += 1),
+    });
+    assert.equal(
+      fire("will-frame-navigate", "https://cdn.example.com/frame", false).prevented,
+      false,
+    );
+    assert.equal(fire("will-navigate", "http://10.0.0.5/private").prevented, true);
+    assert.equal(releases, 0);
+    assert.equal(fire("will-navigate", "https://example.com/away").prevented, false);
     assert.equal(releases, 1);
   });
 
@@ -508,5 +527,28 @@ describe("browserViewRegistry — overlay suppression (#3980)", () => {
     assert.deepEqual(ctx.registry.setSuppressed(true), { ok: true });
     assert.equal(ctx.registry.isSuppressed(), true);
     assert.equal(ctx.visibility.length, 0, "nothing to toggle with no active view");
+  });
+});
+
+describe("browserViewRegistry — pending navigation lifecycle", () => {
+  it("cancels pending attempts on close, closeAll, and a newer navigation but not chat switching", () => {
+    const { registry } = makeRegistry();
+    let cancellations = 0;
+    let token = registry.beginNavigation("conv_1");
+    registry.bindNavigationCancel("conv_1", token, () => (cancellations += 1));
+    registry.setActive(null);
+    assert.equal(cancellations, 0);
+    registry.close("conv_1");
+    assert.equal(cancellations, 1);
+
+    token = registry.beginNavigation("conv_1");
+    registry.bindNavigationCancel("conv_1", token, () => (cancellations += 1));
+    registry.openOrNavigate("conv_1", "https://example.com");
+    assert.equal(cancellations, 2);
+
+    token = registry.beginNavigation("conv_2");
+    registry.bindNavigationCancel("conv_2", token, () => (cancellations += 1));
+    registry.closeAll("server-changed");
+    assert.equal(cancellations, 3);
   });
 });

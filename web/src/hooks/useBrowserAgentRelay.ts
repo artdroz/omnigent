@@ -9,10 +9,12 @@
  *  desktop build that predates the `browser*` bridge is treated as unsupported,
  *  so the relay never claims an action it couldn't fulfill. */
 import { useEffect } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { prefetchSessionHostChain } from "./useSession";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { supportsBrowser } from "@/lib/nativeBridge";
-import { authenticatedFetch, resolveSessionHost } from "@/lib/identity";
+import { authenticatedFetch } from "@/lib/identity";
 import { getSessionHost } from "@/lib/sessionHost";
 
 /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
@@ -218,6 +220,7 @@ async function dispatch(
   action: string,
   args: Record<string, unknown>,
   desktop: BrowserDesktopBridge,
+  queryClient: ReturnType<typeof useQueryClient>,
 ): Promise<ActionResult> {
   try {
     switch (action) {
@@ -229,7 +232,13 @@ async function dispatch(
         }
         // force: honor the explicit agent nav even on same-URL. agent: mark it
         // model-issued so the registry applies the scheme/host allowlist (Risk).
-        await resolveSessionHost(conversationId);
+        let isLoopback = false;
+        try {
+          isLoopback = ["localhost", "127.0.0.1"].includes(new URL(url).hostname);
+        } catch {
+          /* Electron returns the URL validation error. */
+        }
+        if (isLoopback) await prefetchSessionHostChain(queryClient, conversationId);
         const r = await desktop.browserOpenOrNavigate(conversationId, url, undefined, {
           force: true,
           agent: true,
@@ -353,6 +362,7 @@ async function postResult(
  *   open. Routing uses the delivering conversation, not this.
  */
 export function useBrowserAgentRelay(conversationId: string | null | undefined): void {
+  const queryClient = useQueryClient();
   useEffect(() => {
     if (!conversationId) return;
     if (!supportsBrowser()) return;
@@ -364,10 +374,16 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       // Claim FIRST — only the winner proceeds, so two windows can't double-execute.
       const claimToken = await claimAction(sourceConversationId, evt.actionId);
       if (!claimToken) return;
-      const result = await dispatch(sourceConversationId, evt.action, evt.args, desktop);
+      const result = await dispatch(
+        sourceConversationId,
+        evt.action,
+        evt.args,
+        desktop,
+        queryClient,
+      );
       await postResult(sourceConversationId, evt.actionId, claimToken, result);
     };
 
     return onBrowserActionRequest(handler);
-  }, [conversationId]);
+  }, [conversationId, queryClient]);
 }
