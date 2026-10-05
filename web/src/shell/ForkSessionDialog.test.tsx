@@ -1074,7 +1074,7 @@ describe("ForkSessionDialog", () => {
       expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
     });
 
-    it("leaves the host unpicked with a reconnect hint when the source host is offline", () => {
+    it("leaves the host unpicked with a reconnect hint when the source host is offline, then warns on an explicit pick", () => {
       // The caller's own source host is offline while another of theirs is
       // online. A cross-host clone would be created broken, so the dialog must
       // leave the host unpicked, say why, and keep submit greyed.
@@ -1090,18 +1090,10 @@ describe("ForkSessionDialog", () => {
       // No silent cross-host default.
       expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Select a host");
       expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
-    });
 
-    it("warns about the unsupported cross-host clone when a different host is picked", () => {
       // Explicitly picking a different machine is still allowed (the user
       // may want the history there regardless), but the dialog must say the
       // clone may fail to start — not just the soft file-references note.
-      setHosts([
-        host({ host_id: "host_1", name: "arca", status: "offline" }),
-        host({ host_id: "host_2", name: "other-laptop", status: "online" }),
-      ]);
-      renderDialog(CODING);
-
       openHostSelect();
       fireEvent.click(screen.getByTestId("fork-session-host-option-host_2"));
 

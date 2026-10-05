@@ -109,7 +109,7 @@ def test_fork_of_offline_host_session_must_not_silently_land_on_another_host(
         handle_session_detail,
     )
     page.route(
-        re.compile(rf".*/v1/hosts/{_OTHER_HOST_ID}/filesystem([/?].*)?$"),
+        re.compile(rf".*/v1/hosts/{re.escape(_OTHER_HOST_ID)}/filesystem([/?].*)?$"),
         handle_filesystem,
     )
 
