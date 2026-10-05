@@ -256,7 +256,12 @@ function makeDesignModeInputHandler(gestureState) {
  *          (import('./browserViewRegistry').Registry | null)} deps.getRegistryForEvent
  *        Resolves the sender window's own browser-view registry.
  */
-function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent }) {
+function registerBrowserIpc({
+  ipcMain,
+  isPinnedOriginSender,
+  getRegistryForEvent,
+  prepareAgentNavigation = async (_event, _conversationId, _url, opts) => opts,
+}) {
   /**
    * Resolve the sender's registry after the privileged-origin gate. Returns
    * `{ registry }` on success or `{ error }` (a structured result, never a
@@ -284,12 +289,21 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
   // Open (create-if-absent) or navigate a conversation's view, and measure it
   // into place. `force` reloads even on the same URL (agent "bring me back"
   // intent). Returns the registry's structured `{ ok, created, error }`.
-  ipcMain.handle("omnigent:browser-open-or-navigate", (event, args) => {
+  ipcMain.handle("omnigent:browser-open-or-navigate", async (event, args) => {
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
-    const { conversationId, url, bounds, opts } = args ?? {};
+    const { conversationId, url, bounds } = args ?? {};
+    let { opts } = args ?? {};
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
+    }
+    if (opts?.agent) {
+      g.registry.clearAgentOrigin(conversationId);
+      try {
+        opts = await prepareAgentNavigation(event, conversationId, url, opts);
+      } catch (error) {
+        return { ok: false, created: false, error: error.message || String(error) };
+      }
     }
     const r = g.registry.openOrNavigate(conversationId, url, bounds, opts);
     // On first creation, wire nav listeners here (not in the registry factory,

@@ -10,8 +10,16 @@ vi.mock("@/lib/nativeBridge", () => ({
 // The relay POSTs claim + result through authenticatedFetch; mock it so we can
 // script the claim response and inspect the result POST body.
 const authenticatedFetch = vi.fn();
+const sessionHosts = new Map<string, string>();
+const resolveSessionHost = vi.fn(async (id: string) => {
+  if (id === "conv_background_A") sessionHosts.set(id, "host_arca");
+});
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: (...args: unknown[]) => authenticatedFetch(...args),
+  resolveSessionHost: (id: string) => resolveSessionHost(id),
+}));
+vi.mock("@/lib/sessionHost", () => ({
+  getSessionHost: (id: string) => sessionHosts.get(id) ?? null,
 }));
 
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
@@ -96,6 +104,7 @@ function postedResult(): Record<string, unknown> {
 
 beforeEach(() => {
   authenticatedFetch.mockReset();
+  sessionHosts.clear();
 });
 
 afterEach(() => {
@@ -150,6 +159,7 @@ describe("useBrowserAgentRelay — claim-first protocol", () => {
       {
         force: true,
         agent: true,
+        hostId: null,
       },
     );
     const body = postedResult();
@@ -188,7 +198,9 @@ describe("useBrowserAgentRelay — claim-first protocol", () => {
     expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(BACKGROUND, "https://a", undefined, {
       force: true,
       agent: true,
+      hostId: "host_arca",
     });
+    expect(resolveSessionHost).toHaveBeenCalledWith(BACKGROUND);
     const resultUrl = String(
       authenticatedFetch.mock.calls.find((c) =>
         String(c[0]).includes("/browser/action_result/"),

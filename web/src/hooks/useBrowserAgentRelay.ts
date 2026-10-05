@@ -12,7 +12,8 @@ import { useEffect } from "react";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { supportsBrowser } from "@/lib/nativeBridge";
-import { authenticatedFetch } from "@/lib/identity";
+import { authenticatedFetch, resolveSessionHost } from "@/lib/identity";
+import { getSessionHost } from "@/lib/sessionHost";
 
 /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
  *  nativeBridge). All optional — an older shell may predate the feature, so the
@@ -22,7 +23,7 @@ interface BrowserDesktopBridge {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: { force?: boolean; agent?: boolean },
+    opts?: { force?: boolean; agent?: boolean; hostId?: string | null },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   browserScreenshot?: (
     conversationId: string,
@@ -228,9 +229,11 @@ async function dispatch(
         }
         // force: honor the explicit agent nav even on same-URL. agent: mark it
         // model-issued so the registry applies the scheme/host allowlist (Risk).
+        await resolveSessionHost(conversationId);
         const r = await desktop.browserOpenOrNavigate(conversationId, url, undefined, {
           force: true,
           agent: true,
+          hostId: getSessionHost(conversationId),
         });
         if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
         return { ok: true, data: { final_url: url } };

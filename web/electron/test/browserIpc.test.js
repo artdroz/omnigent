@@ -111,10 +111,13 @@ function makeRegistry(conversationId, webContents) {
   const entries = new Map();
   if (conversationId) entries.set(conversationId, { view: { webContents } });
   const suppressedCalls = []; // booleans passed to setSuppressed, in order
+  const opened = [];
+  const cleared = [];
   return {
     get: (id) => entries.get(id) ?? null,
     has: (id) => entries.has(id),
-    openOrNavigate: (id) => {
+    openOrNavigate: (id, url, bounds, opts) => {
+      opened.push({ id, url, bounds, opts });
       const wc = makeWebContents();
       const entry = { view: { webContents: wc } };
       entries.set(id, entry);
@@ -126,13 +129,21 @@ function makeRegistry(conversationId, webContents) {
       return { ok: true };
     },
     close: () => ({ ok: true, removed: true }),
+    clearAgentOrigin: (id) => cleared.push(id),
     suppressedCalls,
+    opened,
+    cleared,
   };
 }
 
 /** Register the IPC surface with injectable gate + registry, and capture the
  *  events sent to a fake sender. */
-function setup({ pinned = true, conversationId = "conv_1", webContents } = {}) {
+function setup({
+  pinned = true,
+  conversationId = "conv_1",
+  webContents,
+  prepareAgentNavigation,
+} = {}) {
   const ipcMain = makeIpcMain();
   const wc = webContents ?? makeWebContents();
   const registry = makeRegistry(conversationId, wc);
@@ -142,6 +153,7 @@ function setup({ pinned = true, conversationId = "conv_1", webContents } = {}) {
     ipcMain,
     isPinnedOriginSender: () => pinned,
     getRegistryForEvent: () => registry,
+    prepareAgentNavigation,
   });
   return { ipcMain, registry, wc, sent, event };
 }
@@ -276,6 +288,39 @@ describe("browserIpc — devtools toggle", () => {
 });
 
 describe("browserIpc — url live-tracking", () => {
+  it("prepares an agent navigation before opening and surfaces preparation failure", async () => {
+    const prepared = { agent: true, ownedOrigin: "http://localhost:5173" };
+    const calls = [];
+    const ok = setup({
+      prepareAgentNavigation: async (_event, id, url, opts) => {
+        calls.push({ id, url, opts });
+        return prepared;
+      },
+    });
+    const result = await ok.ipcMain.invoke("omnigent:browser-open-or-navigate", ok.event, {
+      conversationId: "conv_arca",
+      url: "http://localhost:5173",
+      opts: { agent: true, hostId: "host_arca" },
+    });
+    assert.equal(result.ok, true);
+    assert.deepEqual(ok.registry.cleared, ["conv_arca"]);
+    assert.equal(ok.registry.opened[0].opts, prepared);
+    assert.equal(calls[0].opts.hostId, "host_arca");
+
+    const failed = setup({
+      prepareAgentNavigation: async () => {
+        throw new Error("host mismatch");
+      },
+    });
+    const rejected = await failed.ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      failed.event,
+      { conversationId: "conv_arca", url: "http://localhost:5173", opts: { agent: true } },
+    );
+    assert.deepEqual(rejected, { ok: false, created: false, error: "host mismatch" });
+    assert.equal(failed.registry.opened.length, 0);
+  });
+
   it("open-or-navigate wires did-navigate listeners that emit url + nav-state", async () => {
     const { ipcMain, registry, sent, event } = setup({ conversationId: null });
     await ipcMain.invoke("omnigent:browser-open-or-navigate", event, {

@@ -44,6 +44,17 @@ const CONNECT_TIMEOUT_MS = 5 * 60 * 1000;
  */
 const SAFE_URL_RE = /^[A-Za-z0-9\-._~:/?=&%]+$/;
 
+function normalizeSafeServerUrl(serverUrl) {
+  const url = new URL(serverUrl);
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error(`unsupported server URL scheme: ${url.protocol}`);
+  }
+  if (!SAFE_URL_RE.test(url.toString())) {
+    throw new Error("server URL contains characters that are not allowed in an ssh command");
+  }
+  return url.toString();
+}
+
 /**
  * Well-known install locations for the arca binary. Probed because a
  * GUI-launched Electron app inherits a minimal PATH (mirrors the omnigent CLI
@@ -120,13 +131,7 @@ function resolveArcaPath(deps = {}) {
  * @returns {string[]}
  */
 function buildConnectArgs(serverUrl) {
-  const url = new URL(serverUrl);
-  if (url.protocol !== "https:" && url.protocol !== "http:") {
-    throw new Error(`unsupported server URL scheme: ${url.protocol}`);
-  }
-  if (!SAFE_URL_RE.test(url.toString())) {
-    throw new Error("server URL contains characters that are not allowed in an ssh command");
-  }
+  const url = normalizeSafeServerUrl(serverUrl);
   return [
     "ssh",
     // Ordinary arca ssh inherits -R 19222 from ~/.ssh/config. Arca Companion
@@ -139,7 +144,7 @@ function buildConnectArgs(serverUrl) {
     "omni",
     "host",
     "--server",
-    url.toString(),
+    url,
     "--background",
     "--non-interactive",
   ];
@@ -347,6 +352,7 @@ module.exports = {
   buildConnectArgs,
   connectArcaHost,
   describeConnectFailure,
+  normalizeSafeServerUrl,
   resolveArcaPath,
   startArcaConnect,
 };

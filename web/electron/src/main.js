@@ -69,6 +69,7 @@ const {
   getManagedServerUrls,
 } = require("./managed_preferences");
 const arca = require("./arca");
+const { createArcaPreviewManager, loopbackPreview } = require("./arcaPreview");
 const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const { registerSessionExpiryReload } = require("./session-expiry");
@@ -2704,13 +2705,17 @@ function hardenAgentPartition(partition, win, canPrompt, getAnchorBounds) {
  * @returns {ReturnType<typeof createBrowserViewRegistry>}
  */
 function createBrowserRegistryForWindow(win) {
+  let registry;
+  const arcaPreview = createArcaPreviewManager({
+    onExit: (conversationId) => registry?.close(conversationId, "preview-exited"),
+  });
   const canPrompt = (wc) =>
     !win.isDestroyed() &&
     win.isVisible() &&
     !win.isMinimized() &&
     !registry.isSuppressed() &&
     registry.get(registry.activeConversationId())?.view.webContents === wc;
-  const registry = createBrowserViewRegistry({
+  registry = createBrowserViewRegistry({
     WebContentsViewCtor: (opts) => {
       // Install before construction: Electron otherwise auto-grants requests.
       const policy = hardenAgentPartition(opts.webPreferences.partition, win, canPrompt, () =>
@@ -2749,6 +2754,7 @@ function createBrowserRegistryForWindow(win) {
       Menu.buildFromTemplate(items).popup({ window: win });
     },
   });
+  registry.arcaPreview = arcaPreview;
   return registry;
 }
 
@@ -3488,6 +3494,30 @@ function registerIpc() {
     ipcMain,
     isPinnedOriginSender,
     getRegistryForEvent: browserRegistryForSender,
+    prepareAgentNavigation: async (event, conversationId, url, opts) => {
+      const registry = browserRegistryForSender(event);
+      const preview = loopbackPreview(url);
+      if (!registry) throw new Error("no browser registry for this window");
+      if (!preview) {
+        registry.arcaPreview.release(conversationId);
+        return opts;
+      }
+      const serverUrl = senderServerUrl(event);
+      if (
+        !databricksInternalFeaturesEnabled() ||
+        !serverUrl ||
+        !isDatabricksManagedServerUrl(serverUrl)
+      ) {
+        throw new Error("Arca localhost previews require a managed Databricks server");
+      }
+      const owned = await registry.arcaPreview.prepare({
+        conversationId,
+        url,
+        hostId: opts.hostId,
+        serverUrl,
+      });
+      return { ...opts, ownedOrigin: owned.origin, releaseOwnedOrigin: owned.release };
+    },
   });
 }
 

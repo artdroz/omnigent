@@ -75,7 +75,7 @@ function isBlockedHostname(hostname) {
  * @param {string} url
  * @returns {{ ok: true } | { ok: false, error: string }}
  */
-function isAgentNavigationAllowed(url) {
+function isAgentNavigationAllowed(url, ownedOrigin = null) {
   if (typeof url !== "string" || url.trim() === "") {
     return { ok: false, error: "navigation blocked: empty url" };
   }
@@ -91,6 +91,7 @@ function isAgentNavigationAllowed(url) {
       error: `navigation blocked: scheme "${parsed.protocol}" is not allowed for agent navigation (only http/https)`,
     };
   }
+  if (ownedOrigin && parsed.origin === ownedOrigin) return { ok: true };
   const hostname = parsed.hostname;
   if (isBlockedHostname(hostname)) {
     return {

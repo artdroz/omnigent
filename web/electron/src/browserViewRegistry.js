@@ -127,6 +127,8 @@ function createBrowserViewRegistry({
       // this, the allowlist only guards the first hop and a redirect to an
       // internal host slips through (SSRF via screenshot).
       agentNavLocked: false,
+      agentOwnedOrigin: null,
+      releaseAgentOrigin: null,
       // Design-mode listeners + webContents, set by browserIpc's enable handler
       // and cleared on disable/close (console-message forwarder + native-gesture
       // tracker). Null until design mode is enabled for this entry.
@@ -185,8 +187,13 @@ function createBrowserViewRegistry({
       if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
         return { action: "deny" };
       }
+      if (entry.agentOwnedOrigin && parsed.origin !== entry.agentOwnedOrigin) {
+        entry.releaseAgentOrigin?.();
+        entry.agentOwnedOrigin = null;
+        entry.releaseAgentOrigin = null;
+      }
       if (entry.agentNavLocked) {
-        const verdict = isAgentNavigationAllowed(url);
+        const verdict = isAgentNavigationAllowed(url, entry.agentOwnedOrigin);
         if (!verdict.ok) {
           sendToRenderer("browser-nav-blocked", {
             conversationId: entry.conversationId,
@@ -250,8 +257,19 @@ function createBrowserViewRegistry({
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
     const guard = (event, targetUrl) => {
+      let targetOrigin = null;
+      try {
+        targetOrigin = new URL(targetUrl).origin;
+      } catch {
+        /* policy below rejects malformed targets */
+      }
+      if (entry.agentOwnedOrigin && targetOrigin !== entry.agentOwnedOrigin) {
+        entry.releaseAgentOrigin?.();
+        entry.agentOwnedOrigin = null;
+        entry.releaseAgentOrigin = null;
+      }
       if (!entry.agentNavLocked) return; // user-driven nav: permissive
-      const verdict = isAgentNavigationAllowed(targetUrl);
+      const verdict = isAgentNavigationAllowed(targetUrl, entry.agentOwnedOrigin);
       if (!verdict.ok) {
         try {
           event.preventDefault();
@@ -283,7 +301,7 @@ function createBrowserViewRegistry({
     // (user-typed) nav stays permissive. Checked before getOrCreate so a
     // rejected nav creates no blank view.
     if (opts && opts.agent && url) {
-      const verdict = isAgentNavigationAllowed(url);
+      const verdict = isAgentNavigationAllowed(url, opts.ownedOrigin);
       if (!verdict.ok) {
         return { ok: false, error: verdict.error };
       }
@@ -291,10 +309,24 @@ function createBrowserViewRegistry({
     const result = getOrCreate(conversationId);
     if (!result.ok) return result;
     const { entry, created } = result;
+    if (url && entry.agentOwnedOrigin) {
+      let targetOrigin = null;
+      try {
+        targetOrigin = new URL(url).origin;
+      } catch {
+        /* malformed target is handled by the policy/load below */
+      }
+      if (targetOrigin !== entry.agentOwnedOrigin) clearAgentOrigin(conversationId);
+    }
     // Latch who drives THIS navigation so the will-navigate/will-redirect guard
     // enforces the allowlist on an agent nav's whole redirect chain, and leaves
     // user-typed URL-bar nav permissive. Set only when a url is actually issued.
     if (url) entry.agentNavLocked = !!(opts && opts.agent);
+    if (opts?.agent && opts.ownedOrigin) {
+      entry.releaseAgentOrigin?.();
+      entry.agentOwnedOrigin = opts.ownedOrigin;
+      entry.releaseAgentOrigin = opts.releaseOwnedOrigin || null;
+    }
     if (bounds) entry.boundsController.setRendererBounds(bounds);
     // Only attach immediately when this is the active conversation; otherwise
     // create-detached and let `setActive(conversationId)` attach on user switch.
@@ -426,6 +458,7 @@ function createBrowserViewRegistry({
       entry.designModeWebContents = null;
     }
     entry.boundsController.clear();
+    entry.releaseAgentOrigin?.();
     try {
       entry.view.webContents.close();
     } catch {
@@ -442,6 +475,14 @@ function createBrowserViewRegistry({
     }
   }
 
+  function clearAgentOrigin(conversationId) {
+    const entry = entries.get(conversationId);
+    if (!entry) return;
+    entry.releaseAgentOrigin?.();
+    entry.agentOwnedOrigin = null;
+    entry.releaseAgentOrigin = null;
+  }
+
   return {
     // Lifecycle
     get,
@@ -451,6 +492,7 @@ function createBrowserViewRegistry({
     setSuppressed,
     close,
     closeAll,
+    clearAgentOrigin,
     // Introspection
     activeConversationId: () => activeConversationId,
     isSuppressed: () => overlaySuppressed,

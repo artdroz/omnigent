@@ -305,6 +305,34 @@ function makeEventCapturingRegistry() {
 }
 
 describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every hop)", () => {
+  it("admits the owned exact origin on every guard and releases it on navigation away", () => {
+    const { registry, fire, windowOpen } = makeEventCapturingRegistry();
+    let releases = 0;
+    registry.openOrNavigate("conv_1", "http://localhost:5173/app", undefined, {
+      agent: true,
+      ownedOrigin: "http://localhost:5173",
+      releaseOwnedOrigin: () => (releases += 1),
+    });
+    assert.equal(fire("will-redirect", "http://localhost:5173/next").prevented, false);
+    assert.equal(fire("will-frame-navigate", "http://localhost:5173/frame").prevented, false);
+    assert.deepEqual(windowOpen("http://localhost:5173/popup"), { action: "deny" });
+    assert.equal(fire("will-navigate", "https://example.com/away").prevented, false);
+    assert.equal(releases, 1);
+    assert.equal(fire("will-navigate", "http://localhost:5173/stale").prevented, true);
+  });
+
+  it("releases the owned origin when the view closes", () => {
+    const { registry } = makeEventCapturingRegistry();
+    let releases = 0;
+    registry.openOrNavigate("conv_1", "http://localhost:5173", undefined, {
+      agent: true,
+      ownedOrigin: "http://localhost:5173",
+      releaseOwnedOrigin: () => (releases += 1),
+    });
+    registry.close("conv_1", "user");
+    assert.equal(releases, 1);
+  });
+
   it("blocks an agent-locked will-redirect to the cloud-metadata IP", () => {
     const { registry, sent, fire } = makeEventCapturingRegistry();
     // Agent navigates to an allowed host (locks the view to agent policy).

@@ -192,7 +192,7 @@ interface ElectronDesktopApi extends NativeShellApi {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: { force?: boolean; agent?: boolean },
+    opts?: { force?: boolean; agent?: boolean; hostId?: string | null },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   /**
    * Hide/show the active embedded browser view while a DOM overlay is open.
