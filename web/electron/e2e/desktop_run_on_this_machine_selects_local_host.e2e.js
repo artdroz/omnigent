@@ -95,17 +95,12 @@ function isolateEnv(home) {
   process.env = cleanEnv;
 }
 
-async function waitForSpaWindow(electronApp, firstWindow, timeoutMs = 30_000) {
-  const deadline = Date.now() + timeoutMs;
-  // The update overlay can open first; select the served SPA window.
-  /* oxlint-disable no-await-in-loop */
-  while (Date.now() < deadline) {
-    const spa = [firstWindow, ...electronApp.windows()].find((w) => w.url().startsWith("http"));
-    if (spa) return spa;
-    await sleep(500);
-  }
-  /* oxlint-enable no-await-in-loop */
-  throw new Error("no SPA window (http…) appeared within the deadline");
+function servedWindow(launched) {
+  // launchDesktop already waits for the shell's loaded page; the journeys need
+  // the served SPA, not the setup or server-selector page.
+  const url = launched.window.url();
+  assert.match(url, /^https?:/, `desktop shell did not load the served SPA: ${url}`);
+  return launched.window;
 }
 
 function startHostDaemon(cliShim, serverUrl, logPath) {
@@ -127,17 +122,17 @@ function startHostDaemon(cliShim, serverUrl, logPath) {
     const onData = (buf) => {
       const text = buf.toString();
       log += text;
-      out.write(text);
+      if (!out.writableEnded) out.write(text);
       if (log.includes(CONNECTED_MARKER)) finish(true);
     };
     child.stdout.on("data", onData);
     child.stderr.on("data", onData);
     child.on("error", (err) => {
       log += `spawn error: ${err.message}\n`;
-      closeLog();
       finish(false);
     });
-    child.on("exit", () => {
+    // "close" follows "exit"/"error" once the stdio pipes have drained.
+    child.on("close", () => {
       closeLog();
       finish(false);
     });
@@ -176,14 +171,14 @@ async function waitForChipOutcome(window) {
   /* oxlint-disable no-await-in-loop */
   while (Date.now() < deadline) {
     if ((await errorBox.count()) > 0) {
-      return { label, error: (await errorBox.textContent()) ?? "(empty error)" };
+      return { label, error: (await errorBox.textContent()) ?? "(empty error)", timedOut: false };
     }
     label = await chipLabel(window);
-    if (THIS_MACHINE.test(label)) return { label, error: null };
+    if (THIS_MACHINE.test(label)) return { label, error: null, timedOut: false };
     await sleep(500);
   }
   /* oxlint-enable no-await-in-loop */
-  return { label, error: null };
+  return { label, error: null, timedOut: true };
 }
 
 async function settleAndSnapshot(window, recordDir, name, extra) {
@@ -267,7 +262,7 @@ describe(
         const launched = await launchDesktop({ recordDir, userDataDir: journey.userDataDir });
         journey.electronApp = launched.electronApp;
         journey.stopDisplayCapture = launched.stopDisplayCapture;
-        const window = await waitForSpaWindow(journey.electronApp, launched.window);
+        const window = servedWindow(launched);
         const chip = window.locator(CHIP);
         await chip.waitFor({ state: "visible", timeout: 30_000 });
         await window
@@ -287,6 +282,10 @@ describe(
           outcome.error,
           null,
           `"Use this machine" surfaced a connect error: ${outcome.error}`,
+        );
+        assert.ok(
+          !outcome.timedOut,
+          `host chip never settled within ${SELECT_TIMEOUT_MS} ms — it reads ${JSON.stringify(outcome.label)}`,
         );
         assert.match(
           outcome.label,
@@ -326,12 +325,16 @@ describe(
         const launched = await launchDesktop({ recordDir, userDataDir: journey.userDataDir });
         journey.electronApp = launched.electronApp;
         journey.stopDisplayCapture = launched.stopDisplayCapture;
-        const window = await waitForSpaWindow(journey.electronApp, launched.window);
+        const window = servedWindow(launched);
         await window.locator(CHIP).waitFor({ state: "visible", timeout: 30_000 });
 
         const outcome = await waitForChipOutcome(window);
         const hosts = await fetchHosts(journey.server.serverUrl);
         await settleAndSnapshot(window, recordDir, "outcome", { ...outcome, hosts });
+        assert.ok(
+          !outcome.timedOut,
+          `host chip never settled within ${SELECT_TIMEOUT_MS} ms — it reads ${JSON.stringify(outcome.label)}`,
+        );
         assert.match(
           outcome.label,
           THIS_MACHINE,
@@ -364,7 +367,7 @@ describe(
         const launched = await launchDesktop({ recordDir, userDataDir: journey.userDataDir });
         journey.electronApp = launched.electronApp;
         journey.stopDisplayCapture = launched.stopDisplayCapture;
-        const window = await waitForSpaWindow(journey.electronApp, launched.window);
+        const window = servedWindow(launched);
         const chip = window.locator(CHIP);
         await chip.waitFor({ state: "visible", timeout: 30_000 });
         const beforeSeed = await waitForChipOutcome(window);
@@ -389,6 +392,10 @@ describe(
           storedChoice,
           hosts,
         });
+        assert.ok(
+          !outcome.timedOut,
+          `host chip never settled within ${SELECT_TIMEOUT_MS} ms — it reads ${JSON.stringify(outcome.label)}`,
+        );
         assert.match(
           outcome.label,
           THIS_MACHINE,

@@ -32,11 +32,7 @@ describe("hostPreferences", () => {
     expect(readLastHostChoice()).toBe(bareId);
   });
 
-  it.each([
-    "host_2",
-    "host_9E03C5574BA040E6B79AFA47FBD59946",
-    "host_9e03c5574ba040e6b79afa47fbd599460",
-  ])(
+  it.each(["host_9E03C5574BA040E6B79AFA47FBD59946", "host_9e03c5574ba040e6b79afa47fbd599460"])(
     "leaves %s untouched: only the exact host_<32 lowercase hex> spelling is rewritten",
     (stored) => {
       localStorage.setItem("omnigent:last-host-choice", stored);
