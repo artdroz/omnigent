@@ -146,6 +146,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_terminal_pending,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
+    _remove_session_worktree_best_effort,
     _require_codex_approval_mode_forward,
     _require_collaboration_mode_forward,
     _require_cost_control_label_authority,
@@ -851,6 +852,32 @@ def register_core_routes(
                     _publish_terminal_pending(resp.id, False)
                 resp.runner_id = runner_id
                 resp.host_id = launch_host_id
+                if (
+                    launch_failed
+                    and body.git is not None
+                    and not body.git.existing_worktree
+                    and conv is not None
+                    and conv.workspace is not None
+                    and conv.git_branch is not None
+                ):
+                    # Nothing reaps worktrees, so a worktree this create made
+                    # must be rolled back on launch failure (the bind and delete
+                    # paths already do); an existing user worktree is kept.
+                    await _remove_session_worktree_best_effort(
+                        host_id=launch_host_id,
+                        worktree_path=conv.workspace,
+                        branch=conv.git_branch,
+                        # Never -D a pre-existing branch the user checked out.
+                        delete_branch=not body.git.existing_branch,
+                        request=request,
+                        reason="create-launch-failure",
+                    )
+                    conv = await asyncio.to_thread(conversation_store.clear_host_binding, resp.id)
+                    resp.runner_id = None
+                    resp.host_id = None
+                    resp.workspace = None
+                    resp.git_branch = None
+                    launch_host_id = None
 
         # Default-public grant only once every launch step has been accepted, so a
         # rejected request never leaves a public session behind. Sub-agent
