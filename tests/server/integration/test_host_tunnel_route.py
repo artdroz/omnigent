@@ -1222,3 +1222,129 @@ async def test_host_sender_loop_reraises_send_failure_while_connected() -> None:
     conn.outbound_queue.put_nowait("frame")
     with pytest.raises(RuntimeError):
         await host_tunnel._sender_loop(ws, conn)
+
+
+@pytest.fixture
+async def startup_app(db_uri):
+    import httpx
+    from fastapi.responses import JSONResponse
+
+    from omnigent.errors import OmnigentError
+    from omnigent.host.frames import CAP_HARNESS_STARTUP
+    from omnigent.server.routes.harness_startup import create_harness_startup_router
+
+    app, registry, store = _owned_app(db_uri, authed_user="owner")
+    auth = _FixedAuthProvider("owner")
+    app.include_router(
+        create_harness_startup_router(registry, store, auth_provider=auth), prefix="/v1"
+    )
+
+    @app.exception_handler(OmnigentError)
+    async def error_handler(request, exc):
+        return JSONResponse(status_code=exc.http_status, content={"detail": exc.message})
+
+    peer = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(peer, registry)
+    conn = registry.get(_HOST_ID)
+    conn.hello.capabilities.append(CAP_HARNESS_STARTUP)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            yield client, peer, registry, conn, auth
+    finally:
+        if not peer.future.done():
+            await peer.send_input({"type": "websocket.disconnect", "code": 1000})
+        await peer.wait(timeout=budget(2.0))
+
+
+@pytest.mark.parametrize(
+    "user,harness,state,status",
+    [
+        (None, "claude-native", "online", 401),
+        ("stranger", "claude-native", "online", 403),
+        ("owner", "claude-native", "offline", 409),
+        ("owner", "claude-native", "old", 501),
+        ("owner", "claude-native", "unknown", 404),
+        ("owner", "pi-native", "online", 404),
+        ("owner", "antigravity-native", "online", 404),
+        ("owner", "opencode-native", "online", 404),
+    ],
+)
+async def test_startup_gates_before_dispatch(
+    startup_app, monkeypatch, user, harness, state, status
+):
+    client, peer, registry, conn, auth = startup_app
+    monkeypatch.setattr(auth, "get_user_id", lambda request: user)
+    host_id = _HOST_ID
+    if state == "old":
+        conn.hello.capabilities.clear()
+    elif state == "offline":
+        registry.deregister(_HOST_ID)
+    elif state == "unknown":
+        host_id = "0000000000000000000000000000beef"
+    response = await client.get(f"/v1/hosts/{host_id}/harnesses/{harness}/startup")
+    assert response.status_code == status
+    assert not conn.pending_harness_startup
+    if state != "offline":
+        assert await peer.receive_nothing(timeout=0.01)
+
+
+@pytest.mark.parametrize(
+    "reply,status",
+    [
+        ({"extra": "SECRET"}, 200),
+        ({"arg_count": "4"}, 502),
+        ({"arg_count": -3}, 502),
+        ({"arg_count": True}, 502),
+        ({"command": 5}, 502),
+        ({"resolved_path": []}, 502),
+        ({"command_source": "unknown"}, 502),
+        (None, 502),
+        ("disconnect", 502),
+        ("replace", 502),
+        ("timeout", 504),
+    ],
+)
+async def test_startup_http_through_real_tunnel(startup_app, monkeypatch, reply, status):
+    import json
+
+    from omnigent.host.frames import HostHarnessStartupFrame
+
+    client, peer, registry, conn, _ = startup_app
+    if reply == "timeout":
+        monkeypatch.setattr("omnigent.server.routes.harness_startup._STARTUP_TIMEOUT_S", 0.05)
+    task = asyncio.create_task(client.get(f"/v1/hosts/{_HOST_ID}/harnesses/claude-native/startup"))
+    outbound = await peer.receive_output(timeout=budget(2.0))
+    frame = decode_host_frame(outbound["text"])
+    assert isinstance(frame, HostHarnessStartupFrame) and frame.harness == "claude-native"
+    expected = {
+        "command": "claude",
+        "resolved_path": None,
+        "command_source": "default",
+        "arg_count": 2,
+    }
+    if reply == "disconnect":
+        await peer.send_input({"type": "websocket.disconnect", "code": 1000})
+    elif reply == "replace":
+        registry.register(_HOST_ID, conn.ws, conn.hello, owner="owner")
+    elif reply != "timeout":
+        payload = {**expected, **reply} if isinstance(reply, dict) else reply
+        await peer.send_input(
+            {
+                "type": "websocket.receive",
+                "text": json.dumps(
+                    {
+                        "kind": "host.harness_startup_result",
+                        "request_id": frame.request_id,
+                        "startup": payload,
+                    }
+                ),
+            }
+        )
+    response = await asyncio.wait_for(task, timeout=budget(2.0))
+    assert response.status_code == status
+    if status == 200:
+        assert response.json() == expected
+    assert "SECRET" not in response.text
+    assert not conn.pending_harness_startup
