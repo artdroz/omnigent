@@ -32,10 +32,17 @@ describe("hostPreferences", () => {
     expect(readLastHostChoice()).toBe(bareId);
   });
 
-  it("leaves a non-uuid value starting with host_ untouched", () => {
-    localStorage.setItem("omnigent:last-host-choice", "host_2");
-    expect(readLastHostChoice()).toBe("host_2");
-  });
+  it.each([
+    "host_2",
+    "host_9E03C5574BA040E6B79AFA47FBD59946",
+    "host_9e03c5574ba040e6b79afa47fbd599460",
+  ])(
+    "leaves %s untouched: only the exact host_<32 lowercase hex> spelling is rewritten",
+    (stored) => {
+      localStorage.setItem("omnigent:last-host-choice", stored);
+      expect(readLastHostChoice()).toBe(stored);
+    },
+  );
 
   it("round-trips the sandbox sentinel", () => {
     // The sandbox option has no host id, so it persists as the reserved
