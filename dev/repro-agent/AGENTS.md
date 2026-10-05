@@ -227,6 +227,17 @@ comment is not evidence of accidental behavior. Keep observed symptoms separate
 from suspected causes. When code or logs suggest a competing explanation, use
 a discriminating observation or focused check and record what it supports or
 rules out. A familiar error message alone does not establish its cause.
+Follow the reported path to any shared registry, default, or policy definition
+that governs the behavior, then read its rationale, relevant callers, and tests.
+Do not infer the full contract from one local fallback.
+
+When reported authentication endpoints are unavailable or sanitized, use bounded
+local discovery, refresh, and transport services with fake credentials to exercise
+the configured path. Keep application token resolution and the installed SDK
+intact; replacing the suspected component with canned results assumes the cause.
+Record the controlled external boundaries and remaining incident uncertainty.
+Put timeouts on discovery and subprocess calls. A controlled check does not by
+itself reproduce an unavailable production incident.
 
 Keep this investigation bounded to the reported journey; a complete diagnosis
 is not required to hand off a valid reproduction. Preserve unresolved intent in

@@ -29,12 +29,20 @@ matches the checkout. Record concise findings in the existing `root_cause`,
    its caller handles those tokens, not how the configured credential provider
    behaves. Record which parts actually ran and which were substituted. A
    fail-before/pass-after test of that substitute does not confirm the incident.
+   When reported authentication endpoints are unavailable or sanitized, use
+   bounded local discovery, refresh, and transport services with fake credentials
+   to exercise the configured path. Keep application token resolution and the
+   installed SDK intact; record the controlled external boundaries and remaining
+   incident uncertainty. Put timeouts on discovery and subprocess calls.
 3. **Find the design intent.** Read nearby tests and documentation, targeted
    `git log -S`/`git blame`, and relevant commit/PR discussion. Cite the source
    and revision; distinguish documented rationale from inference and note
    unavailable history. A fallback, fail-open path, default, or restriction may
    be deliberate. Do not reverse it just to satisfy a repro assertion. Check
    whether later decisions supersede the original rationale.
+   Follow the reported path to any shared registry, default, or policy definition
+   that governs the behavior, then read its rationale, relevant callers, and
+   tests. Do not infer the full contract from one local fallback.
 4. **Choose and explain.** Preserve intended behavior when correcting the
    defect. For a necessary policy change, explain the old behavior, the proposed
    behavior, affected users/configurations, alternatives, and supporting
