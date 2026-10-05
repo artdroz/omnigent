@@ -147,15 +147,19 @@ def active_review_runs(repository, number, head, reviewer, request):
     ]
 
 
-def ocr_receipt(repository, artifact_id):
-    result = subprocess.run(
+def artifact_zip(repository, artifact_id):
+    """Download through the caller's GitHub transport, replaceable by the CI host."""
+    return subprocess.run(
         ["gh", "api", f"repos/{repository}/actions/artifacts/{artifact_id}/zip"],
         check=True,
         capture_output=True,
         timeout=120,
-    )
+    ).stdout
+
+
+def ocr_receipt(repository, artifact_id):
     try:
-        with ZipFile(io.BytesIO(result.stdout)) as archive:
+        with ZipFile(io.BytesIO(artifact_zip(repository, artifact_id))) as archive:
             info = archive.getinfo("ocr-completion.json")
             if info.file_size > 65536:
                 raise RuntimeError("OCR completion receipt is too large")
