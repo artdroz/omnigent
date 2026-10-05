@@ -381,7 +381,7 @@ async def test_owned_client_bypasses_proxy_env_for_loopback(
     probe = socket.socket()
     probe.bind(("127.0.0.1", 0))
     dead_port = probe.getsockname()[1]
-    probe.close()
+    # Keep probe bound (never listening) so dead_port refuses connects deterministically.
     proxy = f"http://127.0.0.1:{dead_port}"
 
     client = None
@@ -403,6 +403,7 @@ async def test_owned_client_bypasses_proxy_env_for_loopback(
     finally:
         if client is not None:
             await client.aclose()
+        probe.close()
         httpd.shutdown()
         httpd.server_close()
 
