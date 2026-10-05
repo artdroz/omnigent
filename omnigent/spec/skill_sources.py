@@ -435,10 +435,10 @@ def _plugin_install_paths(
     return out
 
 
-# Claude Code skips plugin command files larger than this; so does the menu.
+# Claude Code's plugin command loader stops at these bounds; so does the menu.
 _MAX_PLUGIN_COMMAND_BYTES = 1024 * 1024
-# Bounds the ``commands/`` walk so a symlink cycle cannot recurse forever.
-_MAX_PLUGIN_COMMAND_DEPTH = 8
+_MAX_PLUGIN_COMMAND_DEPTH = 32
+_MAX_PLUGIN_COMMAND_DIRS = 4096
 
 
 def _parse_plugin_command(command_md: Path, name: str) -> SkillSpec | None:
@@ -450,9 +450,11 @@ def _parse_plugin_command(command_md: Path, name: str) -> SkillSpec | None:
     :returns: The command spec, or None for unreadable or oversized files."""
     try:
         if command_md.stat().st_size > _MAX_PLUGIN_COMMAND_BYTES:
+            _log.warning("Skipping oversized plugin command %s", command_md)
             return None
         text = command_md.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+    except (OSError, UnicodeDecodeError) as exc:
+        _log.warning("Skipping unreadable plugin command %s: %s", command_md, exc)
         return None
     description = ""
     user_invocable = True
@@ -488,20 +490,32 @@ def _discover_plugin_commands(commands_dir: Path) -> list[SkillSpec]:
     """Read a plugin's command markdown files in stable order, skipping unreadable ones.
 
     Mirrors Claude Code's plugin command loader: ``commands/<dir>/<name>.md``
-    is the command ``<dir>:<name>``, with every subdirectory segment joined
-    by ``:``, and a ``<dir>/skill.md`` is the single command ``<dir>``.
+    is the command ``<dir>:<name>`` with every subdirectory segment joined by
+    ``:``, a ``<dir>/skill.md`` makes the directory the single command
+    ``<dir>``, and symlinked entries are not followed.
 
     :param commands_dir: Plugin commands directory.
     :returns: Parsed commands, or an empty list when the directory is unavailable."""
     out: list[SkillSpec] = []
+    scanned = 0
+
+    def _is_markdown(entry: Path) -> bool:
+        return not entry.is_symlink() and entry.is_file() and entry.name.lower().endswith(".md")
 
     def _walk(directory: Path, prefix: tuple[str, ...]) -> None:
+        nonlocal scanned
+        scanned += 1
+        if len(prefix) >= _MAX_PLUGIN_COMMAND_DEPTH or scanned > _MAX_PLUGIN_COMMAND_DIRS:
+            _log.warning("Skipping plugin commands beyond the walk's bounds: %s", directory)
+            return
         try:
             entries = sorted(directory.iterdir())
         except OSError as exc:
             _log.warning("Skipping unreadable plugin commands dir %s: %s", directory, exc)
             return
-        skill_md = next((e for e in entries if e.name.lower() == "skill.md" and e.is_file()), None)
+        skill_md = next(
+            (e for e in entries if e.name.lower() == "skill.md" and _is_markdown(e)), None
+        )
         if skill_md is not None and prefix:
             # The directory is one command; Claude Code ignores its siblings.
             spec = _parse_plugin_command(skill_md, ":".join(prefix))
@@ -509,17 +523,16 @@ def _discover_plugin_commands(commands_dir: Path) -> list[SkillSpec]:
                 out.append(spec)
             return
         for entry in entries:
-            if entry.name.startswith("."):
+            if entry.is_symlink():
                 continue
             if entry.is_dir():
-                if len(prefix) < _MAX_PLUGIN_COMMAND_DEPTH:
-                    _walk(entry, (*prefix, entry.name))
-                continue
-            if not entry.is_file() or entry.suffix != ".md" or entry.name.lower() == "skill.md":
-                continue
-            spec = _parse_plugin_command(entry, ":".join((*prefix, entry.stem)))
-            if spec is not None:
-                out.append(spec)
+                _walk(entry, (*prefix, entry.name))
+            elif _is_markdown(entry) and entry.name.lower() != "skill.md":
+                # Claude Code accepts any-case ``.md`` but strips only the lowercase spelling.
+                name = entry.name[:-3] if entry.name.endswith(".md") else entry.name
+                spec = _parse_plugin_command(entry, ":".join((*prefix, name)))
+                if spec is not None:
+                    out.append(spec)
 
     if commands_dir.is_dir():
         _walk(commands_dir, ())

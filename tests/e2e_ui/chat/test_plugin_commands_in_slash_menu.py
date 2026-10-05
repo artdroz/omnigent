@@ -5,12 +5,10 @@ checks both menu entries. No model turn or provider credentials are needed."""
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import subprocess
 import sys
-import tarfile
 import time
 import uuid
 from collections.abc import Iterator
@@ -20,6 +18,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.session import bundle_files, post_session_bundle
+
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # Host registration budget.
@@ -27,11 +27,11 @@ _HOST_ONLINE_TIMEOUT_S = 60.0
 # Host discovery budget.
 _SKILLS_TIMEOUT_S = 90.0
 
-# Mirrors the reported plugin: knowledge-base from plugin-marketplace.
+# An enabled plugin whose command and skill the test expects in the menu.
 _PLUGIN = "knowledge-base"
 _MARKETPLACE = "plugin-marketplace"
 _PLUGIN_KEY = f"{_PLUGIN}@{_MARKETPLACE}"
-# The plugin command the reporter invoked (``commands/kb-review.md``).
+# The plugin's command (``commands/kb-review.md``).
 _COMMAND = "kb-review"
 # A sibling plugin skill — the control that proves plugin discovery ran.
 _SKILL = "kb-search"
@@ -98,26 +98,6 @@ def _seed_claude_plugin_home(home: Path) -> None:
     )
 
 
-def _agent_bundle(name: str) -> bytes:
-    """Gzip-tar the inline claude-sdk agent YAML for multipart upload.
-
-    Uses a non-``config.yaml`` archive name so the bundle routes through the
-    omnigent compat adapter (same convention as the suite's other inline
-    bundles).
-
-    :param name: Agent name (unique per test run).
-    :returns: The ``.tar.gz`` bundle bytes.
-    """
-    yaml_text = _AGENT_YAML.format(name=name)
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        info = tarfile.TarInfo(name=f"{name}.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-    return buf.getvalue()
-
-
 @pytest.fixture(scope="module")
 def plugin_host(
     live_server: str,
@@ -159,8 +139,15 @@ def plugin_host(
             deadline = time.monotonic() + _HOST_ONLINE_TIMEOUT_S
             while time.monotonic() < deadline:
                 assert proc.poll() is None, "plugin host exited before registration"
-                response = httpx.get(f"{live_server}/v1/hosts/{host_id}", timeout=2)
-                if response.status_code == 200 and response.json().get("status") == "online":
+                try:
+                    response = httpx.get(f"{live_server}/v1/hosts/{host_id}", timeout=2)
+                except httpx.HTTPError:  # transient while the server settles
+                    response = None
+                if (
+                    response is not None
+                    and response.status_code == 200
+                    and response.json().get("status") == "online"
+                ):
                     break
                 time.sleep(0.25)
             else:
@@ -186,12 +173,10 @@ def plugin_session(
     """
     host_id, workspace = plugin_host
     name = f"kb-plugin-{uuid.uuid4().hex[:8]}"
-    bundle = _agent_bundle(name)
-    create_resp = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        timeout=30.0,
+    # A non-``config.yaml`` member name routes the bundle through the compat adapter.
+    bundle = bundle_files({f"{name}.yaml": _AGENT_YAML.format(name=name).encode()})
+    create_resp = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", bundle, timeout=30.0
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
@@ -217,43 +202,46 @@ def _wait_for_plugin_skills(base_url: str, session_id: str) -> list[dict]:
     deadline = time.monotonic() + _SKILLS_TIMEOUT_S
     last: list[dict] = []
     while time.monotonic() < deadline:
-        resp = httpx.get(f"{base_url}/v1/skills", params={"session_id": session_id}, timeout=20.0)
-        if resp.status_code == 200:
+        try:
+            resp = httpx.get(
+                f"{base_url}/v1/skills", params={"session_id": session_id}, timeout=20.0
+            )
+        except httpx.HTTPError:  # transient while the host binds
+            resp = None
+        if resp is not None and resp.status_code == 200:
             last = resp.json().get("skills") or []
-            if any(s.get("name", "").endswith(_SKILL) for s in last):
+            if any(s.get("name") == f"{_PLUGIN}:{_SKILL}" for s in last):
                 return last
         time.sleep(1.0)
     raise AssertionError(
-        f"plugin skill {_SKILL!r} never reached host discovery within "
-        f"{_SKILLS_TIMEOUT_S:.0f}s (rig failure, not the bug); "
-        f"last skills: {last!r}"
+        f"plugin skill {_PLUGIN}:{_SKILL} never reached host discovery within "
+        f"{_SKILLS_TIMEOUT_S:.0f}s; last skills: {last!r}"
     )
 
 
 @pytest.mark.timeout(600)
 def test_plugin_commands_listed_in_slash_menu(
     request: pytest.FixtureRequest,
+    plugin_host: tuple[str, Path],
     plugin_session: tuple[str, str],
 ) -> None:
-    """The menu contains both the control skill and its sibling command.
+    """The menu lists the control skill and its sibling command, both namespaced.
 
     :param request: Used to open the browser page only once the host has
         discovered the plugin, so a recording starts at the user journey.
+    :param plugin_host: The seeded host, whose one-time import review is
+        marked as already seen so the menu is not covered by that dialog.
     :param plugin_session: Server URL and session bound to the plugin host."""
+    host_id, _ = plugin_host
     base_url, session_id = plugin_session
     _wait_for_plugin_skills(base_url, session_id)
 
     page: Page = request.getfixturevalue("page")
+    page.add_init_script(
+        "window.localStorage.setItem("
+        f"'omnigent:imports-reviewed:{host_id}', new Date().toISOString())"
+    )
     page.goto(f"{base_url}/c/{session_id}")
-
-    # A host whose harnesses bring plugins opens the one-time import review
-    # first; confirm it, as a user would, before reaching the composer.
-    imports = page.get_by_role("dialog", name="Your imports are ready")
-    expect(imports).to_be_visible(timeout=60_000)
-    expect(imports.get_by_role("list", name="Plugins")).to_contain_text(_PLUGIN)
-    imports.get_by_role("button", name="Confirm").click()
-    expect(imports).to_be_hidden()
-
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible(timeout=30_000)
 
@@ -265,13 +253,9 @@ def test_plugin_commands_listed_in_slash_menu(
     skill_row = page.get_by_test_id(f"slash-menu-item-{_PLUGIN}:{_SKILL}")
     expect(skill_row).to_be_visible(timeout=30_000)
 
-    # The bug: the plugin's COMMAND is missing from the same menu. Accept
-    # either the bare or the plugin-namespaced spelling so the assertion
-    # pins discoverability, not the fix's namespace choice.
-    command_row = page.locator(
-        f'[data-testid="slash-menu-item-{_COMMAND}"], '
-        f'[data-testid="slash-menu-item-{_PLUGIN}:{_COMMAND}"]'
-    )
-    expect(command_row.first).to_be_visible(timeout=10_000)
+    # The command row is namespaced like the skill and carries its description.
+    command_row = page.get_by_test_id(f"slash-menu-item-{_PLUGIN}:{_COMMAND}")
+    expect(command_row).to_be_visible(timeout=10_000)
+    expect(command_row).to_contain_text("Review a knowledge-base PR")
     # Hold the populated menu so a recording of this journey ends on it.
     page.wait_for_timeout(2_000)
