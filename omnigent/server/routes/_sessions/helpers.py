@@ -78,6 +78,7 @@ from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
 from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.native.failure_telemetry import failure_log_attributes
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
@@ -4809,6 +4810,7 @@ def _publish_status(
     persist_live_status: bool = True,
     scheduled_run_outcome: Literal["auto", "failed"] = "auto",
     failure_origin: str | None = None,
+    failure_context: object = None,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -4841,6 +4843,8 @@ def _publish_status(
         server-side failure logs one ERROR from here, so without it the
         dozen unrelated causes that reach this function are one
         undifferentiated signature. Ignored for non-failed edges.
+    :param failure_context: Untrusted optional native evidence, normalized at
+        the failure-log boundary. Malformed values cannot reject the status edge.
     """
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
@@ -4915,6 +4919,7 @@ def _publish_status(
                 code=failure_code,
                 previous_status=previous_status or "unknown",
                 response_id=response_id,
+                **failure_log_attributes(failure_context),
             ),
         )
         session_live_state.persist_scheduled_run_completion(
@@ -5892,11 +5897,15 @@ async def _launch_runner_on_host_locked(
     binding_token = secrets.token_urlsafe(32)
     new_runner_id = token_bound_runner_id(binding_token)
 
-    await asyncio.to_thread(
+    bound_conv = await asyncio.to_thread(
         conversation_store.replace_runner_id,
         conv.id,
         new_runner_id,
     )
+    if bound_conv.runner_last_seen is not None:
+        # The new token has not reached the host, so this stamp can only
+        # belong to the previous runner. Clear it before launching.
+        await asyncio.to_thread(conversation_store.clear_runner_liveness, new_runner_id)
     _logger.info(
         "Session bound to runner",
         extra=debug_event(

@@ -2626,6 +2626,49 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "HarnessStartup": {
+        "description": "The only launch metadata allowed across the host tunnel and HTTP API.",
+        "properties": {
+          "arg_count": {
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Arg Count",
+            "type": "integer"
+          },
+          "command": {
+            "title": "Command",
+            "type": "string"
+          },
+          "command_source": {
+            "enum": [
+              "env",
+              "config",
+              "default"
+            ],
+            "title": "Command Source",
+            "type": "string"
+          },
+          "resolved_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolved Path"
+          }
+        },
+        "required": [
+          "command",
+          "resolved_path",
+          "command_source",
+          "arg_count"
+        ],
+        "title": "HarnessStartup",
+        "type": "object"
+      },
       "HeartbeatEvent": {
         "description": "Keepalive event emitted on a fixed cadence during streaming.\n\nLets consumers detect stalled producers via missed-interval\ntiming. Cadence is set by `_HEARTBEAT_INTERVAL_S` in\n`omnigent/runtime/workflow.py` (15 seconds at the time of\nwriting). Wire shape matches the existing emit at\n`omnigent/runtime/workflow.py:4636-4639`.\n\nPer `designs/SERVER_HARNESS_CONTRACT.md` \u00a7Heartbeats, the\nevent MAY carry timing metadata so consumers can do richer\ndead-detection than \"did anything arrive\":\n\n- `server_time` is the producer's wall-clock at emission,\n  letting consumers detect clock drift between producer and\n  consumer.\n- `last_event_seq` is the `sequence_number` of the most\n  recent NON-heartbeat event (or `None` when this is the\n  first heartbeat before any user-visible event), letting\n  consumers detect dropped events on reconnect.\n\nBoth fields are optional on the wire (`None` round-trips as\nomitted) so older AP\u2192harness pairs that pre-date the field\naddition still parse cleanly.",
         "properties": {
@@ -3845,6 +3888,111 @@
           "level"
         ],
         "title": "PermissionObject",
+        "type": "object"
+      },
+      "PluginSummary": {
+        "description": "Installed Claude plugin metadata, without paths or executable configuration.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 1000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "harness": {
+            "const": "claude",
+            "title": "Harness",
+            "type": "string"
+          },
+          "has_commands": {
+            "title": "Has Commands",
+            "type": "boolean"
+          },
+          "has_hooks": {
+            "title": "Has Hooks",
+            "type": "boolean"
+          },
+          "marketplace": {
+            "maxLength": 256,
+            "title": "Marketplace",
+            "type": "string"
+          },
+          "mcp_servers": {
+            "items": {
+              "maxLength": 256,
+              "type": "string"
+            },
+            "maxItems": 128,
+            "title": "Mcp Servers",
+            "type": "array"
+          },
+          "name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "skills": {
+            "items": {
+              "maxLength": 256,
+              "type": "string"
+            },
+            "maxItems": 128,
+            "title": "Skills",
+            "type": "array"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "harness",
+          "name",
+          "marketplace",
+          "enabled",
+          "skills",
+          "mcp_servers",
+          "has_hooks",
+          "has_commands"
+        ],
+        "title": "PluginSummary",
+        "type": "object"
+      },
+      "PluginsResponse": {
+        "description": "Installed plugins reported by the host (Claude only).",
+        "properties": {
+          "plugins": {
+            "items": {
+              "$ref": "#/components/schemas/PluginSummary"
+            },
+            "maxItems": 128,
+            "title": "Plugins",
+            "type": "array"
+          }
+        },
+        "required": [
+          "plugins"
+        ],
+        "title": "PluginsResponse",
         "type": "object"
       },
       "PolicyDeniedEvent": {
@@ -10085,6 +10233,58 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/harnesses/{harness}/startup": {
+      "get": {
+        "description": "Read the binary, source, and argument count; never argument values.",
+        "operationId": "get_harness_startup_v1_hosts__host_id__harnesses__harness__startup_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HarnessStartup"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Harness Startup",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/mcp-servers": {
       "get": {
         "description": "List the user-level MCP servers configured for each harness on a host.\n\nReturns names and non-secret metadata only; the caller must own the host.",
@@ -10123,6 +10323,49 @@
           }
         },
         "summary": "Get Mcp Servers",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/plugins": {
+      "get": {
+        "description": "List installed Claude plugins. The caller must own the host.",
+        "operationId": "get_plugins_v1_hosts__host_id__plugins_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Plugins",
         "tags": [
           "hosts"
         ]

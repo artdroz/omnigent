@@ -68,6 +68,7 @@ from omnigent.host.frames import (
 )
 from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.native.failure_telemetry import FailureContext, normalize_failure_context
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -3181,13 +3182,21 @@ async def _enrich_terminal_status_with_subagent_output(
     """
     if status not in ("idle", "failed"):
         return data
+    context: FailureContext = {}
+    if status == "failed":
+        context = normalize_failure_context(data.get("failure_context"))
+        context.setdefault("failure_source", "external_status")
+        data = {**data, "failure_context": context}
     current_turn_only = status == "failed" or data.get("turn_outcome") == "cancelled"
     existing = data.get("output")
     if current_turn_only and isinstance(existing, str) and existing.strip():
+        if status == "failed":
+            context.setdefault("detail_source", "external_status_output")
         return data
     # The store's latest assistant text can be prose that preceded the error.
     failure_detail = data.get("failure_detail") if status == "failed" else None
     if isinstance(failure_detail, str) and failure_detail.strip():
+        context.setdefault("detail_source", "external_status_failure_detail")
         return {**data, "output": failure_detail.strip()}
     raw_response_id = data.get("response_id") if current_turn_only else None
     response_id = raw_response_id if isinstance(raw_response_id, str) and raw_response_id else None
@@ -3199,7 +3208,11 @@ async def _enrich_terminal_status_with_subagent_output(
         stop_at_user_message=current_turn_only,
     )
     if output is None:
+        if status == "failed":
+            context["detail_source"] = "missing"
         return data
+    if status == "failed":
+        context["detail_source"] = "assistant_output_fallback"
     return {**data, "output": output}
 
 
@@ -3533,6 +3546,46 @@ async def _mark_runner_sessions_offline_impl(
             conv.id, "returned", conversation_store, turn_id=turn_id, status="failed"
         )
         await _persist_session_status_error_labels(conv.id, error, conversation_store)
+
+
+async def _wait_for_host_reconnect(
+    host_id: str,
+    host_registry: HostRegistry,
+    tunnel_registry: TunnelRegistry | None,
+    *,
+    runner_id: str | None,
+    timeout_s: float,
+) -> HostConnection | None:
+    """Wait for an absent host or its surviving runner to reconnect.
+
+    Only reads the local registries; no database or network polling. A runner
+    reconnect ends the host grace too, so a surviving runner can serve the
+    input even while its host daemon remains offline. Callers re-resolve the
+    runner before launching a replacement. Remote reconnects and changed
+    runner bindings are resolved after this grace and can take the full timeout.
+
+    :param host_id: Host whose tunnel must return before a launch is possible.
+    :param host_registry: Workspace-scoped registry of host connections.
+    :param tunnel_registry: Registry of locally connected runners, if configured.
+    :param runner_id: Existing runner binding, or ``None`` before the first launch.
+    :param timeout_s: Maximum host grace, separate from runner startup time.
+    :returns: The reconnected host, or ``None`` on runner recovery or timeout.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        host_conn = host_registry.get(host_id)
+        if host_conn is not None:
+            return host_conn
+        if (
+            runner_id is not None
+            and tunnel_registry is not None
+            and tunnel_registry.get(runner_id) is not None
+        ):
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        await asyncio.sleep(min(0.1, remaining))
 
 
 async def _wait_for_host_bound_runner_client(
@@ -3884,8 +3937,8 @@ async def _maybe_relaunch_managed_sandbox(
     Relaunch a dead managed sandbox for a session, if it has one.
 
     Called from the message-dispatch relaunch path when the session's
-    host tunnel is gone. For an external (laptop) host that is the end
-    of the line, but a managed host's sandbox is RELAUNCHABLE: the
+    host tunnel is gone. External hosts must reconnect themselves,
+    but a managed host's sandbox is relaunchable: the
     host row is durable, so a new sandbox generation can be provisioned
     under the same host identity — "send a message to wake the
     sandbox", mirroring how a message relaunches a dead runner on a
@@ -3907,7 +3960,7 @@ async def _maybe_relaunch_managed_sandbox(
         successfully (the session row is re-bound; re-resolve the
         runner client). ``False`` when the host is not a managed
         sandbox or managed hosts are not configured — the caller
-        falls through to the normal unavailable handling.
+        can wait for the existing host to reconnect.
     :raises OmnigentError: 503 when the relaunch failed or timed out.
     """
     host_store = getattr(app_state, "host_store", None)
@@ -7211,38 +7264,40 @@ async def _relay_runner_live_elsewhere(
     conversation_store: ConversationStore,
 ) -> bool:
     """
-    Resolve this relay's bound runner and check it against another replica.
+    Check this relay's bound runner using shared runner metadata.
 
-    The active relay's runner id is normally known from its own
-    ``_runner_relay_tasks`` registration; a caller that drives
-    :func:`_relay_runner_stream` directly (tests, or a code path
-    bypassing :func:`_ensure_runner_relay`) has no such entry, so fall
-    back to the session row's binding. One row read serves both the
-    binding and the liveness stamp, keeping this path bounded.
+    A full-conversation read can depend on unrelated backends; their outage
+    must not hide a fresh heartbeat from another replica. Prefer the active
+    relay's runner binding, falling back to the metadata binding when called
+    without a registered relay.
 
     :param session_id: Session/conversation identifier.
-    :param conversation_store: Store used to read the session row.
+    :param conversation_store: Store used to read runner metadata.
     :returns: ``True`` when the bound runner is confirmed live on
         another replica; ``False`` when unbound, unreadable, or not.
     """
     try:
-        row = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        liveness = await asyncio.to_thread(conversation_store.get_runner_liveness, session_id)
     except Exception:  # noqa: BLE001 — fall through to the mid-turn check instead
         _logger.warning(
-            "Relay: session-row lookup failed for session=%s",
+            "Relay: runner liveness lookup failed for session=%s",
             session_id,
             exc_info=True,
             extra={"session_id": session_id},
         )
         return False
-    if row is None:
+    if liveness is None:
         return False
+    bound_runner_id, runner_last_seen = liveness
     handle = _runner_relay_tasks.get(session_id)
-    runner_id = handle.runner_id if handle is not None else row.runner_id
+    runner_id = handle.runner_id if handle is not None else bound_runner_id
     if runner_id is None:
         return False
     reference_stamp = session_live_state.last_liveness_stamp(runner_id)
-    return _runner_live_on_another_replica_from_conversations([row], runner_id, reference_stamp)
+    return bound_runner_id == runner_id and _runner_stamp_is_live_elsewhere(
+        stamp=runner_last_seen,
+        reference_stamp=reference_stamp,
+    )
 
 
 async def _relay_runner_stream(
@@ -11916,6 +11971,7 @@ __all__ = [
     "_spawn_native_approval_popup_forward",
     "_spawn_native_blocked_notice_forward",
     "_wait_for_host_bound_runner_client",
+    "_wait_for_host_reconnect",
     "_wake_parent_for_blocked_child",
     "configure_subagent_block_notifier",
     "ensure_runner_connected",
