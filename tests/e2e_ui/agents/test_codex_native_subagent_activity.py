@@ -70,9 +70,13 @@ def _stale_running_snapshot_event() -> dict:
     }
 
 
-async def _forward_events(base_url: str, session_id: str, events: list[dict]) -> None:
+async def _forward_events(
+    base_url: str,
+    session_id: str,
+    events: list[dict],
+    state: codex_native_forwarder._CodexForwarderState,
+) -> None:
     """Drive Codex events through the real forwarder into the live server."""
-    state = codex_native_forwarder._CodexForwarderState(parent_session_id=session_id)
     tracker = codex_native_forwarder._CodexElicitationTaskTracker()
     async with httpx.AsyncClient(base_url=base_url) as client:
         for event in events:
@@ -89,9 +93,14 @@ async def _forward_events(base_url: str, session_id: str, events: list[dict]) ->
     await tracker.close()
 
 
-def _forward_events_sync(base_url: str, session_id: str, events: list[dict]) -> None:
+def _forward_events_sync(
+    base_url: str,
+    session_id: str,
+    events: list[dict],
+    state: codex_native_forwarder._CodexForwarderState,
+) -> None:
     with ThreadPoolExecutor(max_workers=1) as executor:
-        executor.submit(asyncio.run, _forward_events(base_url, session_id, events)).result()
+        executor.submit(asyncio.run, _forward_events(base_url, session_id, events, state)).result()
 
 
 def _assert_child_completed(base_url: str, session_id: str) -> None:
@@ -116,31 +125,18 @@ def _expect_child_row_done(page: Page, base_url: str, session_id: str) -> None:
     )
 
 
-def test_codex_spawn_activity_appears_in_agents_rail(
+def test_codex_child_stays_done_in_agents_rail_after_stale_running_snapshot(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A Codex native spawn event creates the child row rendered by the UI."""
+    """A spawned child shows "Done" once finished and keeps it after a stale snapshot."""
     base_url, session_id = seeded_session
-    _forward_events_sync(base_url, session_id, _spawn_and_complete_events())
-
+    state = codex_native_forwarder._CodexForwarderState(parent_session_id=session_id)
+    _forward_events_sync(base_url, session_id, _spawn_and_complete_events(), state)
     _assert_child_completed(base_url, session_id)
     _expect_child_row_done(page, base_url, session_id)
 
-
-def test_codex_completed_child_stays_done_after_stale_running_snapshot(
-    request,
-    seeded_session: tuple[str, str],
-) -> None:
-    """A finished child stays "Done" when a later parent snapshot still calls it running."""
-    base_url, session_id = seeded_session
-    _forward_events_sync(
-        base_url,
-        session_id,
-        [*_spawn_and_complete_events(), _stale_running_snapshot_event()],
-    )
-
+    # A later parent spawn item still lists the finished child as running.
+    _forward_events_sync(base_url, session_id, [_stale_running_snapshot_event()], state)
     _assert_child_completed(base_url, session_id)
-    # Create the recorded page only after the non-browser setup above.
-    page: Page = request.getfixturevalue("page")
     _expect_child_row_done(page, base_url, session_id)

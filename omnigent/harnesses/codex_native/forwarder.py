@@ -400,7 +400,7 @@ class _CodexForwarderState:
     :param child_turn_status_by_thread: Latest Omnigent status derived from
         each child thread's own turn lifecycle (live edges or its backfilled
         resume payload), e.g. ``{"thread_child": "idle"}``. A parent collab
-        snapshot may not move a settled child back to ``running``.
+        snapshot that disagrees with it is ignored.
     :param synced_item_keys: Stable item keys already posted to Omnigent this
         connection, e.g. ``{"thread_c:turn_c:item-1"}``. In-memory only;
         guards replay-vs-live overlap within one forwarder lifetime.
@@ -686,15 +686,24 @@ class _CodexForwarderState:
         """
         self.child_turn_status_by_thread[thread_id] = status
 
-    def child_turn_settled(self, thread_id: str) -> bool:
+    def seed_child_turn_status(self, thread_id: str, status: str) -> None:
         """
-        Return whether a child's own lifecycle last reported a terminal status.
+        Record a backfilled status unless the child's live lifecycle already spoke.
 
         :param thread_id: Codex child thread id, e.g. ``"thread_child"``.
-        :returns: ``True`` when the child's latest own edge was ``idle`` or
-            ``failed`` and no newer ``turn/started`` has been observed.
+        :param status: Omnigent status literal from the child's resume payload.
+        :returns: None.
         """
-        return self.child_turn_status_by_thread.get(thread_id) in {"idle", "failed"}
+        self.child_turn_status_by_thread.setdefault(thread_id, status)
+
+    def child_turn_status(self, thread_id: str) -> str | None:
+        """
+        Return the status a child's own lifecycle last reported.
+
+        :param thread_id: Codex child thread id, e.g. ``"thread_child"``.
+        :returns: Omnigent status literal, or ``None`` when nothing was observed.
+        """
+        return self.child_turn_status_by_thread.get(thread_id)
 
     def note_user_message_posted(self, turn_id: str) -> None:
         """
@@ -5726,6 +5735,12 @@ async def _apply_child_resume(
     :param forwarder_state: Mutable state for sub-agent mappings.
     :returns: None.
     """
+    # Codex's own view of the child's newest turn outranks any parent collab
+    # snapshot replayed for this child afterwards. A live edge observed since
+    # the resume request is fresher still, so it is never overwritten.
+    resumed_status = _latest_resume_turn_status(response)
+    if resumed_status is not None:
+        forwarder_state.seed_child_turn_status(child_thread_id, resumed_status)
     await _upsert_child_name_from_resume(
         client,
         parent_session_id=parent_session_id,
@@ -5750,11 +5765,6 @@ async def _apply_child_resume(
         )
     finally:
         await child_elicitation_tracker.close()
-    # Codex's own view of the child's newest turn outranks any parent collab
-    # snapshot replayed for this child afterwards.
-    resumed_status = _latest_resume_turn_status(response)
-    if resumed_status is not None:
-        forwarder_state.note_child_turn_status(child_thread_id, resumed_status)
     forwarder_state.note_child_thread_subscribed(child_thread_id)
 
 
@@ -5849,10 +5859,11 @@ async def _post_collab_agent_statuses(
     """
     Publish Omnigent status updates from a Codex collab-agent state snapshot.
 
-    A ``running`` snapshot is skipped for a child whose own turn lifecycle
-    already settled: Codex keeps finished sub-agents open, so later (or
-    replayed) spawn items still list them, and the stale snapshot would
-    otherwise show a finished agent as working forever.
+    Once a child's own turn lifecycle has reported a status, a snapshot that
+    disagrees with it is skipped: Codex keeps finished sub-agents open, so
+    later (or replayed) spawn items still carry stale ``agentsStates`` for
+    them, and the stale snapshot would otherwise show a finished agent as
+    working forever (or a working agent as done).
 
     :param client: HTTP client for Omnigent event posts.
     :param item: Codex ``collabAgentToolCall`` item carrying
@@ -5872,9 +5883,13 @@ async def _post_collab_agent_statuses(
         ap_status = _omnigent_status_from_collab_state(state)
         if ap_status is None:
             continue
-        if ap_status == "running" and forwarder_state.child_turn_settled(thread_id):
+        own_status = forwarder_state.child_turn_status(thread_id)
+        if own_status is not None and ap_status != own_status:
             _logger.info(
-                "Codex forwarder ignored running collab snapshot for settled child: thread_id=%s",
+                "Codex forwarder ignored collab snapshot %s for child with own status %s: "
+                "thread_id=%s",
+                ap_status,
+                own_status,
                 thread_id,
             )
             continue
