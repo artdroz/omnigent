@@ -94,7 +94,7 @@ def completed_review_runs(repository, number, head, default_branch, reviewer, re
         if not run_id:
             continue
         run = api_object(f"repos/{repository}/actions/runs/{run_id}", request)
-        trusted = (reviewer == "ocr" and run.get("event") == "pull_request_target") or (
+        trusted = run.get("event") == "pull_request_target" or (
             run.get("head_branch") == default_branch
             and run.get("event") in {"issue_comment", "workflow_dispatch"}
         )
@@ -106,6 +106,45 @@ def completed_review_runs(repository, number, head, default_branch, reviewer, re
         ):
             markers[f"{run_id}-{run['run_attempt']}"] = artifact.get("id")
     return markers
+
+
+def review_attempts(repository, number, head, reviewer, request):
+    """Find review attempts whose trusted trigger identifies this PR revision."""
+    repo = api_object(f"repos/{repository}", request)
+    runs = api_object(
+        f"repos/{repository}/actions/workflows/{REVIEWERS[reviewer]}/runs?per_page=100",
+        request,
+    )["workflow_runs"]
+    label = "Polly" if reviewer == "polly" else "OCR"
+    return [
+        run
+        for run in runs
+        if (
+            run.get("event") == "pull_request_target"
+            or (
+                run.get("event") == "workflow_dispatch"
+                and run.get("head_branch") == repo["default_branch"]
+            )
+        )
+        and (
+            run.get("display_title") == f"{label} #{number} @{head}"
+            or (
+                run.get("event") == "pull_request_target"
+                and any(
+                    pull.get("number") == number and pull.get("head", {}).get("sha") == head
+                    for pull in run.get("pull_requests", [])
+                )
+            )
+        )
+    ]
+
+
+def active_review_runs(repository, number, head, reviewer, request):
+    return [
+        run
+        for run in review_attempts(repository, number, head, reviewer, request)
+        if run.get("status") != "completed"
+    ]
 
 
 def ocr_receipt(repository, artifact_id):
@@ -314,7 +353,9 @@ def request_reviews(repository, number, state, request=gh_json):
     """Explicit dispatch is the supported bot equivalent of /review and /ocr."""
     repo = api_object(f"repos/{repository}", request)
     for name, workflow in REVIEWERS.items():
-        if not state["completed"][name]:
+        if not state["completed"][name] and not active_review_runs(
+            repository, number, state["head_sha"], name, request
+        ):
             request(
                 [
                     "api",
@@ -327,6 +368,8 @@ def request_reviews(repository, number, state, request=gh_json):
                     f"inputs[pr]={number}",
                     "-f",
                     "inputs[force]=true",
+                    "-f",
+                    f"inputs[expected_head]={state['head_sha']}",
                 ]
             )
 

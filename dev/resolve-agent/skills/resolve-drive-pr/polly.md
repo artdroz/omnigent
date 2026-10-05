@@ -4,13 +4,18 @@ Run **both Polly AI Review (`/review`) and Open Code Review (`/ocr`)** on the
 PR you are driving. Neither reviewer automatically reruns on every push. Their
 slash-command handlers ignore bot comments, so Resolve uses the equivalent
 `workflow_dispatch` entry points with its App token (Actions: read and write, for run/artifact reads and dispatch). Use
-`review_cycle.py request` below as the single dispatch path; it forces missing
-reviews to rerun even when skip markers or incomplete publication evidence remain.
+`review_cycle.py request` below as the single dispatch path. It reuses verified
+automatic reviews of the current commit and waits for a matching review already
+running. New commits need their own reviews. CI may route this command through
+its host so the session does not need a broader token.
 
 Use the target repository's default branch for workflow code, including fork
-PRs. Never run a workflow from the contributor's branch. A missing workflow,
-403, unavailable credentials, or failed review is an incomplete review, never a
-clean result. Do not fall back to bot-authored slash comments.
+PRs. Never run a workflow from the contributor's branch. A missing workflow, 403, capacity limit, timeout, or failed review is unavailable
+coverage, never a clean result. In CI's checked-publication mode, record these
+as `review_failures` with the run URL, head and reason, or retain the host's
+request-failure receipt. They are warnings and do not require code changes.
+Continue checking product CI and dispositioning every real finding. CI's helper
+validates those conditions before allowing `fixed` with a review warning. Do not fall back to bot-authored slash comments.
 
 #### Collect complete, current-head feedback
 
@@ -108,7 +113,7 @@ proof and dispositions cannot establish readiness for a new head. A fork takeove
 starts the same loop on the replacement PR.
 
 Continue fix → test → push → both reviews → triage until no actionable findings
-remain. There is **no fixed review-round cap**. Repeated invalid findings can be
+remain. Follow the workflow-provided review budget when present; otherwise there is no fixed review-round cap. Repeated invalid findings can be
 justified against current code; they do not require meaningless edits to appease
 a reviewer. For ambiguous design intent, use `resolve-investigate` to prepare a
 supported recommendation on the PR and complete independent work. A remaining

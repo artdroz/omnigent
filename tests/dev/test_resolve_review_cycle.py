@@ -86,6 +86,7 @@ class Github:
         }
         self.polly_run = {**self.run, "workflow_id": 21}
         self.calls = []
+        self.active_runs = []
         self.permissions = {}
 
     @staticmethod
@@ -116,6 +117,8 @@ class Github:
             return {"permission": self.permissions.get(path.split("/")[-2], "write")}
         if "/actions/artifacts?" in path:
             return {"artifacts": copy.deepcopy(self.artifacts)}
+        if "/runs?per_page=100" in path:
+            return {"workflow_runs": self.active_runs}
         if "/actions/workflows/open-code-review.yml" in path:
             return {"id": 20}
         if "/actions/workflows/polly-review.yml" in path:
@@ -491,7 +494,17 @@ def test_cli_requests_force_review_when_evidence_is_missing(
     dispatches = [args for args in github_cli.calls if "POST" in args]
     assert {args[3].split("/")[-2] for args in dispatches} == expected
     assert all(
-        args[-6:] == ["-f", "ref=main", "-f", "inputs[pr]=7", "-f", "inputs[force]=true"]
+        args[-8:]
+        == [
+            "-f",
+            "ref=main",
+            "-f",
+            "inputs[pr]=7",
+            "-f",
+            "inputs[force]=true",
+            "-f",
+            f"inputs[expected_head]={github_cli.pull['head']['sha']}",
+        ]
         for args in dispatches
     )
 
@@ -540,9 +553,10 @@ def test_cli_preserves_github_error_details(monkeypatch, capsys):
         ("issue_comment", "main"),
     ],
 )
-def test_ocr_accepts_trusted_target_and_comment_events(event, branch):
+@pytest.mark.parametrize("reviewer", ["polly", "ocr"])
+def test_accepts_trusted_target_and_comment_events(event, branch, reviewer):
     api = Github()
-    api.run.update(event=event, head_branch=branch)
+    (api.polly_run if reviewer == "polly" else api.run).update(event=event, head_branch=branch)
     state = cycle.snapshot("o/r", 7, api)
     cycle.validate(state, handoff(state))
 
@@ -759,3 +773,37 @@ def test_download_ocr_completion_receipt(monkeypatch, payload):
     else:
         with pytest.raises((RuntimeError, ValueError, subprocess.CalledProcessError)):
             cycle.ocr_receipt("o/r", 123)
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "timed_out", "cancelled"])
+def test_automatic_polly_outage_is_not_a_completed_review(conclusion):
+    api = Github()
+    api.polly_run.update(event="pull_request_target", conclusion=conclusion)
+    assert cycle.snapshot("o/r", 7, api)["completed"]["polly"] is False
+
+
+def test_automatic_polly_review_does_not_cover_a_later_push():
+    api = Github()
+    api.polly_run["event"] = "pull_request_target"
+    assert cycle.snapshot("o/r", 7, api)["completed"]["polly"] is True
+    api.pull["head"]["sha"] = "b" * 40
+    assert cycle.snapshot("o/r", 7, api)["completed"]["polly"] is False
+
+
+@pytest.mark.parametrize("status", ["queued", "in_progress", "waiting"])
+def test_request_waits_for_automatic_review_of_current_head(status):
+    api = Github()
+    api.artifacts = []
+    api.active_runs = [
+        {
+            "event": "pull_request_target",
+            "status": status,
+            "display_title": f"Polly #7 @{'a' * 40}",
+            "pull_requests": [{"number": 7, "head": {"sha": "a" * 40}}],
+        }
+    ]
+    cycle.request_reviews("o/r", 7, cycle.snapshot("o/r", 7, api), api)
+    assert not any("POST" in call for call in api.calls)
+    api.pull["head"]["sha"] = "b" * 40
+    cycle.request_reviews("o/r", 7, cycle.snapshot("o/r", 7, api), api)
+    assert len([call for call in api.calls if "POST" in call]) == 2
