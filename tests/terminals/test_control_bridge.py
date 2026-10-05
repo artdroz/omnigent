@@ -1204,6 +1204,34 @@ async def _tmux_client_widths(sock: Path) -> list[int]:
     return [int(w) for w in out.decode().split() if w.strip().isdigit()]
 
 
+async def _wait_for_pane_text(sock: Path, target: str, needle: str) -> None:
+    """Wait until ``needle`` is in the pane, confirming it landed pre-attach.
+
+    Polling capture-pane (rather than sleeping) guarantees the text is in pane
+    history before attaching, so the attach exercises the capture-pane seed path
+    instead of racing a post-attach ``%output`` frame carrying the same text.
+    """
+    tmux = shutil.which("tmux")
+    assert tmux
+    for _ in range(100):
+        proc = await asyncio.create_subprocess_exec(
+            tmux,
+            "-S",
+            str(sock),
+            "capture-pane",
+            "-p",
+            "-t",
+            target,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await proc.communicate()
+        if needle.encode() in out:
+            return
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"{needle!r} never rendered in the pane")
+
+
 async def _wait_for_client_width(sock: Path, width: int) -> None:
     """Wait until an attached client reports ``width`` columns.
 
@@ -1261,10 +1289,11 @@ async def test_second_interactive_client_does_not_shrink_first_clients_pane() ->
         await _wait_for_client_width(sock, 45)
         width_with_phone = await _tmux_window_width(sock, target)
 
-        # Detach the phone and wait for tmux to drop it.
+        # Detach the phone and wait for its bridge to exit, then for tmux to
+        # drop the client. A hung detach fails here directly instead of as a
+        # vaguer client-count timeout below.
         phone._recv_gate.set()
-        with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(phone_task, timeout=5)
+        await asyncio.wait_for(phone_task, timeout=5)
         await _wait_for_client_count(sock, 1)
         width_after_phone_left = await _tmux_window_width(sock, target)
 
@@ -1314,8 +1343,13 @@ async def test_control_bridge_attach_continues_when_window_size_option_is_reject
     # `cat` echoes input to the pane (-> %output); the printf lands pre-attach
     # so it can only reach the browser via the capture-pane seed.
     sock, target = await _new_private_tmux("printf 'SEEDED-LINE\\n'; cat")
-    await asyncio.sleep(0.3)
-    monkeypatch.setattr("omnigent.terminals.control_bridge.shutil.which", lambda _: str(wrapper))
+    await _wait_for_pane_text(sock, target, "SEEDED-LINE")
+    real_which = shutil.which
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda cmd, *a, **kw: str(wrapper) if cmd == "tmux" else real_which(cmd, *a, **kw),
+    )
 
     ws = _FakeWebSocket(
         inbound=[
@@ -1330,8 +1364,12 @@ async def test_control_bridge_attach_continues_when_window_size_option_is_reject
         )
 
     task = asyncio.create_task(_run())
-    await asyncio.sleep(1.2)
     try:
+        for _ in range(100):
+            joined = b"".join(ws.sent)
+            if b"SEEDED-LINE" in joined and b"typed-input" in joined:
+                break
+            await asyncio.sleep(0.1)
         joined = b"".join(ws.sent)
         assert b"SEEDED-LINE" in joined, "attach seed failed when window-size was rejected"
         assert b"typed-input" in joined, "input echo failed when window-size was rejected"

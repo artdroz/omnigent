@@ -55,7 +55,11 @@ class _AttachObserver:
     def _on_websocket(self, ws: WebSocket) -> None:
         if not _ATTACH_URL_RE.search(ws.url):
             return
+        # A reattach opens a fresh socket with its own grid; drop the previous
+        # socket's captures so screen_lines() replays only the live connection.
         self.urls.append(ws.url)
+        self.resizes.clear()
+        self.received.clear()
         ws.on("framesent", self._on_sent)
         ws.on("framereceived", self._on_received)
 
