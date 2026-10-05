@@ -32,7 +32,7 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 import pytest
@@ -494,6 +494,27 @@ def _signal_sent(monkeypatch: pytest.MonkeyPatch, name: str) -> asyncio.Event:
     return sent
 
 
+@contextlib.asynccontextmanager
+async def _sigterm_ignoring_child(
+    manager: HarnessProcessManager,
+) -> AsyncIterator[tuple[int, Path]]:
+    """Run conv_a on a child that ignores SIGTERM; SIGKILL it on exit if still alive."""
+    await manager.start()
+    pid: int | None = None
+    try:
+        client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        pid = (await client.get("/pid")).json()["pid"]
+        assert (await client.get("/ignore-sigterm")).json()["status"] == "sigterm_ignored"
+        socket_path = manager.instance_dir / "conv-conv_a.sock"
+        assert socket_path.exists()
+        yield pid, socket_path
+    finally:
+        if pid is not None and _pid_alive(pid):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        await manager.shutdown()
+
+
 async def test_release_cancelled_during_sigterm_wait_still_kills_subprocess(
     manager: HarnessProcessManager,
     monkeypatch: pytest.MonkeyPatch,
@@ -504,15 +525,7 @@ async def test_release_cancelled_during_sigterm_wait_still_kills_subprocess(
     into it; the entry is already popped, so nothing else would reap it.
     """
     terminated = _signal_sent(monkeypatch, "terminate_tree")
-    await manager.start()
-    pid: int | None = None
-    try:
-        client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
-        pid = (await client.get("/pid")).json()["pid"]
-        assert (await client.get("/ignore-sigterm")).json()["status"] == "sigterm_ignored"
-        socket_path = manager.instance_dir / "conv-conv_a.sock"
-        assert socket_path.exists()
-
+    async with _sigterm_ignoring_child(manager) as (pid, socket_path):
         release_task = asyncio.create_task(manager.release("conv_a"))
         # Once SIGTERM is out, the task sits in the grace wait on a child that ignores it.
         await asyncio.wait_for(terminated.wait(), timeout=10.0)
@@ -526,11 +539,6 @@ async def test_release_cancelled_during_sigterm_wait_still_kills_subprocess(
             "subprocess survived a cancelled release and is no longer tracked"
         )
         assert not socket_path.exists(), "socket file left behind by a cancelled release"
-    finally:
-        if pid is not None and _pid_alive(pid):
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(pid, signal.SIGKILL)
-        await manager.shutdown()
 
 
 async def test_release_cancelled_during_sigkill_wait_still_removes_socket(
@@ -547,15 +555,7 @@ async def test_release_cancelled_during_sigkill_wait_still_removes_socket(
     monkeypatch.setattr(pm_mod, "_RELEASE_GRACE_S", 0.2)
     killed = _signal_sent(monkeypatch, "kill_tree")
 
-    await manager.start()
-    pid: int | None = None
-    try:
-        client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
-        pid = (await client.get("/pid")).json()["pid"]
-        assert (await client.get("/ignore-sigterm")).json()["status"] == "sigterm_ignored"
-        socket_path = manager.instance_dir / "conv-conv_a.sock"
-        assert socket_path.exists()
-
+    async with _sigterm_ignoring_child(manager) as (pid, socket_path):
         release_task = asyncio.create_task(manager.release("conv_a"))
         await asyncio.wait_for(killed.wait(), timeout=10.0)
         release_task.cancel()
@@ -565,11 +565,6 @@ async def test_release_cancelled_during_sigkill_wait_still_removes_socket(
         assert not manager.has_session("conv_a")
         assert await _pid_exits(pid, timeout_s=3.0), "SIGKILLed subprocess was never reaped"
         assert not socket_path.exists(), "socket file left behind by a cancelled forced kill"
-    finally:
-        if pid is not None and _pid_alive(pid):
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(pid, signal.SIGKILL)
-        await manager.shutdown()
 
 
 async def test_release_cancelled_twice_still_kills_subprocess_and_removes_socket(
@@ -594,15 +589,7 @@ async def test_release_cancelled_twice_still_kills_subprocess_and_removes_socket
     monkeypatch.setattr(pm_mod._proc, "kill_tree", _kill_tree_then_cancel_again)
     terminated = _signal_sent(monkeypatch, "terminate_tree")
 
-    await manager.start()
-    pid: int | None = None
-    try:
-        client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
-        pid = (await client.get("/pid")).json()["pid"]
-        assert (await client.get("/ignore-sigterm")).json()["status"] == "sigterm_ignored"
-        socket_path = manager.instance_dir / "conv-conv_a.sock"
-        assert socket_path.exists()
-
+    async with _sigterm_ignoring_child(manager) as (pid, socket_path):
         release_task = asyncio.create_task(manager.release("conv_a"))
         await asyncio.wait_for(terminated.wait(), timeout=10.0)
         assert not manager.has_session("conv_a"), "release never unregistered the entry"
@@ -615,11 +602,6 @@ async def test_release_cancelled_twice_still_kills_subprocess_and_removes_socket
             "subprocess survived a twice-cancelled release and is no longer tracked"
         )
         assert not socket_path.exists(), "socket file left behind by a twice-cancelled release"
-    finally:
-        if pid is not None and _pid_alive(pid):
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(pid, signal.SIGKILL)
-        await manager.shutdown()
 
 
 async def test_release_completes_when_forced_kill_fails(
@@ -640,25 +622,12 @@ async def test_release_completes_when_forced_kill_fails(
 
     monkeypatch.setattr(pm_mod._proc, "kill_tree", _kill_tree_fails)
 
-    await manager.start()
-    pid: int | None = None
-    try:
-        client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
-        pid = (await client.get("/pid")).json()["pid"]
-        assert (await client.get("/ignore-sigterm")).json()["status"] == "sigterm_ignored"
-        socket_path = manager.instance_dir / "conv-conv_a.sock"
-        assert socket_path.exists()
-
+    async with _sigterm_ignoring_child(manager) as (pid, socket_path):
         await asyncio.wait_for(manager.release("conv_a"), timeout=5.0)
 
         assert not manager.has_session("conv_a")
         assert await _pid_exits(pid, timeout_s=3.0), "subprocess survived a failed forced kill"
         assert not socket_path.exists(), "socket file left behind after a failed forced kill"
-    finally:
-        if pid is not None and _pid_alive(pid):
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(pid, signal.SIGKILL)
-        await manager.shutdown()
 
 
 async def test_stop_process_closed_during_grace_wait_kills_without_awaiting(
@@ -715,6 +684,44 @@ async def test_stop_process_escalates_when_zygote_wait_swallows_the_grace_timeou
     handle = ZygoteHarnessProc(4242, _StillRunning())  # type: ignore[arg-type]
     try:
         await pm_mod._stop_process(handle)
+    finally:
+        if handle._poll_task is not None:
+            handle._poll_task.cancel()
+    assert calls == ["terminate", "kill"]
+
+
+async def test_stop_process_reraises_cancellation_swallowed_by_zygote_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation the zygote handle's wait() swallows still kills and propagates.
+
+    ``ZygoteHarnessProc.wait()`` returns normally after a cancellation, so the
+    caller would otherwise keep running as if it had never been cancelled.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+    from omnigent.runtime.harnesses._harness_zygote_client import ZygoteHarnessProc
+
+    calls: list[str] = []
+    terminated = asyncio.Event()
+
+    def _terminate_then_set(process: object) -> None:
+        calls.append("terminate")
+        terminated.set()
+
+    monkeypatch.setattr(pm_mod._proc, "terminate_tree", _terminate_then_set)
+    monkeypatch.setattr(pm_mod._proc, "kill_tree", lambda process: calls.append("kill"))
+
+    class _StillRunning:
+        async def poll(self, pid: int) -> int | None:
+            return None
+
+    handle = ZygoteHarnessProc(4242, _StillRunning())  # type: ignore[arg-type]
+    stop_task = asyncio.create_task(pm_mod._stop_process(handle))
+    try:
+        await asyncio.wait_for(terminated.wait(), timeout=10.0)
+        stop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stop_task
     finally:
         if handle._poll_task is not None:
             handle._poll_task.cancel()
