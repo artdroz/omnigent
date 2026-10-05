@@ -20,14 +20,32 @@ const assert = require("node:assert/strict");
 const { readFileSync } = require("node:fs");
 const fs = require("node:fs");
 const os = require("node:os");
-const { createRequire } = require("node:module");
+const Module = require("node:module");
 const path = require("node:path");
 const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
 
+const { createRequire } = Module;
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
 const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
 const setupSource = readFileSync(path.join(__dirname, "../setup/index.html"), "utf8");
+
+const oidcModules = (() => {
+  const originalLoad = Module["_load"];
+  Module["_load"] = function (specifier, ...args) {
+    if (specifier === "electron")
+      return { shell: {}, safeStorage: { isEncryptionAvailable: () => false } };
+    return originalLoad.call(this, specifier, ...args);
+  };
+  try {
+    return {
+      credentials: require("../src/oidc-credentials"),
+      auth: require("../src/oidc-auth"),
+    };
+  } finally {
+    Module["_load"] = originalLoad;
+  }
+})();
 
 const wait = (ms = 10) =>
   new Promise((resolve) => {
@@ -533,7 +551,7 @@ function loadNavigationHarness({
       removeStoredRefreshToken: () => false,
     },
     "./oidc-credentials": {
-      ...require("../src/oidc-credentials"),
+      ...oidcModules.credentials,
       refreshSession: async (...args) => {
         calls.oidc.refresh++;
         if (!oidc.refresh) throw Object.assign(new Error("none"), { code: "NO_STORED_TOKEN" });
@@ -551,7 +569,7 @@ function loadNavigationHarness({
     },
     "./oidc-auth": {
       createOidcAuth: (options) =>
-        require("../src/oidc-auth").createOidcAuth({
+        oidcModules.auth.createOidcAuth({
           ...options,
           // /v1/me accepts exactly the session tokens the test allows.
           fetchFn: async (_url, init) => ({
@@ -1121,6 +1139,7 @@ describe("Arca shutdown warning wiring", () => {
       serverUrl: workspace,
       databricksMode: "browser",
       arcaPath,
+      notificationsSupported: true,
       arcaWatchNow: mondayEvening,
       arcaStatus: { ok: true, state: "running", shutdownAt },
       dialogResponse: () =>
@@ -1165,6 +1184,7 @@ describe("Arca shutdown warning wiring", () => {
       serverUrl: workspace,
       databricksMode: "browser",
       arcaPath,
+      notificationsSupported: true,
       arcaWatchNow: mondayEvening,
       arcaStatus: { ok: true, state: "running", shutdownAt },
       dialogResponse: { response: 0, checkboxChecked: false },
@@ -1238,6 +1258,7 @@ describe("Arca shutdown warning wiring", () => {
       serverUrl: workspace,
       databricksMode: "browser",
       arcaPath,
+      notificationsSupported: true,
       arcaWatchNow: mondayNoon,
       arcaStatus: { ok: true, state: "running", shutdownAt: soon() },
       dialogResponse: { response: 0, checkboxChecked: true },
@@ -1342,7 +1363,7 @@ describe("Arca shutdown warning wiring", () => {
   });
 
   it("uses notifications without a parentless dialog when no window is open", async (t) => {
-    const h = loadNavigationHarness();
+    const h = loadNavigationHarness({ notificationsSupported: true });
     t.after(h.cleanup);
     h.api.windows.clear();
     const prompt = await h.api.promptArcaShutdown({
