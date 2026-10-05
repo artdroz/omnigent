@@ -24,6 +24,7 @@ const {
   ipcMain,
   nativeImage,
   nativeTheme,
+  powerMonitor,
   screen,
   session,
   shell,
@@ -81,6 +82,7 @@ const cliInstall = require("./cli_install");
 const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const { createArcaAutoConnect } = require("./arca_autoconnect");
+const { createArcaShutdownWatch } = require("./arca_shutdown");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { ensureDatabricksSession } = require("./databricks-session");
 const {
@@ -381,6 +383,130 @@ function arcaAutoConnectFeatureEnabled() {
   );
 }
 
+/** Launch-prompt tuning knob: warn only within this window of shutdown. */
+const ARCA_LAUNCH_PROMPT_MAX_LEAD_MS = 8 * 60 * 60 * 1000;
+
+/** Format the local shutdown time, adding the weekday when it is not today. */
+function arcaShutdownTime(shutdownAt, now, alwaysWeekday = false) {
+  const date = new Date(shutdownAt);
+  const today = new Date(now);
+  const isToday =
+    date.getFullYear() === today.getFullYear() &&
+    date.getMonth() === today.getMonth() &&
+    date.getDate() === today.getDate();
+  const time = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const weekday = date.toLocaleDateString([], { weekday: "short" });
+  return { time: alwaysWeekday || !isToday ? `${weekday} ${time}` : time, isToday };
+}
+
+/** Pick a live Omnigent window for a native dialog. */
+function arcaDialogWindow() {
+  const focused = BrowserWindow.getFocusedWindow();
+  if (focused && windows.has(focused) && !focused.isDestroyed()) return focused;
+  const active = activeWindow();
+  if (active && !active.isDestroyed()) return active;
+  return [...windows.keys()].find((win) => !win.isDestroyed()) ?? null;
+}
+
+/** Ask whether to extend an Arca instance near its shutdown time. */
+async function promptArcaShutdown({ kind, shutdownAt, now, modes }) {
+  try {
+    const { time, isToday } = arcaShutdownTime(shutdownAt, now);
+    const remaining = shutdownAt - now;
+    const message =
+      kind === "launch"
+        ? `Arca shuts down at ${time}`
+        : remaining <= 0
+          ? "Arca can shut down any time now"
+          : remaining < 50 * 60 * 1000
+            ? `Arca may shut down in ${Math.ceil(remaining / 60_000)} minutes`
+            : "Arca may shut down in about an hour";
+    const detail =
+      kind === "launch"
+        ? `Your Arca instance can shut down when it's idle after ${time}${isToday ? " today" : ""}. Keep it running longer so your Omnigent sessions on Arca stay available?`
+        : remaining <= 0
+          ? "It's past your Arca instance's scheduled shutdown time, so it will shut down once it's been idle for an hour. Keep it running?"
+          : `Your Arca instance can shut down when it's idle after ${time}. Keep it running so your Omnigent sessions on Arca stay available?`;
+    const labels = {
+      overnight: "Keep running overnight",
+      workweek: "Keep running until Friday",
+    };
+    const buttons = [...modes.map((mode) => labels[mode]), "Not now"];
+    const options = {
+      type: kind === "final" ? "warning" : "info",
+      message,
+      detail,
+      buttons,
+      defaultId: 0,
+      cancelId: modes.length,
+      checkboxLabel: "Don't remind me about Arca shutdowns",
+      checkboxChecked: false,
+    };
+    const win = arcaDialogWindow();
+    const focused = BrowserWindow.getFocusedWindow();
+    if (
+      (!focused || !windows.has(focused) || focused.isDestroyed()) &&
+      Notification.isSupported()
+    ) {
+      try {
+        const notification = new Notification({
+          title: message,
+          body: "Open Omnigent to keep your Arca instance running.",
+        });
+        notification.on("click", () => {
+          const target = win && !win.isDestroyed() ? win : arcaDialogWindow();
+          if (!target) return;
+          if (target.isMinimized()) target.restore();
+          target.focus();
+        });
+        notification.show();
+      } catch (error) {
+        console.log(`[omnigent] arca shutdown: notification failed: ${error}`);
+      }
+    }
+    const { response, checkboxChecked } = win
+      ? await dialog.showMessageBox(win, options)
+      : await dialog.showMessageBox(options);
+    if (checkboxChecked) {
+      const settings = loadSettings();
+      settings.arca_shutdown_prompts = false;
+      saveSettings(settings);
+      return { mode: null };
+    }
+    return { mode: modes[response] ?? null };
+  } catch (error) {
+    console.log(`[omnigent] arca shutdown: prompt failed: ${error}`);
+    return { mode: null };
+  }
+}
+
+/** Show the outcome of an Arca extension request. */
+function reportArcaExtendResult(result) {
+  try {
+    if (result.ok) {
+      if (!Notification.isSupported()) return;
+      const body =
+        result.shutdownAt === null
+          ? "Your Arca instance's shutdown time was extended."
+          : `Until ${arcaShutdownTime(result.shutdownAt, Date.now(), true).time}.`;
+      new Notification({ title: "Arca will keep running", body }).show();
+      return;
+    }
+    const options = {
+      type: "error",
+      message: "Couldn't extend Arca",
+      detail: result.error,
+      buttons: ["OK"],
+    };
+    const win = arcaDialogWindow();
+    void (win ? dialog.showMessageBox(win, options) : dialog.showMessageBox(options)).catch(
+      (error) => console.log(`[omnigent] arca shutdown: result dialog failed: ${error}`),
+    );
+  } catch (error) {
+    console.log(`[omnigent] arca shutdown: result failed: ${error}`);
+  }
+}
+
 /** Launch-time Arca auto-connect, behind the feature flag above. */
 const arcaAutoConnect = createArcaAutoConnect({
   // Auto-connect needs arca itself: the MDM flag alone keeps the manual item
@@ -398,7 +524,21 @@ const arcaAutoConnect = createArcaAutoConnect({
       return null;
     }
   },
+  onStatus: (_origin, status) => {
+    if (status.state === "online") arcaShutdownWatch.start();
+  },
   log: (message) => console.log(`[omnigent] ${message}`),
+});
+
+const arcaShutdownWatch = createArcaShutdownWatch({
+  readStatus: () => arca.readArcaStatus({ resolveArcaPath: cachedArcaBinary }),
+  extend: (mode) => arca.runArcaExtend(mode, { resolveArcaPath: cachedArcaBinary }),
+  isEnabled: () =>
+    arcaAutoConnectFeatureEnabled() && loadSettings().arca_shutdown_prompts !== false,
+  prompt: promptArcaShutdown,
+  onExtendResult: reportArcaExtendResult,
+  log: (message) => console.log(`[omnigent] ${message}`),
+  options: { finalLeadMs: 60 * 60 * 1000, launchMaxLeadMs: ARCA_LAUNCH_PROMPT_MAX_LEAD_MS },
 });
 
 /**
@@ -4971,6 +5111,7 @@ if (!gotLock) {
   });
 
   app.whenReady().then(() => {
+    powerMonitor.on("resume", () => arcaShutdownWatch.onResume());
     // App User Model ID so Windows attributes notifications/taskbar correctly.
     if (process.platform === "win32")
       app.setAppUserModelId(isDevBuild ? DEV_DOMAIN : "ai.omnigent.desktop");
@@ -5057,6 +5198,7 @@ if (!gotLock) {
   app.on("quit", clearQuitForceExitTimer);
   app.on("before-quit", (event) => {
     if (quitCleanupDone) return;
+    arcaShutdownWatch.dispose();
     // A second quit (e.g. Cmd-Q again during the SIGKILL grace window) must not
     // re-enter shutdown() concurrently — just keep deferring until the first
     // cleanup finishes and re-issues the quit.

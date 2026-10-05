@@ -143,6 +143,11 @@ function loadNavigationHarness({
   arcaPath = null,
   arcaResult = { ok: true, alreadyRunning: false },
   arcaLoginResult = { ok: true },
+  arcaStatus = { ok: true, state: "running", shutdownAt: Date.now() + 4 * 60 * 60 * 1000 },
+  arcaExtendResult = { ok: true, message: "extended" },
+  dialogResponse = { response: 2, checkboxChecked: false },
+  focusedWindow = false,
+  windowMinimized = false,
   loadServer = async () => {},
   loadURL = null,
   managedServers = [],
@@ -179,6 +184,13 @@ function loadNavigationHarness({
     oidc: { refresh: 0, signIn: 0, signOut: 0 },
     arcaLogins: [],
     arcaLoginCancels: 0,
+    arcaStatusReads: [],
+    arcaExtends: [],
+    showMessageBox: [],
+    notifications: [],
+    closedNotifications: [],
+    restores: 0,
+    focuses: 0,
   };
   const pickers = [];
   const ipc = new Map();
@@ -212,6 +224,8 @@ function loadNavigationHarness({
   });
   const defaultSession = {
     cookies: network?.cookies ?? cookies,
+    setPermissionRequestHandler: () => {},
+    setPermissionCheckHandler: () => {},
     webRequest: {
       onBeforeRequest: (fn) => {
         webRequest.beforeRequest = fn;
@@ -228,6 +242,8 @@ function loadNavigationHarness({
   const permissionPromptCalls = { show: [], dismiss: [] };
   let currentUrl = serverUrl;
   const appEvents = new Map();
+  const powerEvents = new Map();
+  let readyCallback;
   const webContents = {
     id: 1,
     send: (channel, data) => calls.progress.push({ channel, data }),
@@ -261,14 +277,17 @@ function loadNavigationHarness({
     webContents,
     contentView: { addChildView: () => {}, removeChildView: () => {} },
     isDestroyed: () => false,
-    isMaximized: () => false,
-    isMinimized: () => false,
+    isMinimized: () => windowMinimized,
     isFocused: () => true,
-    restore: () => {},
+    restore: () => {
+      calls.restores++;
+    },
     show: () => {},
     focus: () => {
+      calls.focuses++;
       calls.focused = (calls.focused ?? 0) + 1;
     },
+    isMaximized: () => false,
     getNormalBounds: () => ({ x: 0, y: 0, width: 1280, height: 860 }),
     getPosition: () => [0, 0],
     setPosition: () => {},
@@ -310,7 +329,11 @@ function loadNavigationHarness({
       setBadgeCount: () => true,
       requestSingleInstanceLock: () => true,
       on: (eventName, listener) => appEvents.set(eventName, listener),
-      whenReady: () => ({ then: () => {} }),
+      whenReady: () => ({
+        then: (fn) => {
+          readyCallback = fn;
+        },
+      }),
       quit: () => {},
       exit: () => {},
       isReady: () => false,
@@ -339,7 +362,7 @@ function loadNavigationHarness({
       },
       {
         fromWebContents: (sender) => (sender === webContents ? win : null),
-        getFocusedWindow: () => null,
+        getFocusedWindow: () => (focusedWindow ? win : null),
         getAllWindows: () => [],
       },
     ),
@@ -368,16 +391,36 @@ function loadNavigationHarness({
     },
     Notification: Object.assign(
       function Notification(options) {
-        calls.notifications = [...(calls.notifications ?? []), options];
-        return { on: () => {}, show: () => {} };
+        const handlers = new Map();
+        const notification = {
+          ...options,
+          options,
+          on: (name, fn) => handlers.set(name, fn),
+          show: () => calls.notifications.push(notification),
+          click: () => handlers.get("click")?.(),
+          close: () => {
+            calls.closedNotifications.push(notification);
+            handlers.get("close")?.();
+          },
+        };
+        return notification;
       },
       { isSupported: () => notificationsSupported },
     ),
     clipboard: { writeText: () => {} },
-    dialog: {},
+    dialog: {
+      showMessageBox: (winOrOptions, options) => {
+        calls.showMessageBox.push({
+          win: options ? winOrOptions : null,
+          options: options ?? winOrOptions,
+        });
+        return Promise.resolve(dialogResponse);
+      },
+    },
     ipcMain: { handle: (name, fn) => ipc.set(name, fn), on: (name, fn) => ipc.set(name, fn) },
     nativeImage: { createFromPath: () => ({ isEmpty: () => true }) },
     nativeTheme: { shouldUseDarkColors: false, on: () => {} },
+    powerMonitor: { on: (name, fn) => powerEvents.set(name, fn) },
     screen: {},
     session: { defaultSession },
     shell: {},
@@ -448,6 +491,16 @@ function loadNavigationHarness({
             calls.arcaLoginCancels += 1;
           },
         };
+      },
+      readArcaStatus: (deps) => {
+        calls.arcaStatusReads.push(deps.resolveArcaPath());
+        return Promise.resolve(typeof arcaStatus === "function" ? arcaStatus() : arcaStatus);
+      },
+      runArcaExtend: (mode, deps) => {
+        calls.arcaExtends.push({ mode, path: deps.resolveArcaPath() });
+        return Promise.resolve(
+          typeof arcaExtendResult === "function" ? arcaExtendResult(mode) : arcaExtendResult,
+        );
       },
     },
     "./databricks-session": {
@@ -570,7 +623,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
+    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); arcaShutdownWatch.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -622,6 +675,8 @@ function loadNavigationHarness({
     webRequest,
     webContents,
     settingsPath: path.join(userData, "settings.json"),
+    powerEvents,
+    runReady: () => readyCallback(),
     pickers,
     emit: (eventName, ...args) => webContents.emit(eventName, ...args),
     emitWindow: (eventName) => {
@@ -1003,6 +1058,175 @@ describe("Arca auto-connect wiring", () => {
     await h.api.loadServerUrl(h.win, local);
     await tick();
     assert.deepEqual(h.calls.arcaConnects, []);
+  });
+});
+
+describe("Arca shutdown warning wiring", () => {
+  const workspace = "https://workspace.cloud.databricks.com/omnigent";
+  const arcaPath = "/usr/local/bin/arca";
+  const settings = (h, values) => fs.writeFileSync(h.settingsPath, JSON.stringify(values));
+  const connect = (h) => h.api.loadServerUrl(h.win, workspace);
+  const soon = () => Date.now() + 30 * 60 * 1000;
+
+  it("does not read status with auto-connect disabled", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
+    t.after(h.cleanup);
+    await connect(h);
+    assert.deepEqual(h.calls.arcaStatusReads, []);
+    assert.deepEqual(h.calls.showMessageBox, []);
+    assert.deepEqual(h.calls.notifications, []);
+  });
+
+  it("starts the watch when auto-connect comes online", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
+    t.after(h.cleanup);
+    settings(h, { arca_auto_connect: true });
+    await connect(h);
+    await until(() => h.calls.arcaStatusReads.length === 1, "Arca status read");
+    assert.deepEqual(h.calls.arcaStatusReads, [arcaPath]);
+  });
+
+  it("honors the shutdown prompt preference without reading status", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
+    t.after(h.cleanup);
+    settings(h, { arca_auto_connect: true, arca_shutdown_prompts: false });
+    await connect(h);
+    assert.deepEqual(h.calls.arcaStatusReads, []);
+    assert.deepEqual(h.calls.showMessageBox, []);
+  });
+
+  it("shows launch copy and a focusable notification when Omnigent is unfocused", async (t) => {
+    const shutdownAt = Date.now() + 4 * 60 * 60 * 1000;
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      arcaPath,
+      arcaStatus: { ok: true, state: "running", shutdownAt },
+      windowMinimized: true,
+    });
+    t.after(h.cleanup);
+    settings(h, { arca_auto_connect: true });
+    await connect(h);
+    await until(() => h.calls.showMessageBox.length === 1, "launch warning");
+    const date = new Date(shutdownAt);
+    const now = new Date();
+    const isToday = date.toDateString() === now.toDateString();
+    const time = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    const label = isToday ? time : `${date.toLocaleDateString([], { weekday: "short" })} ${time}`;
+    const { options } = h.calls.showMessageBox[0];
+    assert.equal(options.type, "info");
+    assert.equal(options.message, `Arca shuts down at ${label}`);
+    assert.equal(
+      options.detail,
+      `Your Arca instance can shut down when it's idle after ${label}${isToday ? " today" : ""}. Keep it running longer so your Omnigent sessions on Arca stay available?`,
+    );
+    assert.equal(h.calls.notifications[0].options.title, options.message);
+    assert.equal(
+      h.calls.notifications[0].options.body,
+      "Open Omnigent to keep your Arca instance running.",
+    );
+    h.calls.notifications[0].click();
+    assert.equal(h.calls.restores, 1);
+    assert.equal(h.calls.focuses, 1);
+    assert.deepEqual(h.calls.arcaExtends, []);
+  });
+
+  it("shows the final warning and extends overnight", async (t) => {
+    const shutdownAt = soon();
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      arcaPath,
+      arcaStatus: { ok: true, state: "running", shutdownAt },
+      dialogResponse: { response: 0, checkboxChecked: false },
+      focusedWindow: true,
+    });
+    t.after(h.cleanup);
+    settings(h, { arca_auto_connect: true });
+    await connect(h);
+    await until(() => h.calls.arcaExtends.length === 1, "overnight extension");
+    await until(() => h.calls.notifications.length === 1, "extension notification");
+    assert.deepEqual(h.calls.arcaExtends, [{ mode: "overnight", path: arcaPath }]);
+    const { win, options } = h.calls.showMessageBox[0];
+    const time = new Date(shutdownAt).toLocaleTimeString([], {
+      hour: "numeric",
+      minute: "2-digit",
+    });
+    assert.equal(win, h.win);
+    assert.equal(options.type, "warning");
+    assert.equal(options.message, "Arca may shut down in 30 minutes");
+    assert.equal(
+      options.detail,
+      `Your Arca instance can shut down when it's idle after ${time}. Keep it running so your Omnigent sessions on Arca stay available?`,
+    );
+    assert.deepEqual(
+      [...options.buttons],
+      ["Keep running overnight", "Keep running until Friday", "Not now"],
+    );
+    assert.equal(options.defaultId, 0);
+    assert.equal(options.cancelId, 2);
+    assert.equal(options.checkboxLabel, "Don't remind me about Arca shutdowns");
+    assert.equal(options.checkboxChecked, false);
+    assert.equal(h.calls.notifications[0].options.title, "Arca will keep running");
+  });
+
+  it("saves the opt-out and preserves settings without extending", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      arcaPath,
+      arcaStatus: { ok: true, state: "running", shutdownAt: soon() },
+      dialogResponse: { response: 0, checkboxChecked: true },
+      focusedWindow: true,
+    });
+    t.after(h.cleanup);
+    settings(h, { arca_auto_connect: true, server_url: workspace });
+    await connect(h);
+    await until(
+      () => JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).arca_shutdown_prompts === false,
+      "saved Arca opt-out",
+    );
+    assert.deepEqual(JSON.parse(fs.readFileSync(h.settingsPath, "utf8")), {
+      arca_auto_connect: true,
+      server_url: workspace,
+      arca_shutdown_prompts: false,
+    });
+    assert.deepEqual(h.calls.arcaExtends, []);
+  });
+
+  it("shows the extension error detail", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      arcaPath,
+      arcaStatus: { ok: true, state: "running", shutdownAt: soon() },
+      arcaExtendResult: { ok: false, errorKind: "runtime-limit", error: "Arca runtime limit" },
+      dialogResponse: { response: 0, checkboxChecked: false },
+      focusedWindow: true,
+    });
+    t.after(h.cleanup);
+    settings(h, { arca_auto_connect: true });
+    await connect(h);
+    await until(() => h.calls.showMessageBox.length === 2, "extension error dialog");
+    assert.equal(h.calls.showMessageBox[1].win, h.win);
+    assert.deepEqual(JSON.parse(JSON.stringify(h.calls.showMessageBox[1].options)), {
+      type: "error",
+      message: "Couldn't extend Arca",
+      detail: "Arca runtime limit",
+      buttons: ["OK"],
+    });
+  });
+
+  it("re-reads Arca status on resume after starting", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
+    t.after(h.cleanup);
+    settings(h, { arca_auto_connect: true });
+    h.runReady();
+    assert.equal(typeof h.powerEvents.get("resume"), "function");
+    await connect(h);
+    await until(() => h.calls.arcaStatusReads.length === 1, "initial Arca status read");
+    h.powerEvents.get("resume")();
+    await until(() => h.calls.arcaStatusReads.length === 2, "resumed Arca status read");
   });
 });
 
