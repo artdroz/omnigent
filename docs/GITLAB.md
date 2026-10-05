@@ -82,9 +82,11 @@ or manual linking. Tracking does not make API calls.
 ## Limits and verification
 
 Each panel request has an eight-second CLI budget. Lists are limited to 500
-items. The panel marks incomplete comments, checks, and file lists; omitted,
-large, binary, or metadata-only patches direct you to GitLab. A failed content
-read is an error rather than an apparent file deletion.
+items. The panel marks incomplete comments, checks, and file lists. Files without
+a text patch (including empty, binary, metadata-only, or omitted large files)
+show a per-file notice while readable diffs remain visible. Truncated file lists
+still direct you to GitLab for the full diff. A failed content read is an error
+rather than an apparent file deletion.
 
 Account selection remains in `glab`; the panel has no GitLab account or base
 remote switcher. Repository picking, webhook events, and managed sandbox
