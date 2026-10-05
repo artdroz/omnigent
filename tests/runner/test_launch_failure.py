@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import pytest
 
+from omnigent.errors import ErrorCategory
 from omnigent.runner.launch_failure import (
     FailureDiagnosis,
+    classify_native_turn_error,
     classify_terminal_failure,
     describe_failure_code,
 )
@@ -32,7 +34,7 @@ def test_classifies_root_permission_failure() -> None:
 
 def test_root_failure_survives_mid_word_truncation() -> None:
     # The pane snapshot may be clipped to "...for secuRITY REASONS" — the
-    # matcher keys on "security reasons", which line-boundary trimming keeps.
+    # matcher keys on "security reasons", which tail trimming keeps.
     diagnosis = classify_terminal_failure(
         command="claude",
         exit_status=1,
@@ -40,6 +42,26 @@ def test_root_failure_survives_mid_word_truncation() -> None:
     )
     assert diagnosis is not None
     assert diagnosis.title == "Claude Code can't run as root"
+
+
+@pytest.mark.parametrize(
+    ("command", "exit_status", "output"),
+    [
+        (
+            "env",
+            0,
+            "'--background' is disabled by CLAUDE_CODE_DISABLE_AGENT_VIEW.\n"
+            "Claude Code exited with code 1",
+        ),
+        ("env", 0, "error: unknown option '--codex' (did you mean --model?)"),
+        ("codex", 2, "error: unexpected argument '--foo' found\n\nUsage: codex [OPTIONS]"),
+    ],
+)
+def test_classifies_rejected_arguments(command: str, exit_status: int, output: str) -> None:
+    diagnosis = classify_terminal_failure(command=command, exit_status=exit_status, output=output)
+    assert diagnosis is not None
+    assert diagnosis.title == "Agent CLI rejected its launch arguments"
+    assert diagnosis.category is ErrorCategory.CONFIG
 
 
 @pytest.mark.parametrize(
@@ -110,6 +132,151 @@ def test_command_path_is_matched_by_basename() -> None:
     assert isinstance(diagnosis, FailureDiagnosis)
 
 
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        (
+            "API Error: Request rejected (429) · REQUEST_LIMIT_EXCEEDED: Exceeded "
+            "workspace input tokens per minute rate limit for databricks-test-model. "
+            "Work with your Databricks account team to request a higher FMAPI rate limit tier."
+        ),
+        "API Error: Request rejected (429)",
+        'API Error: 429 {"error": {"type": "rate_limit_error"}}',
+        "REQUEST_LIMIT_EXCEEDED: request throttled",
+        "Rate limit exceeded",
+        "rate-limit reached for this model",
+        "rate limited",
+        "Rate limited",
+        "rate-limited",
+        "rate_limited",
+        "HTTP 429",
+        "HTTP/1.1 429",
+        "status_code: 429",
+        "Too Many Requests",
+        'API Error: 429 {"error": {"code": "insufficient_quota"}}',
+        "HTTP 429: billing_hard_limit_reached",
+        "API Error: 429: Your credit balance is too low to access the API.",
+    ],
+)
+def test_classifies_native_429_and_rate_limit_errors(code: str, message: str) -> None:
+    assert classify_native_turn_error(code, message) == "rate_limit_exceeded"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "An unexpected error occurred",
+        "API Error: Request rejected (401) · UNAUTHENTICATED",
+        "API Error: Request rejected (403) · PERMISSION_DENIED",
+        (
+            "API Error: Request rejected (403) · PERMISSION_DENIED: "
+            "See rate_limit_error troubleshooting"
+        ),
+        "API Error: 401 Unauthorized. Previous request: rate limit exceeded.",
+        "HTTP/1.1 403: See rate_limit_exceeded troubleshooting",
+        "There's an issue with the selected model. It may not exist.",
+        "You've hit your usage limit.",
+        "Error loading model-429",
+        "Request rejected (4290)",
+    ],
+)
+def test_preserves_other_native_turn_errors(message: str) -> None:
+    assert classify_native_turn_error("native_turn_error", message) == "native_turn_error"
+
+
+@pytest.mark.parametrize("code", ["workspace_missing", "invalid_input"])
+def test_rate_limit_text_does_not_override_specific_failure_codes(code: str) -> None:
+    assert classify_native_turn_error(code, "HTTP 429: rate limit exceeded") == code
+
+
+@pytest.mark.parametrize(
+    "code",
+    # Budget detection runs before the early-return guard, so it applies to
+    # codex_reauth_required (old runners) as well as the two generic codes.
+    ["native_turn_error", "codex_turn_error", "codex_reauth_required"],
+)
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Realistic AI-gateway budget exhaustion message (budget name/id synthetic).
+        (
+            'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED","message":'
+            '"Budget \\"test-budget\\" (00000000-0000-0000-0000-000000000001) has reached'
+            " its limit of $100. To continue, contact an admin to increase the budget or"
+            ' use a different budget."}'
+        ),
+        # Realistic budget message with the old re-auth hint appended by older runners.
+        (
+            'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED","message":'
+            '"Budget \\"test-budget\\" (00000000-0000-0000-0000-000000000001) has reached'
+            " its limit of $100. To continue, contact an admin to increase the budget or"
+            ' use a different budget."}\n\n'
+            "If this looks like an auth issue, running `codex login` may help."
+        ),
+        # Minimal form — just the key phrase.
+        "Budget X has reached its limit of $0.",
+        # Disabled per-user rate limit (rate limit is set to 0).
+        (
+            'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED",'
+            '"message":"rate limit is set to 0 for user test@example.com"}'
+        ),
+    ],
+)
+def test_classifies_budget_exhausted(code: str, message: str) -> None:
+    assert classify_native_turn_error(code, message) == "budget_exhausted"
+
+
+def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
+    """A real auth failure under codex_reauth_required must not be reclassified."""
+    message = (
+        "401 Unauthorized: your login has expired.\n\n"
+        "If this looks like an auth issue, running `codex login` may help."
+    )
+    assert classify_native_turn_error("codex_reauth_required", message) == "codex_reauth_required"
+
+
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "API Error: Server error mid-response. The response above may be incomplete.",
+        "Connection lost mid-response. The response above may be incomplete.",
+        "connection lost mid-response",
+        "API Error: 503 Service Unavailable",
+        "HTTP 500 Internal Server Error",
+        "HTTP/1.1 502 Bad Gateway",
+        "status_code: 504 Gateway Timeout",
+        "API Error: 529",
+        "The model is overloaded. Please retry your request.",
+    ],
+)
+def test_classifies_transient_upstream_errors(code: str, message: str) -> None:
+    assert classify_native_turn_error(code, message) == "transient_upstream_error"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Deterministic failures must keep the generic, non-retryable code.
+        "prompt is too long: 250000 tokens > 200000 maximum",
+        "API Error: 400 · context_length_exceeded: maximum context window reached",
+        "There's an issue with the selected model. It may not exist.",
+        "API Error: Request rejected (404) · model not found",
+        "API Error: Request rejected (401) · UNAUTHENTICATED",
+        "API Error: Request rejected (403) · PERMISSION_DENIED",
+    ],
+)
+def test_deterministic_native_errors_are_not_transient(message: str) -> None:
+    assert classify_native_turn_error("native_turn_error", message) == "native_turn_error"
+
+
+def test_429_still_classifies_as_rate_limit_not_transient() -> None:
+    assert (
+        classify_native_turn_error("native_turn_error", "API Error: 429") == "rate_limit_exceeded"
+    )
+
+
 @pytest.mark.parametrize(
     ("code", "expected_substring"),
     [
@@ -119,6 +286,12 @@ def test_command_path_is_matched_by_basename() -> None:
         ("runner_disconnected", "host dropped"),
         ("connection_error", "connection"),
         ("context_length_exceeded", "context window"),
+        ("rate_limit_exceeded", "You can retry this turn"),
+        ("transient_upstream_error", "temporary error"),
+        ("budget_exhausted", "budget"),
+        ("databricks_sign_in_pending", "Databricks sign-in"),
+        ("agent_startup_pending", "still starting"),
+        ("codex_thread_not_started", "never ran"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:
