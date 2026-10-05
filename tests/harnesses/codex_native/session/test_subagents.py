@@ -1010,43 +1010,24 @@ def _child_resume_response_with_turns(statuses: list[str]) -> dict[str, Any]:
     return response
 
 
-def test_forwarder_collab_snapshot_does_not_revive_completed_child(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    A completed child stays idle when a later collab snapshot reports it running.
-    """
-    posted: list[tuple[str, dict[str, Any]]] = []
-    state, bridge_dir = _snapshot_test_state(tmp_path, monkeypatch)
-
-    _deliver_parent_events(
-        state,
-        bridge_dir,
-        [
-            _subagent_activity_started_event(),
-            _child_turn_event("turn/started"),
-            _child_turn_event("turn/completed"),
-            _running_snapshot_event(),
-        ],
-        posted,
-    )
-
-    assert _status_posts(posted, "conv_child") == ["running", "idle"]
-
-
 @pytest.mark.parametrize(
-    "terminal_event",
-    [_child_turn_event("turn/failed"), _child_error_event()],
-    ids=["turn-failed", "error-notification"],
+    ("terminal_event", "settled_status"),
+    [
+        (_child_turn_event("turn/completed"), "idle"),
+        (_child_turn_event("turn/failed"), "failed"),
+        (_child_error_event(), "failed"),
+    ],
+    ids=["turn-completed", "turn-failed", "error-notification"],
 )
-def test_forwarder_collab_snapshot_does_not_revive_failed_child(
+def test_forwarder_collab_snapshot_does_not_revive_settled_child(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     terminal_event: dict[str, Any],
+    settled_status: str,
 ) -> None:
     """
-    A failed child keeps its failed status when a later collab snapshot reports it running.
+    A child that finished or failed keeps that status when a later collab snapshot
+    reports it running.
     """
     posted: list[tuple[str, dict[str, Any]]] = []
     state, bridge_dir = _snapshot_test_state(tmp_path, monkeypatch)
@@ -1063,7 +1044,7 @@ def test_forwarder_collab_snapshot_does_not_revive_failed_child(
         posted,
     )
 
-    assert _status_posts(posted, "conv_child") == ["running", "failed"]
+    assert _status_posts(posted, "conv_child") == ["running", settled_status]
 
 
 def test_forwarder_collab_snapshot_marks_child_running_after_new_turn_starts(
@@ -1144,7 +1125,8 @@ def test_forwarder_replayed_spawn_snapshot_marks_backfilled_running_child_workin
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A replayed spawn snapshot still marks a child busy when its resumed turn is live.
+    A replayed spawn snapshot still marks a child busy when its resumed turn is live,
+    and a stale completed snapshot does not settle it.
     """
     posted: list[tuple[str, dict[str, Any]]] = []
     codex_client = _PerThreadFakeCodexClient(
@@ -1152,7 +1134,9 @@ def test_forwarder_replayed_spawn_snapshot_marks_backfilled_running_child_workin
     )
     state, bridge_dir = _snapshot_test_state(tmp_path, monkeypatch, codex_client=codex_client)
 
-    _deliver_parent_events(state, bridge_dir, [_running_snapshot_event()], posted)
+    _deliver_parent_events(
+        state, bridge_dir, [_running_snapshot_event(), _completed_snapshot_event()], posted
+    )
 
     assert len(_transcript_posts(posted, "conv_child")) == 1, "child backfill did not replay"
     assert _status_posts(posted, "conv_child") == ["running"]

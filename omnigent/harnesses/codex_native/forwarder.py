@@ -193,6 +193,8 @@ _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE = "subAgentActivity"
 _CODEX_COLLAB_SPAWN_TOOL = "spawnAgent"
 _CODEX_COLLAB_RUNNING_STATUSES = frozenset({"pendingInit", "running"})
 _CODEX_COLLAB_FAILED_STATUSES = frozenset({"errored", "notFound"})
+# Codex ``turn.status`` values for a turn that is still running.
+_CODEX_ACTIVE_TURN_STATUSES = frozenset({"inProgress", "in_progress"})
 # Omnigent control event type sent when a Codex child thread is discovered.
 _EXTERNAL_CODEX_SUBAGENT_START_TYPE = "external_codex_subagent_start"
 _PLAN_IMPLEMENTATION_QUESTION_ID = "plan_implementation"
@@ -2911,27 +2913,39 @@ def _resume_terminal_status_edge_for_latest_turn(
     state = read_bridge_state(bridge_dir)
     if state is None or state.thread_id != thread_id:
         return None
+    turn = _newest_resume_turn(turns)
+    if turn is None:
+        return None
+    turn_id = _turn_id_from_payload(turn)
+    if turn_id is None:
+        return None
+    if state.active_turn_id is not None and state.active_turn_id != turn_id:
+        return None
+    status = _omnigent_status_from_resume_turn(turn)
+    if status is None:
+        return None
+    update_active_turn_id(bridge_dir, None)
+    # Parity with the live path — surface ``turn.error`` (if any) that
+    # forced this resume turn to ``failed``.
+    error = _terminal_error_from_turn({"turn": turn})
+    return _CodexTurnStatusEdge(
+        status=status,
+        turn_id=turn_id,
+        source="thread/resume:turn-error" if error is not None else "thread/resume",
+        error=error,
+    )
+
+
+def _newest_resume_turn(turns: list[object]) -> _JsonObject | None:
+    """
+    Return the newest turn object in a Codex resume turn list.
+
+    :param turns: Raw Codex resume turn list, oldest first.
+    :returns: The last turn dict, or ``None`` when the list holds none.
+    """
     for turn in reversed(turns):
-        if not isinstance(turn, dict):
-            continue
-        turn_id = _turn_id_from_payload(turn)
-        if turn_id is None:
-            return None
-        if state.active_turn_id is not None and state.active_turn_id != turn_id:
-            return None
-        status = _omnigent_status_from_resume_turn(turn)
-        if status is None:
-            return None
-        update_active_turn_id(bridge_dir, None)
-        # Parity with the live path — surface ``turn.error`` (if any) that
-        # forced this resume turn to ``failed``.
-        error = _terminal_error_from_turn({"turn": turn})
-        return _CodexTurnStatusEdge(
-            status=status,
-            turn_id=turn_id,
-            source="thread/resume:turn-error" if error is not None else "thread/resume",
-            error=error,
-        )
+        if isinstance(turn, dict):
+            return turn
     return None
 
 
@@ -2968,18 +2982,23 @@ def _latest_resume_turn_status(response: CodexMessage) -> str | None:
 
     :param response: Codex ``thread/resume`` (or ``thread/read``) response
         envelope.
-    :returns: ``"idle"`` / ``"failed"`` when the newest turn is terminal, or
-        ``None`` when it is still active or the payload carries no turns.
+    :returns: ``"idle"`` / ``"failed"`` when the newest turn is terminal,
+        ``"running"`` when it is still active, or ``None`` when its status is
+        unrecognized or the payload carries no turns.
     """
     result = response.get("result")
     thread = result.get("thread") if isinstance(result, dict) else None
     turns = thread.get("turns") if isinstance(thread, dict) else None
-    if not isinstance(turns, list):
+    turn = _newest_resume_turn(turns) if isinstance(turns, list) else None
+    if turn is None:
         return None
-    for turn in reversed(turns):
-        if isinstance(turn, dict):
-            return _omnigent_status_from_resume_turn(turn)
-    return None
+    status = _omnigent_status_from_resume_turn(turn)
+    if status is not None:
+        return status
+    raw_status = turn.get("status")
+    if isinstance(raw_status, dict):
+        raw_status = raw_status.get("type") or raw_status.get("status")
+    return "running" if raw_status in _CODEX_ACTIVE_TURN_STATUSES else None
 
 
 async def _handle_event(
