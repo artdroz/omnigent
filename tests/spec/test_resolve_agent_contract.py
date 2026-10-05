@@ -321,6 +321,26 @@ def test_recording_blockers_are_explicit_and_do_not_block_delivery() -> None:
     )
     assert "keeping the inherited before-clip declared" in final_review_gate
 
+    # Bind the failure-evidence and inherited-clip requirements to each skill's
+    # own source. The aggregate checks above pass if either resolve-author-fix or
+    # resolve-handoff carries a phrase, so dropping it from one skill alone would
+    # otherwise escape detection.
+    author_fix = " ".join(
+        (_RESOLVE_AGENT / "skills" / "resolve-author-fix" / "SKILL.md")
+        .read_text(encoding="utf-8")
+        .split()
+    )
+    assert "name the Repro driver path or command you ran and its observed result" in author_fix
+    assert "re-declare the recovered clip in `recordings` with its caption unchanged" in author_fix
+
+    handoff = " ".join(
+        (_RESOLVE_AGENT / "skills" / "resolve-handoff" / "SKILL.md")
+        .read_text(encoding="utf-8")
+        .split()
+    )
+    assert "name the Repro driver path or command you ran and its observed result" in handoff
+    assert "a blocked after-clip is not a reason to drop a recovered before-clip" in handoff
+
 
 def test_resolve_drives_both_reviews_and_preserves_incomplete_outcomes() -> None:
     instructions = _normalized_resolve_instructions()

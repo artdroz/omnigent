@@ -52,9 +52,9 @@ the `cli` section below for setup steps.
 Recording is **best-effort**:
 
 - If a required tool is missing or the product cannot reach the state you need
-  to show, set `recordings: []` for that facet. Name the specific blocker in
-  `recording_unavailable_reason`, such as missing `vhs` or `ttyd`, or a server
-  that cannot start.
+  to show, set `recordings: []` for that facet, but only when no inherited clip
+  exists for it. Name the specific blocker in `recording_unavailable_reason`,
+  such as missing `vhs` or `ttyd`, or a server that cannot start.
 - **Run the Repro bundle's capture method before claiming a blocker.** On a
   resolve run, when the restored Repro bundle carries a recording driver, or its
   handoff describes how the same surface was filmed (for example a real host
@@ -136,8 +136,9 @@ concluding anything; do **not** file it as an environmental blocker or a "runner
 not coming online" env problem. Once the SPA is built, the env is stripped, and the
 spawned runner still doesn't reach `online: true` within the fixture's timeout,
 capture the tail of the fixture's `runner.log`, treat that lane as genuinely
-unreachable here, keep `recordings: []` for it, and say plainly **"recorder's test
-server did not come online in time"** with the `runner.log` tail — noting whether
+unreachable here, keep `recordings: []` for it only when no inherited clip
+exists, and say plainly **"recorder's test server did not come online in
+time"** with the `runner.log` tail — noting whether
 the log was empty (the leaked-env/zygote hang) or showed a later failure, so the
 cause is named from what you observed rather than guessed.
 
