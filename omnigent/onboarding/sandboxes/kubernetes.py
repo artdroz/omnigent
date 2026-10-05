@@ -184,11 +184,12 @@ _INIT_CONTAINER_NAME: str = "workspace-prep"
 
 # Pod-start wait budget, consumed inside start_host BEFORE the
 # shared _wait_for_host_online poll, so a Pod that can't schedule / pull its
-# image / clone its repo fails fast with a clear reason instead of as a generic
-# online timeout. Kept tight; a cold image pull is the usual slow case —
-# deployments whose host image regularly takes longer to pull can raise the
-# budget via ``sandbox.kubernetes.pod_ready_timeout_s``, or, when that isn't
-# set, via :data:`_POD_READY_TIMEOUT_ENV_VAR`.
+# image / start its workspace prep fails fast with a clear reason instead of
+# as a generic online timeout. Kept tight; a cold image pull is the usual slow
+# case — deployments whose host image regularly takes longer to pull can raise
+# the budget via ``sandbox.kubernetes.pod_ready_timeout_s``, or, when that
+# isn't set, via :data:`_POD_READY_TIMEOUT_ENV_VAR`. Once the workspace-prep
+# init container is running, :data:`_WORKSPACE_PREP_TIMEOUT_S` takes over.
 _POD_READY_TIMEOUT_S: int = 90
 _POD_READY_POLL_S: float = 2.0
 
@@ -198,6 +199,15 @@ _POD_READY_POLL_S: float = 2.0
 # sandbox.kubernetes.pod_ready_timeout_s is unset in the bundle) — the
 # explicit config key always wins when both are present.
 _POD_READY_TIMEOUT_ENV_VAR: str = "OMNIGENT_K8S_POD_READY_TIMEOUT_S"
+
+# Workspace-preparation budget, counted from the moment the init container is
+# observed running. A clone's duration scales with the repository, not the
+# cluster — a large monorepo takes many minutes — so it is bounded separately
+# from the tight pod-start budget. Overridable via
+# ``sandbox.kubernetes.workspace_prep_timeout_s`` or, when that isn't set,
+# :data:`_WORKSPACE_PREP_TIMEOUT_ENV_VAR`.
+_WORKSPACE_PREP_TIMEOUT_S: int = 30 * 60
+_WORKSPACE_PREP_TIMEOUT_ENV_VAR: str = "OMNIGENT_K8S_WORKSPACE_PREP_TIMEOUT_S"
 
 # Per-request client timeout for the blocking calls. Without it a stalled
 # apiserver socket blocks indefinitely and the wait deadline never fires.
@@ -321,6 +331,29 @@ def _ensure_sdk() -> None:
         ) from exc
 
 
+def _resolve_timeout_s(configured: int | None, env_var: str, default: int) -> int:
+    """
+    Resolve a wait budget: the explicit config value wins, then the env
+    override, then the built-in default.
+
+    :param configured: The launcher's constructor argument, or ``None`` when
+        the bundle didn't set it.
+    :param env_var: Environment variable consulted when *configured* is ``None``.
+    :param default: Built-in budget when neither is set.
+    :returns: The budget in seconds.
+    :raises click.ClickException: When the env override is not a number.
+    """
+    if configured is not None:
+        return configured
+    raw = os.environ.get(env_var)
+    if raw is None:
+        return default
+    try:
+        return int(float(raw))
+    except ValueError as exc:
+        raise click.ClickException(f"{env_var} must be a number of seconds") from exc
+
+
 def _resolve_pod_ready_timeout_s(configured: int | None) -> int:
     """
     Resolve the pod-ready wait budget for :meth:`_wait_for_pod_running`.
@@ -336,17 +369,26 @@ def _resolve_pod_ready_timeout_s(configured: int | None) -> int:
     :returns: The timeout in seconds to wait for the Pod to reach ``Running``.
     :raises click.ClickException: When the env override is not a number.
     """
-    if configured is not None:
-        return configured
-    raw = os.environ.get(_POD_READY_TIMEOUT_ENV_VAR)
-    if raw is None:
-        return _POD_READY_TIMEOUT_S
-    try:
-        return int(float(raw))
-    except ValueError as exc:
-        raise click.ClickException(
-            f"{_POD_READY_TIMEOUT_ENV_VAR} must be a number of seconds"
-        ) from exc
+    return _resolve_timeout_s(configured, _POD_READY_TIMEOUT_ENV_VAR, _POD_READY_TIMEOUT_S)
+
+
+def _resolve_workspace_prep_timeout_s(configured: int | None) -> int:
+    """
+    Resolve the workspace-preparation budget for :meth:`_wait_for_pod_running`.
+
+    Same precedence as :func:`_resolve_pod_ready_timeout_s`:
+    ``sandbox.kubernetes.workspace_prep_timeout_s``, then
+    :data:`_WORKSPACE_PREP_TIMEOUT_ENV_VAR`, then
+    :data:`_WORKSPACE_PREP_TIMEOUT_S`.
+
+    :param configured: The launcher's ``workspace_prep_timeout_s`` constructor
+        argument, or ``None`` when the bundle didn't set it.
+    :returns: Seconds the running init container may take before the launch fails.
+    :raises click.ClickException: When the env override is not a number.
+    """
+    return _resolve_timeout_s(
+        configured, _WORKSPACE_PREP_TIMEOUT_ENV_VAR, _WORKSPACE_PREP_TIMEOUT_S
+    )
 
 
 def _env_name_is_sensitive(name: str) -> bool:
@@ -1221,6 +1263,21 @@ def _current_wait_reason(pod: object) -> str | None:
     return None
 
 
+def _workspace_prep_running(pod: object) -> bool:
+    """
+    Whether the workspace-prep init container is currently running — the Pod
+    is scheduled, its image pulled, and the clone is under way.
+
+    :param pod: A ``V1Pod`` read from the API.
+    :returns: ``True`` while the init container is in the running state.
+    """
+    status = getattr(pod, "status", None)
+    for cs in getattr(status, "init_container_statuses", None) or []:
+        if getattr(cs, "name", None) == _INIT_CONTAINER_NAME:
+            return getattr(getattr(cs, "state", None), "running", None) is not None
+    return False
+
+
 class KubernetesSandboxLauncher(SandboxHostLauncher):
     """
     :class:`SandboxLauncher` for on-demand Kubernetes Jobs.
@@ -1279,6 +1336,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         secret_mounts: Sequence[Mapping[str, object]] | None = None,
         tolerations: Sequence[Mapping[str, object]] | None = None,
         pod_ready_timeout_s: int | None = None,
+        workspace_prep_timeout_s: int | None = None,
         runtime_class: str | None = None,
         home_size_limit: str | None = _HOME_SIZE_LIMIT_DEFAULT,
     ) -> None:
@@ -1308,6 +1366,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         self._secret_mounts = list(secret_mounts) if secret_mounts else None
         self._tolerations = list(tolerations) if tolerations else None
         self._pod_ready_timeout_s = pod_ready_timeout_s
+        self._workspace_prep_timeout_s = workspace_prep_timeout_s
         self._runtime_class = runtime_class
         self._home_size_limit = home_size_limit
         self._core: k8s_client.CoreV1Api | None = None
@@ -1555,7 +1614,8 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         :param agent_name: Server-resolved built-in agent name the session runs,
             stamped as the Job's ``omnigent.ai/agent`` classifier, or ``None`` to
             leave the runner unclassified.
-        :param on_stage: Progress observer; invoked with ``"starting"``.
+        :param on_stage: Progress observer; invoked with ``"starting"``, then
+            ``"cloning"`` once the init container is cloning *repos*.
         :returns: The absolute in-sandbox workspace path.
         :raises click.ClickException: When creation fails or the host does not
             start in time.
@@ -1622,7 +1682,9 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                 ) from exc
 
             try:
-                self._wait_for_pod_running(namespace, sandbox_id)
+                self._wait_for_pod_running(
+                    namespace, sandbox_id, on_stage=on_stage, cloning=bool(repos)
+                )
             except BaseException:
                 self._best_effort_delete(namespace, sandbox_id, secret_name)
                 raise
@@ -1694,7 +1756,14 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                 return getattr(getattr(p, "metadata", None), "name", None)
         return getattr(getattr(alive[0], "metadata", None), "name", None)
 
-    def _wait_for_pod_running(self, namespace: str, job_name: str) -> None:
+    def _wait_for_pod_running(
+        self,
+        namespace: str,
+        job_name: str,
+        *,
+        on_stage: Callable[[str], None] | None = None,
+        cloning: bool = False,
+    ) -> None:
         """
         Block until the Job's child Pod's main container is running,
         fast-failing on genuinely terminal states.
@@ -1704,16 +1773,26 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         and the host container started — the handoff point to the shared
         online poll.
 
+        The pod-ready budget bounds scheduling and the image pull. Once the
+        workspace-prep init container is observed running, the wait switches
+        to the workspace-prep budget: a clone takes as long as the repository
+        is large, and a Pod that got this far is alive, not stuck.
+
         :param namespace: Namespace the Job lives in.
         :param job_name: The Job whose child Pod to wait on.
+        :param on_stage: Progress observer told ``"cloning"`` when the init
+            container starts and *cloning* is set.
+        :param cloning: Whether the init container clones repositories.
         :raises click.ClickException: On a terminal state or timeout.
         """
         from kubernetes.client.rest import ApiException
         from urllib3.exceptions import HTTPError
 
         core = self._load_core()
-        timeout_s = _resolve_pod_ready_timeout_s(self._pod_ready_timeout_s)
-        deadline = time.monotonic() + timeout_s
+        budget_s = _resolve_pod_ready_timeout_s(self._pod_ready_timeout_s)
+        prep_timeout_s = _resolve_workspace_prep_timeout_s(self._workspace_prep_timeout_s)
+        deadline = time.monotonic() + budget_s
+        preparing = False
         last_reason: str | None = None
         pod_name: str | None = None
         while True:
@@ -1724,7 +1803,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     if time.monotonic() >= deadline:
                         raise click.ClickException(
                             f"Kubernetes sandbox job '{job_name}' did not create a "
-                            f"child pod within {timeout_s}s."
+                            f"child pod within {budget_s}s."
                         )
                     time.sleep(_POD_READY_POLL_S)
                     continue
@@ -1749,7 +1828,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                                 namespace,
                                 replaced_pod_name,
                                 "disappeared and could not be rediscovered before the "
-                                f"{timeout_s}s deadline",
+                                f"{budget_s}s deadline",
                             )
                         ) from exc
                     time.sleep(_POD_READY_POLL_S)
@@ -1760,7 +1839,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                         self._pod_failure_message(
                             namespace,
                             pod_name,
-                            f"could not be read before the {timeout_s}s deadline ({last_reason})",
+                            f"could not be read before the {budget_s}s deadline ({last_reason})",
                         )
                     ) from exc
                 time.sleep(_POD_READY_POLL_S)
@@ -1772,7 +1851,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                         self._pod_failure_message(
                             namespace,
                             pod_name,
-                            f"could not be read before the {timeout_s}s deadline ({last_reason})",
+                            f"could not be read before the {budget_s}s deadline ({last_reason})",
                         )
                     ) from exc
                 time.sleep(_POD_READY_POLL_S)
@@ -1799,14 +1878,29 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                         namespace, pod_name, f"container cannot start ({fatal})"
                     )
                 )
+            if not preparing and _workspace_prep_running(pod):
+                preparing = True
+                budget_s = prep_timeout_s
+                deadline = time.monotonic() + prep_timeout_s
+                if on_stage is not None and cloning:
+                    on_stage("cloning")
             last_reason = _current_wait_reason(pod) or last_reason
             if time.monotonic() >= deadline:
+                if preparing:
+                    raise click.ClickException(
+                        self._pod_failure_message(
+                            namespace,
+                            pod_name,
+                            f"was still preparing its workspace after {prep_timeout_s}s",
+                            log_container=_INIT_CONTAINER_NAME,
+                        )
+                    )
                 detail = f"; last reason: {last_reason}" if last_reason else ""
                 raise click.ClickException(
                     self._pod_failure_message(
                         namespace,
                         pod_name,
-                        f"did not start within {timeout_s}s "
+                        f"did not start within {budget_s}s "
                         f"(last phase '{phase or 'unknown'}'{detail})",
                     )
                 )
