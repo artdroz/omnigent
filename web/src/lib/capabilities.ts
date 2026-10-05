@@ -57,13 +57,16 @@ export interface Branding {
 }
 
 /** Release features understood by this frontend build. */
-export type FeatureKey = "usage_page" | "harness_install" | "canvas" | "harness_settings_ui";
+export type FeatureKey =
+  "usage_page" | "harness_install" | "canvas" | "harness_settings_ui" | "custom_agents_settings_ui";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
 
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
+  /** Whether the server supports installing, listing, and removing user agents. */
+  agent_install?: boolean;
   accounts_enabled: boolean;
   /**
    * True only on an explicit single-user local runtime
@@ -291,6 +294,14 @@ export function isFeatureEnabled(info: ServerInfo | "loading", feature: FeatureK
   return info !== "loading" && info.features?.[feature] === true;
 }
 
+export function customAgentsSettingsEnabled(info: ServerInfo | "loading"): boolean {
+  return (
+    isFeatureEnabled(info, "custom_agents_settings_ui") &&
+    info !== "loading" &&
+    info.agent_install === true
+  );
+}
+
 let cachedServerInfo: ServerInfo | null = null;
 let pendingServerInfo: Promise<ServerInfo> | null = null;
 
@@ -316,6 +327,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
         const smartRoutingEnabled = data.smart_routing_enabled === true;
         const harnessInstallEnabled = data.harness_install_enabled === true;
         cachedServerInfo = {
+          agent_install: data.agent_install === true,
           accounts_enabled: data.accounts_enabled === true,
           single_user: data.single_user === true,
           login_url: typeof data.login_url === "string" ? data.login_url : null,

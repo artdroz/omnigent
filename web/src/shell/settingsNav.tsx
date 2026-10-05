@@ -11,6 +11,7 @@ import {
   ArchiveIcon,
   ArrowLeftIcon,
   BlocksIcon,
+  BotIcon,
   DownloadIcon,
   GitBranchIcon,
   KeyboardIcon,
@@ -26,7 +27,11 @@ import {
 import { Link, useLocation } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
+import {
+  customAgentsSettingsEnabled,
+  isFeatureEnabled,
+  isSingleUserMode,
+} from "@/lib/capabilities";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
@@ -35,6 +40,7 @@ import { SIDEBAR_ROW } from "./sidebarStyles";
 export type SettingsSectionId =
   | "appearance"
   | "harnesses"
+  | "custom-agents"
   | "general"
   | "git"
   | "integrations"
@@ -51,6 +57,7 @@ export type SettingsSectionId =
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
   "harnesses",
+  "custom-agents",
   "general",
   "git",
   "integrations",
@@ -94,6 +101,7 @@ export function settingsNavGroups(
   isSingleUser = false,
   integrationsEnabled = false,
   harnessesEnabled = false,
+  customAgentsEnabled = false,
 ): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
     { id: "general", label: "General", icon: SettingsIcon },
@@ -105,6 +113,13 @@ export function settingsNavGroups(
   // WIP: gated behind the `harness_settings_ui` release feature. Slots after Appearance.
   if (harnessesEnabled) {
     general.splice(2, 0, { id: "harnesses", label: "Harnesses", icon: VectorSquareIcon });
+  }
+  if (customAgentsEnabled) {
+    general.splice(harnessesEnabled ? 3 : 2, 0, {
+      id: "custom-agents",
+      label: "Custom agents",
+      icon: BotIcon,
+    });
   }
   // Sandbox Integrations appears once any connection provider is wired
   // (enabled_connections non-empty). Slots right after Git.
@@ -168,6 +183,7 @@ export function useSettingsRoute(): {
   inSettings: boolean;
   section: SettingsSectionId;
   harness?: string;
+  agentId?: string;
 } {
   const info = useServerInfo();
   const defaultSection: SettingsSectionId = "general";
@@ -188,9 +204,13 @@ export function useSettingsRoute(): {
     // Harnesses is WIP behind the `harness_settings_ui` release feature; a deep link to
     // it while disabled falls back to the default section rather than an empty
     // page. Keeps content, nav, and header in agreement on availability.
-    !(next === "harnesses" && !isFeatureEnabled(info, "harness_settings_ui"));
+    !(next === "harnesses" && !isFeatureEnabled(info, "harness_settings_ui")) &&
+    !(next === "custom-agents" && !customAgentsSettingsEnabled(info));
   const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
   const harness = section === "harnesses" ? segments[idx + 2] : undefined;
+  if (section === "custom-agents" && segments[idx + 2]) {
+    return { inSettings: true, section, agentId: segments[idx + 2] };
+  }
   return harness ? { inSettings: true, section, harness } : { inSettings: true, section };
 }
 
@@ -241,6 +261,7 @@ export function SettingsSidebarBody({
     isSingleUserMode(info),
     integrationsEnabled,
     harnessesEnabled,
+    customAgentsSettingsEnabled(info),
   );
 
   return (

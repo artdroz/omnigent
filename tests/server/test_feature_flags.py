@@ -24,6 +24,7 @@ def test_features_default_off() -> None:
         "harness_install": False,
         "canvas": False,
         "harness_settings_ui": False,
+        "custom_agents_settings_ui": False,
     }
 
 

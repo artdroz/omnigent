@@ -88,6 +88,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["features"] == {
         "usage_page": False,
         "harness_settings_ui": False,
+        "custom_agents_settings_ui": False,
         "harness_install": False,
         "canvas": False,
     }

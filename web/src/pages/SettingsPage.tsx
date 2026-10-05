@@ -258,6 +258,7 @@ import {
   writeBackgroundSessionTitlesEnabled,
 } from "@/lib/backgroundSessionTitlesPreferences";
 import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
+import { SettingsCustomAgentsSection } from "./settings/SettingsCustomAgentsSection";
 import { ReviewImportsPanel } from "@/components/onboarding/HostImportReview";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
@@ -292,7 +293,7 @@ export function SettingsPage() {
   useOmnigentPageView(`settings.${section}`);
 
   const pageWrapperSettings = useMemo(() => {
-    if (section === "harnesses") {
+    if (section === "harnesses" || section === "custom-agents") {
       return {
         maxWidthClassName: "max-w-4xl",
         contentClassName: "px-8",
@@ -327,6 +328,7 @@ export function SettingsPage() {
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
       {section === "harnesses" && <SettingsHarnessesSection />}
+      {section === "custom-agents" && <SettingsCustomAgentsSection />}
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}
       {section === "shortcuts" && <ShortcutsSection />}
