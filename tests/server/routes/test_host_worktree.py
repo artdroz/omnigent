@@ -18,14 +18,17 @@ import pytest
 from omnigent.host.frames import (
     HostCreateWorktreeFrame,
     HostHelloFrame,
+    HostListWorktreesFrame,
     HostRemoveWorktreeFrame,
     decode_host_frame,
 )
+from omnigent.host.git_worktree import GIT_CHECKOUT_TIMEOUT_S
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._host_worktree import (
     WorktreeHostUnavailableError,
     WorktreeProxyError,
     create_worktree_on_host,
+    list_worktrees_on_host,
     remove_worktree_on_host,
 )
 
@@ -282,7 +285,7 @@ async def test_create_worktree_timeout_raises_unavailable(
     """
     import omnigent.server.routes._host_worktree as hw_mod
 
-    monkeypatch.setattr(hw_mod, "_WORKTREE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(hw_mod, "_WORKTREE_CREATE_TIMEOUT_S", 0.05)
     registry = HostRegistry()
     registry.register(
         host_id="host_silent",
@@ -302,3 +305,110 @@ async def test_create_worktree_timeout_raises_unavailable(
             base_branch=None,
         )
     assert "did not respond" in exc.value.message
+
+
+async def test_create_worktree_outwaits_a_checkout_longer_than_the_short_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Creation waits on a bound sized for a long checkout; listing keeps the short one.
+
+    The fake host answers every frame only after the short bound has
+    elapsed: the create still succeeds while the list times out.
+    """
+    import omnigent.server.routes._host_worktree as hw_mod
+
+    monkeypatch.setattr(hw_mod, "_WORKTREE_TIMEOUT_S", 0.05)
+    # Creating a worktree checks the repo out, so its bound is sized for
+    # that work, not the short metadata bound.
+    assert hw_mod._WORKTREE_CREATE_TIMEOUT_S >= GIT_CHECKOUT_TIMEOUT_S
+
+    registry = HostRegistry()
+    registry.register(
+        host_id="host_slow_checkout",
+        ws=_FakeWebSocket(),  # type: ignore[arg-type] — duck-typed
+        hello=_hello_frame(),
+        owner=None,
+    )
+    conn = registry.get("host_slow_checkout")
+    assert conn is not None
+
+    async def _reply_late() -> None:
+        """Answer each outbound frame only after the short bound elapses."""
+        while True:
+            frame_text = await conn.outbound_queue.get()
+            if frame_text is None:
+                return
+            frame = decode_host_frame(frame_text)
+            await asyncio.sleep(0.2)
+            if isinstance(frame, HostCreateWorktreeFrame):
+                fut = conn.pending_create_worktrees.pop(frame.request_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(
+                        {
+                            "status": "ok",
+                            "worktree_path": "/repo-worktrees/slow",
+                            "branch": "slow",
+                            "error": None,
+                        }
+                    )
+            elif isinstance(frame, HostListWorktreesFrame):
+                fut = conn.pending_list_worktrees.pop(frame.request_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result({"status": "ok", "worktrees": [], "error": None})
+
+    drain_task = asyncio.create_task(_reply_late())
+    try:
+        created = await create_worktree_on_host(
+            host_registry=registry,
+            host_conn=conn,
+            repo_path="/repo",
+            branch_name="slow",
+            base_branch=None,
+        )
+        assert created.worktree_path == "/repo-worktrees/slow"
+
+        with pytest.raises(WorktreeHostUnavailableError) as exc:
+            await list_worktrees_on_host(
+                host_registry=registry,
+                host_conn=conn,
+                repo_path="/repo",
+            )
+        assert "did not respond" in exc.value.message
+    finally:
+        conn.outbound_queue.put_nowait(None)
+        try:
+            await asyncio.wait_for(drain_task, timeout=1.0)
+        except asyncio.TimeoutError:
+            drain_task.cancel()
+
+
+async def test_create_worktree_fails_fast_when_host_disconnects_mid_request() -> None:
+    """A dropped host fails an in-flight creation at once, not after the full bound."""
+    registry = HostRegistry()
+    registry.register(
+        host_id="host_dropped",
+        ws=_FakeWebSocket(),  # type: ignore[arg-type] — duck-typed
+        hello=_hello_frame(),
+        owner=None,
+    )
+    conn = registry.get("host_dropped")
+    assert conn is not None
+
+    create = asyncio.create_task(
+        create_worktree_on_host(
+            host_registry=registry,
+            host_conn=conn,
+            repo_path="/repo",
+            branch_name="x",
+            base_branch=None,
+        )
+    )
+    # Wait until the proxy has registered its pending future, then drop
+    # the host as if the tunnel died mid-request.
+    while not conn.pending_create_worktrees:
+        await asyncio.sleep(0)
+    registry.deregister("host_dropped")
+
+    with pytest.raises(WorktreeHostUnavailableError) as exc:
+        await asyncio.wait_for(create, timeout=5.0)
+    assert "connection lost" in exc.value.message

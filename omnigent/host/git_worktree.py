@@ -17,9 +17,15 @@ from pathlib import Path
 
 _logger = logging.getLogger(__name__)
 
-# fetch/add can be slow on large repos; bound it so git can't hang the
-# host's tunnel loop.
+# Bound every git command so a wedged git cannot pin its worker thread
+# (and the orphan-reaper pause) forever. Metadata commands finish well
+# within this on any repository.
 _GIT_TIMEOUT_S: float = 120.0
+
+# Populating a worktree (``worktree add`` / ``checkout``) and ``fetch``
+# scale with repository size: a large monorepo legitimately takes many
+# minutes, so those commands get this bound instead.
+GIT_CHECKOUT_TIMEOUT_S: float = 3600.0
 
 # Max directory-collision suffixes (``-2`` .. ``-N``) before giving up.
 _MAX_DIR_COLLISION_SUFFIX: int = 50
@@ -99,6 +105,7 @@ def _run_git(
     args: list[str],
     *,
     cwd: str,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a git command, returning the completed process.
 
@@ -107,10 +114,14 @@ def _run_git(
         shell parsing occurs.
     :param cwd: Working directory to run git in, e.g.
         ``"/Users/alice/myrepo"``.
+    :param timeout: Seconds to allow before killing git. Defaults to
+        :data:`_GIT_TIMEOUT_S`; commands whose duration scales with
+        repository size pass :data:`GIT_CHECKOUT_TIMEOUT_S`.
     :returns: The completed process with captured text stdout/stderr.
     :raises WorktreeError: If git is not installed, or the command
-        exceeds :data:`_GIT_TIMEOUT_S`.
+        exceeds ``timeout``.
     """
+    bound = _GIT_TIMEOUT_S if timeout is None else timeout
     try:
         return subprocess.run(
             ["git", *args],
@@ -119,13 +130,13 @@ def _run_git(
             env={**os.environ, "LC_ALL": "C"},
             capture_output=True,
             text=True,
-            timeout=_GIT_TIMEOUT_S,
+            timeout=bound,
             check=False,
         )
     except FileNotFoundError as exc:
         raise WorktreeError("git is not installed on the host") from exc
     except subprocess.TimeoutExpired as exc:
-        raise WorktreeError(f"git command timed out after {_GIT_TIMEOUT_S:.0f}s") from exc
+        raise WorktreeError(f"git command timed out after {bound:.0f}s") from exc
 
 
 def _git_error(label: str, result: subprocess.CompletedProcess[str]) -> WorktreeError:
@@ -373,7 +384,7 @@ def _ensure_base_resolvable(repo_root: str, base_branch: str) -> None:
     ):
         return
     # Best-effort fetch from the default remote, then re-verify.
-    _run_git(["fetch"], cwd=repo_root)
+    _run_git(["fetch"], cwd=repo_root, timeout=GIT_CHECKOUT_TIMEOUT_S)
     if (
         _run_git(
             ["rev-parse", "--verify", "--quiet", "--end-of-options", base_branch], cwd=repo_root
@@ -514,7 +525,7 @@ def create_worktree(
             add_args.insert(2, "--no-checkout")
         if base_branch is not None:
             add_args += ["--end-of-options", base_branch]
-    result = _run_git(add_args, cwd=repo_root)
+    result = _run_git(add_args, cwd=repo_root, timeout=GIT_CHECKOUT_TIMEOUT_S)
     if result.returncode != 0:
         raise _git_error("git worktree add failed", result)
     if validated_commit is not None:
@@ -532,6 +543,7 @@ def create_worktree(
                 checkout = _run_git(
                     ["checkout", "--force", "-B", branch_name, validated_commit],
                     cwd=str(worktree_path),
+                    timeout=GIT_CHECKOUT_TIMEOUT_S,
                 )
                 if checkout.returncode != 0:
                     raise _git_error("could not check out validated worktree revision", checkout)
