@@ -2193,3 +2193,99 @@ def test_stalled_clone_fails_after_workspace_prep_budget_with_init_log_tail(
     assert "Receiving objects:  41%" in exc.value.message
     assert clock["now"] >= 600
     assert "delete_job" in batch.calls
+
+
+def test_wait_resets_to_pod_ready_budget_when_cloning_pod_is_replaced(
+    fake_clients: tuple[_FakeCore, _FakeBatch], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cloning Pod replaced by one stuck before cloning falls back to the tight
+    pod-ready budget, not the long preparation budget it never earned."""
+    core, _batch = fake_clients
+    clock = _fake_clock(monkeypatch)
+    stuck = _pod(
+        phase="Pending",
+        init_statuses=[
+            SimpleNamespace(
+                name="workspace-prep",
+                state=SimpleNamespace(
+                    running=None,
+                    waiting=SimpleNamespace(reason="ImagePullBackOff", message="back-off"),
+                    terminated=None,
+                ),
+            )
+        ],
+    )
+    core.pod_list_items = [_cloning_pod()]
+    core.read_queue = [_cloning_pod(), _FakeApiException(status=404, reason="Not Found")]
+    core.read_default = stuck
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        secret_name="omnigent-creds",
+        env=(),
+        pod_ready_timeout_s=90,
+        workspace_prep_timeout_s=1800,
+    )
+
+    with pytest.raises(click.ClickException) as exc:
+        launcher.start_host(
+            "omnigent-job-replaced",
+            token=_TOKEN,
+            host_id="host_replaced",
+            host_name="managed-replaced",
+            server_url="http://srv.example.com",
+            repos=[RepoWorkspace(url="https://x/monorepo.git", branch=None, repo_name="monorepo")],
+        )
+
+    assert "did not start within 90s" in exc.value.message
+    assert "was still preparing" not in exc.value.message
+    assert clock["now"] < 1800
+
+
+def test_wait_resets_to_pod_ready_budget_when_clone_finishes_but_host_stalls(
+    fake_clients: tuple[_FakeCore, _FakeBatch], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the clone finishes, a main container that cannot start is a pod-start
+    failure on the tight budget, not a workspace-preparation timeout."""
+    core, _batch = fake_clients
+    clock = _fake_clock(monkeypatch)
+    stalled = _pod(
+        phase="Pending",
+        init_statuses=[_terminated(0, name="workspace-prep", reason="Completed")],
+        container_statuses=[
+            SimpleNamespace(
+                name="host",
+                state=SimpleNamespace(
+                    running=None,
+                    waiting=SimpleNamespace(reason="ContainerCreating", message=None),
+                    terminated=None,
+                ),
+            )
+        ],
+    )
+    core.pod_list_items = [_cloning_pod()]
+    core.read_queue = [_cloning_pod()]
+    core.read_default = stalled
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        secret_name="omnigent-creds",
+        env=(),
+        pod_ready_timeout_s=90,
+        workspace_prep_timeout_s=1800,
+    )
+
+    with pytest.raises(click.ClickException) as exc:
+        launcher.start_host(
+            "omnigent-job-host-stall",
+            token=_TOKEN,
+            host_id="host_stall",
+            host_name="managed-stall",
+            server_url="http://srv.example.com",
+            repos=[RepoWorkspace(url="https://x/monorepo.git", branch=None, repo_name="monorepo")],
+        )
+
+    assert "did not start within 90s" in exc.value.message
+    assert "ContainerCreating" in exc.value.message
+    assert "was still preparing" not in exc.value.message
+    assert clock["now"] < 1800

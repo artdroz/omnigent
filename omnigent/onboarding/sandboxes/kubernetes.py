@@ -182,14 +182,9 @@ _HOME_DIR: str = "/home/omnigent"
 _CONTAINER_NAME: str = "host"
 _INIT_CONTAINER_NAME: str = "workspace-prep"
 
-# Pod-start wait budget, consumed inside start_host BEFORE the
-# shared _wait_for_host_online poll, so a Pod that can't schedule / pull its
-# image / start its workspace prep fails fast with a clear reason instead of
-# as a generic online timeout. Kept tight; a cold image pull is the usual slow
-# case — deployments whose host image regularly takes longer to pull can raise
-# the budget via ``sandbox.kubernetes.pod_ready_timeout_s``, or, when that
-# isn't set, via :data:`_POD_READY_TIMEOUT_ENV_VAR`. Once the workspace-prep
-# init container is running, :data:`_WORKSPACE_PREP_TIMEOUT_S` takes over.
+# Tight pod-start budget consumed before the shared online poll, so scheduling
+# or image-pull failures fail fast. Raise via ``sandbox.kubernetes.pod_ready_timeout_s``
+# or :data:`_POD_READY_TIMEOUT_ENV_VAR`; once the clone runs _WORKSPACE_PREP_TIMEOUT_S takes over.
 _POD_READY_TIMEOUT_S: int = 90
 _POD_READY_POLL_S: float = 2.0
 
@@ -200,12 +195,9 @@ _POD_READY_POLL_S: float = 2.0
 # explicit config key always wins when both are present.
 _POD_READY_TIMEOUT_ENV_VAR: str = "OMNIGENT_K8S_POD_READY_TIMEOUT_S"
 
-# Workspace-preparation budget, counted from the moment the init container is
-# observed running. A clone's duration scales with the repository, not the
-# cluster — a large monorepo takes many minutes — so it is bounded separately
-# from the tight pod-start budget. Overridable via
-# ``sandbox.kubernetes.workspace_prep_timeout_s`` or, when that isn't set,
-# :data:`_WORKSPACE_PREP_TIMEOUT_ENV_VAR`.
+# Clone budget, counted from when the init container is observed running — clone
+# duration scales with the repository, not the cluster, so it is bounded apart
+# from the tight pod-start budget. Override via workspace_prep_timeout_s or its env var.
 _WORKSPACE_PREP_TIMEOUT_S: int = 30 * 60
 _WORKSPACE_PREP_TIMEOUT_ENV_VAR: str = "OMNIGENT_K8S_WORKSPACE_PREP_TIMEOUT_S"
 
@@ -1789,8 +1781,9 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         from urllib3.exceptions import HTTPError
 
         core = self._load_core()
-        budget_s = _resolve_pod_ready_timeout_s(self._pod_ready_timeout_s)
+        pod_ready_timeout_s = _resolve_pod_ready_timeout_s(self._pod_ready_timeout_s)
         prep_timeout_s = _resolve_workspace_prep_timeout_s(self._workspace_prep_timeout_s)
+        budget_s = pod_ready_timeout_s
         deadline = time.monotonic() + budget_s
         preparing = False
         last_reason: str | None = None
@@ -1878,12 +1871,20 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                         namespace, pod_name, f"container cannot start ({fatal})"
                     )
                 )
-            if not preparing and _workspace_prep_running(pod):
+            # Track the Pod's phase each poll: the clone gets its own budget while
+            # its init container runs, but a replacement Pod or a main container
+            # stalled after the clone falls back to the tight pod-ready budget.
+            prep_now = _workspace_prep_running(pod)
+            if prep_now and not preparing:
                 preparing = True
                 budget_s = prep_timeout_s
                 deadline = time.monotonic() + prep_timeout_s
                 if on_stage is not None and cloning:
                     on_stage("cloning")
+            elif preparing and not prep_now:
+                preparing = False
+                budget_s = pod_ready_timeout_s
+                deadline = time.monotonic() + pod_ready_timeout_s
             last_reason = _current_wait_reason(pod) or last_reason
             if time.monotonic() >= deadline:
                 if preparing:
