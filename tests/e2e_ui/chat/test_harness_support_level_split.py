@@ -1,19 +1,18 @@
 """E2E: the prototype picker leads with Claude Code, Cursor, and Codex.
 
-Other harnesses stay in Other; its label identifies the selected harness.
+Other harnesses stay in Other unless selected; the current pick is promoted on reopen.
 All stubbed harnesses are ready, so grouping is independent of availability.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
-import threading
-from collections.abc import Coroutine
-from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
+
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 # Stubbed host the composer auto-selects (the tunneled runner registers no
 # host). Keyed identically in the recent-workspaces localStorage seed.
@@ -25,33 +24,6 @@ _CLAUDE_AGENT_ID = "ag_claude_e2e"
 _CODEX_AGENT_ID = "ag_codex_e2e"
 _CURSOR_AGENT_ID = "ag_cursor_e2e"
 _PI_AGENT_ID = "ag_pi_e2e"
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* to completion in a dedicated thread with its own event loop.
-
-    The e2e_ui suite runs many pytest-playwright **sync** tests in the same
-    session; once one has run, pytest-asyncio can't start a loop on the main
-    thread. Running the coroutine from a fresh thread via :func:`asyncio.run`
-    sidesteps that. Any exception (including assertion failures) is captured and
-    re-raised on the calling thread so the test fails normally.
-
-    :param coro: The coroutine to run to completion.
-    :raises Exception: Whatever the coroutine raised, re-raised here.
-    """
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
 
 
 def _hosts_body() -> str:
@@ -142,8 +114,11 @@ async def _register_routes(page) -> None:
         )
 
     await page.route("**/v1/hosts", handle_hosts)
+    await stub_empty_host_picker_data(page, _HOST_ID)
     await page.route("**/v1/agents", handle_agents)
-    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+    await page.route(
+        re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+    )
 
 
 async def _open_picker(page) -> None:
@@ -152,11 +127,10 @@ async def _open_picker(page) -> None:
 
 
 def test_recent_harness_remains_in_other_group(
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """Recent launches do not change the prototype's primary harness order."""
-    base_url, session_id = seeded_session
-    del session_id  # this flow never creates a session — only reads the picker
+    base_url = live_server
     _run_in_fresh_loop(_drive_recent(base_url))
 
 
@@ -196,11 +170,10 @@ async def _drive_recent(base_url: str) -> None:
 
 
 def test_picker_leads_with_primary_harnesses(
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
-    """Primary harnesses remain inline; Other identifies a selected Pi harness."""
-    base_url, session_id = seeded_session
-    del session_id  # this flow never creates a session — only reads the picker
+    """Primary harnesses lead; the selected secondary harness joins them on reopen."""
+    base_url = live_server
     _run_in_fresh_loop(_drive(base_url))
 
 
@@ -249,7 +222,7 @@ async def _drive(base_url: str) -> None:
                 "expected primary Cursor row to precede Pi in Other"
             )
 
-            # The trigger and Other label both identify the selected harness.
+            # Selecting Pi keeps its config reachable, then promotes it on reopen.
             await pi_row.click()
             await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_have_attribute(
                 "aria-label", re.compile("Pi")
@@ -257,12 +230,8 @@ async def _drive(base_url: str) -> None:
             await page.keyboard.press("Escape")
             await expect(page.get_by_role("menu")).to_have_count(0)
             await _open_picker(page)
-            other = page.get_by_test_id("new-chat-landing-harness-more")
-            await expect(other).to_contain_text("Pi")
-            await expect(
-                page.get_by_test_id(f"new-chat-landing-agent-{_PI_AGENT_ID}")
-            ).to_have_count(0)
-            await other.click()
+            await expect(page.get_by_test_id("new-chat-landing-harness-more")).to_have_count(0)
+            await expect(pi_row).to_be_visible()
             await expect(
                 page.get_by_test_id(f"new-chat-landing-agent-{_PI_AGENT_ID}")
             ).to_have_attribute("data-active", "true")
