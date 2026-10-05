@@ -1,13 +1,6 @@
-// Desktop-shell journeys for the new-session host picker's local-machine path:
-// "Use this machine" (reported as "Run on this machine") must connect and
-// select this machine, and a host daemon the user already started in a
-// terminal must be picked up — including for a returning user whose saved host
-// pick still carries the legacy `host_` prefix.
-//
-// Run from web/electron after building the SPA:
-//   OMNIGENT_PW_NO_SANDBOX=1 OMNIGENT_PYTHON=../../.venv/bin/python \
-//     xvfb-run -a node --test --test-concurrency=1 \
-//     e2e/desktop_run_on_this_machine_selects_local_host.e2e.js
+// New-session host picker, local-machine path: "Use this machine" must connect
+// and select this machine, and a host daemon already running must be picked up,
+// also when the saved host pick still carries the legacy `host_` prefix.
 
 "use strict";
 
