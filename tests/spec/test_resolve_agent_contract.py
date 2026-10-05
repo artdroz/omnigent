@@ -302,7 +302,6 @@ def test_recording_blockers_are_explicit_and_do_not_block_delivery() -> None:
     assert "name the specific blocker in `recording_unavailable_reason`" in normalized
     assert "Text-only CLI output is not a reason to skip recording" in normalized
     assert "run that driver and setup first" in normalized
-    assert "name the Repro driver path or command you ran and its observed result" in normalized
     assert "re-declare the recovered clip in `recordings` with its caption unchanged" in normalized
     assert "The inherited before clip stays declared even then" in normalized
     assert "no before-clip was recovered" in normalized
@@ -321,10 +320,9 @@ def test_recording_blockers_are_explicit_and_do_not_block_delivery() -> None:
     )
     assert "keeping the inherited before-clip declared" in final_review_gate
 
-    # Bind the failure-evidence and inherited-clip requirements to each skill's
-    # own source. The aggregate checks above pass if either resolve-author-fix or
-    # resolve-handoff carries a phrase, so dropping it from one skill alone would
-    # otherwise escape detection.
+    # Pin the failure-evidence and inherited-clip requirements at each skill's own
+    # source, so a regression in resolve-author-fix or resolve-handoff is caught
+    # individually instead of being masked by the other skill.
     author_fix = " ".join(
         (_RESOLVE_AGENT / "skills" / "resolve-author-fix" / "SKILL.md")
         .read_text(encoding="utf-8")
