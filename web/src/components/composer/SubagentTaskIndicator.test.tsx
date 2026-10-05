@@ -9,6 +9,10 @@ const useChildSessionsMock = vi.fn();
 vi.mock("@/hooks/useChildSessions", () => ({
   useChildSessions: (conversationId: string | null) => useChildSessionsMock(conversationId),
 }));
+const useSessionMock = vi.fn();
+vi.mock("@/hooks/useSession", () => ({
+  useSession: (conversationId: string | null) => useSessionMock(conversationId),
+}));
 
 function child(overrides: Partial<ChildSessionInfo>): ChildSessionInfo {
   return {
@@ -27,22 +31,46 @@ function child(overrides: Partial<ChildSessionInfo>): ChildSessionInfo {
   };
 }
 
-function setChildren(children: ChildSessionInfo[]) {
-  useChildSessionsMock.mockReturnValue({ children, isLoading: false, error: null });
+const childrenById = new Map<string, ChildSessionInfo[]>();
+
+/** Children served for `conversationId`; like the real hook, `null` yields none. */
+function setChildren(children: ChildSessionInfo[], conversationId = "conv-1") {
+  childrenById.set(conversationId, children);
 }
 
-function renderIndicator(conversationId: string | null = "conv-1", route = "/") {
+function setSessionTitle(conversationId: string, title: string | null) {
+  useSessionMock.mockImplementation((id: string | null) => ({
+    session: id === conversationId ? { title } : null,
+    isLoading: false,
+    error: null,
+  }));
+}
+
+function renderIndicator(
+  conversationId: string | null = "conv-1",
+  route = "/",
+  parentSessionId: string | null = null,
+) {
   return render(
     <MemoryRouter initialEntries={[route]}>
-      <SubagentTaskIndicator conversationId={conversationId} />
+      <SubagentTaskIndicator conversationId={conversationId} parentSessionId={parentSessionId} />
     </MemoryRouter>,
   );
 }
 
-beforeEach(() => setChildren([]));
+beforeEach(() => {
+  childrenById.clear();
+  useChildSessionsMock.mockImplementation((conversationId: string | null) => ({
+    children: conversationId === null ? [] : (childrenById.get(conversationId) ?? []),
+    isLoading: false,
+    error: null,
+  }));
+  useSessionMock.mockReturnValue({ session: null, isLoading: false, error: null });
+});
 afterEach(() => {
   cleanup();
   useChildSessionsMock.mockReset();
+  useSessionMock.mockReset();
 });
 
 describe("SubagentTaskIndicator", () => {
@@ -104,6 +132,8 @@ describe("SubagentTaskIndicator", () => {
     );
     fireEvent.click(screen.getByTestId("subagent-task-pill"));
 
+    // A top-level session has nothing to climb back to.
+    expect(screen.queryByTestId("subagent-indicator-parent-row")).toBeNull();
     const workingStatus = screen
       .getAllByRole("status")
       .find((status) => status.textContent === "Working");
@@ -153,5 +183,63 @@ describe("SubagentTaskIndicator", () => {
     expect(pill).toHaveAttribute("data-state", "parked");
     expect(pill).toHaveClass("text-warning");
     expect(pill).toHaveAccessibleName("1 sub-agent: 1 awaiting input");
+  });
+
+  it("keeps tallying inside a running sub-agent and leads with a row back to its parent", () => {
+    setChildren(
+      [
+        child({ id: "conv-1", busy: true, task_summary: "Investigate auth", tool: "researcher" }),
+        child({ id: "sibling", busy: true, task_summary: "Review the docs" }),
+        child({ id: "sibling-done", current_task_status: "completed" }),
+      ],
+      "conv-parent",
+    );
+    setSessionTitle("conv-parent", "Ship the auth fix");
+    renderIndicator("conv-1", "/c/conv-1?file=README.md&debug=1", "conv-parent");
+
+    const pill = screen.getByTestId("subagent-task-pill");
+    expect(pill).toHaveTextContent("2");
+    expect(pill).toHaveAccessibleName("2 sub-agents: 2 active");
+    expect(useChildSessionsMock).toHaveBeenCalledWith("conv-1");
+    expect(useChildSessionsMock).toHaveBeenCalledWith("conv-parent");
+
+    fireEvent.click(pill);
+    const links = screen.getAllByRole("link");
+    const parentRow = screen.getByTestId("subagent-indicator-parent-row");
+    expect(links[0]).toBe(parentRow);
+    expect(parentRow).toHaveTextContent("Back to parent");
+    expect(parentRow).toHaveTextContent("Ship the auth fix");
+    expect(parentRow).toHaveAttribute("href", "/c/conv-parent?debug=1");
+    expect(parentRow).not.toHaveAttribute("aria-current");
+
+    const currentRow = screen.getByRole("link", { name: /Investigate auth.*Working/ });
+    expect(currentRow).toHaveAttribute("aria-current", "page");
+    expect(currentRow).toHaveAttribute("href", "/c/conv-1?debug=1");
+    expect(screen.getByRole("link", { name: /Review the docs.*Working/ })).not.toHaveAttribute(
+      "aria-current",
+    );
+  });
+
+  it("adds a nested sub-agent's own children to the tally", () => {
+    setChildren(
+      [child({ id: "conv-1", busy: true, task_summary: "Plan the rollout" })],
+      "conv-parent",
+    );
+    setChildren([child({ id: "grandchild", busy: true, task_summary: "Draft the checklist" })]);
+    renderIndicator("conv-1", "/c/conv-1", "conv-parent");
+
+    expect(screen.getByTestId("subagent-task-pill")).toHaveAccessibleName("2 sub-agents: 2 active");
+    fireEvent.click(screen.getByTestId("subagent-task-pill"));
+
+    // Parent snapshot still loading: a generic label keeps the row usable.
+    expect(screen.getByTestId("subagent-indicator-parent-row")).toHaveTextContent("Parent session");
+    const rows = screen.getAllByRole("link").map((link) => link.getAttribute("href"));
+    expect(rows).toEqual(["/c/conv-parent", "/c/conv-1", "/c/grandchild"]);
+  });
+
+  it("hides inside a sub-agent once it and its siblings have settled", () => {
+    setChildren([child({ id: "conv-1", current_task_status: "completed" })], "conv-parent");
+    const { container } = renderIndicator("conv-1", "/c/conv-1", "conv-parent");
+    expect(container).toBeEmptyDOMElement();
   });
 });

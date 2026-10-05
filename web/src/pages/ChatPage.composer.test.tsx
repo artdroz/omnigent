@@ -109,13 +109,24 @@ afterEach(() => setComposerGitStatus());
 // so the indicator self-hides (no active children) in isolated composer renders.
 const { childSessionsArgsSpy, composerChildSessions } = vi.hoisted(() => ({
   childSessionsArgsSpy: vi.fn(),
-  composerChildSessions: { children: [] as ChildSessionInfo[] },
+  composerChildSessions: {
+    children: [] as ChildSessionInfo[],
+    // When set, only this conversation's query serves `children`.
+    conversationId: null as string | null,
+  },
 }));
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: (conversationId: string | null) => {
     childSessionsArgsSpy(conversationId);
-    return { children: composerChildSessions.children, isLoading: false, error: null };
+    // The real hook disables its query for null (no parent / no conversation).
+    const scope = composerChildSessions.conversationId;
+    const served = conversationId !== null && (scope === null || scope === conversationId);
+    return {
+      children: served ? composerChildSessions.children : [],
+      isLoading: false,
+      error: null,
+    };
   },
 }));
 // HostBadge now renders in the composer's status-line tray and reads the
@@ -2326,6 +2337,7 @@ describe("Composer shared visible controls", () => {
     vi.restoreAllMocks();
     childSessionsArgsSpy.mockClear();
     composerChildSessions.children = [];
+    composerChildSessions.conversationId = null;
     Object.assign(composerSessionSnapshot, {
       hostId: null,
       workspace: null,
@@ -2509,6 +2521,49 @@ describe("Composer shared visible controls", () => {
     expect(
       screen.getByRole("link", { name: /Verify queue behavior.*Working.*developer/ }),
     ).toHaveAttribute("href", "/c/conv_child?debug=1");
+  });
+
+  it("keeps the sub-agent tally inside a child session and offers the way back", () => {
+    useChatStore.setState({ conversationId: "conv_child" });
+    composerChildSessions.conversationId = "conv_parent";
+    composerChildSessions.children = [
+      {
+        id: "conv_child",
+        title: "developer:queue-tests",
+        task_summary: "Verify queue behavior",
+        tool: "developer",
+        session_name: "queue-tests",
+        labels: {},
+        current_task_status: "in_progress",
+        last_task_error: null,
+        busy: true,
+        last_message_preview: null,
+        pending_elicitations_count: 0,
+        routed_model: null,
+      },
+    ];
+
+    render(
+      <MemoryRouter initialEntries={["/c/conv_child?debug=1"]}>
+        <TooltipProvider>
+          <Composer {...composerProps({ parentSessionId: "conv_parent" })} />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+
+    expect(childSessionsArgsSpy).toHaveBeenCalledWith("conv_child");
+    expect(childSessionsArgsSpy).toHaveBeenCalledWith("conv_parent");
+    const subagent = screen.getByTestId("subagent-task-pill");
+    expect(subagent).toHaveAccessibleName("1 sub-agent: 1 active");
+
+    fireEvent.click(subagent);
+    expect(screen.getByTestId("subagent-indicator-parent-row")).toHaveAttribute(
+      "href",
+      "/c/conv_parent?debug=1",
+    );
+    expect(
+      screen.getByRole("link", { name: /Verify queue behavior.*Working.*developer/ }),
+    ).toHaveAttribute("aria-current", "page");
   });
 
   it("passes the real session id/host/workspace/creation-branch to useComposerGitStatus", () => {

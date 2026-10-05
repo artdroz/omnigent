@@ -1,21 +1,24 @@
 import { useEffect, useRef, useState, type MouseEvent } from "react";
-import { BotIcon } from "lucide-react";
+import { BotIcon, CornerLeftUpIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { RunningDot } from "@/components/RunningDot";
 import { useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { useSession } from "@/hooks/useSession";
 import { Link, useLocation } from "@/lib/routing";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
 import { cn } from "@/lib/utils";
 import { childStatus } from "@/shell/subagentStatus";
 
 /**
- * Direct-child attention tally for the ComposerWorkspaceBar, sitting beside
- * the background-task tally: a bot icon + count badge toggling a popover
- * listing each active, parked, disconnected, or errored child. Descendant
- * hierarchy remains in the Agents rail. Mirrors ``BackgroundTaskIndicator``
- * so the two counts read as one family (background shells + delegated agents).
+ * Sub-agent attention tally for the ComposerWorkspaceBar, beside the
+ * background-task tally: a bot icon + count badge toggling a popover of each
+ * active, parked, disconnected, or errored sub-agent. Covers the conversation's
+ * direct children and, inside a sub-agent, that sub-agent and its siblings, so
+ * the pill stays while the viewed sub-agent runs; the popover then leads with a
+ * row back to the parent. Descendant hierarchy remains in the Agents rail.
+ * Mirrors ``BackgroundTaskIndicator`` so the two counts read as one family.
  */
 
 type IndicatorState = "active" | "parked" | "quiet" | "error";
@@ -25,6 +28,9 @@ interface IndicatorChild {
   state: IndicatorState;
   statusLabel: string;
 }
+
+const ROW_CLASS =
+  "flex items-start gap-2 rounded-lg px-1 py-2 hover:bg-accent/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
 
 function subagentLabel(child: ChildSessionInfo): string {
   const summary = child.task_summary?.trim();
@@ -99,11 +105,47 @@ function SubagentStateIndicator({ state, label }: { state: IndicatorState; label
   );
 }
 
+function ParentNavigationRow({
+  parentSessionId,
+  onNavigate,
+}: {
+  parentSessionId: string;
+  onNavigate: (event: MouseEvent<HTMLAnchorElement>) => void;
+}) {
+  const search = sessionNavigationSearch(useLocation().search);
+  const { session } = useSession(parentSessionId);
+  const title = session?.title?.trim() || "Parent session";
+
+  return (
+    <li className="mb-1 border-b border-border/60 pb-1">
+      <Link
+        to={{ pathname: `/c/${parentSessionId}`, search }}
+        componentId="composer-subagent-indicator-parent-row"
+        data-testid="subagent-indicator-parent-row"
+        onClick={onNavigate}
+        className={ROW_CLASS}
+      >
+        <span className="flex h-5 w-5 shrink-0 items-center justify-center text-muted-foreground">
+          <CornerLeftUpIcon className="size-4" aria-hidden="true" />
+        </span>
+        <span className="flex min-w-0 flex-1 flex-col">
+          <span className="text-xs text-muted-foreground">Back to parent</span>
+          <span className="truncate text-sm text-foreground" title={title}>
+            {title}
+          </span>
+        </span>
+      </Link>
+    </li>
+  );
+}
+
 function SubagentNavigationRow({
   item: { child, state, statusLabel },
+  isCurrent,
   onNavigate,
 }: {
   item: IndicatorChild;
+  isCurrent: boolean;
   onNavigate: (event: MouseEvent<HTMLAnchorElement>) => void;
 }) {
   const search = sessionNavigationSearch(useLocation().search);
@@ -116,8 +158,9 @@ function SubagentNavigationRow({
       <Link
         to={{ pathname: `/c/${child.id}`, search }}
         componentId="composer-subagent-indicator-row"
+        aria-current={isCurrent ? "page" : undefined}
         onClick={onNavigate}
-        className="flex items-start gap-2 rounded-lg px-1 py-2 hover:bg-accent/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+        className={cn(ROW_CLASS, isCurrent && "bg-accent/40")}
       >
         <span className="flex h-5 w-5 shrink-0 items-center justify-center text-muted-foreground">
           <BotIcon className="size-4" aria-hidden="true" />
@@ -140,9 +183,19 @@ function SubagentNavigationRow({
   );
 }
 
-export function SubagentTaskIndicator({ conversationId }: { conversationId: string | null }) {
-  const { children } = useChildSessions(conversationId);
-  const items = children
+export function SubagentTaskIndicator({
+  conversationId,
+  parentSessionId = null,
+}: {
+  conversationId: string | null;
+  /** The conversation's parent when it is itself a sub-agent; `null` for a top-level session. */
+  parentSessionId?: string | null;
+}) {
+  const { children: ownChildren } = useChildSessions(conversationId);
+  // Inside a sub-agent, its parent's children are the sub-agent itself and
+  // its siblings; the two lists are disjoint, so no de-duplication is needed.
+  const { children: siblings } = useChildSessions(parentSessionId);
+  const items = [...siblings, ...ownChildren]
     .map(indicatorChild)
     .filter((item): item is IndicatorChild => item !== null);
   const count = items.length;
@@ -232,8 +285,16 @@ export function SubagentTaskIndicator({ conversationId }: { conversationId: stri
           className="max-h-[min(24rem,var(--radix-popover-content-available-height))] w-[min(25rem,calc(100vw-2rem))] overflow-y-auto p-2"
         >
           <ul className="flex flex-col">
+            {parentSessionId ? (
+              <ParentNavigationRow parentSessionId={parentSessionId} onNavigate={handleNavigate} />
+            ) : null}
             {items.map((item) => (
-              <SubagentNavigationRow key={item.child.id} item={item} onNavigate={handleNavigate} />
+              <SubagentNavigationRow
+                key={item.child.id}
+                item={item}
+                isCurrent={item.child.id === conversationId}
+                onNavigate={handleNavigate}
+              />
             ))}
           </ul>
         </PopoverContent>

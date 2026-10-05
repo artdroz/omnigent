@@ -1140,6 +1140,7 @@ export function ChatPage() {
       costRoutingEligible={costRoutingEligible}
       subagentRoutingEligible={subagentRoutingEligible}
       subAgentLabel={subAgentLabel}
+      parentSessionId={activeSession?.parentSessionId ?? null}
       wrapperLabel={capabilitySource.labels[WRAPPER_LABEL_KEY] ?? null}
     />
   );
@@ -1435,6 +1436,11 @@ interface MainAgentSurfaceProps {
    * ``subAgentComposerLabel``.
    */
   subAgentLabel: string | null;
+  /**
+   * The active session's parent when it is itself a sub-agent, else ``null``;
+   * keeps the composer's sub-agent tally alive inside a child session.
+   */
+  parentSessionId: string | null;
   /** The session's ``omnigent.wrapper`` label; see ``ComposerProps``. */
   wrapperLabel: string | null;
 }
@@ -1572,6 +1578,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   costRoutingEligible,
   subagentRoutingEligible,
   subAgentLabel,
+  parentSessionId,
   wrapperLabel,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
@@ -1891,6 +1898,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             costRoutingEligible={costRoutingEligible}
             subagentRoutingEligible={subagentRoutingEligible}
             subAgentLabel={subAgentLabel}
+            parentSessionId={parentSessionId}
             wrapperLabel={wrapperLabel}
             onViewportShrinkPinScroll={pinScrollOnComposerGrowth}
           />
@@ -2052,6 +2060,11 @@ interface ComposerProps {
    * tray above the card. See ``subAgentComposerLabel``.
    */
   subAgentLabel?: string | null;
+  /**
+   * The session's parent id when it is a sub-agent; ``null``/omitted for
+   * top-level sessions. Scopes the sub-agent tally (``SubagentTaskIndicator``).
+   */
+  parentSessionId?: string | null;
   /**
    * The session's ``omnigent.wrapper`` label, or ``null`` when it carries
    * none. Only the identity label reads it — to name the vendor running a
@@ -2354,6 +2367,7 @@ function ComposerImpl(
     onShowReconnectHelp,
     costRoutingEligible = false,
     subAgentLabel = null,
+    parentSessionId = null,
     wrapperLabel = null,
     onViewportShrinkPinScroll,
   }: ComposerProps,
@@ -3679,7 +3693,10 @@ function ComposerImpl(
               className="flex items-center gap-0 empty:hidden"
             >
               <BackgroundTaskIndicator />
-              <SubagentTaskIndicator conversationId={conversationId} />
+              <SubagentTaskIndicator
+                conversationId={conversationId}
+                parentSessionId={parentSessionId}
+              />
               {goal && <GoalStatusPill goal={goal} onOpen={() => setGoalDialogOpen(true)} />}
             </div>
             <ComposerContextRing
