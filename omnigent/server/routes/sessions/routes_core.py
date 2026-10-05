@@ -170,6 +170,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _ensure_native_terminal_ready,
     _ensure_runner_relay_ready,
     _ensure_runner_session_initialized,
+    _forget_create_route_prompt,
     _get_session_snapshot,
     _is_native_terminal_session,
     _labels_for_viewer,
@@ -2686,6 +2687,10 @@ def register_core_routes(
         )
         if updated is None:
             raise _session_not_found()
+        if model_override is not None or clear_model:
+            # The user's own model request supersedes a Smart Routing create's
+            # pick; the fingerprint marking the override as routing's goes too.
+            updated = await _forget_create_route_prompt(session_id, updated, conversation_store)
         # Archiving hides the session from the default view (and its unread
         # dot), so drop its per-user read-state to bound in-memory growth.
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).

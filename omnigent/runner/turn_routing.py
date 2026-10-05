@@ -467,7 +467,8 @@ def user_pinned_model(conv: Any) -> bool:
     first, and a Smart Routing create records the routed prompt's
     fingerprint instead — awaiting a first-prompt claim, or a fresh route
     for an edited prompt — so that fingerprint marks the override as
-    routing's, not the user's.
+    routing's, not the user's. A user's own model request retires it (the
+    picker PATCH), so a pick made over the create's reads as the pin it is.
 
     Children are exempt: a routed parent deliberately routes its spawns past
     an orchestrator-supplied model, the same choice the composer gate makes.
