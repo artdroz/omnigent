@@ -1,12 +1,8 @@
-"""Browser e2e: start a session with a new worktree when the checkout is slow.
+"""Browser e2e: a new-worktree session survives a checkout slower than the
+host's short metadata-command timeout.
 
-The host bounds every git command, including the ``git worktree add``
-checkout, with one fixed timeout. A repository whose checkout outlasts it
-(a very large monorepo) cannot start a session with a new worktree: the
-user waits on the pending session, then the create fails with a timeout.
-
-A sleeping smudge filter stands in for the large repository so a tiny repo
-takes longer than the host timeout to check out.
+A sleeping smudge filter makes a tiny repo's checkout outlast that short
+bound, standing in for a very large monorepo.
 """
 
 from __future__ import annotations
@@ -74,7 +70,7 @@ def _spawn_host(
     if config.exists():
         host_id = yaml.safe_load(config.read_text())["host"]["host_id"]
     else:
-        config.parent.mkdir(parents=True)
+        config.parent.mkdir(parents=True, exist_ok=True)
         host_id = uuid.uuid4().hex
         config.write_text(
             yaml.safe_dump({"host": {"host_id": host_id, "name": f"slow-checkout-{host_id[:8]}"}})
@@ -272,6 +268,12 @@ def test_new_session_worktree_survives_slow_checkout(
         page.screenshot(path=str(evidence / "settled.png"))
 
         create = creates[0] if creates else None
+        try:
+            create_body = create.text()[:1000] if create else None
+        except Exception:
+            # The body may be unretrievable (e.g. after navigation); don't let
+            # evidence collection pre-empt the assertions below.
+            create_body = "<body unavailable>"
         record = {
             "repo": str(repo),
             "branch": _BRANCH,
@@ -279,7 +281,7 @@ def test_new_session_worktree_survives_slow_checkout(
             "checkout_s": _CHECKOUT_S,
             "host_git_timeout_s": _GIT_TIMEOUT_S,
             "create_status": create.status if create else None,
-            "create_body": create.text()[:1000] if create else None,
+            "create_body": create_body,
             "settled_after_s": round(time.monotonic() - started, 1),
             "timeline": timeline,
             "worktree_list": _git(repo, "worktree", "list", "--porcelain"),
@@ -291,14 +293,24 @@ def test_new_session_worktree_survives_slow_checkout(
         assert create is not None, f"POST /v1/sessions did not settle within {_SETTLE_TIMEOUT_S}s"
         assert create.ok, (
             f"starting a session with a new worktree failed after {record['settled_after_s']}s: "
-            f"HTTP {create.status} {record['create_body']}; the page ended on "
+            f"HTTP {create.status} {create_body}; the page ended on "
             f"{timeline[-1]['path']} with toasts {timeline[-1]['toasts']}"
+        )
+        # Guard against a disabled slow filter silently passing the test: the
+        # create only exercises the regression if its checkout outlasted the
+        # short metadata bound.
+        assert record["settled_after_s"] > _GIT_TIMEOUT_S, (
+            f"create settled in {record['settled_after_s']}s, within the "
+            f"{_GIT_TIMEOUT_S}s metadata bound; the slow checkout did not run"
         )
         expect(page).to_have_url(_SESSION_PATH, timeout=60_000)
         worktree = repo.parent / f"{repo.name}-worktrees" / _BRANCH.replace("/", "-")
         deadline = time.monotonic() + _CHECKOUT_S
         while not (worktree / "slow.bin").exists() and time.monotonic() < deadline:
             time.sleep(2)
+        assert (worktree / "slow.bin").exists(), (
+            f"worktree checkout did not materialize {worktree / 'slow.bin'} within {_CHECKOUT_S}s"
+        )
         assert (worktree / "slow.bin").read_text() == "payload\n"
     finally:
         host.send_signal(signal.SIGTERM)

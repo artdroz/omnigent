@@ -553,6 +553,7 @@ def create_worktree(
                     worktree_path=str(worktree_path),
                     branch=branch_name,
                     delete_branch=not existing_branch,
+                    remove_timeout=GIT_CHECKOUT_TIMEOUT_S,
                 )
             except WorktreeError:
                 _logger.warning("Could not roll back worktree %s", worktree_path, exc_info=True)
@@ -595,6 +596,7 @@ def remove_worktree(
     worktree_path: str,
     branch: str | None = None,
     delete_branch: bool = False,
+    remove_timeout: float | None = None,
 ) -> None:
     """Remove a git worktree and optionally delete its branch.
 
@@ -610,6 +612,10 @@ def remove_worktree(
         deletion.
     :param delete_branch: When ``True``, run ``git branch -D`` on
         ``branch`` after removing the worktree directory.
+    :param remove_timeout: Bound for ``git worktree remove``. Removing a
+        fully populated large worktree can outlast the default metadata
+        bound, so callers rolling back such a worktree pass
+        :data:`GIT_CHECKOUT_TIMEOUT_S`. ``None`` uses the default.
     :raises WorktreeError: If the worktree path is missing/invalid, or
         a git command fails.
     """
@@ -626,6 +632,7 @@ def remove_worktree(
     remove_result = _run_git(
         ["worktree", "remove", "--force", root.stdout.strip()],
         cwd=main_repo,
+        timeout=remove_timeout,
     )
     if remove_result.returncode != 0:
         raise _git_error("git worktree remove failed", remove_result)

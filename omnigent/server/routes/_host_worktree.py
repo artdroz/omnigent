@@ -31,9 +31,12 @@ _logger = logging.getLogger(__name__)
 # surfaces instead of a generic server-side timeout.
 _WORKTREE_TIMEOUT_S: float = 150.0
 
-# Creating a worktree checks the repository out, which the host bounds far
-# more generously; keep the same margin above that bound.
-_WORKTREE_CREATE_TIMEOUT_S: float = GIT_CHECKOUT_TIMEOUT_S + 30.0
+# A create can run two size-scaling git commands back to back: a fallback
+# fetch to resolve the base ref, then the checkout that populates the
+# worktree. Each is bounded by GIT_CHECKOUT_TIMEOUT_S on the host, so the
+# server must outwait both (plus margin) or it abandons a still-running host
+# operation, leaving a half-created worktree and branch behind.
+_WORKTREE_CREATE_TIMEOUT_S: float = 2 * GIT_CHECKOUT_TIMEOUT_S + 30.0
 
 
 WORKTREE_ROOT_LABEL_KEY = "omnigent.git.worktree_root_sha256"

@@ -307,6 +307,21 @@ async def test_create_worktree_timeout_raises_unavailable(
     assert "did not respond" in exc.value.message
 
 
+async def test_create_worktree_server_budget_covers_fallback_fetch_plus_checkout() -> None:
+    """The create wait must outlast a fallback fetch *and* the checkout.
+
+    A single create can run two size-scaling git commands back to back: a
+    fallback ``git fetch`` to resolve the base ref, then the checkout that
+    populates the worktree. Each is bounded by ``GIT_CHECKOUT_TIMEOUT_S`` on
+    the host, so the server budget must cover both. Covering only one lets
+    the server abandon a still-running host operation, leaving a half-created
+    worktree and branch behind.
+    """
+    import omnigent.server.routes._host_worktree as hw_mod
+
+    assert hw_mod._WORKTREE_CREATE_TIMEOUT_S >= 2 * GIT_CHECKOUT_TIMEOUT_S
+
+
 async def test_create_worktree_outwaits_a_checkout_longer_than_the_short_bound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -318,8 +333,6 @@ async def test_create_worktree_outwaits_a_checkout_longer_than_the_short_bound(
     import omnigent.server.routes._host_worktree as hw_mod
 
     monkeypatch.setattr(hw_mod, "_WORKTREE_TIMEOUT_S", 0.05)
-    # Creating a worktree checks the repo out, so its bound is sized for
-    # that work, not the short metadata bound.
     assert hw_mod._WORKTREE_CREATE_TIMEOUT_S >= GIT_CHECKOUT_TIMEOUT_S
 
     registry = HostRegistry()
@@ -339,7 +352,7 @@ async def test_create_worktree_outwaits_a_checkout_longer_than_the_short_bound(
             if frame_text is None:
                 return
             frame = decode_host_frame(frame_text)
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(1.0)
             if isinstance(frame, HostCreateWorktreeFrame):
                 fut = conn.pending_create_worktrees.pop(frame.request_id, None)
                 if fut is not None and not fut.done():
@@ -404,8 +417,9 @@ async def test_create_worktree_fails_fast_when_host_disconnects_mid_request() ->
         )
     )
     # Wait until the proxy has registered its pending future, then drop
-    # the host as if the tunnel died mid-request.
-    while not conn.pending_create_worktrees:
+    # the host as if the tunnel died mid-request. Bail out if the create
+    # task fails first so a setup error surfaces instead of hanging.
+    while not conn.pending_create_worktrees and not create.done():
         await asyncio.sleep(0)
     registry.deregister("host_dropped")
 
