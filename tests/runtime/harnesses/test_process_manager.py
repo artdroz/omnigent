@@ -489,6 +489,8 @@ async def test_get_client_respawns_after_crash(
         original_pid = (await client.get("/pid")).json()["pid"]
         if response_id is not None:
             manager.mark_in_flight("conv_a", response_id)
+            assert await manager.get_client("conv_a", _TEST_HARNESS_NAME) is client
+            assert manager.has_active_turn("conv_a")
         os.kill(original_pid, signal.SIGKILL)
         # Wait for the OS to mark the process dead so the next
         # get_client's ``returncode`` check sees it.
@@ -503,6 +505,11 @@ async def test_get_client_respawns_after_crash(
         # crash detection is broken.
         assert new_pid != original_pid
         assert _pid_alive(new_pid)
+        assert not manager.has_active_turn("conv_a")
+        assert await manager.forward_cancel("conv_a") is False
+        manager._entries["conv_a"].last_used_at = time.monotonic() - 120.0
+        await manager.release("conv_a", only_if_idle_cutoff=time.monotonic() - 60.0)
+        assert "conv_a" not in manager._entries
         exits = [
             r for r in caplog.records if getattr(r, "event_name", None) == "harness_exit_detected"
         ]
@@ -514,6 +521,25 @@ async def test_get_client_respawns_after_crash(
             "returncode": -signal.SIGKILL,
             "tracked_response_id": response_id,
         }
+    finally:
+        await manager.shutdown()
+
+
+async def test_release_clears_marker_before_same_session_replacement(
+    manager: HarnessProcessManager,
+) -> None:
+    """An explicit retirement does not make a replacement look in-flight."""
+    await manager.start()
+    try:
+        await manager.get_client("conv_release", _TEST_HARNESS_NAME)
+        manager.mark_in_flight("conv_release", "resp_old")
+        await manager.release("conv_release")
+        assert not manager.has_active_turn("conv_release")
+
+        replacement = await manager.get_client("conv_release", _TEST_HARNESS_NAME)
+        assert replacement is not None
+        assert not manager.has_active_turn("conv_release")
+        assert await manager.forward_cancel("conv_release") is False
     finally:
         await manager.shutdown()
 
@@ -536,6 +562,7 @@ async def test_get_client_respawns_on_harness_change(
     try:
         client_first = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
         pid_first = (await client_first.get("/pid")).json()["pid"]
+        manager.mark_in_flight("conv_a", "resp_switch")
 
         # Same conversation, DIFFERENT harness → must respawn.
         client_second = await manager.get_client("conv_a", "test2")
@@ -545,6 +572,7 @@ async def test_get_client_respawns_on_harness_change(
         # subprocess and spawned a new one. Same PID would mean the switch
         # kept serving the old harness (the bug this branch fixes).
         assert pid_second != pid_first
+        assert not manager.has_active_turn("conv_a")
         assert _pid_alive(pid_second)
         # The original subprocess was terminated by the respawn's close.
         for _ in range(40):
@@ -1101,6 +1129,130 @@ async def test_orphan_sweep_preserves_live_omnigent_dirs(
         assert (sibling_dir / _AP_PID_FILE).exists()
     finally:
         await fresh.shutdown()
+
+
+@pytest.mark.posix_only
+async def test_orphan_sweep_survives_unreadable_tmp_parent(
+    short_tmp_parent: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Warn and continue startup when the configured parent cannot be listed."""
+    if os.geteuid() == 0:
+        pytest.skip("permission checks do not apply to root")
+    locked_parent = short_tmp_parent / "fp"
+    locked_parent.mkdir(mode=0o700)
+    (locked_parent / "ap-unreachable").mkdir(mode=0o700)
+    # Write+search without read: our own instance dir can be created,
+    # but the sweep cannot enumerate the configured shared parent.
+    locked_parent.chmod(0o333)
+    manager = HarnessProcessManager(tmp_parent=locked_parent)
+    try:
+        await manager.start()
+        assert any(
+            "cannot enumerate" in record.getMessage() and str(locked_parent) in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        locked_parent.chmod(0o700)
+        with contextlib.suppress(Exception):
+            await manager.shutdown()
+
+
+async def test_orphan_sweep_survives_tmp_parent_stat_error(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A tmp-parent stat race must not abort manager startup."""
+    real_exists = Path.exists
+    raised = False
+
+    def _racy_exists(self: Path) -> bool:
+        nonlocal raised
+        if self == short_tmp_parent and not raised:
+            raised = True
+            raise OSError("tmp parent changed during sweep")
+        return real_exists(self)
+
+    monkeypatch.setattr(Path, "exists", _racy_exists)
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    try:
+        await manager.start()
+        assert manager.instance_dir.exists()
+        assert any(
+            "cannot access" in record.getMessage() and str(short_tmp_parent) in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await manager.shutdown()
+
+
+@pytest.mark.posix_only
+async def test_orphan_sweep_skips_unreadable_sibling_and_still_sweeps(
+    short_tmp_parent: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Skip a mode-0000 sibling, remove a readable dead orphan, and retain a live one."""
+    if os.geteuid() == 0:
+        pytest.skip("permission checks do not apply to root")
+    inaccessible = short_tmp_parent / "ap-inaccessible"
+    inaccessible.mkdir(mode=0o700)
+    (inaccessible / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    inaccessible.chmod(0o000)
+
+    dead = short_tmp_parent / "ap-deadsibling"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+
+    live = short_tmp_parent / "ap-livesibling"
+    live.mkdir(mode=0o700)
+    (live / _AP_PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
+
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    try:
+        await manager.start()
+        assert inaccessible.exists(), "unreadable sibling must be skipped, not removed"
+        assert not dead.exists(), "readable dead orphan must still be swept"
+        assert live.exists(), "live sibling must remain untouched"
+        assert any(
+            "cannot inspect" in record.getMessage() and str(inaccessible) in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        inaccessible.chmod(0o700)
+        with contextlib.suppress(Exception):
+            await manager.shutdown()
+
+
+async def test_orphan_sweep_treats_vanishing_child_as_benign_race(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An injected is_dir race must not prevent cleanup of the next dead orphan."""
+    vanishing = short_tmp_parent / "ap-avanishing"
+    vanishing.mkdir(mode=0o700)
+    (vanishing / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    dead = short_tmp_parent / "ap-zzdead"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+
+    real_is_dir = Path.is_dir
+
+    def _racy_is_dir(self: Path, **kwargs: object) -> bool:
+        if self.name == "ap-avanishing":
+            raise FileNotFoundError(2, "vanished mid-sweep", str(self))
+        return real_is_dir(self, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "is_dir", _racy_is_dir)
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    try:
+        await manager.start()
+        assert not dead.exists(), "sweep must continue past the racy child"
+    finally:
+        monkeypatch.undo()
+        with contextlib.suppress(Exception):
+            await manager.shutdown()
 
 
 # ── Helper-level tests (small, fast) ───────────────────────────
