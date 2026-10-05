@@ -1,16 +1,5 @@
 """E2E regression: the Codex web skills menu must list shared ``~/.agents/skills``.
-
-A codex-family session's web composer menu is fed by ``GET /v1/skills``
-(``resolve_harness_skills`` → the Codex ``codex_host_skills`` provider), which
-draws from the same ``codex_skill_sources`` list the executor symlinks into
-``$CODEX_HOME/skills/``. The Codex CLI loads skills from ``~/.agents/skills``,
-but that list omitted it, so the menu dropped commands the terminal can run.
-
-The tests drive the real resolver (``HostSkillDiscovery`` →
-``resolve_harness_skills``) that feeds the composer menu, so they need no
-browser or live host: they fail on the broken build and pass once the shared
-dir joins the source list, including under a custom ``$CODEX_HOME``.
-"""
+It drives the real ``GET /v1/skills`` resolver in-process (no browser or live host)."""
 
 from __future__ import annotations
 
@@ -37,11 +26,7 @@ def _seed_skill(skills_dir: Path, name: str, description: str) -> None:
 
 
 def _menu_names(harness: str, workspace: Path) -> list[str]:
-    """Resolve the skill names the web composer menu would list for ``harness``.
-
-    Uses the in-process ``HostSkillDiscovery`` path behind ``GET /v1/skills``,
-    with a bundle fetch that must never fire for directory discovery.
-    """
+    """Resolve the skill names the web composer menu would list for ``harness``."""
 
     def unexpected_bundle(_: HostSkillsFrame) -> httpx.Response:
         raise AssertionError("Directory discovery must not fetch a session bundle")
@@ -57,15 +42,8 @@ def test_codex_web_menu_lists_shared_agents_skills(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The codex-family web menu must list the shared ``~/.agents/skills`` tier.
-
-    The user journey: the user home carries a skill under the Codex host dir
-    (``~/.codex/skills``) and another under the shared ``~/.agents/skills``; the
-    user opens the web composer's slash menu for a ``codex-native`` session. The
-    Codex CLI loads both, so the menu must list both. On the broken build the
-    menu omits the ``~/.agents/skills`` skill — exactly the reported "Codex
-    skills menu omits skills from ~/.agents/skills".
-    """
+    """A ``codex-native`` web menu lists both the ``~/.codex/skills`` host tier and a
+    skill under the shared ``~/.agents/skills``; the broken build drops the shared one."""
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
@@ -98,14 +76,8 @@ def test_codex_web_menu_shared_skills_survive_custom_codex_home(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A custom ``$CODEX_HOME`` moves the host dir but keeps the shared tier.
-
-    A native ``codex-native`` session honors ``$CODEX_HOME`` for its host dir,
-    so the menu reads the host skill from there instead of ``~/.codex``. The
-    shared ``~/.agents/skills`` dir lives under the user home, not the Codex
-    home, so moving ``$CODEX_HOME`` must not drop it. On the broken build the
-    menu still omits the shared skill regardless of ``$CODEX_HOME``.
-    """
+    """A custom ``$CODEX_HOME`` relocates the host tier but not the shared
+    ``~/.agents/skills`` tier, which lives under the user home and must still be listed."""
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setattr("pathlib.Path.home", lambda: home)

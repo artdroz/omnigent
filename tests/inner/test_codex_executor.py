@@ -3576,11 +3576,7 @@ def test_populate_codex_skills_from_bundle_sources_from_codex_home(tmp_path: Pat
 def test_populate_codex_skills_from_bundle_links_shared_agents_skills(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A ``~/.agents/skills`` skill is linked into ``<codex_home>/skills`` like a host skill.
-
-    The shared user dir is part of the same source list the menu reads, so a
-    skill the menu lists from there is also seeded for the Codex session.
-    """
+    """A ``~/.agents/skills`` skill is linked into ``<codex_home>/skills`` like a host skill."""
     from omnigent.inner.codex_executor import populate_codex_skills_from_bundle
 
     home = tmp_path / "home"
@@ -4916,12 +4912,8 @@ def test_codex_skill_sources_omits_absent_dirs(tmp_path: Path) -> None:
 
 
 def test_codex_skill_sources_appends_shared_agents_dir(tmp_path: Path) -> None:
-    """``<home>/.agents/skills`` follows the Codex skills dir under either Codex home.
-
-    The shared user dir lives under the user home, not the Codex home, so a
-    custom ``codex_home`` swaps only the middle source. An earlier source still
-    wins a name collision, so a Codex-dir skill shadows a shared one.
-    """
+    """``<home>/.agents/skills`` follows the Codex skills dir and stays under the user
+    home across a custom ``codex_home``; an earlier source wins a name collision."""
     from omnigent.inner.codex_executor import codex_skill_sources, select_codex_skill_dirs
 
     bundle = tmp_path / "bundle"

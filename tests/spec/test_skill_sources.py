@@ -257,13 +257,8 @@ def test_codex_native_and_sdk_agree_without_a_configured_codex_home(
 def test_codex_provider_surfaces_shared_agents_skills_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Codex surfaces skills from the shared ``~/.agents/skills`` user dir.
-
-    A skill saved under ``~/.agents/skills`` must appear for both codex harnesses
-    alongside the ``~/.codex/skills`` user-dir skills. Because the Codex source
-    list is shared with the executor that symlinks those roots into
-    ``$CODEX_HOME/skills/``, the shared dir would be runnable in the terminal too.
-    """
+    """A skill under the shared ``~/.agents/skills`` dir surfaces for both codex
+    harnesses alongside the ``~/.codex/skills`` user-dir skills."""
     home = tmp_path / "home"
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     _write_skill(home / ".codex" / "skills", "codex-host-skill")
