@@ -1,45 +1,21 @@
-"""E2E regression: a WHS 403 (gRPC ``PERMISSION_DENIED``) reaching the
-session-listing funnel must surface as a *handled* 403, not an unhandled 500.
+"""E2E regression: a WHS 403 (gRPC ``PERMISSION_DENIED``) on the session listing
+must surface as a handled 403, not an unhandled 500.
 
-The bug
-=======
-The workspace hierarchy service, reached through Barnacle's gRPC channel, can
-answer a listing request with a raw ``PERMISSION_DENIED`` whose details read
-``"Received http2 header with status: 403"``. That ``grpc.RpcError`` is not
-caught by any of the server's typed exception handlers
-(``omnigent/server/app.py`` registers handlers for ``OmnigentError``,
-``StatementError`` and a bare ``Exception`` catch-all only), so it lands in
-``_handle_unhandled_exception`` and the user gets
+In the Databricks embedding the conversation store lists sessions through the
+workspace hierarchy service over Barnacle's gRPC channel. When that service
+answers HTTP 403, the client raises ``grpc.RpcError`` with
+``StatusCode.PERMISSION_DENIED`` / ``"Received http2 header with status: 403"``
+from inside ``GET /v1/sessions`` -- the request the SPA sidebar issues on load.
+Unhandled, it reached the catch-all: ``500 internal_error`` for the client and
+"Failed to load: An internal error occurred." in the sidebar.
 
-    500 {"error": {"code": "internal_error", "message": "An internal error occurred."}}
+The real backend is Databricks-internal, so a real deny-all gRPC server stands
+in for it at the same boundary; the server, SPA and HTTP path are all real.
 
-with the traceback in the log and nothing naming the resource or a remedy. In
-the web SPA the sidebar session list renders "Failed to load: 500 Internal
-Server Error". The fix maps this class of gRPC ``PERMISSION_DENIED`` — matched
-structurally in the catch-all, so a vendored grpc matches too — to a handled
-403 (``ErrorCode.UPSTREAM_PERMISSION_DENIED``) instead.
+Run::
 
-The reproduction environment
-============================
-The real trigger lives in Databricks-internal code (``whs_client.list_children``
--> ``ListTreeNodeChildren`` via ``barnacle_grpc_channel``), which is not present
-in this repo. This test stands in for it faithfully at the same boundary: a
-**real** deny-all gRPC server that ``abort``\\s every call with
-``StatusCode.PERMISSION_DENIED`` / ``"Received http2 header with status: 403"``,
-wired into the conversation store's listing funnel so a genuine
-``grpc._channel._InactiveRpcError`` (byte-identical to the ticket's log) is
-raised from inside ``GET /v1/sessions`` -- the request the SPA sidebar issues on
-load. The server, SPA and HTTP path are all real; only the workspace-hierarchy
-backend is the stand-in.
-
-What this asserts
-=================
-The tight fix target is the HTTP contract: ``GET /v1/sessions`` must return a
-handled ``403 upstream_permission_denied`` rather than the unhandled
-``500 internal_error``. This test fails today (it observes the 500) and passes
-once the gRPC ``PERMISSION_DENIED`` is mapped to a handled 403. The browser drive renders the
-real user-visible failure (the sidebar's "Failed to load" state) so the journey
-can be filmed.
+    .venv/bin/python -m pytest \\
+        tests/e2e_ui/sessions/test_whs_permission_denied_maps_to_403.py --ui-skip-build -v
 """
 
 from __future__ import annotations
@@ -126,14 +102,11 @@ def _wait_until_serving(base_url: str, timeout: float = 30.0) -> None:
 def whs_403_server(built_spa: None, tmp_path: Path) -> Iterator[str]:
     """Run the real Omnigent app whose session listing hits a WHS 403.
 
-    A deny-all gRPC backend stands in for the workspace hierarchy service
-    behind Barnacle. The conversation store's ``list_conversations`` -- the
-    funnel every ``GET /v1/sessions`` query goes through -- calls that backend,
-    so a genuine ``grpc._channel._InactiveRpcError`` (``PERMISSION_DENIED`` /
-    ``"Received http2 header with status: 403"``) is raised inside the request,
-    exactly as ``whs_client.list_children`` -> ``ListTreeNodeChildren`` does in
-    production. The SPA is served from the built bundle so the browser can drive
-    the real sidebar.
+    A deny-all gRPC backend stands in for the workspace hierarchy service: the
+    store's ``list_conversations`` -- the funnel behind ``GET /v1/sessions`` --
+    calls it, so a genuine ``grpc._channel._InactiveRpcError``
+    (``PERMISSION_DENIED`` / ``"Received http2 header with status: 403"``) is
+    raised inside the request.
 
     :param built_spa: Ensures the web SPA bundle is present on disk.
     :param tmp_path: Per-test scratch dir for the sqlite DB / artifacts.
@@ -206,17 +179,14 @@ def test_whs_permission_denied_is_handled_not_500(
 ) -> None:
     """A WHS gRPC ``PERMISSION_DENIED`` must surface as a handled 403, not a 500.
 
-    Drives the real SPA to render the user-visible failure (the sidebar's
-    "Failed to load" state), checks that the failure names the denied resource
-    and a remedy, then pins the fix target on the HTTP contract:
-    ``GET /v1/sessions`` must answer ``403 upstream_permission_denied`` instead
-    of the unhandled ``500 internal_error`` the bug produces.
+    Opens the real SPA, waits for the sidebar's failure line, checks that it
+    names the denied resource and a remedy, then pins the HTTP contract:
+    ``GET /v1/sessions`` answers ``403 upstream_permission_denied`` rather than
+    ``500 internal_error``.
 
-    :param request: Opens the Playwright ``page`` fixture only once the server
-        is up, so a recording starts at the user's first navigation instead of
-        on a blank page while the server boots.
-    :param whs_403_server: Base URL of the app whose session listing hits the
-        WHS 403 stand-in.
+    :param request: Opens the ``page`` fixture only once the server is up, so a
+        recording starts at the first navigation rather than on a blank page.
+    :param whs_403_server: Base URL of the app whose listing hits the WHS 403.
     """
     page: Page = request.getfixturevalue("page")
 
