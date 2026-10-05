@@ -506,14 +506,12 @@ def _cursor_restore_escape(meta: _PaneMetadata | None) -> bytes:
 
 
 async def _set_shared_window_size_largest(tmux: str, socket_path: str, tmux_target: str) -> None:
-    """Keep the shared tmux window from shrinking to a narrower owner client.
+    """Max the shared window to its widest owner so a phone can't shrink the desktop.
 
-    The default ``window-size latest`` lets whichever owner attached last win, so
-    the same session opened on a phone shrinks every client's pane. ``largest``
-    instead maxes columns and rows independently across size-contributing clients,
-    keeping the desktop's width (a taller client can leave rows below the fold).
-    Read-only viewers are already excluded via ``ignore-size``; best-effort, since
-    a tmux that rejects the option keeps the previous behavior.
+    tmux's default ``window-size latest`` tracks whichever owner attached last;
+    ``largest`` maxes columns and rows across size-contributing clients instead
+    (read-only viewers already use ``ignore-size``). Best-effort: a tmux that
+    rejects the option keeps the previous behavior.
     """
     try:
         proc = await asyncio.create_subprocess_exec(

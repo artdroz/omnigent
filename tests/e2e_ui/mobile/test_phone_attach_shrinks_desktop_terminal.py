@@ -8,17 +8,14 @@ how wide the TUI is actually drawn.
 
 from __future__ import annotations
 
-import io
 import json
 import re
 import time
-from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pyte
 import pytest
-from PIL import Image
 from playwright.sync_api import Browser, BrowserContext, Page, WebSocket, expect
 
 from tests.e2e_ui.messages.test_message_render_parity import _select_view_mode
@@ -101,7 +98,15 @@ def _drawn_frame_width(lines: list[str]) -> int:
     return max(widths, default=0)
 
 
-def _wait_for_frame(observer: _AttachObserver, *, min_width: int, timeout_s: float) -> int:
+def _wait_for_frame(
+    page: Page, observer: _AttachObserver, *, min_width: int, timeout_s: float
+) -> int:
+    """Pump the page until the TUI has drawn at least ``min_width`` columns.
+
+    The sync Playwright API only dispatches the attach-WebSocket callbacks while
+    the main greenlet is inside a Playwright call, so the wait yields through
+    ``page.wait_for_timeout`` (not ``time.sleep``) to let received frames arrive.
+    """
     deadline = time.monotonic() + timeout_s
     width = 0
     while time.monotonic() < deadline:
@@ -109,57 +114,34 @@ def _wait_for_frame(observer: _AttachObserver, *, min_width: int, timeout_s: flo
             width = _drawn_frame_width(observer.screen_lines())
             if width >= min_width:
                 return width
-        time.sleep(0.5)
+        page.wait_for_timeout(500)
     return width
 
 
-def _wait_for_frame_change(observer: _AttachObserver, *, previous: int, timeout_s: float) -> int:
-    """Wait for the drawn width to change and settle on two consecutive equal reads.
+def _min_frame_width_over(page: Page, observer: _AttachObserver, *, settle_s: float) -> int:
+    """Smallest TUI frame width seen while pumping the desktop for ``settle_s``.
 
-    Bytes stream in continuously, so a single poll can land mid-redraw; requiring
-    the changed width to repeat avoids returning a transient, partially drawn frame.
+    Proving the pane did *not* shrink needs a bounded wait: a regression resizes
+    the shared window the moment the phone attaches, so we sample across the
+    settle (catching a shrink even if it later recovers) rather than reading once.
+    ``page.wait_for_timeout`` yields so received frames dispatch in the sync API.
     """
-    deadline = time.monotonic() + timeout_s
-    last = previous
+    deadline = time.monotonic() + settle_s
+    widths = [_drawn_frame_width(observer.screen_lines())]
     while time.monotonic() < deadline:
-        width = _drawn_frame_width(observer.screen_lines())
-        if width != previous and width == last:
-            return width
-        last = width
-        time.sleep(0.5)
-    return last
+        page.wait_for_timeout(250)
+        widths.append(_drawn_frame_width(observer.screen_lines()))
+    return min(widths)
 
 
-def _wait_for_resize(observer: _AttachObserver, *, timeout_s: float) -> None:
-    """Wait until the tab has recorded its initial resize frame (sent async on WS open)."""
+def _wait_for_resize(page: Page, observer: _AttachObserver, *, timeout_s: float) -> None:
+    """Wait until the tab records its initial resize frame (sent async on WS open)."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if observer.resizes:
             return
-        time.sleep(0.1)
-
-
-def _painted_extent_px(page: Page, path: Path) -> tuple[int, int]:
-    """Rightmost painted pixel column of the desktop pane vs. its full width.
-
-    A viewport-clipped ``page.screenshot`` is safe on a recorded page (the
-    suite's conftest crops a full-viewport capture). Saves the PNG for review.
-    """
-    rect = page.locator(f"{_MAIN_TERMINAL} .xterm-screen").bounding_box()
-    assert rect is not None
-    clip = {k: int(rect[k]) for k in ("x", "y", "width", "height")}
-    png = page.screenshot(path=str(path), clip=clip)
-    image = Image.open(io.BytesIO(png)).convert("RGB")
-    background = Counter(image.getdata()).most_common(1)[0][0]
-    width, height = image.size
-    pixels = image.load()
-    rightmost = 0
-    for x in range(width):
-        for y in range(height):
-            if sum(abs(a - b) for a, b in zip(pixels[x, y], background, strict=True)) > 60:
-                rightmost = x
-                break
-    return rightmost, width
+        page.wait_for_timeout(100)
+    raise TimeoutError(f"attach WebSocket sent no resize frame within {timeout_s:.0f}s")
 
 
 def _show_terminal_view(page: Page) -> None:
@@ -191,7 +173,7 @@ def _open_session_terminal(context: BrowserContext, url: str, observer: _AttachO
     )
     # The resize frame is delivered asynchronously over CDP, so wait for the
     # observer to record it before callers read ``cols_rows``.
-    _wait_for_resize(observer, timeout_s=_SETTLE_TIMEOUT_S)
+    _wait_for_resize(page, observer, timeout_s=_SETTLE_TIMEOUT_S)
     return page
 
 
@@ -219,12 +201,14 @@ def test_phone_attach_keeps_desktop_terminal_pane_width(
     try:
         desktop_page = _open_session_terminal(desktop, url, desktop_obs)
         desktop_cols, _ = desktop_obs.cols_rows
-        baseline = _wait_for_frame(desktop_obs, min_width=int(desktop_cols * 0.8), timeout_s=60)
+        baseline = _wait_for_frame(
+            desktop_page, desktop_obs, min_width=int(desktop_cols * 0.8), timeout_s=60
+        )
         _dump(artifacts / "desktop-before-phone.txt", desktop_obs.screen_lines())
-        baseline_px = _painted_extent_px(desktop_page, artifacts / "desktop-before-phone.png")
+        desktop_page.screenshot(path=str(artifacts / "desktop-before-phone.png"))
         print(
             f"[shared-pane] desktop attach read_only={desktop_obs.read_only} "
-            f"cols={desktop_cols} drawn_frame_width={baseline} painted_px={baseline_px}"
+            f"cols={desktop_cols} drawn_frame_width={baseline}"
         )
         assert desktop_obs.read_only is False
         assert baseline >= desktop_cols * 0.8, "Claude TUI never drew a full-width frame"
@@ -242,15 +226,10 @@ def test_phone_attach_keeps_desktop_terminal_pane_width(
         assert phone_obs.read_only is False
         assert phone_cols < desktop_cols * 0.5
 
-        with_phone = _wait_for_frame_change(
-            desktop_obs, previous=baseline, timeout_s=_SETTLE_TIMEOUT_S
-        )
+        with_phone = _min_frame_width_over(desktop_page, desktop_obs, settle_s=_SETTLE_TIMEOUT_S)
         _dump(artifacts / "desktop-with-phone.txt", desktop_obs.screen_lines())
-        with_phone_px = _painted_extent_px(desktop_page, artifacts / "desktop-with-phone.png")
-        print(
-            f"[shared-pane] desktop while phone attached: drawn_frame_width={with_phone} "
-            f"painted_px={with_phone_px}"
-        )
+        desktop_page.screenshot(path=str(artifacts / "desktop-with-phone.png"))
+        print(f"[shared-pane] desktop while phone attached: min drawn_frame_width={with_phone}")
         assert with_phone >= baseline * 0.9, (
             f"desktop pane shrank from {baseline} to {with_phone} columns while a "
             f"{phone_cols}-column phone was attached"
@@ -258,15 +237,10 @@ def test_phone_attach_keeps_desktop_terminal_pane_width(
 
         phone.close()
         phone = None
-        after_close = _wait_for_frame_change(
-            desktop_obs, previous=with_phone, timeout_s=_SETTLE_TIMEOUT_S
-        )
+        after_close = _min_frame_width_over(desktop_page, desktop_obs, settle_s=_SETTLE_TIMEOUT_S)
         _dump(artifacts / "desktop-after-phone-closed.txt", desktop_obs.screen_lines())
-        after_px = _painted_extent_px(desktop_page, artifacts / "desktop-after-phone-closed.png")
-        print(
-            f"[shared-pane] desktop after phone closed: drawn_frame_width={after_close} "
-            f"painted_px={after_px}"
-        )
+        desktop_page.screenshot(path=str(artifacts / "desktop-after-phone-closed.png"))
+        print(f"[shared-pane] desktop after phone closed: min drawn_frame_width={after_close}")
         assert after_close >= baseline * 0.9, (
             f"desktop pane did not recover after the phone closed: "
             f"{after_close} vs baseline {baseline}"

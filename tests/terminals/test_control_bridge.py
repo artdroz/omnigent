@@ -1197,9 +1197,10 @@ async def _tmux_client_widths(sock: Path) -> list[int]:
         "-F",
         "#{client_width}",
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
     )
-    out, _ = await proc.communicate()
+    out, err = await proc.communicate()
+    assert proc.returncode == 0, err.decode()
     return [int(w) for w in out.decode().split() if w.strip().isdigit()]
 
 
@@ -1281,3 +1282,58 @@ async def test_second_interactive_client_does_not_shrink_first_clients_pane() ->
             with contextlib.suppress(asyncio.CancelledError):
                 await phone_task
         await _kill_and_join(sock, desktop_task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_attach_continues_when_window_size_option_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tmux that rejects ``window-size`` still attaches and streams I/O.
+
+    The pane-width guard is best-effort: ``_set_shared_window_size_largest``
+    swallows a non-zero ``set-window-option`` exit, so an older tmux keeps the
+    previous behavior instead of breaking the attach.
+    """
+    real_tmux = shutil.which("tmux")
+    assert real_tmux
+    # Wrapper tmux: fail any ``window-size`` option, exec the real binary for
+    # every other command so the control-mode attach behaves normally.
+    wrapper = tmp_path / "tmux"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        'for arg in "$@"; do\n'
+        '  if [ "$arg" = "window-size" ]; then\n'
+        "    exit 1\n"
+        "  fi\n"
+        "done\n"
+        f'exec {shlex.quote(real_tmux)} "$@"\n'
+    )
+    wrapper.chmod(0o755)
+
+    # `cat` echoes input to the pane (-> %output); the printf lands pre-attach
+    # so it can only reach the browser via the capture-pane seed.
+    sock, target = await _new_private_tmux("printf 'SEEDED-LINE\\n'; cat")
+    await asyncio.sleep(0.3)
+    monkeypatch.setattr("omnigent.terminals.control_bridge.shutil.which", lambda _: str(wrapper))
+
+    ws = _FakeWebSocket(
+        inbound=[
+            {"type": "websocket.receive", "text": '{"type":"resize","cols":100,"rows":30}'},
+            {"type": "websocket.receive", "bytes": b"typed-input\r"},
+        ]
+    )
+
+    async def _run() -> None:
+        await bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+
+    task = asyncio.create_task(_run())
+    await asyncio.sleep(1.2)
+    try:
+        joined = b"".join(ws.sent)
+        assert b"SEEDED-LINE" in joined, "attach seed failed when window-size was rejected"
+        assert b"typed-input" in joined, "input echo failed when window-size was rejected"
+    finally:
+        await _kill_and_join(sock, task)
