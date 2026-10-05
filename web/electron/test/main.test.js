@@ -1160,12 +1160,12 @@ describe("Arca shutdown warning wiring", () => {
   });
 
   it("shows the final warning and extends overnight", async (t) => {
-    const shutdownAt = soon();
+    const shutdownAt = soon(mondayEvening);
     const h = loadNavigationHarness({
       serverUrl: workspace,
       databricksMode: "browser",
       arcaPath,
-      arcaWatchNow: mondayNoon,
+      arcaWatchNow: mondayEvening,
       arcaStatus: { ok: true, state: "running", shutdownAt },
       dialogResponse: { response: 0, checkboxChecked: false },
       focusedWindow: true,
