@@ -11,14 +11,24 @@ const {
   sameServer,
 } = require("../src/arcaPreview");
 
-function child() {
+function child({ exitOnKill = true } = {}) {
   const value = new EventEmitter();
   value.stdout = new EventEmitter();
   value.stderr = new EventEmitter();
   value.stderr.resume = () => (value.stderr.resumed = true);
   value.killed = false;
-  value.kill = () => {
+  value.exitCode = null;
+  value.killSignals = [];
+  value.on("exit", (code) => {
+    value.exitCode = code;
+  });
+  value.kill = (signal) => {
     value.killed = true;
+    value.killSignals.push(signal);
+    if (exitOnKill && value.exitCode == null) {
+      value.signalCode = signal;
+      value.emit("exit", null, signal);
+    }
   };
   return value;
 }
@@ -173,6 +183,7 @@ describe("Arca preview manager", () => {
       fake.children[fake.calls.findIndex((call) => call.args.includes("-M"))].stderr.resumed,
       true,
     );
+    await Promise.all([first.release(), second.release()]);
   });
 
   it("bounds an unresponsive mux exit before killing the master and removing its socket", async () => {
@@ -183,7 +194,7 @@ describe("Arca preview manager", () => {
       resolveArcaPathFn: () => "/arca",
       spawnFn: (file, args) => {
         if (args.includes("-O") && args.includes("exit")) {
-          exitChild = child();
+          exitChild = child({ exitOnKill: false });
           return exitChild;
         }
         return fake.spawn(file, args);
@@ -194,6 +205,7 @@ describe("Arca preview manager", () => {
         unlinked = true;
       },
       shutdownTimeoutMs: 5,
+      terminationGraceMs: 5,
     });
     const owned = await manager.prepare({
       conversationId: "bounded-exit",
@@ -204,8 +216,99 @@ describe("Arca preview manager", () => {
     await owned.release();
     const masterIndex = fake.calls.findIndex((call) => call.args.includes("-M"));
     assert.equal(exitChild.killed, true);
+    assert.deepEqual(exitChild.killSignals, ["SIGTERM", "SIGKILL"]);
     assert.equal(fake.children[masterIndex].killed, true);
     assert.equal(unlinked, true);
+  });
+
+  it("waits for an in-flight shutdown before rebinding a replacement", async () => {
+    const fake = successfulSpawner();
+    let delayedExit;
+    const manager = createArcaPreviewManager({
+      resolveArcaPathFn: () => "/arca",
+      spawnFn: (file, args) => {
+        if (!delayedExit && args.includes("-O") && args.includes("exit")) {
+          delayedExit = child();
+          return delayedExit;
+        }
+        return fake.spawn(file, args);
+      },
+      socketReady: () => true,
+      terminationGraceMs: 5,
+    });
+    await manager.prepare({
+      conversationId: "replace",
+      url: "http://localhost:5173",
+      hostId: "host_arca",
+      serverUrl: "https://srv.example.com",
+    });
+    const replacement = manager.prepare({
+      conversationId: "replace",
+      url: "http://127.0.0.1:5173",
+      hostId: "host_arca",
+      serverUrl: "https://srv.example.com",
+    });
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    assert.equal(fake.calls.filter((call) => call.args.includes("status")).length, 1);
+    delayedExit.emit("exit", 0);
+    const owned = await replacement;
+    assert.equal(fake.calls.filter((call) => call.args.includes("status")).length, 2);
+    await owned.release();
+  });
+
+  it("keeps released and pending work in shutdownAll until cleanup settles", async () => {
+    const fake = successfulSpawner();
+    let delayedExit;
+    const manager = createArcaPreviewManager({
+      resolveArcaPathFn: () => "/arca",
+      spawnFn: (file, args) => {
+        if (!delayedExit && args.includes("-O") && args.includes("exit")) {
+          delayedExit = child();
+          return delayedExit;
+        }
+        return fake.spawn(file, args);
+      },
+      socketReady: () => true,
+      terminationGraceMs: 5,
+    });
+    const owned = await manager.prepare({
+      conversationId: "released",
+      url: "http://localhost:5173",
+      hostId: "host_arca",
+      serverUrl: "https://srv.example.com",
+    });
+    const firstRelease = owned.release();
+    assert.equal(manager.release("released"), firstRelease);
+    let settled = false;
+    const all = manager.shutdownAll().then(() => (settled = true));
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    assert.equal(settled, false);
+    delayedExit.emit("exit", 0);
+    await all;
+    assert.equal(settled, true);
+
+    const pendingChild = child({ exitOnKill: false });
+    const pendingManager = createArcaPreviewManager({
+      resolveArcaPathFn: () => "/arca",
+      spawnFn: () => pendingChild,
+      terminationGraceMs: 5,
+    });
+    const attempt = pendingManager.prepare({
+      conversationId: "pending",
+      url: "http://localhost:7331",
+      hostId: "host_arca",
+      serverUrl: "https://srv.example.com",
+    });
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    await pendingManager.shutdownAll();
+    await assert.rejects(attempt, /cancelled|superseded/);
+    assert.deepEqual(pendingChild.killSignals, ["SIGTERM", "SIGKILL"]);
   });
 
   it("rejects a different, offline, or unknown requesting host", async () => {
@@ -317,8 +420,7 @@ describe("Arca preview manager", () => {
       serverUrl: "https://srv.example.com",
     });
     await manager.prepare({ conversationId: "a", url: "https://example.com" });
-    assert.equal(pending.killed, true);
-    pending.emit("exit", null);
+    assert.equal(calls, 0);
     await assert.rejects(attempt, /cancelled|superseded/);
 
     const fake = successfulSpawner();
@@ -442,6 +544,6 @@ describe("Arca preview manager", () => {
       }),
       /Arca preview exited \(9\)/,
     );
-    assert.equal(master.killed, true);
+    assert.equal(master.killed, false);
   });
 });

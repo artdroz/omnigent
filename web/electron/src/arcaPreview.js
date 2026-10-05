@@ -73,6 +73,57 @@ function terminate(child) {
   timer.unref?.();
 }
 
+function terminateAndWait(child, graceMs) {
+  if (!child || child.exitCode != null || child.signalCode != null) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.removeListener?.("exit", finish);
+      child.removeListener?.("error", finish);
+      resolve();
+    };
+    const signal = (name) => {
+      try {
+        if (child.pid && child.spawnargs) process.kill(-child.pid, name);
+        else child.kill(name);
+      } catch {
+        finish();
+      }
+    };
+    child.once?.("exit", finish);
+    child.once?.("error", finish);
+    signal("SIGTERM");
+    if (settled) return;
+    timer = setTimeout(() => {
+      signal("SIGKILL");
+      finish();
+    }, graceMs);
+  });
+}
+
+function waitForChildExit(child, timeoutMs) {
+  if (!child || child.exitCode != null || child.signalCode != null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (exited) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.removeListener?.("exit", onExit);
+      child.removeListener?.("error", onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    child.once?.("exit", onExit);
+    child.once?.("error", onExit);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+  });
+}
+
 function run(file, args, { spawnFn, deadline, onChild }) {
   return new Promise((resolve, reject) => {
     let child;
@@ -96,8 +147,8 @@ function run(file, args, { spawnFn, deadline, onChild }) {
     }
     timer = setTimeout(
       () => {
-        terminate(child);
         finish(new Error("timed out preparing the Arca localhost preview"));
+        terminate(child);
       },
       Math.max(0, deadline - Date.now()),
     );
@@ -158,6 +209,7 @@ function createArcaPreviewManager({
   unlinkSocket = (socketPath) => fs.rmSync(socketPath, { force: true }),
   removeSocketDir = (socketDir) => fs.rmSync(socketDir, { recursive: true, force: true }),
   shutdownTimeoutMs = 500,
+  terminationGraceMs = 1_000,
   socketPathFn = () => {
     const socketDir = fs.mkdtempSync(path.join("/tmp", "oa-"));
     return { socketPath: path.join(socketDir, "s"), socketDir };
@@ -165,6 +217,8 @@ function createArcaPreviewManager({
   onExit = () => {},
 } = {}) {
   const owned = new Map();
+  const shuttingDown = new Set();
+  const latestShutdown = new Map();
   let sequence = 0;
 
   function cleanupSocket(state) {
@@ -180,54 +234,56 @@ function createArcaPreviewManager({
     }
   }
 
+  function shutdownState(conversationId, state) {
+    if (state.shutdownPromise) return state.shutdownPromise;
+    if (owned.get(conversationId) === state) owned.delete(conversationId);
+    state.cancel?.();
+    const shutdown = (async () => {
+      let control = null;
+      if (state.master && !state.masterExited && state.socketPath) {
+        try {
+          // Keep the socket reachable until the exact owned mux master has
+          // acknowledged exit or the bounded fallback takes ownership.
+          control = spawnFn(
+            state.arcaPath,
+            ["ssh", "-F", "/dev/null", "-S", state.socketPath, "-O", "exit"],
+            { stdio: ["ignore", "ignore", "ignore"], detached: true },
+          );
+        } catch {
+          /* fall through to process-group termination */
+        }
+      }
+      if (control && !(await waitForChildExit(control, shutdownTimeoutMs))) {
+        await terminateAndWait(control, terminationGraceMs);
+      }
+      const processes = [...new Set([state.child, state.master].filter(Boolean))];
+      await Promise.all(processes.map((child) => terminateAndWait(child, terminationGraceMs)));
+      cleanupSocket(state);
+    })();
+    state.shutdownPromise = shutdown;
+    shuttingDown.add(shutdown);
+    latestShutdown.set(conversationId, shutdown);
+    shutdown.finally(() => {
+      shuttingDown.delete(shutdown);
+      if (latestShutdown.get(conversationId) === shutdown) latestShutdown.delete(conversationId);
+    });
+    return shutdown;
+  }
+
   function release(conversationId, token) {
     const current = owned.get(conversationId);
-    if (!current || (token && current.token !== token)) return null;
-    owned.delete(conversationId);
-    current.cancel?.();
-    let control = null;
-    if (current.master && !current.masterExited && current.socketPath) {
-      try {
-        // Keep the socket reachable until the exact owned mux master has been
-        // asked to exit; the timer below bounds wrapper incompatibility.
-        control = spawnFn(
-          current.arcaPath,
-          ["ssh", "-F", "/dev/null", "-S", current.socketPath, "-O", "exit"],
-          { stdio: ["ignore", "ignore", "ignore"], detached: true },
-        );
-      } catch {
-        /* fall through to process-group termination */
-      }
+    if (current && (!token || current.token === token)) {
+      return shutdownState(conversationId, current);
     }
-    if (!control) {
-      terminate(current.child);
-      if (current.master !== current.child) terminate(current.master);
-      cleanupSocket(current);
-      return null;
-    }
-    return new Promise((resolve) => {
-      let settled = false;
-      const finish = (timedOut = false) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (timedOut) terminate(control);
-        terminate(current.child);
-        if (current.master !== current.child) terminate(current.master);
-        cleanupSocket(current);
-        resolve();
-      };
-      const timer = setTimeout(() => finish(true), shutdownTimeoutMs);
-      control.once("error", () => finish());
-      control.once("exit", () => finish());
-    });
+    return latestShutdown.get(conversationId) || null;
   }
 
   async function prepare({ conversationId, url, hostId, serverUrl, deadline: requestedDeadline }) {
     const preview = loopbackPreview(url);
-    const priorRelease = release(conversationId);
-    if (priorRelease) await priorRelease;
-    if (!preview) return null;
+    if (!preview) {
+      await release(conversationId);
+      return null;
+    }
     if (typeof hostId !== "string" || !hostId)
       throw new Error("the requesting session's host is unknown");
     const arcaPath = resolveArcaPathFn();
@@ -244,8 +300,11 @@ function createArcaPreviewManager({
       cancel: null,
       socketPath: null,
       socketDir: null,
+      shutdownPromise: null,
     };
+    const previous = owned.get(conversationId);
     owned.set(conversationId, state);
+    if (previous) shutdownState(conversationId, previous);
     const onChild = (child, cancel) => {
       if (owned.get(conversationId)?.token !== token) {
         terminate(child);
@@ -256,6 +315,10 @@ function createArcaPreviewManager({
       state.cancel = cancel;
     };
     try {
+      await Promise.allSettled(
+        [...shuttingDown].filter((shutdown) => shutdown !== state.shutdownPromise),
+      );
+      if (owned.get(conversationId)?.token !== token) throw new Error("preview was superseded");
       await verifyArcaHost({ arcaPath, serverUrl, hostId, spawnFn, deadline, onChild });
       if (owned.get(conversationId)?.token !== token) throw new Error("preview was superseded");
       const socket = socketPathFn();
@@ -283,15 +346,16 @@ function createArcaPreviewManager({
       state.child = master;
       state.master = master;
       let rejectMaster;
+      let preparing = true;
       const masterExit = new Promise((_, reject) => {
         rejectMaster = reject;
         master.on("error", (error) => {
           state.masterExited = true;
-          reject(error);
+          if (preparing) reject(error);
         });
         master.on("exit", (code) => {
           state.masterExited = true;
-          reject(new Error(`Arca preview exited (${code ?? "unknown"})`));
+          if (preparing) reject(new Error(`Arca preview exited (${code ?? "unknown"})`));
         });
       });
       state.cancel = () => rejectMaster(new Error("preview was cancelled"));
@@ -340,6 +404,7 @@ function createArcaPreviewManager({
       }
       state.child = master;
       state.cancel = null;
+      preparing = false;
       master.on("exit", () => {
         if (owned.get(conversationId)?.token !== token) return;
         owned.delete(conversationId);
@@ -347,14 +412,22 @@ function createArcaPreviewManager({
         if (state.socketDir) removeSocketDir(state.socketDir);
         onExit(conversationId);
       });
-      return { origin: preview.origin, release: () => release(conversationId, token) };
+      return {
+        origin: preview.origin,
+        release: () => shutdownState(conversationId, state),
+      };
     } catch (error) {
       await release(conversationId, token);
       throw error;
     }
   }
 
-  return { prepare, release: (conversationId) => release(conversationId) };
+  async function shutdownAll() {
+    for (const [conversationId, state] of [...owned]) shutdownState(conversationId, state);
+    await Promise.allSettled([...shuttingDown]);
+  }
+
+  return { prepare, release: (conversationId) => release(conversationId), shutdownAll };
 }
 
 module.exports = {

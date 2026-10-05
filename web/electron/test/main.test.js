@@ -41,6 +41,7 @@ function loadNavigationHarness({
   ensureSession = async (_ses, origin) => origin,
   expandWorkspace = async (url) => url,
   realBrowserRegistry = false,
+  serverShutdown = async () => {},
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -50,7 +51,15 @@ function loadNavigationHarness({
     );
   }
   const listeners = new Map();
-  const calls = { loadFile: [], loadURL: [], auth: [], manifests: [], progress: [], reloads: 0 };
+  const calls = {
+    loadFile: [],
+    loadURL: [],
+    auth: [],
+    manifests: [],
+    progress: [],
+    reloads: 0,
+    quits: 0,
+  };
   const pickers = [];
   const ipc = new Map();
   const webRequest = {};
@@ -146,7 +155,7 @@ function loadNavigationHarness({
       requestSingleInstanceLock: () => true,
       on: (eventName, listener) => appEvents.set(eventName, listener),
       whenReady: () => ({ then: () => {} }),
-      quit: () => {},
+      quit: () => (calls.quits += 1),
       exit: () => {},
       isReady: () => false,
       setAsDefaultProtocolClient: () => {},
@@ -278,7 +287,7 @@ function loadNavigationHarness({
       getCliStatus: () => ({ installed: false }),
     },
     "./server_manager": {
-      shutdown: async () => {},
+      shutdown: serverShutdown,
       onChange: () => {},
       ensureServerAuth: async () => ({ ok: true }),
       ensureHostConnected: async () => ({ ok: true }),
@@ -292,7 +301,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { createWindow, createBrowserRegistryForWindow, loadServerUrl, pinWindow, matchesAgentPreviewOwner, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; } };";
+    "\nmodule.exports.testApi = { createWindow, createBrowserRegistryForWindow, loadServerUrl, pinWindow, matchesAgentPreviewOwner, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, trackPreviewShutdown, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; } };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -314,6 +323,7 @@ function loadNavigationHarness({
       return mainRequire(specifier);
     },
     setInterval,
+    setImmediate,
     setTimeout,
   };
 
@@ -330,6 +340,7 @@ function loadNavigationHarness({
 
   return {
     api,
+    appEvents,
     calls,
     bannerCalls,
     browserRegistryCalls,
@@ -1523,6 +1534,59 @@ describe("browser-view teardown on server change (src/main.js)", () => {
       liveCode,
       /app\.on\("before-quit"[\s\S]{0,500}browserRegistry\?\.closeAll\("app-quit"\)[\s\S]{0,700}app\.exit\(0\)/,
     );
+  });
+
+  it("waits for preview cleanup before reissuing app.quit", async () => {
+    const harness = loadNavigationHarness();
+    let resolvePreview;
+    let closes = 0;
+    const previewCleanup = new Promise((resolve) => {
+      resolvePreview = resolve;
+    });
+    harness.api.windows.get(harness.win).browserRegistry = {
+      closeAll: () => {
+        closes += 1;
+        return previewCleanup;
+      },
+    };
+    const beforeQuit = harness.appEvents.get("before-quit");
+    let prevented = 0;
+    const event = { preventDefault: () => (prevented += 1) };
+    beforeQuit(event);
+    beforeQuit(event);
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    assert.equal(prevented, 2);
+    assert.equal(closes, 1);
+    assert.equal(harness.calls.quits, 0);
+    resolvePreview();
+    await new Promise((resolve) => {
+      setImmediate(() => setImmediate(resolve));
+    });
+    assert.equal(harness.calls.quits, 1);
+    harness.cleanup();
+  });
+
+  it("waits for cleanup retained after its window entry is gone", async () => {
+    const harness = loadNavigationHarness();
+    let resolvePreview;
+    const previewCleanup = new Promise((resolve) => {
+      resolvePreview = resolve;
+    });
+    harness.api.trackPreviewShutdown(previewCleanup);
+    harness.api.windows.clear();
+    harness.appEvents.get("before-quit")({ preventDefault() {} });
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    assert.equal(harness.calls.quits, 0);
+    resolvePreview();
+    await new Promise((resolve) => {
+      setImmediate(() => setImmediate(resolve));
+    });
+    assert.equal(harness.calls.quits, 1);
+    harness.cleanup();
   });
 });
 

@@ -648,4 +648,49 @@ describe("browserViewRegistry — pending navigation lifecycle", () => {
     assert.equal(cancellations, 1);
     assert.equal(registry.isNavigationCurrent("conv_1", token), false);
   });
+
+  it("returns cleanup for repeated close and close without an entry", async () => {
+    const { registry } = makeRegistry();
+    let resolveShutdown;
+    const shutdown = new Promise((resolve) => {
+      resolveShutdown = resolve;
+    });
+    const releases = [];
+    registry.arcaPreview = {
+      release: (conversationId) => {
+        releases.push(conversationId);
+        return shutdown;
+      },
+      shutdownAll: async () => {},
+    };
+    registry.openOrNavigate("conv_1", "https://example.com");
+    const first = registry.close("conv_1");
+    const repeated = registry.close("conv_1");
+    let settled = false;
+    repeated.cleanup.then(() => (settled = true));
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    assert.equal(settled, false);
+    assert.deepEqual(releases, ["conv_1", "conv_1"]);
+    resolveShutdown();
+    await Promise.all([first.cleanup, repeated.cleanup]);
+  });
+
+  it("awaits manager-wide cleanup from closeAll", async () => {
+    const { registry } = makeRegistry();
+    let resolveShutdown;
+    const shutdown = new Promise((resolve) => {
+      resolveShutdown = resolve;
+    });
+    registry.arcaPreview = { release: () => null, shutdownAll: () => shutdown };
+    let settled = false;
+    const closing = registry.closeAll("app-quit").then(() => (settled = true));
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    assert.equal(settled, false);
+    resolveShutdown();
+    await closing;
+  });
 });

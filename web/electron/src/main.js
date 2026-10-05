@@ -733,6 +733,18 @@ function applyDockIcon() {
  * @type {Map<BrowserWindow, WindowState>}
  */
 const windows = new Map();
+const pendingPreviewShutdowns = new Set();
+
+function trackPreviewShutdown(cleanup) {
+  if (!cleanup || typeof cleanup.then !== "function") return cleanup;
+  const tracked = Promise.resolve(cleanup);
+  pendingPreviewShutdowns.add(tracked);
+  tracked.then(
+    () => pendingPreviewShutdowns.delete(tracked),
+    () => pendingPreviewShutdowns.delete(tracked),
+  );
+  return tracked;
+}
 
 /**
  * Live OAuth popup child windows (see hardenOauthPopup). Tracked apart
@@ -1776,7 +1788,7 @@ function createWindow(targetUrl, opts = {}) {
     databricksAuth?.reset(win);
     // Destroy this window's embedded-browser views, else they leak webContents.
     try {
-      windows.get(win)?.browserRegistry?.closeAll("window-closed");
+      trackPreviewShutdown(windows.get(win)?.browserRegistry?.closeAll("window-closed"));
     } catch {
       /* registry already torn down */
     }
@@ -4009,7 +4021,10 @@ if (!gotLock) {
     event.preventDefault();
     if (quitCleanupStarted) return;
     quitCleanupStarted = true;
-    for (const state of windows.values()) state.browserRegistry?.closeAll("app-quit");
+    const previewShutdowns = [...pendingPreviewShutdowns];
+    for (const state of windows.values()) {
+      previewShutdowns.push(trackPreviewShutdown(state.browserRegistry?.closeAll("app-quit")));
+    }
 
     // unref'd so the cap itself can't hold the event loop open; app.exit()
     // bypasses before-quit/will-quit, so it's the guaranteed way out when
@@ -4027,7 +4042,7 @@ if (!gotLock) {
     // SIGKILL'd within 4s and `omnigent server stop` has its own exec timeout.
     (async () => {
       const cliPath = resolvedCliPath();
-      await serverManager.shutdown(cliPath);
+      await Promise.allSettled([serverManager.shutdown(cliPath), ...previewShutdowns]);
     })()
       .catch(() => {})
       .finally(() => {

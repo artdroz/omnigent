@@ -75,6 +75,7 @@ function createBrowserViewRegistry({
   const intents = new Map(); // conversationId -> pending/current navigation
   let intentSequence = 0;
   let activeConversationId = null;
+  let registry;
   // When true, the active view is hidden in place (setVisible(false)) so DOM
   // overlays (dialogs, menus, tooltips, toasts) aren't covered by the native
   // layer, which always paints above the renderer regardless of z-index. Sticky
@@ -314,6 +315,7 @@ function createBrowserViewRegistry({
         close(conversationId, "preview-expired");
         return;
       }
+      // A full-page reload/HMR during preparation deliberately supersedes it.
       if (!isInPlace && isMainFrame) beginNavigation(conversationId);
     });
     wc.on("did-navigate", (_event, targetUrl) => {
@@ -473,13 +475,21 @@ function createBrowserViewRegistry({
   }
 
   function close(conversationId, reason, preserveIntent = false) {
+    const cleanup = [];
     if (!preserveIntent) {
       const intent = intents.get(conversationId);
       intents.delete(conversationId);
-      intent?.cancel?.();
+      if (intent?.cancel) cleanup.push(intent.cancel());
     }
     const entry = entries.get(conversationId);
-    if (!entry) return { ok: true, removed: false };
+    if (!entry) {
+      cleanup.push(registry.arcaPreview?.release(conversationId));
+      return {
+        ok: true,
+        removed: false,
+        cleanup: Promise.allSettled(cleanup.filter(Boolean)),
+      };
+    }
     if (activeConversationId === conversationId) {
       try {
         detachFromHost(entry.view);
@@ -515,10 +525,15 @@ function createBrowserViewRegistry({
     } catch {
       /* already destroyed */
     }
-    entry.releaseAgentOrigin?.();
+    if (entry.releaseAgentOrigin) cleanup.push(entry.releaseAgentOrigin());
+    cleanup.push(registry.arcaPreview?.release(conversationId));
     entries.delete(conversationId);
     sendToRenderer("browser-view-closed", { conversationId, reason: reason || null });
-    return { ok: true, removed: true };
+    return {
+      ok: true,
+      removed: true,
+      cleanup: Promise.allSettled(cleanup.filter(Boolean)),
+    };
   }
 
   function discardForNavigation(conversationId, token) {
@@ -527,13 +542,16 @@ function createBrowserViewRegistry({
     return isNavigationCurrent(conversationId, token);
   }
 
-  function closeAll(reason) {
+  async function closeAll(reason) {
+    const cleanup = [];
     for (const conversationId of [...intents.keys()]) {
-      if (!entries.has(conversationId)) close(conversationId, reason);
+      if (!entries.has(conversationId)) cleanup.push(close(conversationId, reason).cleanup);
     }
     for (const conversationId of [...entries.keys()]) {
-      close(conversationId, reason);
+      cleanup.push(close(conversationId, reason).cleanup);
     }
+    cleanup.push(registry.arcaPreview?.shutdownAll());
+    await Promise.allSettled(cleanup.filter(Boolean));
   }
 
   function clearAgentOrigin(conversationId) {
@@ -547,7 +565,7 @@ function createBrowserViewRegistry({
     entry.releaseAgentOrigin = null;
   }
 
-  return {
+  registry = {
     // Lifecycle
     get,
     getOrCreate,
@@ -570,6 +588,7 @@ function createBrowserViewRegistry({
     // Constants exposed for tests / main.js wiring
     cap,
   };
+  return registry;
 }
 
 module.exports = {
