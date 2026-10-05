@@ -5027,6 +5027,114 @@ def reconcile_orphaned_running_status(
     return True
 
 
+# Strong refs so the loop can't collect these fire-and-forget settle tasks
+# before they finish; the in-flight set coalesces repeat polls of the same
+# still-stuck session onto a single runner probe.
+_live_runner_reconcile_tasks: set[asyncio.Task[bool]] = set()
+_live_runner_reconcile_inflight: set[str] = set()
+
+
+async def reconcile_live_runner_idle_status(
+    session_id: str,
+    runner_id: str,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter,
+) -> bool:
+    """
+    Settle a session stuck ``running`` whose live runner confirms no turn.
+
+    The confirmed-gone backstop (``reconcile_orphaned_running_status``)
+    deliberately leaves a fresh-runner row running so a real in-flight turn is
+    never falsely idled. But a terminal ``idle`` edge can be lost while the
+    runner stays alive — a dropped relay frame, a failed stop hook, replica lag
+    — stranding the row ``running`` with no turn behind it, so the sidebar
+    spinner never stops. The runner is the authority on whether a turn is in
+    flight, so probe its session snapshot: settle only when it reports no active
+    turn, and leave the row running when it reports a turn or cannot be reached.
+
+    :param session_id: Session/conversation identifier to reconcile.
+    :param runner_id: The runner bound on the list row; the settle is guarded on
+        this id so a rebind to a different runner is not overwritten.
+    :param conversation_store: Store performing the conditional transition.
+    :param runner_router: Router used to reach the pinned runner.
+    :returns: Whether this call settled the row to idle.
+    """
+    try:
+        routed = await asyncio.to_thread(
+            runner_router.client_for_existing_conversation, session_id
+        )
+    except OmnigentError:
+        # Runner offline, or pinned to another replica — can't confirm here.
+        return False
+    if routed is None:
+        return False
+    try:
+        resp = await routed.client.get(f"/v1/sessions/{session_id}", timeout=5.0)
+    except httpx.HTTPError:
+        return False
+    if resp.status_code == 200:
+        try:
+            runner_status = resp.json().get("status")
+        except ValueError:
+            return False
+        # running/waiting = a real in-flight turn; failed = terminal and owned
+        # by the runner. Only an explicit idle means the turn is gone.
+        if runner_status != "idle":
+            return False
+    elif resp.status_code != 404:
+        # 404 = the runner never initialized this session, so it holds no turn.
+        # Any other status is inconclusive, so don't settle on uncertainty.
+        return False
+    if not await asyncio.to_thread(
+        conversation_store.settle_live_runner_idle_status, session_id, runner_id
+    ):
+        return False
+    _publish_status(session_id, "idle", persist_live_status=False)
+    return True
+
+
+def spawn_live_runner_idle_reconcile(
+    session_id: str,
+    runner_id: str,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter,
+) -> None:
+    """
+    Schedule :func:`reconcile_live_runner_idle_status` as a background task.
+
+    ``GET /v1/sessions`` is a hot poll, so the runner probe must not block it:
+    the list returns the current status immediately and this settles any
+    lost-edge ``running`` row for the next poll. The task inherits the request's
+    workspace context from ``create_task``, repeat polls of a still-stuck
+    session coalesce onto one probe, and the task is held in a module set until
+    it finishes so the loop cannot collect it early.
+
+    :param session_id: Session/conversation identifier to reconcile.
+    :param runner_id: The runner bound on the list row.
+    :param conversation_store: Store performing the conditional transition.
+    :param runner_router: Router used to reach the pinned runner.
+    """
+    if session_id in _live_runner_reconcile_inflight:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    async def _run() -> bool:
+        try:
+            return await reconcile_live_runner_idle_status(
+                session_id, runner_id, conversation_store, runner_router
+            )
+        finally:
+            _live_runner_reconcile_inflight.discard(session_id)
+
+    _live_runner_reconcile_inflight.add(session_id)
+    task = loop.create_task(_run())
+    _live_runner_reconcile_tasks.add(task)
+    task.add_done_callback(_live_runner_reconcile_tasks.discard)
+
+
 def _truncate_label(value: str) -> str:
     """Truncate a label value to fit the ``conversation_labels.value`` column.
 
