@@ -93,23 +93,26 @@ def _load_state() -> dict[str, object]:
     return json.loads(path.read_text())
 
 
-def configure(urls: list[str], agents: list[str], profile: str | None) -> int:
+def configure(targets: list[tuple[str, str | None]], agents: list[str]) -> int:
+    """Configure each ``(workspace url, requested profile name)`` target."""
     state = _load_state()
-    workspaces = state.setdefault("workspaces", {})
-    assert isinstance(workspaces, dict)
-    for url in urls:
+    workspaces = state.get("workspaces")
+    if not isinstance(workspaces, dict):
+        workspaces = {}
+        state["workspaces"] = workspaces
+    for url, requested in targets:
         url = url.rstrip("/")
-        name = _save_profile(url, profile)
+        name = _save_profile(url, requested)
         print(f"Select workspace: {name}  {url}")
         print("Databricks Login")
         print(f"  Workspace: {url}")
         print(f"Profile {name} was successfully saved")
         print("Databricks authentication complete")
         print("Unity Gateway connected")
-        entry = workspaces.get(url) if isinstance(workspaces.get(url), dict) else {}
-        assert isinstance(entry, dict)
-        existing_agents = entry.get("agents") if isinstance(entry.get("agents"), dict) else {}
-        assert isinstance(existing_agents, dict)
+        entry = workspaces.get(url)
+        existing_agents = entry.get("agents") if isinstance(entry, dict) else None
+        if not isinstance(existing_agents, dict):
+            existing_agents = {}
         for agent in agents:
             existing_agents[agent] = _agent_entry(url, agent, name)
             print(f"Settings configured for {_AGENT_DISPLAY.get(agent, agent)}")
@@ -169,7 +172,10 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="ug", description="fake ucode for tests")
     sub = parser.add_subparsers(dest="command", required=True)
     conf = sub.add_parser("configure")
-    conf.add_argument("--workspaces", required=True)
+    # The two real invocations: ``--workspaces <urls>`` from interactive setup and
+    # ``--profiles <names>`` from the headless sandbox boot.
+    conf.add_argument("--workspaces", default=None)
+    conf.add_argument("--profiles", default=None)
     conf.add_argument("--agents", default="claude,codex,pi")
     conf.add_argument("--profile", default=None)
     for flag in (
@@ -180,13 +186,23 @@ def main(argv: list[str]) -> int:
         "--use-pat",
     ):
         conf.add_argument(flag, action="store_true")
-    conf.add_argument("--profiles", default=None)
     sub.add_parser("status")
     args = parser.parse_args(argv)
     if args.command == "configure":
-        urls = [u for u in args.workspaces.split(",") if u]
         agents = [a for a in args.agents.split(",") if a]
-        return configure(urls, agents, args.profile)
+        targets: list[tuple[str, str | None]] = []
+        if args.profiles:
+            cfg = _read_cfg()
+            for name in args.profiles.split(","):
+                host = cfg.get(name, "host", fallback=None) if name else None
+                if not host:
+                    parser.error(f"profile {name!r} has no host in ~/.databrickscfg")
+                targets.append((host, name))
+        elif args.workspaces:
+            targets = [(u, args.profile) for u in args.workspaces.split(",") if u]
+        else:
+            parser.error("configure needs --workspaces or --profiles")
+        return configure(targets, agents)
     return status()
 
 

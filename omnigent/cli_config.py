@@ -1368,21 +1368,26 @@ def _databricks_workspace_drift_notice(config: dict[str, Any]) -> str | None:  #
     ucode_state = read_current_ucode_state()
     if ucode_state is None or not ucode_state.workspace_url:
         return None
-    ucode_url = normalize_workspace_url(ucode_state.workspace_url)
+    # Hostnames are case-insensitive: a mixed-case ~/.databrickscfg host must
+    # not read as drift from ucode's lowercase copy of the same workspace.
+    ucode_url = normalize_workspace_url(ucode_state.workspace_url).lower()
 
-    configured: list[tuple[str, str]] = []
+    configured: list[tuple[str, bool, str]] = []
     for entry in load_providers(config).values():
         if entry.kind != DATABRICKS_KIND or not entry.profile:
             continue
         host = get_workspace_url_for_profile(entry.profile)
         if host:
-            configured.append((entry.profile, normalize_workspace_url(host)))
+            configured.append(
+                (entry.profile, entry.default, normalize_workspace_url(host).lower())
+            )
     if not configured:
         return None
-    if any(url == ucode_url for _profile, url in configured):
+    if any(url == ucode_url for _profile, _default, url in configured):
         return None
 
-    profile, omni_url = configured[0]
+    # With several drifted profiles, name the default one: sessions route through it.
+    profile, _default, omni_url = next((item for item in configured if item[1]), configured[0])
 
     def _bare(url: str) -> str:
         return url.split("://", 1)[-1]

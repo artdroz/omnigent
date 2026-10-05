@@ -1447,6 +1447,14 @@ def _databricks_add_menu_index() -> int:
 
 _WS_A = "https://workspace-a.cloud.databricks.com"
 _WS_B = "https://workspace-b.cloud.databricks.com"
+_WS_C = "https://workspace-c.cloud.databricks.com"
+
+
+def _drift_notice(ucode_host: str, profile: str, omni_host: str) -> str:
+    return (
+        f"⚠ Databricks: ucode now points at {ucode_host}, but Omnigent still uses "
+        f"the '{profile}' profile ({omni_host}). Reconfigure Databricks to follow ucode."
+    )
 
 
 def _seed_ucode_and_databrickscfg(
@@ -1490,11 +1498,46 @@ def test_databricks_drift_notice_flags_ucode_switch(tmp_path, monkeypatch) -> No
     )
     config = {"providers": {"databricks": {"kind": "databricks", "profile": "ai_devtools"}}}
 
-    notice = _databricks_workspace_drift_notice(config)
-    assert notice is not None
-    assert "workspace-b.cloud.databricks.com" in notice
-    assert "ai_devtools" in notice
-    assert "workspace-a.cloud.databricks.com" in notice
+    assert _databricks_workspace_drift_notice(config) == _drift_notice(
+        "workspace-b.cloud.databricks.com", "ai_devtools", "workspace-a.cloud.databricks.com"
+    )
+
+
+def test_databricks_drift_notice_ignores_host_case(tmp_path, monkeypatch) -> None:
+    """A mixed-case profile host still matches ucode's lowercase workspace URL."""
+    from omnigent.cli_config import _databricks_workspace_drift_notice
+
+    _seed_ucode_and_databrickscfg(
+        tmp_path,
+        monkeypatch,
+        cfg_profiles={"ai_devtools": "https://Workspace-A.cloud.databricks.com"},
+        ucode_current=_WS_A,
+    )
+    config = {"providers": {"databricks": {"kind": "databricks", "profile": "ai_devtools"}}}
+
+    assert _databricks_workspace_drift_notice(config) is None
+
+
+def test_databricks_drift_notice_names_the_default_profile(tmp_path, monkeypatch) -> None:
+    """With several drifted Databricks profiles, the notice names the default one."""
+    from omnigent.cli_config import _databricks_workspace_drift_notice
+
+    _seed_ucode_and_databrickscfg(
+        tmp_path,
+        monkeypatch,
+        cfg_profiles={"staging": _WS_C, "ai_devtools": _WS_A},
+        ucode_current=_WS_B,
+    )
+    config = {
+        "providers": {
+            "staging": {"kind": "databricks", "profile": "staging"},
+            "prod": {"kind": "databricks", "default": True, "profile": "ai_devtools"},
+        }
+    }
+
+    assert _databricks_workspace_drift_notice(config) == _drift_notice(
+        "workspace-b.cloud.databricks.com", "ai_devtools", "workspace-a.cloud.databricks.com"
+    )
 
 
 def test_databricks_drift_notice_silent_when_in_sync(tmp_path, monkeypatch) -> None:
@@ -1576,10 +1619,9 @@ def test_overview_banner_warns_on_databricks_ucode_drift(
     monkeypatch.setattr("omnigent.onboarding.interactive.select", _capture_select)
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"])
     assert result.exit_code == 0, result.output
-    status = captured.get("status")
-    assert isinstance(status, str), captured
-    assert "workspace-b.cloud.databricks.com" in status
-    assert "ai_devtools" in status
+    assert captured.get("status") == _drift_notice(
+        "workspace-b.cloud.databricks.com", "ai_devtools", "workspace-a.cloud.databricks.com"
+    ), captured
     assert captured["status_style"] == "bold yellow"
 
 

@@ -37,12 +37,12 @@ _UVX_SHIM = (
     "#!/usr/bin/env bash\n"
     'if [ "${{1:-}}" = "--from" ] && [ "${{3:-}}" = "ucode" ]; then\n'
     "  shift 3\n"
-    '  exec {python} {script} "$@"\n'
+    '  exec "{python}" "{script}" "$@"\n'
     "fi\n"
     'echo "fake uvx: unsupported invocation: $*" >&2\n'
     "exit 2\n"
 )
-_UG_SHIM = '#!/usr/bin/env bash\nexec {python} {script} "$@"\n'
+_UG_SHIM = '#!/usr/bin/env bash\nexec "{python}" "{script}" "$@"\n'
 
 
 def _write_shims(bin_dir: Path) -> None:
