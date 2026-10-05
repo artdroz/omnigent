@@ -764,7 +764,7 @@ export function ForkSessionForm({
   // shared session that ran on someone else's machine — nothing to reconnect).
   const offlineSourceHost = useMemo(() => {
     const src = (hosts ?? []).find((h) => h.host_id === sourceHostId) ?? null;
-    return src !== null && src.status !== "online" ? src : null;
+    return src !== null && src.status === "offline" ? src : null;
   }, [hosts, sourceHostId]);
   const serverUrl = getCliServerUrl();
 

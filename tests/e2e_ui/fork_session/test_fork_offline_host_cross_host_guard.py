@@ -1,12 +1,11 @@
 """Browser e2e: forking a host-bound session must not silently land on a different host.
 
-An offline source host must leave the clone's target unpicked, with a hint
-that names the host and asks for a reconnect, and "Clone & start" greyed;
-explicitly choosing another host must show a cross-host warning before any
-directory is typed. Cross-host forks are unsupported, so a silent default
-would create a clone whose runner never starts. The two-host state and the
-session's host/workspace are network stubs: the harness can't register two
-real hosts, and the logic under test is client-side.
+An offline source host is not silently replaced: the clone's target stays
+unpicked, a hint names the host and asks for a reconnect, and "Clone & start"
+stays greyed. An explicit cross-host choice remains allowed and is visibly
+warned before any directory is typed. The two-host state and the session's
+host/workspace are network stubs: the harness can't register two real hosts,
+and the logic under test is client-side.
 """
 
 from __future__ import annotations
