@@ -29,6 +29,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostConnection
+from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -90,11 +91,13 @@ async def register_worktree_launch_host(
     db_uri: str,
 ) -> AsyncIterator[RegisterHost]:
     """Yield a factory registering a fake host that answers and captures
-    stat/create/launch/list/remove frames. Its ``launch_status`` kwarg
-    (``"launched"``/``"failed"``) models the runner-launch verdict."""
+    stat/create/launch/list/remove frames. ``launch_status`` models the launch
+    verdict; ``workspace_subdir`` relocates the picked subdir into the worktree."""
     conns: list[HostConnection] = []
 
-    def _register(*, launch_status: str = "launched") -> _HostCapture:
+    def _register(
+        *, launch_status: str = "launched", workspace_subdir: str | None = None
+    ) -> _HostCapture:
         HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
         conn = app.state.host_registry.register(
             host_id=_HOST_ID,
@@ -129,13 +132,14 @@ async def register_worktree_launch_host(
                     cap.worktrees.append(
                         {"path": worktree_path, "branch": frame.branch_name, "is_main": False}
                     )
+                    workspace = f"{worktree_path}/{workspace_subdir}" if workspace_subdir else None
                     fut = conn.pending_create_worktrees.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
                         fut.set_result(
                             {
                                 "status": "ok",
                                 "worktree_path": worktree_path,
-                                "workspace": None,
+                                "workspace": workspace,
                                 "branch": frame.branch_name,
                                 "error": None,
                             }
@@ -238,6 +242,45 @@ async def test_inline_create_launch_failure_cleans_up_worktree(
     assert conv.workspace is None, observed
     assert conv.git_branch is None, observed
     assert conv.runner_id is None, observed
+    assert WORKTREE_ROOT_LABEL_KEY not in conv.labels, observed
+
+    # The create response reports the cleared binding, not the removed worktree.
+    body = resp.json()
+    assert body["host_id"] is None and body["runner_id"] is None, body
+    assert body["workspace"] is None and body["git_branch"] is None, body
+    assert WORKTREE_ROOT_LABEL_KEY not in body["labels"], body
+
+
+async def test_inline_create_launch_failure_removes_relocated_worktree_root(
+    register_worktree_launch_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A picked repo subdirectory is relocated inside the new worktree, so
+    the rollback must remove the worktree root, not that subdirectory."""
+    cap = register_worktree_launch_host(launch_status="failed", workspace_subdir="packages/app")
+    agent = await create_test_agent(client, name="wt-subdir-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": f"{_SOURCE_REPO}/packages/app",
+            "git": {"branch_name": "feature/sub", "base_branch": "main"},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    assert len(cap.create) == 1 and cap.create[0].repo_path == f"{_SOURCE_REPO}/packages/app"
+    assert len(cap.launch) == 1, f"expected one launch_runner frame, got {len(cap.launch)}"
+    assert len(cap.remove) == 1, f"expected one remove_worktree frame, got {cap.remove}"
+    assert cap.remove[0].worktree_path == f"{_SOURCE_REPO}-worktrees/feature-sub"
+    assert cap.remove[0].delete_branch is True
+
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(resp.json()["id"])
+    assert conv is not None
+    assert conv.host_id is None and conv.workspace is None and conv.git_branch is None
+    assert WORKTREE_ROOT_LABEL_KEY not in conv.labels
 
 
 async def test_inline_create_existing_worktree_launch_failure_keeps_worktree(
