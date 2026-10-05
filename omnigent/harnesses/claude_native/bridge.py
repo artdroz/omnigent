@@ -6670,6 +6670,9 @@ def _tool_relay_handler_factory(
                     severed = can_repark and budget.held_poll_severed(attempt_started)
                 if severed:
                     budget.repark()
+                    # A re-park starts a fresh budget; measure "retried for"
+                    # from here so the parked wait is not counted as retry time.
+                    started = time.monotonic()
                     continue
                 if not budget.wait():
                     elapsed = time.monotonic() - started

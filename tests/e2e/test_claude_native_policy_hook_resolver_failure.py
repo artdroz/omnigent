@@ -17,39 +17,22 @@ from __future__ import annotations
 import asyncio
 import atexit
 import json
-import os
-import signal
 import socket
-import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
 
 import httpx
 import pytest
-import yaml
 
-from tests._helpers.session import bundle_files, post_session_bundle
-
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+from tests._helpers.live_server import isolated_local_server
+from tests._helpers.native_session import create_native_session
 
 # Every HTTP call the test itself makes targets 127.0.0.1 (an IP literal, no
 # getaddrinfo); CI shells often carry an egress proxy, so bypass autodetection.
 _http = httpx.Client(trust_env=False)
 atexit.register(_http.close)
 
-_PYTHONPATH = os.pathsep.join(
-    [
-        str(_REPO_ROOT),
-        str(_REPO_ROOT / "sdks" / "python-client"),
-        str(_REPO_ROOT / "sdks" / "ui"),
-        os.environ.get("PYTHONPATH", ""),
-    ]
-)
-
-_HEALTH_TIMEOUT_S = 120.0
-_POLL_S = 0.5
 # The relay retries over its transient budget before failing closed.
 _HOOK_TIMEOUT_S = 120.0
 
@@ -65,93 +48,6 @@ _SUSTAINED_BUDGET_S = 3.0
 _EXTERNAL_SID = "11111111-2222-4333-8444-555566667777"
 
 _PROMPT = "summarize the open issues in this repository"
-
-
-def _find_free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _localhost_env(extra: dict[str, str]) -> dict[str, str]:
-    env = {
-        **os.environ,
-        "PYTHONPATH": _PYTHONPATH,
-        "NO_PROXY": "127.0.0.1,localhost",
-        "no_proxy": "127.0.0.1,localhost",
-    }
-    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-        env.pop(name, None)
-    env.update(extra)
-    return env
-
-
-def _terminate(proc: subprocess.Popen[bytes] | None) -> None:
-    if proc is None or proc.poll() is not None:
-        return
-    proc.send_signal(signal.SIGTERM)
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
-
-
-def _wait_http_ok(url: str, deadline: float) -> None:
-    last = "not polled"
-    while time.monotonic() < deadline:
-        try:
-            if _http.get(url, timeout=2.0).status_code == 200:
-                return
-        except httpx.HTTPError as exc:
-            last = repr(exc)
-        time.sleep(_POLL_S)
-    raise AssertionError(f"server never became healthy at {url}; last: {last}")
-
-
-def _start_server(tmp_path: Path) -> tuple[subprocess.Popen[bytes], int]:
-    """Spawn a real ``omnigent server`` on a free loopback port; return it + port."""
-    port = _find_free_port()
-    # The child dups the fd at spawn, so the parent closes its handle at once
-    # and leaks no descriptor while the server keeps writing its own log.
-    with (tmp_path / "server.log").open("w") as log:
-        proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                "from omnigent.cli import main; main()",
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--database-uri",
-                f"sqlite:///{tmp_path / 'db.sqlite'}",
-                "--artifact-location",
-                str(tmp_path / "artifacts"),
-            ],
-            env=_localhost_env({}),
-            stdout=log,
-            stderr=subprocess.STDOUT,
-        )
-    _wait_http_ok(f"http://127.0.0.1:{port}/health", time.monotonic() + _HEALTH_TIMEOUT_S)
-    return proc, port
-
-
-def _create_session(port: int) -> str:
-    """Register a minimal inline agent and return its session id."""
-    cfg = {
-        "name": "policy-hook-dns-repro",
-        "prompt": "You are a test agent.",
-        "executor": {"harness": "claude-native", "model": "claude-sonnet-4-20250514"},
-    }
-    data = yaml.safe_dump(cfg).encode()
-    bundle_bytes = bundle_files({"policy-hook-dns-repro.yaml": data})
-    resp = post_session_bundle(
-        _http.post, f"http://127.0.0.1:{port}/v1/sessions", bundle_bytes, timeout=30.0
-    )
-    resp.raise_for_status()
-    return str(resp.json()["session_id"])
 
 
 class _ResolverFault:
@@ -279,12 +175,11 @@ class _Relay:
 @pytest.fixture(scope="module")
 def _server(tmp_path_factory: pytest.TempPathFactory):
     tmp_path = tmp_path_factory.mktemp("policy-hook-dns")
-    proc, port = _start_server(tmp_path)
-    try:
-        session_id = _create_session(port)
-        yield port, session_id, tmp_path
-    finally:
-        _terminate(proc)
+    with isolated_local_server(tmp_path) as base_url:
+        port = httpx.URL(base_url).port
+        assert port is not None, base_url
+        session = create_native_session(_http, base_url, harness="claude")
+        yield port, str(session["session_id"]), tmp_path
 
 
 def test_transient_resolver_blip_does_not_drop_prompt(_server) -> None:

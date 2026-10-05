@@ -11450,15 +11450,22 @@ async def test_hook_evaluate_endpoint_names_resolver_failure_without_errno(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sever",
+    [
+        pytest.param(504, id="held-504"),
+        pytest.param(httpx.ReadError("torn poll"), id="torn-connection"),
+    ],
+)
 async def test_hook_evaluate_endpoint_reparks_a_held_poll_the_gateway_severed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sever: int | BaseException
 ) -> None:
-    """A 5xx after the held-poll floor re-POSTs the same id without spending budget."""
+    """A held 5xx or torn connection re-POSTs the same id without spending budget."""
     from omnigent.native import native_policy_hook
 
     _fast_evaluate_retries(monkeypatch, budget_s=0.0)
     monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_HELD_POLL_FLOOR_S", 0.0)
-    client = _ScriptedPolicyClient(504, {"result": "POLICY_ACTION_ALLOW"})
+    client = _ScriptedPolicyClient(sever, {"result": "POLICY_ACTION_ALLOW"})
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
         body = await asyncio.to_thread(

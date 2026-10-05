@@ -654,15 +654,15 @@ def is_transient_connect_error(exc: BaseException) -> bool:
     Whether *exc* means the server was never cleanly reached, so a retry may help.
 
     :param exc: Exception raised by an evaluate POST.
-    :returns: ``True`` for httpx connect errors and timeouts, a stdlib
-        :class:`ConnectionError` (refused / reset / aborted), and the raw
-        :class:`socket.gaierror` a non-httpx client may surface. A bare
-        :class:`OSError` (file / permission / disk) is not a connect failure
-        and is treated as final.
+    :returns: ``True`` for httpx connect errors and timeouts, a refused
+        connection, and the raw :class:`socket.gaierror` a non-httpx client may
+        surface. Broader :class:`OSError` kinds (a mid-stream reset, a
+        :class:`TimeoutError`, a :class:`PermissionError`) are not connect-phase
+        failures and are treated as final, matching the direct-hook path.
     """
     return isinstance(
         exc,
-        (httpx.ConnectError, httpx.ConnectTimeout, ConnectionError, socket.gaierror),
+        (httpx.ConnectError, httpx.ConnectTimeout, ConnectionRefusedError, socket.gaierror),
     )
 
 
