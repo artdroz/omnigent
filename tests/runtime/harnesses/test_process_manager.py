@@ -479,14 +479,31 @@ async def _pid_exits(pid: int, *, timeout_s: float) -> bool:
     return not _pid_alive(pid)
 
 
+def _signal_sent(monkeypatch: pytest.MonkeyPatch, name: str) -> asyncio.Event:
+    """Wrap ``_proc.<name>`` so the returned event is set once that signal went out."""
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    sent = asyncio.Event()
+    real = getattr(pm_mod._proc, name)
+
+    def _signal_then_set(process: object) -> None:
+        real(process)
+        sent.set()
+
+    monkeypatch.setattr(pm_mod._proc, name, _signal_then_set)
+    return sent
+
+
 async def test_release_cancelled_during_sigterm_wait_still_kills_subprocess(
     manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Cancelling release() during the SIGTERM grace wait must still kill the child.
 
     A SIGTERM-ignoring child holds the grace wait open long enough to cancel
     into it; the entry is already popped, so nothing else would reap it.
     """
+    terminated = _signal_sent(monkeypatch, "terminate_tree")
     await manager.start()
     pid: int | None = None
     try:
@@ -497,14 +514,9 @@ async def test_release_cancelled_during_sigterm_wait_still_kills_subprocess(
         assert socket_path.exists()
 
         release_task = asyncio.create_task(manager.release("conv_a"))
-        for _ in range(200):
-            if not manager.has_session("conv_a"):
-                break
-            await asyncio.sleep(0.01)
+        # Once SIGTERM is out, the task sits in the grace wait on a child that ignores it.
+        await asyncio.wait_for(terminated.wait(), timeout=10.0)
         assert not manager.has_session("conv_a"), "release never unregistered the entry"
-        # The entry is popped; aclose() and SIGTERM follow within milliseconds,
-        # so this lands inside the 5 s grace wait on a child that ignores SIGTERM.
-        await asyncio.sleep(0.5)
         release_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await release_task
@@ -533,14 +545,7 @@ async def test_release_cancelled_during_sigkill_wait_still_removes_socket(
     from omnigent.runtime.harnesses import process_manager as pm_mod
 
     monkeypatch.setattr(pm_mod, "_RELEASE_GRACE_S", 0.2)
-    killed = asyncio.Event()
-    real_kill_tree = pm_mod._proc.kill_tree
-
-    def _kill_tree_then_signal(process: object) -> None:
-        real_kill_tree(process)  # type: ignore[arg-type]
-        killed.set()
-
-    monkeypatch.setattr(pm_mod._proc, "kill_tree", _kill_tree_then_signal)
+    killed = _signal_sent(monkeypatch, "kill_tree")
 
     await manager.start()
     pid: int | None = None
@@ -587,6 +592,7 @@ async def test_release_cancelled_twice_still_kills_subprocess_and_removes_socket
         release_task.cancel()
 
     monkeypatch.setattr(pm_mod._proc, "kill_tree", _kill_tree_then_cancel_again)
+    terminated = _signal_sent(monkeypatch, "terminate_tree")
 
     await manager.start()
     pid: int | None = None
@@ -598,12 +604,8 @@ async def test_release_cancelled_twice_still_kills_subprocess_and_removes_socket
         assert socket_path.exists()
 
         release_task = asyncio.create_task(manager.release("conv_a"))
-        for _ in range(200):
-            if not manager.has_session("conv_a"):
-                break
-            await asyncio.sleep(0.01)
+        await asyncio.wait_for(terminated.wait(), timeout=10.0)
         assert not manager.has_session("conv_a"), "release never unregistered the entry"
-        await asyncio.sleep(0.5)
         release_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await release_task
@@ -657,6 +659,35 @@ async def test_release_completes_when_forced_kill_fails(
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
         await manager.shutdown()
+
+
+async def test_stop_process_closed_during_grace_wait_kills_without_awaiting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closing the coroutine mid-grace-wait must still send the kill and close cleanly.
+
+    ``GeneratorExit`` is a ``BaseException`` too, and a coroutine handling it
+    cannot await again: doing so turns the close into a ``RuntimeError``.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(pm_mod._proc, "terminate_tree", lambda process: calls.append("terminate"))
+    monkeypatch.setattr(pm_mod._proc, "kill_tree", lambda process: calls.append("kill"))
+
+    class _NeverExits:
+        returncode: int | None = None
+        pid = 4242
+
+        async def wait(self) -> int:
+            await asyncio.Event().wait()
+            return 0
+
+    coro = pm_mod._stop_process(_NeverExits())  # type: ignore[arg-type]
+    coro.send(None)  # SIGTERM sent; suspended in the grace wait
+    assert calls == ["terminate"]
+    coro.close()
+    assert calls == ["terminate", "kill"]
 
 
 @pytest.mark.parametrize("response_id", [None, "resp_crashed"])
