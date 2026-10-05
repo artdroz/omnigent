@@ -3389,7 +3389,7 @@ def create_app(
             )
             return
         if _runner_live_on_another_replica_from_conversations(
-            affected, runner_id, reference_stamp
+            affected, runner_id, reference_stamp, use_connect_stamp=True
         ):
             for conv in affected:
                 _relinquish_session_live_state(conv.id)

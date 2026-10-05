@@ -7431,12 +7431,22 @@ def _runner_live_on_another_replica_from_conversations(
     conversations: Sequence[Conversation],
     runner_id: str,
     reference_stamp: int | None,
+    *,
+    use_connect_stamp: bool = False,
 ) -> bool:
-    """Check already-loaded runner-bound rows for a fresher replica's stamp."""
+    """Check already-loaded runner-bound rows for a fresher replica's stamp.
+
+    The "should this mid-turn runner be failed?" decision passes
+    ``use_connect_stamp=True`` to read the never-cleared
+    ``runner_last_connected`` stamp, so a sibling's transient reconnect blip
+    (which clears ``runner_last_seen``) cannot look like the runner vanishing.
+    The message re-addressing path leaves it ``False`` so it requires a
+    currently-live tunnel before bouncing a message to a sibling.
+    """
     return any(
         conv.runner_id == runner_id
         and _runner_stamp_is_live_elsewhere(
-            stamp=conv.runner_last_seen,
+            stamp=conv.runner_last_connected if use_connect_stamp else conv.runner_last_seen,
             reference_stamp=reference_stamp,
         )
         for conv in conversations
@@ -7561,9 +7571,14 @@ async def _relay_runner_live_elsewhere(
     Check this relay's bound runner using shared runner metadata.
 
     A full-conversation read can depend on unrelated backends; their outage
-    must not hide a fresh heartbeat from another replica. Prefer the active
+    must not hide a fresh stamp from another replica. Prefer the active
     relay's runner binding, falling back to the metadata binding when called
     without a registered relay.
+
+    Reads the never-cleared ``runner_last_connected`` stamp rather than the
+    disconnect-cleared ``runner_last_seen``: the runner may re-tunnel to a
+    sibling whose own tunnel then briefly blips, and that blip must not erase
+    the only evidence the runner is alive there.
 
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store used to read runner metadata.
@@ -7582,14 +7597,14 @@ async def _relay_runner_live_elsewhere(
         return False
     if liveness is None:
         return False
-    bound_runner_id, runner_last_seen = liveness
+    bound_runner_id, _runner_last_seen, runner_last_connected = liveness
     handle = _runner_relay_tasks.get(session_id)
     runner_id = handle.runner_id if handle is not None else bound_runner_id
     if runner_id is None:
         return False
     reference_stamp = session_live_state.last_liveness_stamp(runner_id)
     return bound_runner_id == runner_id and _runner_stamp_is_live_elsewhere(
-        stamp=runner_last_seen,
+        stamp=runner_last_connected,
         reference_stamp=reference_stamp,
     )
 

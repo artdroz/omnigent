@@ -59,7 +59,13 @@ _ANSWER = "RUNNER_RECONNECT_GRACE_E2E_COMPLETED"
 _FAILURE_SIGNATURE = re.compile(
     r"session turn failed for \S+ \(origin=\S+ code=runner_disconnected"
 )
+# The relay's outage outcome row: ``(live_elsewhere)``, ``(failed_mid_turn)``, ...
+_RELAY_DECISION = re.compile(r"Relay: runner transport lost for session=(\S+) \((\w+)\)")
 _HEALTH_TIMEOUT_S = 90.0
+# How long the new replica's tunnel stays down on either side of the old
+# replica's deadline, so the blip covers it despite reconnect latency.
+_NEW_REPLICA_BLIP_LEAD_S = 6.0
+_NEW_REPLICA_BLIP_TRAIL_S = 6.0
 
 # Only replica A uses this bootstrap; the file arms its backend outage after
 # the real runner has reconnected to B. The metadata database remains readable.
@@ -517,6 +523,32 @@ def _send_user_message(
     response.raise_for_status()
 
 
+def _hand_runner_to_replica(proxy: _TunnelIngressProxy, replica: _Replica) -> float:
+    """Cut the current tunnel and route the runner's reconnect to *replica*.
+
+    :returns: ``time.monotonic()`` of the cut, when the old replica's grace starts.
+    """
+    proxy.begin_blackout()
+    dropped_at = time.monotonic()
+    _poll_until(
+        lambda: proxy.rejected_connections > 0,
+        timeout=10.0,
+        what="the real runner to attempt a reconnect through the 503 ingress",
+    )
+    proxy.retarget("127.0.0.1", replica.port)
+    proxy.end_blackout()
+    _poll_until(
+        replica.runner_online,
+        timeout=_HEALTH_TIMEOUT_S,
+        what="the runner WebSocket tunnel to register on the new replica",
+    )
+    return dropped_at
+
+
+def _relay_decisions(log_text: str, session_id: str) -> list[str]:
+    return [m.group(2) for m in _RELAY_DECISION.finditer(log_text) if m.group(1) == session_id]
+
+
 def test_mid_turn_tunnel_blackout_recovers_without_failed_edge(
     reconnect_stack: _ReconnectStack,
     mock_llm_server_url: str,
@@ -669,20 +701,7 @@ def test_reconnect_to_another_replica_does_not_fail_the_turn(
             what="the real turn to block inside the mock LLM on replica A",
         )
 
-        # Cut A's tunnel, then hand the runner's next connection to B.
-        proxy.begin_blackout()
-        _poll_until(
-            lambda: proxy.rejected_connections > 0,
-            timeout=10.0,
-            what="the real runner to attempt a reconnect through the 503 ingress",
-        )
-        proxy.retarget("127.0.0.1", replica_b.port)
-        proxy.end_blackout()
-        _poll_until(
-            replica_b.runner_online,
-            timeout=_HEALTH_TIMEOUT_S,
-            what="the runner WebSocket tunnel to register on replica B",
-        )
+        _hand_runner_to_replica(proxy, replica_b)
 
         if stack.conversation_read_fault is not None:
             stack.conversation_read_fault.touch()
@@ -753,6 +772,128 @@ def test_reconnect_to_another_replica_does_not_fail_the_turn(
             f"snapshot={json.dumps(snapshot)[:2000]}"
         )
         assert "runner_disconnected" not in json.dumps(snapshot)
+        assert not _FAILURE_SIGNATURE.search(stack.process_log.read_text())
+        assert not _FAILURE_SIGNATURE.search(replica_b.process_log.read_text())
+    finally:
+        replica_b.teardown()
+
+
+def test_new_replica_blip_at_old_deadline_does_not_fail_the_recovered_turn(
+    reconnect_stack: _ReconnectStack,
+    mock_llm_server_url: str,
+) -> None:
+    """A's expiring grace must not fail a turn B adopted while B's tunnel blips.
+
+    After the runner re-tunnels to replica B, B's tunnel drops for a few
+    seconds spanning A's original disconnect deadline. B's disconnect clears
+    the shared liveness stamp, so A sees no evidence of the handoff at the
+    instant it decides. The turn is still running and B reconnects inside its
+    own grace, so A must not publish or persist ``runner_disconnected``.
+    """
+    from omnigent.server.routes.sessions import RUNNER_DISCONNECT_GRACE_S
+
+    stack = reconnect_stack
+    proxy = stack.proxy
+    assert proxy is not None
+    replica_b = stack.start_second_replica()
+    try:
+        reset_mock_llm(mock_llm_server_url)
+        model = f"runner-replica-blip-{uuid.uuid4().hex[:8]}"
+        configure_mock_llm(
+            mock_llm_server_url,
+            [{"text": _ANSWER, "block": True}],
+            key=model,
+        )
+        agent_name = register_inline_agent(
+            stack.client,
+            name=f"runner-replica-blip-{uuid.uuid4().hex[:8]}",
+            harness="openai-agents",
+            model=model,
+            profile="",
+            prompt="Return the configured answer.",
+            mock_llm_base_url=f"{mock_llm_server_url}/v1",
+        )
+        session_id = create_runner_bound_session(
+            stack.client,
+            agent_name=agent_name,
+            runner_id=stack.runner_id,
+        )
+        _send_user_message(stack.client, session_id)
+        _poll_until(
+            lambda: _gate_pending(mock_llm_server_url),
+            timeout=60.0,
+            what="the real turn to block inside the mock LLM on replica A",
+        )
+
+        dropped_at = _hand_runner_to_replica(proxy, replica_b)
+        assert _session_snapshot(replica_b.client, session_id).get("status") == "running"
+
+        # B's tunnel goes down shortly before A's deadline and stays down past it.
+        blip_start = dropped_at + RUNNER_DISCONNECT_GRACE_S - _NEW_REPLICA_BLIP_LEAD_S
+        time.sleep(max(0.0, blip_start - time.monotonic()))
+        rejected_before = proxy.rejected_connections
+        proxy.begin_blackout()
+        blip_started = time.monotonic() - dropped_at
+        try:
+            _poll_until(
+                lambda: proxy.rejected_connections > rejected_before,
+                timeout=10.0,
+                what="the runner to attempt a reconnect to replica B during the blip",
+            )
+            _poll_until(
+                lambda: not replica_b.runner_online(),
+                timeout=10.0,
+                what="replica B to register the tunnel drop",
+            )
+            blip_end = dropped_at + RUNNER_DISCONNECT_GRACE_S + _NEW_REPLICA_BLIP_TRAIL_S
+            time.sleep(max(0.0, blip_end - time.monotonic()))
+        finally:
+            proxy.end_blackout()
+        blip_ended = time.monotonic() - dropped_at
+        _poll_until(
+            replica_b.runner_online,
+            timeout=_HEALTH_TIMEOUT_S,
+            what="the runner to reconnect to replica B after the blip",
+        )
+        assert _gate_pending(mock_llm_server_url), "the held turn ended during the blip"
+
+        decision_deadline = dropped_at + RUNNER_DISCONNECT_GRACE_S + 30.0
+        _poll_until(
+            lambda: (
+                bool(_relay_decisions(stack.process_log.read_text(), session_id))
+                or bool(_FAILURE_SIGNATURE.search(stack.process_log.read_text()))
+                or time.monotonic() > decision_deadline
+            ),
+            timeout=60.0,
+            what="replica A to resolve the disconnect while the turn is still running on B",
+        )
+        server_a_log = stack.process_log.read_text()
+        failed_edges = _FAILURE_SIGNATURE.findall(server_a_log)
+        assert not failed_edges, (
+            f"Replica A failed session {session_id} at its old disconnect deadline while "
+            "replica B owned the turn and was inside its own reconnect grace (B's tunnel "
+            f"was down from {blip_started:.1f}s to {blip_ended:.1f}s after A's drop; relay "
+            f"decisions: {_relay_decisions(server_a_log, session_id)}).\n"
+            f"Failure lines: {failed_edges}\n"
+            f"Replica A log tail:\n{server_a_log[-4000:]}"
+        )
+
+        release_mock_gate(mock_llm_server_url)
+        _poll_until(
+            lambda: _ANSWER in _session_blob(replica_b.client, session_id),
+            timeout=60.0,
+            what="the original in-flight turn to complete via replica B",
+        )
+        for client, label in ((replica_b.client, "B"), (stack.client, "A")):
+            snapshot = _session_snapshot(client, session_id)
+            assert snapshot.get("status") != "failed", (
+                f"Session {session_id} reads failed on replica {label} after completing on B; "
+                f"snapshot={json.dumps(snapshot)[:2000]}"
+            )
+            assert "runner_disconnected" not in json.dumps(snapshot), (
+                f"Session {session_id} carries a runner_disconnected label on replica {label} "
+                f"after completing on B; snapshot={json.dumps(snapshot)[:2000]}"
+            )
         assert not _FAILURE_SIGNATURE.search(stack.process_log.read_text())
         assert not _FAILURE_SIGNATURE.search(replica_b.process_log.read_text())
     finally:

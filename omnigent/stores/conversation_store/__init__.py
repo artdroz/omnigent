@@ -539,15 +539,20 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def get_runner_liveness(self, conversation_id: str) -> tuple[str | None, int | None] | None:
-        """Return the bound runner ID and heartbeat from the metadata database.
+    def get_runner_liveness(
+        self, conversation_id: str
+    ) -> tuple[str | None, int | None, int | None] | None:
+        """Return the bound runner ID and liveness stamps from the metadata database.
 
         Reads neither conversation data nor labels, so an unrelated
         conversation backend outage cannot hide a healthy runner.
 
         :param conversation_id: Session/conversation ID to look up.
-        :returns: ``(runner_id, runner_last_seen)``, or ``None`` if the
-            metadata row is missing. Either field may be ``None``.
+        :returns: ``(runner_id, runner_last_seen, runner_last_connected)``, or
+            ``None`` if the metadata row is missing. Any field may be ``None``.
+            ``runner_last_connected`` survives a graceful disconnect, so a
+            cross-replica liveness check should prefer it over the
+            disconnect-cleared ``runner_last_seen``.
         """
         ...
 
@@ -1402,12 +1407,14 @@ class ConversationStore(ABC):
     @abstractmethod
     def touch_runner_liveness(self, runner_ids: list[str], now: int) -> None:
         """
-        Stamp ``runner_last_seen`` for every session bound to these runners.
+        Stamp ``runner_last_seen`` and ``runner_last_connected`` for these runners.
 
         Called by the replica holding the runner tunnels (on connect and
         on a periodic sweep of the live registry) so any replica can
-        derive ``runner_online`` from freshness. One bulk ``UPDATE``;
-        must NOT bump ``updated_at`` (it drives sidebar ordering).
+        derive ``runner_online`` from freshness. Both stamps advance
+        together here; only a graceful disconnect clears
+        ``runner_last_seen`` alone. One bulk ``UPDATE``; must NOT bump
+        ``updated_at`` (it drives sidebar ordering).
 
         :param runner_ids: Runner ids with a live tunnel,
             e.g. ``["runner_token_abc123"]``. Empty is a no-op.
@@ -1422,7 +1429,9 @@ class ConversationStore(ABC):
 
         Called on a graceful tunnel disconnect so the sidebar flips
         offline immediately instead of waiting out
-        :data:`RUNNER_LIVENESS_TTL_S`. Must NOT bump ``updated_at``.
+        :data:`RUNNER_LIVENESS_TTL_S`. Leaves ``runner_last_connected``
+        intact for the cross-replica liveness check. Must NOT bump
+        ``updated_at``.
 
         :param runner_id: The disconnected runner's id.
         :param not_after: When given, only clear a row whose

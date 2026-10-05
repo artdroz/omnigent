@@ -269,9 +269,13 @@ class Conversation:
     # ``runner_last_seen`` is the runner tunnel's last heartbeat (epoch
     # seconds, None = no live stamp) — carried on the row so a session list
     # can judge runner liveness without a second connectivity query.
+    # ``runner_last_connected`` is stamped alongside it but never cleared on
+    # a graceful disconnect, so a cross-replica liveness check survives a
+    # sibling's transient reconnect blip (epoch seconds, None = never stamped).
     live_status: str | None = None
     pending_elicitation_count: int | None = None
     runner_last_seen: int | None = None
+    runner_last_connected: int | None = None
     project_id: str | None = None
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.

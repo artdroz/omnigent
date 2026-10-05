@@ -1758,9 +1758,11 @@ async def test_runner_disconnect_grace_spares_runner_live_on_another_replica(
     """A dropped runner that re-tunnelled to another replica is not failed.
 
     This replica's registry only knows its own tunnels. When the runner's
-    row carries a fresh ``runner_last_seen`` newer than this replica's own
-    last stamp, another replica wrote it — the runner is live there, so the
-    grace timer must leave the mid-turn session alone.
+    row carries a fresh ``runner_last_connected`` newer than this replica's
+    own last stamp, another replica wrote it — the runner is live there, so
+    the grace timer must leave the mid-turn session alone. The connect stamp
+    (unlike ``runner_last_seen``) survives a sibling's transient reconnect
+    blip, so this holds even across that blip.
     """
 
     from omnigent.runtime import get_conversation_store

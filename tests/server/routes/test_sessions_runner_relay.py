@@ -725,15 +725,16 @@ async def test_relay_publishes_failed_status_on_tunnel_close(
 class _RecordingLabelStore:
     """Minimal store for disconnect labels, live status, and runner liveness.
 
-    :param runner_liveness: Canned runner bindings and heartbeats used to
-        simulate a runner live on another replica.
+    :param runner_liveness: Canned ``(runner_id, runner_last_seen,
+        runner_last_connected)`` tuples used to simulate a runner live on
+        another replica.
     """
 
     def __init__(
         self,
         *,
         live_status: str = "idle",
-        runner_liveness: dict[str, tuple[str | None, int | None]] | None = None,
+        runner_liveness: dict[str, tuple[str | None, int | None, int | None]] | None = None,
     ) -> None:
         self.labels: dict[str, dict[str, str]] = {}
         self.live_status = live_status
@@ -742,7 +743,9 @@ class _RecordingLabelStore:
     def set_labels(self, conversation_id: str, updates: dict[str, str]) -> None:
         self.labels.setdefault(conversation_id, {}).update(updates)
 
-    def get_runner_liveness(self, conversation_id: str) -> tuple[str | None, int | None] | None:
+    def get_runner_liveness(
+        self, conversation_id: str
+    ) -> tuple[str | None, int | None, int | None] | None:
         return self._runner_liveness.get(conversation_id)
 
     def get_conversation(self, conversation_id: str) -> Conversation:
@@ -2680,9 +2683,10 @@ async def test_relay_stays_quiet_when_runner_is_live_on_another_replica(
 
     The runner may reconnect elsewhere before this replica's grace expires
     (ingress recycle, a 4003 close after a silent stretch). That replica's
-    fresh ``runner_last_seen`` stamp means it now owns the turn, so this
-    drop must publish no ``failed`` status and persist no
-    ``runner_disconnected`` labels — mirroring the idle-session case.
+    fresh ``runner_last_connected`` stamp means it now owns the turn — even
+    when that replica's own tunnel briefly blipped and cleared
+    ``runner_last_seen`` — so this drop must publish no ``failed`` status and
+    persist no ``runner_disconnected`` labels, mirroring the idle-session case.
     """
     import time
 
@@ -2699,13 +2703,15 @@ async def test_relay_stays_quiet_when_runner_is_live_on_another_replica(
     runner_id = "runner_live_elsewhere"
     session_id = "d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6"
     now = int(time.time())
-    # This replica's own last stamp is a minute old; the row's fresh stamp can
-    # only come from the replica the runner re-tunnelled to.
+    # This replica's own last stamp is a minute old; the row's fresh connect
+    # stamp can only come from the replica the runner re-tunnelled to. Its
+    # ``runner_last_seen`` is cleared (None) to model that replica's own tunnel
+    # briefly blipping, which must not erase the cross-replica liveness signal.
     monkeypatch.setattr(
         "omnigent.server.session_live_state.last_liveness_stamp",
         lambda _runner_id: now - 60,
     )
-    store = _RecordingLabelStore(runner_liveness={session_id: (runner_id, now)})
+    store = _RecordingLabelStore(runner_liveness={session_id: (runner_id, None, now)})
     if conversation_backend_unavailable:
 
         def unavailable(conversation_id: str) -> Any:
@@ -2745,7 +2751,13 @@ async def test_relay_stays_quiet_when_runner_is_live_on_another_replica(
 
 
 def test_runner_live_elsewhere_uses_preloaded_conversation_stamps() -> None:
-    """The grace path can detect a newer replica from already-loaded rows."""
+    """The grace path detects a newer replica from already-loaded rows.
+
+    With ``use_connect_stamp=True`` it reads the never-cleared
+    ``runner_last_connected`` and ignores ``runner_last_seen`` (cleared here
+    to None), so a sibling's transient reconnect blip cannot look like the
+    runner vanishing.
+    """
     import time
     from types import SimpleNamespace
 
@@ -2756,14 +2768,25 @@ def test_runner_live_elsewhere_uses_preloaded_conversation_stamps() -> None:
 
     now = int(time.time())
     expired_stamp = now - RUNNER_LIVENESS_TTL_S - 1
-    conversations = [SimpleNamespace(runner_id="runner_a", runner_last_seen=now)]
+    conversations = [
+        SimpleNamespace(runner_id="runner_a", runner_last_seen=None, runner_last_connected=now)
+    ]
 
-    assert _runner_live_on_another_replica_from_conversations(conversations, "runner_a", now - 1)
-    assert not _runner_live_on_another_replica_from_conversations(conversations, "runner_a", now)
+    assert _runner_live_on_another_replica_from_conversations(
+        conversations, "runner_a", now - 1, use_connect_stamp=True
+    )
     assert not _runner_live_on_another_replica_from_conversations(
-        [SimpleNamespace(runner_id="runner_a", runner_last_seen=expired_stamp)],
+        conversations, "runner_a", now, use_connect_stamp=True
+    )
+    assert not _runner_live_on_another_replica_from_conversations(
+        [
+            SimpleNamespace(
+                runner_id="runner_a", runner_last_seen=None, runner_last_connected=expired_stamp
+            )
+        ],
         "runner_a",
         expired_stamp - 1,
+        use_connect_stamp=True,
     )
 
 
@@ -2826,6 +2849,7 @@ async def test_relay_still_fails_mid_turn_session_without_handoff_evidence(
         else {
             session_id: (
                 "other-runner" if liveness_state == "different-runner" else runner_id,
+                stamp,
                 stamp,
             )
         }
