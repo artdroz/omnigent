@@ -24,12 +24,12 @@ import yaml
 from playwright.sync_api import Page, Response, expect
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-from omnigent.host.git_worktree import GIT_METADATA_TIMEOUT_S
+from omnigent.host.git_worktree import _GIT_TIMEOUT_S
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _BRANCH = "repro/large-repo-worktree"
-_CHECKOUT_S = int(GIT_METADATA_TIMEOUT_S) + 15
+_CHECKOUT_S = int(_GIT_TIMEOUT_S) + 15
 _SETTLE_TIMEOUT_S = _CHECKOUT_S + 90
 _AGENT_PREFERENCE = ("claude-native-ui", "codex-native-ui", "hello_world")
 _SESSION_PATH = re.compile(r"/c/[0-9a-f]{32}$")
@@ -280,7 +280,7 @@ def test_new_session_worktree_survives_slow_checkout(
             "branch": _BRANCH,
             "host_id": host_id,
             "checkout_s": _CHECKOUT_S,
-            "host_git_timeout_s": GIT_METADATA_TIMEOUT_S,
+            "host_git_timeout_s": _GIT_TIMEOUT_S,
             "create_status": create.status if create else None,
             "create_body": create_body,
             "settled_after_s": round(time.monotonic() - started, 1),
@@ -300,9 +300,9 @@ def test_new_session_worktree_survives_slow_checkout(
         # Guard against a disabled slow filter silently passing the test: the
         # create only exercises the regression if its checkout outlasted the
         # short metadata bound.
-        assert record["settled_after_s"] > GIT_METADATA_TIMEOUT_S, (
+        assert record["settled_after_s"] > _GIT_TIMEOUT_S, (
             f"create settled in {record['settled_after_s']}s, within the "
-            f"{GIT_METADATA_TIMEOUT_S}s metadata bound; the slow checkout did not run"
+            f"{_GIT_TIMEOUT_S}s metadata bound; the slow checkout did not run"
         )
         expect(page).to_have_url(_SESSION_PATH, timeout=60_000)
         worktree = repo.parent / f"{repo.name}-worktrees" / _BRANCH.replace("/", "-")
