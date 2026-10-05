@@ -1,0 +1,38 @@
+"""Prepare visible-message watermark storage without activating readers.
+
+Revision ID: mn1a2b3c4d5e
+Revises: mm1a2b3c4d5e
+Create Date: 2026-10-05 00:00:00.000000
+
+Existing rows remain unknown until the application reconciles their visible
+message history in bounded transactions. Older writers can continue using
+the existing columns throughout this additive schema deployment.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from alembic import op
+
+revision: str = "mn1a2b3c4d5e"
+down_revision: str | None = "mm1a2b3c4d5e"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+
+def upgrade() -> None:
+    """Add nullable storage; leave initialization to bounded reconciliation."""
+    bind = op.get_bind()
+    existing = {column["name"] for column in sa.inspect(bind).get_columns("conversations")}
+    for name in ("last_message_at", "last_message_observed_position"):
+        if name not in existing:
+            op.add_column("conversations", sa.Column(name, sa.Integer(), nullable=True))
+
+
+def downgrade() -> None:
+    """Remove watermark storage after all schema-aware binaries are stopped."""
+    with op.batch_alter_table("conversations") as batch:
+        batch.drop_column("last_message_observed_position")
+        batch.drop_column("last_message_at")
