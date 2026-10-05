@@ -37,6 +37,7 @@ const STATUS_TIMEOUT_MS = 60_000;
 const EXTEND_TIMEOUT_MS = 120_000;
 const ARCA_EXTEND_MODES = Object.freeze(["default", "overnight", "workweek"]);
 const ARCA_AUTH_RE = /arca (auth )?login|certificate.*expired|permission denied \(publickey/i;
+const MAX_STATUS_STDOUT_BYTES = 256 * 1024;
 
 /**
  * The only characters allowed in the server URL that rides inside the ssh
@@ -286,23 +287,46 @@ function parseArcaStatus(stdout) {
   };
   let status = parseObject(stdout.trim());
   if (!status) {
-    for (
-      let start = stdout.indexOf("{");
-      start !== -1 && !status;
-      start = stdout.indexOf("{", start + 1)
-    ) {
-      for (
-        let end = stdout.indexOf("}", start + 1);
-        end !== -1;
-        end = stdout.indexOf("}", end + 1)
-      ) {
-        const candidate = parseObject(stdout.slice(start, end + 1));
+    let start = -1;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    let candidates = 0;
+    for (let i = 0; i < stdout.length && candidates < 20; i++) {
+      const char = stdout[i];
+      if (depth === 0) {
+        if (char === "{") {
+          start = i;
+          depth = 1;
+        }
+        continue;
+      }
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === '"') inString = false;
+      } else if (char === '"') {
+        inString = true;
+      } else if (char === "{") {
+        depth++;
+      } else if (char === "}" && --depth === 0) {
+        candidates++;
+        const candidate = parseObject(stdout.slice(start, i + 1));
+        const hasInstance =
+          candidate &&
+          Object.hasOwn(candidate, "instance") &&
+          (candidate.instance === null ||
+            (typeof candidate.instance === "object" && !Array.isArray(candidate.instance)));
         if (
           candidate &&
-          (typeof candidate.status === "string" || Object.hasOwn(candidate, "instance"))
+          typeof candidate.status === "string" &&
+          (hasInstance || Object.hasOwn(candidate, "shutdown_time"))
         ) {
-          status = candidate;
-          break;
+          if (hasInstance) {
+            status = candidate;
+            break;
+          }
+          status ??= candidate;
         }
       }
     }
@@ -325,7 +349,7 @@ function parseArcaStatus(stdout) {
  * Run a headless Arca command and capture both output streams.
  * @param {string} arcaPath
  * @param {string[]} args
- * @param {{ spawn?: typeof spawn, timeoutMs: number }} options
+ * @param {{ spawn?: typeof spawn, timeoutMs: number, maxStdoutBytes?: number }} options
  * @returns {Promise<{ code: number | null, stdout: string, stderr: string, timedOut?: boolean, spawnError?: Error }>}
  */
 function runArca(arcaPath, args, options) {
@@ -338,16 +362,40 @@ function runArca(arcaPath, args, options) {
       return;
     }
     let stdout = "";
+    let stdoutBytes = 0;
     let stderr = "";
     let settled = false;
     let exited = false;
     let exitCode = null;
     let exitGraceTimer;
-    const settle = (result) => {
+    const onStdout = (chunk) => {
+      if (stdoutBytes >= (options.maxStdoutBytes ?? Infinity)) return;
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      const retained = bytes.subarray(0, (options.maxStdoutBytes ?? Infinity) - stdoutBytes);
+      stdout += retained.toString("utf8");
+      stdoutBytes += retained.length;
+    };
+    const onStderr = (chunk) => {
+      stderr += String(chunk);
+    };
+    const settle = (result, fromClose = false) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       clearTimeout(exitGraceTimer);
+      if (!fromClose) {
+        for (const [stream, listener] of [
+          [child.stdout, onStdout],
+          [child.stderr, onStderr],
+        ]) {
+          try {
+            stream?.off("data", listener);
+            stream?.destroy?.();
+          } catch {
+            // A child may already have closed the pipe.
+          }
+        }
+      }
       resolve({ code: result.code, stdout, stderr, ...result });
     };
     const timer = setTimeout(() => {
@@ -363,12 +411,8 @@ function runArca(arcaPath, args, options) {
       settle({ code: null, timedOut: true });
     }, options.timeoutMs);
     if (typeof timer.unref === "function") timer.unref();
-    child.stdout?.on("data", (chunk) => {
-      stdout += String(chunk);
-    });
-    child.stderr?.on("data", (chunk) => {
-      stderr += String(chunk);
-    });
+    child.stdout?.on("data", onStdout);
+    child.stderr?.on("data", onStderr);
     child.on("error", (error) => settle({ code: null, spawnError: error }));
     child.on("exit", (code) => {
       if (settled) return;
@@ -377,7 +421,7 @@ function runArca(arcaPath, args, options) {
       exitGraceTimer = setTimeout(() => settle({ code }), 500);
       if (typeof exitGraceTimer.unref === "function") exitGraceTimer.unref();
     });
-    child.on("close", (code) => settle({ code: exited ? exitCode : code }));
+    child.on("close", (code) => settle({ code: exited ? exitCode : code }, true));
   });
 }
 
@@ -457,6 +501,7 @@ async function readArcaStatus(deps = {}) {
     const run = await runArca(arcaPath, ["status", "--json"], {
       spawn: deps.spawn,
       timeoutMs: deps.timeoutMs ?? STATUS_TIMEOUT_MS,
+      maxStdoutBytes: MAX_STATUS_STDOUT_BYTES,
     });
     if (run.spawnError)
       return {

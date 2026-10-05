@@ -2,6 +2,7 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
+const { spawn: realSpawn } = require("node:child_process");
 const { EventEmitter } = require("node:events");
 const {
   ARCA_EXTEND_MODES,
@@ -25,6 +26,12 @@ function fakeConnectChild() {
   const child = new EventEmitter();
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
+  for (const stream of [child.stdout, child.stderr]) {
+    stream.destroyed = false;
+    stream.destroy = () => {
+      stream.destroyed = true;
+    };
+  }
   child.killed = false;
   child.kill = () => {
     child.killed = true;
@@ -103,6 +110,29 @@ describe("arca status output", () => {
       assert.equal(parseArcaStatus(stdout).shutdownAt, Date.UTC(2026, 9, 5, 1));
     }
   });
+
+  it("skips a status-shaped notice before the real payload", () => {
+    const stdout =
+      '{"status":"update available"}\n{"status":"running","instance":{"shutdown_time":"2026-10-05T01:00:00Z"}}';
+    assert.deepEqual(parseArcaStatus(stdout), {
+      state: "running",
+      shutdownAt: Date.UTC(2026, 9, 5, 1),
+      rawShutdownTime: "2026-10-05T01:00:00Z",
+    });
+  });
+
+  it("prefers an instance payload over a minimal status candidate", () => {
+    const stdout =
+      '{"status":"pending","shutdown_time":null}\n{"status":"running","instance":{"shutdown_time":"2026-10-05T01:00:00Z"}}';
+    assert.equal(parseArcaStatus(stdout).shutdownAt, Date.UTC(2026, 9, 5, 1));
+  });
+
+  it("handles brace-heavy malformed output promptly", () => {
+    const malformed = "{not-json}".repeat(1_250);
+    const started = performance.now();
+    assert.equal(parseArcaStatus(malformed), null);
+    assert.ok(performance.now() - started < 100);
+  });
 });
 
 describe("arca status command", () => {
@@ -158,7 +188,34 @@ describe("arca status command", () => {
       rawShutdownTime: null,
     });
     assert.equal(deps.calls[0].child.killed, false);
+    assert.equal(deps.calls[0].child.stdout.destroyed, true);
+    assert.equal(deps.calls[0].child.stderr.destroyed, true);
   });
+
+  it(
+    "closes inherited pipes after a real child exits",
+    { skip: process.platform === "win32" },
+    async () => {
+      let child;
+      const started = performance.now();
+      const result = await readArcaStatus({
+        resolveArcaPath: () => "/bin/sh",
+        spawn: (_file, _args, options) => {
+          child = realSpawn(
+            "/bin/sh",
+            ["-c", 'printf \'%s\\n\' \'{"status":"running","instance":null}\'; sleep 2 &'],
+            options,
+          );
+          return child;
+        },
+        timeoutMs: 900,
+      });
+      assert.equal(result.ok, true);
+      assert.ok(performance.now() - started < 900);
+      assert.equal(child.stdout.destroyed, true);
+      assert.equal(child.stderr.destroyed, true);
+    },
+  );
 
   it("uses the exit code at the overall timeout when close never arrives", async () => {
     const deps = fakeCliSpawn((child) =>
@@ -169,6 +226,19 @@ describe("arca status command", () => {
     );
     assert.equal((await readArcaStatus({ ...deps, timeoutMs: 20 })).ok, true);
     assert.equal(deps.calls[0].child.killed, false);
+    assert.equal(deps.calls[0].child.stdout.destroyed, true);
+    assert.equal(deps.calls[0].child.stderr.destroyed, true);
+  });
+
+  it("caps captured status stdout", async () => {
+    const deps = fakeCliSpawn((child) =>
+      queueMicrotask(() => {
+        child.stdout.emit("data", "noise".repeat(60_000));
+        child.stdout.emit("data", '{"status":"running","instance":null}');
+        child.emit("close", 0);
+      }),
+    );
+    assert.match((await readArcaStatus(deps)).error, /unexpected arca status output/i);
   });
 
   it("maps non-zero exit, timeout, spawn errors, and malformed success", async () => {
@@ -182,6 +252,8 @@ describe("arca status command", () => {
     const timeout = fakeCliSpawn();
     assert.equal((await readArcaStatus({ ...timeout, timeoutMs: 20 })).errorKind, "timeout");
     assert.equal(timeout.calls[0].child.killed, true);
+    assert.equal(timeout.calls[0].child.stdout.destroyed, true);
+    assert.equal(timeout.calls[0].child.stderr.destroyed, true);
     const spawnError = fakeCliSpawn((child) =>
       queueMicrotask(() => child.emit("error", new Error("EACCES"))),
     );
