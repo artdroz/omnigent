@@ -26,12 +26,12 @@ from typing import Any, Literal, Protocol, TypeAlias, cast
 
 import httpx
 
-from omnigent import model_catalog
-from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.errors import is_context_length_exceeded as _is_context_length_exceeded
-from omnigent.reasoning_effort import OPENAI_AGENTS_EFFORTS, validate_effort
+from omnigent.models import model_catalog
 from omnigent.spec.types import RetryPolicy
+from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.reasoning_effort import OPENAI_AGENTS_EFFORTS, validate_effort
 
 from .async_utils import run_sync_on_thread
 from .executor import (
@@ -128,9 +128,11 @@ def _normalize_responses_items_for_chat(
     :returns: New list with normalised ``input_file`` blocks in message
         content.  Items without ``input_file`` blocks are returned as-is.
     """
+    from omnigent.inner.native_attachments import expand_framework_notices
+
     result: list[_JsonObject] = []
-    for item in items:
-        if item.get("type") == "message":
+    for item in expand_framework_notices(items):
+        if item.get("type") == "message" or "role" in item:
             raw_content = item.get("content")
             if item.get("role") == "assistant" and isinstance(raw_content, str):
                 # The chat converter iterates assistant content expecting
@@ -1321,8 +1323,9 @@ class OpenAIAgentsSDKExecutor(Executor):
                 # endpoint may not support ``file`` content blocks at all.
                 # Converting to ``input_text`` is the universally compatible
                 # path: the model sees the file content as plain text.
-                normalized = _normalize_content_blocks_for_chat(content)
-                return [{"type": "message", "role": "user", "content": normalized}]
+                return _normalize_responses_items_for_chat(
+                    [{"type": "message", "role": "user", "content": content}]
+                )
             return json.dumps(content)
         return _normalize_responses_items_for_chat(_convert_messages_to_responses(delta_messages))
 
@@ -1851,21 +1854,19 @@ class OpenAIAgentsSDKExecutor(Executor):
             in_tok = sum(getattr(r.usage, "input_tokens", 0) or 0 for r in raw_responses)
             out_tok = sum(getattr(r.usage, "output_tokens", 0) or 0 for r in raw_responses)
             total_tok = sum(getattr(r.usage, "total_tokens", 0) or 0 for r in raw_responses)
-            # OpenAI's ``input_tokens`` (aka ``prompt_tokens``) is the
-            # TOTAL input count *including* cached tokens, whereas
-            # ``compute_llm_cost`` expects Anthropic semantics where
-            # ``input_tokens`` is the non-cached portion and
-            # ``cache_read_input_tokens`` is additive. Extract cached
-            # tokens from ``prompt_tokens_details.cached_tokens`` and
-            # subtract so downstream billing uses the cheaper cache rate.
+            # SDK ``input_tokens`` INCLUDES cached tokens; ``compute_llm_cost`` expects
+            # Anthropic semantics (non-cached input + additive cache_read), so subtract
+            # ``Usage.input_tokens_details.cached_tokens`` (its only cache field).
             cached_tok = 0
             for r in raw_responses:
-                details = getattr(r.usage, "prompt_tokens_details", None)
+                details = getattr(r.usage, "input_tokens_details", None)
                 if details is not None:
                     cached = getattr(details, "cached_tokens", None)
                     if cached is None and isinstance(details, dict):
                         cached = details.get("cached_tokens")
-                    cached_tok += cached or 0
+                    # Clamp per response to [0, input] so malformed counts never go negative.
+                    r_in = getattr(r.usage, "input_tokens", 0) or 0
+                    cached_tok += min(max(cached or 0, 0), r_in)
             last_r = raw_responses[-1]
             last_in = getattr(last_r.usage, "input_tokens", 0) or 0
             last_out = getattr(last_r.usage, "output_tokens", 0) or 0

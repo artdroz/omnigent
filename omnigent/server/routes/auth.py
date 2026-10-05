@@ -17,7 +17,7 @@ import secrets
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 import jwt
@@ -169,6 +169,12 @@ def create_auth_router(
         # signed into the state cookie — prevents an open redirect on
         # the post-auth 302 in /callback.
         return_to = _sanitize_return_to(request.query_params.get("return_to"))
+        # A bare "/" default (e.g. an invite link carrying no return_to) would
+        # send the post-auth 302 to the origin root; keep it under the base path
+        # so login stays within a subpath mount.
+        base_path = getattr(request.app.state, "base_path", "")
+        if base_path and return_to == "/":
+            return_to = f"{base_path}/"
         # Optional CLI login ticket — threaded through the state
         # cookie so the callback can fulfill it.
         ticket = request.query_params.get("ticket")
@@ -217,7 +223,13 @@ def create_auth_router(
             # rather than silently reusing an existing IdP session.
             params["prompt"] = "login"
             params["max_age"] = "0"
-        auth_url = config.authorization_endpoint + "?" + urlencode(params)
+        endpoint = urlsplit(config.authorization_endpoint)
+        query = [
+            (name, value)
+            for name, value in parse_qsl(endpoint.query, keep_blank_values=True)
+            if name not in params
+        ]
+        auth_url = urlunsplit(endpoint._replace(query=urlencode(query + list(params.items()))))
 
         response = RedirectResponse(url=auth_url, status_code=302)
         response.set_cookie(
@@ -290,9 +302,10 @@ def create_auth_router(
             "code": code,
             "redirect_uri": config.redirect_uri,
             "client_id": config.client_id,
-            "client_secret": config.client_secret,
             "code_verifier": code_verifier,
         }
+        if config.client_secret:
+            token_data["client_secret"] = config.client_secret
 
         async with httpx.AsyncClient() as client:
             # GitHub requires Accept: application/json to get JSON
@@ -550,16 +563,18 @@ def create_auth_router(
             )
 
     @router.get("/logout")
-    async def logout() -> Response:
+    async def logout(request: Request) -> Response:
         """Clear the session cookie and redirect.
 
         If ``OMNIGENT_OIDC_LOGOUT_REDIRECT_URI`` is configured,
         redirects to the IdP's end-session endpoint. Otherwise,
-        redirects to ``/``.
+        redirects to the app root, kept under the deployment base
+        path so sign-out does not escape a subpath mount.
 
         :returns: 302 redirect with the session cookie cleared.
         """
-        redirect_url = config.logout_redirect_uri or "/"
+        base_path = getattr(request.app.state, "base_path", "")
+        redirect_url = config.logout_redirect_uri or f"{base_path}/"
         response = RedirectResponse(url=redirect_url, status_code=302)
         response.delete_cookie(
             key=_session_cookie,
@@ -873,7 +888,7 @@ def _validate_id_token(
         return jwt.decode(
             id_token,
             signing_key.key,
-            algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
+            algorithms=["RS256", "RS384", "RS512", "PS256", "ES256", "ES384", "ES512"],
             audience=config.client_id,
             issuer=config.issuer,
         )
