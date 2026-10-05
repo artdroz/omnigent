@@ -1,6 +1,12 @@
-"""``omni setup`` surfaces the drift after ``ug configure`` switches ucode's
-current workspace away from the configured profile, while the Databricks label
-keeps naming the profile sessions route through (not ucode's current_workspace)."""
+"""``omni setup`` must show when ``ug configure`` has switched ucode's current
+workspace away from the configured Databricks profile.
+
+The overview labels the credential from ``providers.databricks.profile`` and
+never consulted ``~/.ucode/state.json``, so the two drifted apart silently.
+Whether setup should follow ucode or only flag the divergence is open, so the
+assertion only requires the switched workspace (profile or host) to appear.
+``omni setup`` runs for real under a PTY; ucode is stood in by ``_fake_ucode``.
+"""
 
 from __future__ import annotations
 
@@ -79,6 +85,10 @@ def _spawn_setup(env: dict[str, str]) -> pexpect.spawn:
     return child
 
 
+def _strip(raw: bytes) -> str:
+    return _ANSI_RE.sub(b"", raw).decode("utf-8", "replace")
+
+
 def _frame(child: pexpect.spawn, settle: float = 1.5) -> str:
     """Return the ANSI-stripped output already buffered plus anything arriving within *settle*."""
     buf = bytes(child.buffer)
@@ -91,7 +101,7 @@ def _frame(child: pexpect.spawn, settle: float = 1.5) -> str:
             continue
         except pexpect.EOF:
             break
-    return _ANSI_RE.sub(b"", buf).decode("utf-8", "replace")
+    return _strip(buf)
 
 
 def _status_row(overview: str, harness: str) -> str:
@@ -149,10 +159,8 @@ def _switch_ucode_workspace(env: dict[str, str], url: str, profile: str) -> None
 
 
 @pytest.mark.timeout(300)
-def test_setup_surfaces_ucode_workspace_drift(tmp_path: Path) -> None:
-    """After ``ug configure`` moves ucode to workspace B, the Claude row keeps
-    naming ``Databricks (ai_devtools)`` while the overview gains a banner
-    naming the workspace ucode switched to."""
+def test_setup_shows_the_workspace_ucode_switched_to(tmp_path: Path) -> None:
+    """After ``ug configure`` moves ucode to workspace B, ``omni setup`` must say so."""
     home = tmp_path / "home"
     home.mkdir()
     (home / ".databrickscfg").write_text(
@@ -175,24 +183,17 @@ def test_setup_surfaces_ucode_workspace_drift(tmp_path: Path) -> None:
 
     child = _spawn_setup(env)
     try:
-        # The banner renders above the "Configure harnesses" title _spawn_setup
-        # consumed, so it lands in child.before; the rows arrive in the buffer.
-        banner = _ANSI_RE.sub(b"", bytes(child.before or b"")).decode("utf-8", "replace")
+        # Anything rendered above the title lands in child.before; the rows follow.
+        above_title = _strip(bytes(child.before or b""))
         overview = _frame(child, 2.5)
     finally:
         _quit(child)
-    full = banner + overview
-
-    # The credential keeps naming the profile sessions actually route through
-    # (providers.databricks.profile), not ucode's current_workspace.
     claude_row = _status_row(overview, "Claude")
-    assert f"Databricks ({PROFILE_A})" in claude_row, overview
-
-    # ...but the overview no longer hides the divergence: it names the workspace
-    # ucode switched to. That host appears nowhere on the unfixed base.
+    shown = above_title + overview
     host_b = WORKSPACE_B.split("://", 1)[-1]
-    assert host_b in full, (
+    assert PROFILE_B in shown or host_b in shown, (
         f"ucode's current workspace is now {WORKSPACE_B} (profile {PROFILE_B}), but the "
-        f"`omni setup` overview never surfaces it — shown output was {full!r}; the "
-        "configured profile and ucode's current_workspace drift apart silently"
+        f"`omni setup` overview still shows {claude_row!r} and nothing on it names that "
+        "workspace: the label comes from providers.databricks.profile in "
+        "~/.omnigent/config.yaml and ~/.ucode/state.json current_workspace is never consulted"
     )

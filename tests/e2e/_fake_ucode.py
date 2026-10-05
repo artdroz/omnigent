@@ -1,6 +1,9 @@
 """Stand-in for the ``ucode`` / ``ug`` CLI used by the setup-workspace e2e test.
-The real CLI needs a private git source and Databricks OAuth, so this writes
-only the files Omnigent reads: ``~/.ucode/state.json`` and ``~/.databrickscfg``."""
+
+The real CLI needs a private git source and Databricks OAuth, so this writes only
+the files Omnigent reads after ``ug configure``: ``~/.ucode/state.json`` (shape
+per :mod:`omnigent.onboarding.ucode_state`) and the ``~/.databrickscfg`` profile.
+"""
 
 from __future__ import annotations
 
