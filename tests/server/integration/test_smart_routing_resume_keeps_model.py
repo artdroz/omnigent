@@ -30,6 +30,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from omnigent.runner.subagent_routing import CREATE_ROUTE_PROMPT_LABEL_KEY
 from omnigent.runner.turn_routing import create_route_prompt_fingerprint
@@ -293,3 +294,35 @@ async def test_a_harness_model_report_is_not_a_pin(
         f"a reported model was mistaken for a user pin: {decision}"
     )
     assert decision["model"] == ROUTER_PICK
+
+
+async def test_a_failed_fingerprint_retirement_leaves_the_model_request_unapplied(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A create fingerprint that cannot be retired fails the request whole.
+
+    The fingerprint is dropped before the model write, so a store failure
+    there leaves the create's pick and its fingerprint both in place — the
+    user sees an error and retries — rather than a pin the hook would later
+    route over because its fingerprint outlived it.
+    """
+    session_id = await _smart_routing_session(client, agent_name="routing-resume-retire-fails")
+    _seed_create_route(db_uri, session_id)
+
+    def _unavailable(self: object, conversation_id: str, key: str) -> None:
+        raise OperationalError("DELETE FROM conversation_labels", {}, Exception("locked"))
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "delete_label", _unavailable)
+    resp = await client.patch(f"/v1/sessions/{session_id}", json={"model_override": USER_MODEL})
+    # The server maps the store error to a 500 rather than re-raising it.
+    assert resp.status_code == 500, resp.text
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.model_override == CREATE_PICK
+    assert conv.labels.get(CREATE_ROUTE_PROMPT_LABEL_KEY) == create_route_prompt_fingerprint(
+        CREATE_PROMPT
+    )

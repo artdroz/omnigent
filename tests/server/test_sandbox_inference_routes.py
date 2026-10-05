@@ -18,6 +18,12 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient, MockTransport, Request, Response
 
 from omnigent.db.utils import generate_agent_id
+from omnigent.runner.subagent_routing import CREATE_ROUTE_PROMPT_LABEL_KEY
+from omnigent.runner.turn_routing import (
+    TurnRouteRequest,
+    create_route_prompt_fingerprint,
+    resolve_turn_route,
+)
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
@@ -459,6 +465,11 @@ async def test_rejected_native_switch_restores_saved_model(
     session_id = created.json()["id"]
     if previous_model is None:
         env.store.update_conversation(session_id, _unset_model_override=True)
+    # A Smart Routing create left this pick and the routed prompt's fingerprint,
+    # with the decision still unclaimed; a rejected switch must hand both back.
+    create_fingerprint = create_route_prompt_fingerprint("the prompt the create routed")
+    env.store.update_conversation(session_id, cost_control_mode_override="on")
+    env.store.set_labels(session_id, {CREATE_ROUTE_PROMPT_LABEL_KEY: create_fingerprint})
     original = env.store.get_conversation(session_id)
     assert original is not None
     assert original.model_override == previous_model
@@ -491,6 +502,30 @@ async def test_rejected_native_switch_restores_saved_model(
     assert saved is not None
     assert saved.model_override == previous_model
     assert saved.inference_snapshot == original.inference_snapshot
+    assert saved.labels.get(CREATE_ROUTE_PROMPT_LABEL_KEY) == create_fingerprint
+
+    # The restored pick is still routing's, not the user's: an edited first
+    # prompt routes as it did before the rejected switch.
+    routed: list[str] = []
+
+    async def _route(harness: str | None, prompt: str) -> tuple[str, dict[str, Any]]:
+        routed.append(prompt)
+        return "gateway/fast", {"rationale": "fresh pick"}
+
+    decision = await resolve_turn_route(
+        session_id,
+        TurnRouteRequest(
+            harness="codex-native",
+            prompt="an edited prompt the create never saw",
+            turn_id="turn_1",
+            model=previous_model or "gateway/main",
+        ),
+        conv=saved,
+        route_turn=_route,
+    )
+    # The judge was consulted and its pick carried, not the user-pin allow.
+    assert routed == ["an edited prompt the create never saw"]
+    assert decision.model == "gateway/fast"
 
 
 async def test_inherited_child_rejects_conflicting_auth_before_persistence(env: _Env):

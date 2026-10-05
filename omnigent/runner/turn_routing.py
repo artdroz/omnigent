@@ -459,16 +459,12 @@ def user_pinned_model(conv: Any) -> bool:
     ``model_override`` carries REQUESTS only — the picker PATCH, a create's
     explicit model, a scheduled task's configured model — since harness-side
     model REPORTS (launch defaults, in-pane ``/model`` switches) land in
-    ``reported_model``. (The codex forwarder once mirrored the launch model
-    into ``model_override`` about a second into the first turn, which is why
-    this hook historically could not read the field at all; the mirror now
-    posts reports.) Routing's own pins are told apart by their labels: a
-    routed turn stamps the decision label :func:`already_routed` reads
-    first, and a Smart Routing create records the routed prompt's
-    fingerprint instead — awaiting a first-prompt claim, or a fresh route
-    for an edited prompt — so that fingerprint marks the override as
-    routing's, not the user's. A user's own model request retires it (the
-    picker PATCH), so a pick made over the create's reads as the pin it is.
+    ``reported_model``. Routing's own pins carry provenance: a routed turn
+    stamps the decision label :func:`already_routed` reads first, and a
+    Smart Routing create records the routed prompt's fingerprint — awaiting
+    a first-prompt claim, or a fresh route for an edited prompt — which marks
+    the override as routing's. A user's own model request (the picker PATCH)
+    retires that fingerprint, so a pick made over the create's is a pin too.
 
     Children are exempt: a routed parent deliberately routes its spawns past
     an orchestrator-supplied model, the same choice the composer gate makes.
@@ -672,17 +668,9 @@ async def resolve_turn_route(
         )
         return _allow("this session was routed at create on this prompt", terminal=True)
     if user_pinned_model(conv):
-        # The user chose this session's model themselves (picker PATCH, an
-        # explicit create model, a scheduled task's configured model) and left
-        # Smart Routing on. A pin wins over the router — the same answer the
-        # composer gate and the create path give — so a resumed pane's fresh
-        # hook must not re-pick and switch the session off it. Terminal for
-        # the same reason as "routing is off": pinned is this session's
-        # steady state, so a non-terminal answer would charge every remaining
-        # prompt a full round trip to be told the same thing. The narrow cost
-        # mirrors that gate's — a pin cleared mid-pane routes again only from
-        # the next launch; the composer gate and create-time path are
-        # unaffected.
+        # A user pin wins over the router (same answer as the composer gate).
+        # Terminal: pinned is the steady state, so later prompts skip the
+        # round trip; a pin cleared mid-pane routes again from the next launch.
         _logger.info(
             "route-turn: session=%s keeps its user-pinned model; allowing unrouted",
             session_id,

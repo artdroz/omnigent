@@ -6742,8 +6742,8 @@ async def _forget_create_route_prompt(
     session_id: str,
     conv: Conversation,
     conversation_store: ConversationStore,
-) -> Conversation:
-    """Retire the create-time route's fingerprint after a user model request.
+) -> str | None:
+    """Retire the create-time route's fingerprint ahead of a user model write.
 
     The fingerprint marks ``model_override`` as the create's own pick. A model
     the user asks for — the picker's choice, or a reset to default — replaces
@@ -6751,32 +6751,50 @@ async def _forget_create_route_prompt(
     nor read the user's override as routing's and route over it
     (:func:`omnigent.runner.turn_routing.user_pinned_model`).
 
-    Best-effort like :func:`_record_create_route_prompt`: a label that cannot
-    be cleared is logged rather than failing the request.
+    Runs before the model write and lets a store failure propagate: the
+    request then fails with the row untouched, and a hook racing the request
+    sees the create's pin without its fingerprint — kept unrouted — rather
+    than the user's pin with a stale one.
 
     :param session_id: Session/conversation identifier.
-    :param conv: The refreshed row after the model write, labels included.
+    :param conv: The row as read at the route boundary, labels included.
     :param conversation_store: Store exposing ``delete_label``.
-    :returns: *conv*, with the label dropped from its in-memory copy too.
+    :returns: The retired fingerprint, for :func:`_restore_create_route_prompt`
+        should the model write be rolled back; ``None`` when there was none.
     """
     from omnigent.runner.subagent_routing import CREATE_ROUTE_PROMPT_LABEL_KEY
 
-    if CREATE_ROUTE_PROMPT_LABEL_KEY not in conv.labels:
-        return conv
-    try:
-        await asyncio.to_thread(
-            conversation_store.delete_label, session_id, CREATE_ROUTE_PROMPT_LABEL_KEY
-        )
-    except (OSError, ValueError):
-        _logger.warning(
-            "smart_routing: failed to retire the create-time prompt for session=%s",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
-        return conv
-    conv.labels.pop(CREATE_ROUTE_PROMPT_LABEL_KEY, None)
-    return conv
+    fingerprint = conv.labels.get(CREATE_ROUTE_PROMPT_LABEL_KEY)
+    if not fingerprint:
+        return None
+    await asyncio.to_thread(
+        conversation_store.delete_label, session_id, CREATE_ROUTE_PROMPT_LABEL_KEY
+    )
+    return fingerprint
+
+
+async def _restore_create_route_prompt(
+    session_id: str,
+    fingerprint: str,
+    conversation_store: ConversationStore,
+) -> None:
+    """Hand a retired create-time fingerprint back with a rolled-back model.
+
+    A live native switch the pane rejects puts the create's pick back into
+    ``model_override``; without its fingerprint that pick would read as the
+    user's and an edited first prompt would stop routing.
+
+    :param session_id: Session/conversation identifier.
+    :param fingerprint: The value :func:`_forget_create_route_prompt` retired.
+    :param conversation_store: Store exposing ``set_labels``.
+    """
+    from omnigent.runner.subagent_routing import CREATE_ROUTE_PROMPT_LABEL_KEY
+
+    await asyncio.to_thread(
+        conversation_store.set_labels,
+        session_id,
+        {CREATE_ROUTE_PROMPT_LABEL_KEY: fingerprint},
+    )
 
 
 # Sessions with a message dispatch still awaiting its runner (cold boot). The

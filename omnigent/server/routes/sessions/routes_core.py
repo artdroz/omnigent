@@ -176,6 +176,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _labels_for_viewer,
     _persist_model_change_note,
     _publish_runner_recovered_status,
+    _restore_create_route_prompt,
     _run_managed_launch,
     _spawn_archive_stop,
     _validate_session_model_selection,
@@ -2665,6 +2666,13 @@ def register_core_routes(
                 request, conv, conversation_store, runner_router
             )
 
+        # The user's own model request supersedes a Smart Routing create's pick;
+        # its fingerprint goes first, and a rejected live switch hands it back.
+        retired_create_route: str | None = None
+        if conv is not None and (model_override is not None or clear_model):
+            retired_create_route = await _forget_create_route_prompt(
+                session_id, conv, conversation_store
+            )
         updated = await asyncio.to_thread(
             conversation_store.update_conversation,
             session_id,
@@ -2687,10 +2695,6 @@ def register_core_routes(
         )
         if updated is None:
             raise _session_not_found()
-        if model_override is not None or clear_model:
-            # The user's own model request supersedes a Smart Routing create's
-            # pick; the fingerprint marking the override as routing's goes too.
-            updated = await _forget_create_route_prompt(session_id, updated, conversation_store)
         # Archiving hides the session from the default view (and its unread
         # dot), so drop its per-user read-state to bound in-memory growth.
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).
@@ -2764,6 +2768,10 @@ def register_core_routes(
                         model_override=conv.model_override,
                         _unset_model_override=conv.model_override is None,
                     )
+                    if retired_create_route is not None:
+                        await _restore_create_route_prompt(
+                            session_id, retired_create_route, conversation_store
+                        )
                     raise OmnigentError(
                         "The terminal did not apply the model change. "
                         "The previous selection has been restored.",

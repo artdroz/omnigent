@@ -135,7 +135,8 @@ async def test_a_users_pinned_model_is_kept_unrouted() -> None:
     pins carry a label (the decision label, or the create-prompt fingerprint),
     so a bare override can only be a request the user made — the picker PATCH,
     an explicit create model, a scheduled task's configured model. The pin
-    wins over the router, the same answer the composer gate gives.
+    wins over the router, the same answer the composer gate gives, on every
+    hook round trip — a resumed pane's fresh bridge dir repeats it.
     """
     rec = _Recorder()
     decision = await resolve_turn_route(
@@ -1531,49 +1532,6 @@ async def test_a_second_prompt_after_the_decision_lands_declines() -> None:
     assert second.action == "allow"
     assert second.terminal is True
     assert len(rec.routed) == 1
-
-
-async def test_a_manually_pinned_session_with_routing_on_is_never_hook_routed() -> None:
-    """
-    A user pin survives every hook round trip — including a resume's.
-
-    The composer gate declines a manually pinned session (its gate is
-    ``effective_runner_override is None``); this hook now gives the same
-    answer. Historically it could not: the codex forwarder mirrored
-    ``config.toml``'s launch model into ``model_override`` about a second into
-    the first turn, so a present override could not tell a user's pin from the
-    mirror. Reports have since moved to ``reported_model``, so the override is
-    provenance-clean and the pin gates. A resumed pane's fresh bridge dir
-    repeats the round trip; the answer must hold there too.
-    """
-    rec = _Recorder()
-    # A real user pin: a model set, and NO routing labels.
-    conv = _FakeConv(model_override="databricks-gpt-5-6-sol")
-    decision = await resolve_turn_route(
-        "conv_1",
-        _request(),
-        conv=conv,
-        route_turn=rec.route,
-        pin=rec.pin,
-        persist=rec.persist,
-    )
-
-    assert decision.action == "allow"
-    assert rec.routed == []
-    assert rec.pinned == []
-    # The resume's first prompt makes the same round trip (fresh bridge dir, no
-    # local marker) and must keep the same model.
-    second = await resolve_turn_route(
-        "conv_1",
-        _request(turn_id="turn_2", prompt="continue where we left off"),
-        conv=conv,
-        route_turn=rec.route,
-        pin=rec.pin,
-        persist=rec.persist,
-    )
-    assert second.action == "allow"
-    assert rec.routed == []
-    assert rec.pinned == []
 
 
 # ── D1: the recovery dedup is a structural compare, not a substring ──
