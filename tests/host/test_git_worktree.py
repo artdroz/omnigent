@@ -809,13 +809,19 @@ def test_create_worktree_bounds_only_checkout_commands_generously(
 
     create_worktree(repo_path=str(git_repo / "web"), branch_name="feature/bounds")
 
+    # Key on the full subcommand so a metadata ``worktree prune``/``list`` is
+    # never conflated with the size-scaling ``worktree add``.
+    def _subcommand(argv: list[str]) -> str:
+        return f"worktree {argv[1]}" if argv[0] == "worktree" and len(argv) > 1 else argv[0]
+
+    generous = {"worktree add", "checkout"}
     by_bound: dict[float | None, set[str]] = {}
     for argv, timeout in git_bounds:
-        by_bound.setdefault(timeout, set()).add(argv[0])
+        by_bound.setdefault(timeout, set()).add(_subcommand(argv))
 
-    assert by_bound[git_worktree_module.GIT_CHECKOUT_TIMEOUT_S] == {"worktree", "checkout"}
+    assert by_bound[git_worktree_module.GIT_CHECKOUT_TIMEOUT_S] == generous
     assert all(
-        timeout is None for argv, timeout in git_bounds if argv[0] not in {"worktree", "checkout"}
+        timeout is None for argv, timeout in git_bounds if _subcommand(argv) not in generous
     )
 
 

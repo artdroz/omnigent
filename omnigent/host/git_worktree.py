@@ -357,7 +357,9 @@ def _resolve_worktree_path(repo_root: str, branch_name: str) -> Path:
     )
 
 
-def _ensure_base_resolvable(repo_root: str, base_branch: str) -> None:
+def _ensure_base_resolvable(
+    repo_root: str, base_branch: str, *, checkout_timeout_s: float = GIT_CHECKOUT_TIMEOUT_S
+) -> None:
     """Make ``base_branch`` resolvable, fetching once if needed.
 
     If the base ref doesn't resolve locally (e.g. a remote-tracking
@@ -369,6 +371,7 @@ def _ensure_base_resolvable(repo_root: str, base_branch: str) -> None:
         ``"/Users/alice/myrepo"``.
     :param base_branch: Base ref the user requested, e.g. ``"main"``
         or ``"origin/main"``.
+    :param checkout_timeout_s: Bound for the size-scaling ``git fetch``.
     :raises WorktreeError: If the base ref cannot be resolved even
         after a fetch attempt.
     """
@@ -384,7 +387,7 @@ def _ensure_base_resolvable(repo_root: str, base_branch: str) -> None:
     ):
         return
     # Best-effort fetch from the default remote, then re-verify.
-    _run_git(["fetch"], cwd=repo_root, timeout=GIT_CHECKOUT_TIMEOUT_S)
+    _run_git(["fetch"], cwd=repo_root, timeout=checkout_timeout_s)
     if (
         _run_git(
             ["rev-parse", "--verify", "--quiet", "--end-of-options", base_branch], cwd=repo_root
@@ -417,6 +420,7 @@ def create_worktree(
     branch_name: str,
     base_branch: str | None = None,
     existing_branch: bool = False,
+    checkout_timeout_s: float | None = None,
 ) -> CreatedWorktree:
     """Create a git worktree with a new — or existing — branch checked out.
 
@@ -439,6 +443,12 @@ def create_worktree(
     :param existing_branch: When ``True``, check out the pre-existing
         ``branch_name`` into a fresh worktree instead of creating a new
         branch.
+    :param checkout_timeout_s: Bound for the size-scaling git commands
+        (fetch, ``worktree add``, ``checkout``, and the rollback remove)
+        on a large repo. The caller derives this from how long its own
+        deadline will wait; a new host paired with an older server passes
+        the legacy metadata bound so it never outlives that server.
+        ``None`` uses :data:`GIT_CHECKOUT_TIMEOUT_S`.
     :returns: The worktree root, branch, and relocated selected directory.
     :raises WorktreeError: If the branch name is invalid, the path is
         not a git repo, the base ref can't be resolved, or
@@ -447,6 +457,10 @@ def create_worktree(
         existing-branch mode).
     """
     validate_branch_name(branch_name)
+    # Resolve the default here, not in the signature, so a caller (or test)
+    # overriding GIT_CHECKOUT_TIMEOUT_S is honored at call time.
+    if checkout_timeout_s is None:
+        checkout_timeout_s = GIT_CHECKOUT_TIMEOUT_S
     if existing_branch and base_branch is not None:
         raise WorktreeError("base_branch cannot be set when checking out an existing branch")
     # Always create the worktree off the MAIN work tree, even when
@@ -487,7 +501,7 @@ def create_worktree(
             f"a branch named {branch_name!r} already exists; choose a different branch name"
         )
     if base_branch is not None:
-        _ensure_base_resolvable(repo_root, base_branch)
+        _ensure_base_resolvable(repo_root, base_branch, checkout_timeout_s=checkout_timeout_s)
     validated_commit: str | None = None
     if relative_directory:
         revision = f"refs/heads/{branch_name}" if existing_branch else (base_branch or "HEAD")
@@ -525,7 +539,7 @@ def create_worktree(
             add_args.insert(2, "--no-checkout")
         if base_branch is not None:
             add_args += ["--end-of-options", base_branch]
-    result = _run_git(add_args, cwd=repo_root, timeout=GIT_CHECKOUT_TIMEOUT_S)
+    result = _run_git(add_args, cwd=repo_root, timeout=checkout_timeout_s)
     if result.returncode != 0:
         raise _git_error("git worktree add failed", result)
     if validated_commit is not None:
@@ -543,7 +557,7 @@ def create_worktree(
                 checkout = _run_git(
                     ["checkout", "--force", "-B", branch_name, validated_commit],
                     cwd=str(worktree_path),
-                    timeout=GIT_CHECKOUT_TIMEOUT_S,
+                    timeout=checkout_timeout_s,
                 )
                 if checkout.returncode != 0:
                     raise _git_error("could not check out validated worktree revision", checkout)
@@ -553,7 +567,7 @@ def create_worktree(
                     worktree_path=str(worktree_path),
                     branch=branch_name,
                     delete_branch=not existing_branch,
-                    remove_timeout=GIT_CHECKOUT_TIMEOUT_S,
+                    remove_timeout=checkout_timeout_s,
                 )
             except WorktreeError:
                 _logger.warning("Could not roll back worktree %s", worktree_path, exc_info=True)
@@ -614,8 +628,9 @@ def remove_worktree(
         ``branch`` after removing the worktree directory.
     :param remove_timeout: Bound for ``git worktree remove``. Removing a
         fully populated large worktree can outlast the default metadata
-        bound, so callers rolling back such a worktree pass
-        :data:`GIT_CHECKOUT_TIMEOUT_S`. ``None`` uses the default.
+        bound, so a create rolling back such a worktree passes its
+        negotiated checkout bound. ``None`` uses the metadata default,
+        which the standalone-remove server deadline is sized for.
     :raises WorktreeError: If the worktree path is missing/invalid, or
         a git command fails.
     """

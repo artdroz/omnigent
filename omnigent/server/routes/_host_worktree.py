@@ -31,12 +31,13 @@ _logger = logging.getLogger(__name__)
 # surfaces instead of a generic server-side timeout.
 _WORKTREE_TIMEOUT_S: float = 150.0
 
-# A create can run two size-scaling git commands back to back: a fallback
-# fetch to resolve the base ref, then the checkout that populates the
-# worktree. Each is bounded by GIT_CHECKOUT_TIMEOUT_S on the host, so the
-# server must outwait both (plus margin) or it abandons a still-running host
+# A failing create runs up to three size-scaling git commands in sequence: a
+# fallback fetch to resolve the base ref, the checkout that populates the
+# worktree, then a rollback remove that tears the populated tree back down.
+# Each is bounded by GIT_CHECKOUT_TIMEOUT_S on the host, so the server must
+# outwait all three (plus margin) or it abandons a still-running host
 # operation, leaving a half-created worktree and branch behind.
-_WORKTREE_CREATE_TIMEOUT_S: float = 2 * GIT_CHECKOUT_TIMEOUT_S + 30.0
+_WORKTREE_CREATE_TIMEOUT_S: float = 3 * GIT_CHECKOUT_TIMEOUT_S + 30.0
 
 
 WORKTREE_ROOT_LABEL_KEY = "omnigent.git.worktree_root_sha256"
@@ -220,6 +221,9 @@ async def create_worktree_on_host(
             branch_name=branch_name,
             base_branch=base_branch,
             existing_branch=existing_branch,
+            # Tell a new host the per-command bound this deadline is sized for;
+            # older hosts ignore the field and keep their own metadata bound.
+            checkout_timeout_s=GIT_CHECKOUT_TIMEOUT_S,
         )
     )
     result = await _await_host_worktree_result(

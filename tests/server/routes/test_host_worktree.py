@@ -156,6 +156,9 @@ async def test_create_worktree_success_returns_path_and_branch(
     assert sent.repo_path == "/Users/alice/myrepo"
     assert sent.branch_name == "feature/login"
     assert sent.base_branch == "main"
+    # The server advertises the per-command bound its deadline is sized for so
+    # a new host can match it; older hosts ignore the field.
+    assert sent.checkout_timeout_s == GIT_CHECKOUT_TIMEOUT_S
 
 
 async def test_create_worktree_failure_surfaced(host_setup: HostRegistry) -> None:
@@ -307,19 +310,20 @@ async def test_create_worktree_timeout_raises_unavailable(
     assert "did not respond" in exc.value.message
 
 
-async def test_create_worktree_server_budget_covers_fallback_fetch_plus_checkout() -> None:
-    """The create wait must outlast a fallback fetch *and* the checkout.
+async def test_create_worktree_server_budget_covers_the_whole_failing_create() -> None:
+    """The create wait must outlast every size-scaling command a create runs.
 
-    A single create can run two size-scaling git commands back to back: a
-    fallback ``git fetch`` to resolve the base ref, then the checkout that
-    populates the worktree. Each is bounded by ``GIT_CHECKOUT_TIMEOUT_S`` on
-    the host, so the server budget must cover both. Covering only one lets
-    the server abandon a still-running host operation, leaving a half-created
+    A failing create runs up to three size-scaling git commands in sequence:
+    a fallback ``git fetch`` to resolve the base ref, the checkout that
+    populates the worktree, then a rollback remove that tears the populated
+    tree back down. Each is bounded by ``GIT_CHECKOUT_TIMEOUT_S`` on the host,
+    so the server budget must cover all three. Covering fewer lets the server
+    abandon a still-running host operation mid-rollback, leaving a half-created
     worktree and branch behind.
     """
     import omnigent.server.routes._host_worktree as hw_mod
 
-    assert hw_mod._WORKTREE_CREATE_TIMEOUT_S >= 2 * GIT_CHECKOUT_TIMEOUT_S
+    assert hw_mod._WORKTREE_CREATE_TIMEOUT_S >= 3 * GIT_CHECKOUT_TIMEOUT_S
 
 
 async def test_create_worktree_outwaits_a_checkout_longer_than_the_short_bound(
