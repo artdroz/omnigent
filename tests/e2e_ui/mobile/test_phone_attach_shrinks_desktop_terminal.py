@@ -8,6 +8,7 @@ how wide the TUI is actually drawn.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import time
@@ -246,6 +247,9 @@ def test_phone_attach_keeps_desktop_terminal_pane_width(
             f"{after_close} vs baseline {baseline}"
         )
     finally:
-        desktop.close()
+        # Close the phone first and swallow its errors so a failing close
+        # cannot skip the desktop teardown and leak a browser context.
         if phone is not None:
-            phone.close()
+            with contextlib.suppress(Exception):
+                phone.close()
+        desktop.close()
