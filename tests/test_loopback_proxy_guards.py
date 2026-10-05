@@ -20,13 +20,16 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# Modules whose httpx clients are bound to the Omnigent server's base URL.
+# Modules whose httpx clients are bound to the Omnigent server's base URL or
+# to a native harness's own loopback server (``opencode serve``).
 # Deliberately not repo-wide: runner tool/transport clients talk to harnesses
 # and MCP endpoints, where the environment's proxy is the right thing to use.
 _SERVER_CLIENT_MODULES: list[Path] = [
     *sorted((_REPO_ROOT / "omnigent").glob("*_native.py")),
     _REPO_ROOT / "omnigent" / "chat.py",
     _REPO_ROOT / "omnigent" / "cli.py",
+    _REPO_ROOT / "omnigent" / "harnesses" / "opencode_native" / "app_server.py",
+    _REPO_ROOT / "omnigent" / "harnesses" / "opencode_native" / "client.py",
     _REPO_ROOT / "omnigent" / "runner" / "_entry.py",
     _REPO_ROOT / "omnigent" / "runner" / "app.py",
 ]
