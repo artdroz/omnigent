@@ -965,6 +965,10 @@ describe("ForkSessionDialog", () => {
       // No Enter, no browser — the submit enables purely from the ~-resolve.
       expect(screen.queryByTestId("mock-workspace-picker")).not.toBeInTheDocument();
       await waitFor(() => expect(screen.getByTestId("fork-session-submit")).toBeEnabled());
+      // Same host, different directory: the soft file-references note applies,
+      // not the cross-host warning.
+      expect(screen.getByTestId("fork-session-mismatch-warning")).toBeInTheDocument();
+      expect(screen.queryByTestId("fork-session-cross-host-warning")).toBeNull();
 
       fireEvent.click(screen.getByTestId("fork-session-submit"));
       await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
@@ -1075,9 +1079,7 @@ describe("ForkSessionDialog", () => {
     });
 
     it("leaves the host unpicked with a reconnect hint when the source host is offline, then warns on an explicit pick", () => {
-      // The caller's own source host is offline while another of theirs is
-      // online. A cross-host clone would be created broken, so the dialog must
-      // leave the host unpicked, say why, and keep submit greyed.
+      // Offline source host: no silent cross-host default — hint + disabled submit.
       setHosts([
         host({ host_id: "host_1", name: "arca", status: "offline" }),
         host({ host_id: "host_2", name: "other-laptop", status: "online" }),
@@ -1087,7 +1089,6 @@ describe("ForkSessionDialog", () => {
       const hint = screen.getByTestId("fork-session-source-host-offline-hint");
       expect(hint).toHaveTextContent("arca");
       expect(hint).toHaveTextContent(/isn't supported/);
-      // No silent cross-host default.
       expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Select a host");
       expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
 
@@ -1099,8 +1100,14 @@ describe("ForkSessionDialog", () => {
 
       const warning = screen.getByTestId("fork-session-cross-host-warning");
       expect(warning).toHaveTextContent(/isn't supported/);
-      // The explicit pick replaces the reconnect hint.
       expect(screen.queryByTestId("fork-session-source-host-offline-hint")).toBeNull();
+      // Warned, not blocked: submit now waits only for a directory on that host.
+      expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
+      fireEvent.change(screen.getByTestId("workspace-path-input"), {
+        target: { value: "/elsewhere" },
+      });
+      expect(screen.getByTestId("fork-session-submit")).toBeEnabled();
+      expect(screen.queryByTestId("fork-session-mismatch-warning")).toBeNull();
     });
 
     it("drops the cross-host warning once a sandbox is picked instead", () => {

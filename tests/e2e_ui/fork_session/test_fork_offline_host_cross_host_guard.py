@@ -37,6 +37,7 @@ def _hold_for_recording(page: Page) -> None:
         page.wait_for_timeout(1_500)
 
 
+@pytest.mark.workspace_panel_product_default
 def test_fork_of_offline_host_session_must_not_silently_land_on_another_host(
     request: pytest.FixtureRequest,
     seeded_session: tuple[str, str],
