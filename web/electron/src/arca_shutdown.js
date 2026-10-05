@@ -10,38 +10,45 @@ const DEFAULT_OPTIONS = Object.freeze({
   finalLeadMs: 60 * 60e3,
   launchMaxLeadMs: 8 * 60 * 60e3,
   maxTimerMs: 30 * 60e3,
+  firstRetryMs: 2 * 60e3,
   retryMs: 15 * 60e3,
+  refreshMs: 3 * 60 * 60e3,
   businessHours: Object.freeze({ start: 6, end: 18 }),
 });
 
 /**
- * Account for the weekday business-hours lock when the nominal deadline has
- * already passed.
+ * Find the current warning window's effective deadline.
  *
  * @param {number} shutdownAt
  * @param {number} now
  * @param {{isWeekday: (ms: number) => boolean, localHour: (ms: number) => number,
  *   localTimeAt: (ms: number, hour: number) => number,
+ *   localDayOffset: (ms: number, days: number) => number,
  *   businessHours: {start: number, end: number}}} deps
  * @returns {number}
  */
 function effectiveShutdownAt(
   shutdownAt,
   now,
-  { isWeekday, localHour, localTimeAt, businessHours },
+  { isWeekday, localHour, localTimeAt, localDayOffset, businessHours },
 ) {
-  if (
-    shutdownAt < now &&
-    isWeekday(now) &&
-    localHour(now) >= businessHours.start &&
-    localHour(now) < businessHours.end
-  ) {
-    return localTimeAt(now, businessHours.end);
+  const locked = (ms) =>
+    isWeekday(ms) && localHour(ms) >= businessHours.start && localHour(ms) < businessHours.end;
+  if (shutdownAt > now) {
+    return locked(shutdownAt) ? localTimeAt(shutdownAt, businessHours.end) : shutdownAt;
+  }
+  if (locked(now)) return localTimeAt(now, businessHours.end);
+  // Each weekday evening is a new warning window for an instance still running.
+  for (let daysAgo = 0; daysAgo <= 7; daysAgo++) {
+    const day = localDayOffset(now, -daysAgo);
+    const end = localTimeAt(day, businessHours.end);
+    if (isWeekday(day) && end <= now) return Math.max(shutdownAt, end);
   }
   return shutdownAt;
 }
 
 /**
+ * Choose a prompt and its next final check for one effective deadline.
  * @param {{effectiveAt: number, now: number, launch: boolean,
  *   prompted: Set<string>, finalLeadMs: number, launchMaxLeadMs: number}} input
  * @returns {{promptNow: "launch" | "final" | null, finalAt: number | null}}
@@ -58,6 +65,7 @@ function planPrompt({ effectiveAt, now, launch, prompted, finalLeadMs, launchMax
 }
 
 /**
+ * Watch an Arca instance and serialize warnings, extensions, and status reads.
  * @param {{
  *   readStatus: () => Promise<{ok: true, state: string | null, shutdownAt: number | null,
  *     rawShutdownTime?: string | null} | {ok: false, errorKind: string, error: string}>,
@@ -65,14 +73,15 @@ function planPrompt({ effectiveAt, now, launch, prompted, finalLeadMs, launchMax
  *     {ok: true, message: string} | {ok: false, errorKind: string, error: string}>,
  *   prompt: (request: {kind: "launch" | "final", shutdownAt: number,
  *     now: number, modes: string[]}) => Promise<{mode: string | null}>,
- *   onExtendResult?: (result: object) => void,
+ *   onExtendResult?: (result: object) => void | Promise<void>,
  *   isEnabled: () => boolean,
  *   now?: () => number,
  *   setTimer?: (fn: () => void, ms: number) => unknown,
  *   clearTimer?: (timer: unknown) => void,
- *   isFriday?: (ms: number) => boolean,
+ *   offersWorkweek?: (ms: number) => boolean,
  *   isWeekday?: (ms: number) => boolean,
  *   localTimeAt?: (ms: number, hour: number) => number,
+ *   localDayOffset?: (ms: number, days: number) => number,
  *   localHour?: (ms: number) => number,
  *   log?: (message: string) => void,
  *   options?: Partial<typeof DEFAULT_OPTIONS>,
@@ -91,7 +100,7 @@ function createArcaShutdownWatch({
     return timer;
   },
   clearTimer = clearTimeout,
-  isFriday = (ms) => new Date(ms).getDay() === 5,
+  offersWorkweek = (ms) => ![4, 5].includes(new Date(ms).getDay()),
   isWeekday = (ms) => {
     const day = new Date(ms).getDay();
     return day >= 1 && day <= 5;
@@ -99,6 +108,11 @@ function createArcaShutdownWatch({
   localTimeAt = (ms, hour) => {
     const date = new Date(ms);
     date.setHours(hour, 0, 0, 0);
+    return date.getTime();
+  },
+  localDayOffset = (ms, days) => {
+    const date = new Date(ms);
+    date.setDate(date.getDate() + days);
     return date.getTime();
   },
   localHour = (ms) => new Date(ms).getHours() + new Date(ms).getMinutes() / 60,
@@ -121,6 +135,7 @@ function createArcaShutdownWatch({
   let busy = false;
   let pendingFresh = false;
   let launchPending = true;
+  let failedReads = 0;
 
   function safeLog(message) {
     try {
@@ -183,9 +198,17 @@ function createArcaShutdownWatch({
 
   function armRetry() {
     try {
-      armAt(now() + settings.retryMs);
+      armAt(now() + (failedReads <= 1 ? settings.firstRetryMs : settings.retryMs));
     } catch (error) {
       safeLog(`arca shutdown: retry scheduling failed: ${error}`);
+    }
+  }
+
+  function armRefresh() {
+    try {
+      armAt(now() + settings.refreshMs);
+    } catch (error) {
+      safeLog(`arca shutdown: refresh scheduling failed: ${error}`);
     }
   }
 
@@ -206,14 +229,16 @@ function createArcaShutdownWatch({
     }
     if (disposed) return false;
     if (!status?.ok) {
+      failedReads++;
       shutdownAt = null;
       effectiveAt = null;
       safeLog(`arca shutdown: status failed (${status?.errorKind ?? "unknown"}): ${status?.error}`);
       armRetry();
       return false;
     }
-    launchPending = false;
+    failedReads = 0;
     if (status.state !== "running") {
+      if (!pendingFresh) launchPending = false;
       shutdownAt = null;
       effectiveAt = null;
       clearScheduled();
@@ -221,6 +246,7 @@ function createArcaShutdownWatch({
       return false;
     }
     if (!Number.isFinite(status.shutdownAt)) {
+      if (!pendingFresh) launchPending = false;
       shutdownAt = null;
       effectiveAt = null;
       clearScheduled();
@@ -232,15 +258,16 @@ function createArcaShutdownWatch({
       isWeekday,
       localHour,
       localTimeAt,
+      localDayOffset,
       businessHours: settings.businessHours,
     });
     return true;
   }
 
-  function notifyExtend(result) {
+  async function notifyExtend(result) {
     if (disposed) return;
     try {
-      onExtendResult(result);
+      await onExtendResult(result);
     } catch (error) {
       safeLog(`arca shutdown: result callback failed: ${error}`);
     }
@@ -257,6 +284,7 @@ function createArcaShutdownWatch({
       isWeekday,
       localHour,
       localTimeAt,
+      localDayOffset,
       businessHours: settings.businessHours,
     });
     const plan = planPrompt({
@@ -278,7 +306,7 @@ function createArcaShutdownWatch({
 
     const kind = plan.promptNow;
     const promptedAt = effectiveAt;
-    const modes = isFriday(now()) ? ["overnight"] : ["overnight", "workweek"];
+    const modes = offersWorkweek(now()) ? ["overnight", "workweek"] : ["overnight"];
     prompted.add(`${kind}:${promptedAt}`);
     phase = "prompting";
     let answer;
@@ -303,20 +331,23 @@ function createArcaShutdownWatch({
     }
     if (disposed) return;
     if (!result?.ok) {
-      notifyExtend({
+      await notifyExtend({
         ok: false,
         mode,
         errorKind: result?.errorKind ?? "unknown",
         error: result?.error ?? "Extending Arca failed.",
       });
+      if (disposed) return;
       if (!pendingFresh) await planCached(false);
       return;
     }
     clearScheduled();
     const active = await readAndCache();
     if (disposed) return;
+    phase = "extending";
+    await notifyExtend({ ok: true, mode, shutdownAt: active ? effectiveAt : null });
+    if (disposed) return;
     if (active && !pendingFresh) await planCached(false);
-    notifyExtend({ ok: true, mode, shutdownAt: active ? effectiveAt : null });
   }
 
   async function evaluate(launch) {
@@ -325,7 +356,10 @@ function createArcaShutdownWatch({
     clearScheduled();
     try {
       const active = await readAndCache();
-      if (active && !pendingFresh) await planCached(launch);
+      if (active && !pendingFresh) {
+        launchPending = false;
+        await planCached(launch);
+      }
     } catch (error) {
       if (!disposed) {
         safeLog(`arca shutdown: evaluation failed: ${error}`);
@@ -338,6 +372,7 @@ function createArcaShutdownWatch({
         clearScheduled();
         void evaluate(launchPending);
       } else {
+        if (!disposed && timer === null && enabled()) armRefresh();
         phase = timer !== null ? "scheduled" : "idle";
       }
     }

@@ -11,6 +11,15 @@ const {
 
 const HOUR = 60 * 60e3;
 const MINUTE = 60e3;
+const DAY = 24 * HOUR;
+
+function weekdayOf(ms) {
+  return ((Math.floor(ms / DAY) % 7) + 7) % 7;
+}
+
+function calendarWeekday(ms) {
+  return weekdayOf(ms) < 5;
+}
 
 function flush() {
   return Array.from({ length: 12 }).reduce((pending) => pending.then(() => {}), Promise.resolve());
@@ -52,6 +61,22 @@ function fakeClock(initial = 0) {
       }
       await flush();
     },
+    async advanceTo(target) {
+      const due = [...timers].filter(([, timer]) => timer.at <= target);
+      if (due.length === 0) {
+        time = target;
+        await flush();
+        return;
+      }
+      const [id, timer] = due.reduce((earliest, entry) =>
+        entry[1].at < earliest[1].at ? entry : earliest,
+      );
+      time = timer.at;
+      timers.delete(id);
+      timer.fn();
+      await flush();
+      await this.advanceTo(target);
+    },
     delays,
     timers,
   };
@@ -68,7 +93,8 @@ function makeWatch({
   prompt,
   extend,
   enabled = () => true,
-  isFriday = () => false,
+  offersWorkweek = () => true,
+  isWeekday = () => true,
   options = {},
   onExtendResult = () => {},
   log = () => {},
@@ -76,10 +102,13 @@ function makeWatch({
   const clock = fakeClock(time);
   const prompts = [];
   let reads = 0;
+  let lastStatus = statuses.at(-1) ?? running(2 * HOUR);
   const watch = createArcaShutdownWatch({
     readStatus: async () => {
       reads++;
-      return readStatus ? readStatus() : (statuses.shift() ?? statuses.at(-1) ?? running(2 * HOUR));
+      if (readStatus) return readStatus();
+      if (statuses.length > 0) lastStatus = statuses.shift();
+      return lastStatus;
     },
     prompt: async (request) => {
       prompts.push(request);
@@ -91,10 +120,11 @@ function makeWatch({
     now: clock.now,
     setTimer: clock.setTimer,
     clearTimer: clock.clearTimer,
-    isFriday,
-    isWeekday: () => true,
-    localHour: (ms) => (ms % (24 * HOUR)) / HOUR,
-    localTimeAt: (ms, hour) => Math.floor(ms / (24 * HOUR)) * 24 * HOUR + hour * HOUR,
+    offersWorkweek,
+    isWeekday,
+    localHour: (ms) => (((ms % DAY) + DAY) % DAY) / HOUR,
+    localTimeAt: (ms, hour) => Math.floor(ms / DAY) * DAY + hour * HOUR,
+    localDayOffset: (ms, days) => ms + days * DAY,
     log,
     options,
   });
@@ -109,23 +139,24 @@ function makeWatch({
 }
 
 describe("Arca shutdown planning helpers", () => {
-  it("applies the weekday business-hours lock only to past deadlines", () => {
+  it("groups past deadlines by eligibility window and moves future locked times to 18:00", () => {
     const deps = {
-      isWeekday: () => true,
-      localHour: () => 12,
-      localTimeAt: (_, hour) => hour * HOUR,
+      isWeekday: calendarWeekday,
+      localHour: (ms) => (((ms % DAY) + DAY) % DAY) / HOUR,
+      localTimeAt: (ms, hour) => Math.floor(ms / DAY) * DAY + hour * HOUR,
+      localDayOffset: (ms, days) => ms + days * DAY,
       businessHours: { start: 6, end: 18 },
     };
     assert.equal(effectiveShutdownAt(11 * HOUR, 12 * HOUR, deps), 18 * HOUR);
-    assert.equal(effectiveShutdownAt(13 * HOUR, 12 * HOUR, deps), 13 * HOUR);
-    assert.equal(
-      effectiveShutdownAt(11 * HOUR, 12 * HOUR, { ...deps, isWeekday: () => false }),
-      11 * HOUR,
-    );
-    assert.equal(
-      effectiveShutdownAt(11 * HOUR, 12 * HOUR, { ...deps, localHour: () => 18 }),
-      11 * HOUR,
-    );
+    assert.equal(effectiveShutdownAt(13 * HOUR, 12 * HOUR, deps), 18 * HOUR);
+    assert.equal(effectiveShutdownAt(20 * HOUR, 12 * HOUR, deps), 20 * HOUR);
+    assert.equal(effectiveShutdownAt(11 * HOUR, 20 * HOUR, deps), 18 * HOUR);
+    assert.equal(effectiveShutdownAt(19 * HOUR, 20 * HOUR, deps), 19 * HOUR);
+    const fridayEnd = 4 * DAY + 18 * HOUR;
+    assert.equal(effectiveShutdownAt(fridayEnd, 5 * DAY + 10 * HOUR, deps), fridayEnd);
+    assert.equal(effectiveShutdownAt(fridayEnd, 6 * DAY + 10 * HOUR, deps), fridayEnd);
+    const sundayEnd = 6 * DAY + 18 * HOUR;
+    assert.equal(effectiveShutdownAt(sundayEnd, 7 * DAY + 3 * HOUR, deps), sundayEnd);
   });
 
   it("prioritizes final and records a final check only while unprompted", () => {
@@ -173,8 +204,8 @@ describe("Arca shutdown watch", () => {
     h.watch.start();
     await flush();
     assert.equal(h.prompts.length, 0);
-    assert.equal(h.watch.getState().nextCheckAt, 9 * HOUR);
-    await h.clock.advance(9 * HOUR);
+    assert.equal(h.watch.getState().nextCheckAt, 17 * HOUR);
+    await h.clock.advance(17 * HOUR);
     assert.deepEqual(
       h.prompts.map((p) => p.kind),
       ["final"],
@@ -211,6 +242,89 @@ describe("Arca shutdown watch", () => {
     assert.deepEqual(
       h.prompts.map((p) => p.kind),
       ["launch", "final"],
+    );
+  });
+
+  it("keeps Monday's final key after hours and opens a new Tuesday window", async () => {
+    const h = makeWatch({
+      time: 17 * HOUR,
+      statuses: [running(11 * HOUR)],
+      isWeekday: calendarWeekday,
+    });
+    h.watch.start();
+    await flush();
+    assert.deepEqual(
+      h.prompts.map((request) => request.shutdownAt),
+      [18 * HOUR],
+    );
+    h.clock.jump(2 * HOUR);
+    h.watch.onResume();
+    await flush();
+    assert.equal(h.prompts.length, 1);
+    h.clock.jump(22 * HOUR);
+    h.watch.onResume();
+    await flush();
+    assert.deepEqual(
+      h.prompts.map((request) => request.shutdownAt),
+      [18 * HOUR, DAY + 18 * HOUR],
+    );
+  });
+
+  it("holds a future weekday shutdown time until 18:00", async () => {
+    const h = makeWatch({
+      time: 9 * HOUR,
+      statuses: [running(11 * HOUR)],
+      isWeekday: calendarWeekday,
+    });
+    h.watch.start();
+    await flush();
+    assert.equal(h.watch.getState().effectiveAt, 18 * HOUR);
+    assert.equal(h.watch.getState().nextCheckAt, 17 * HOUR);
+    await h.clock.advanceTo(10 * HOUR);
+    assert.equal(h.prompts.length, 0);
+    await h.clock.advanceTo(17 * HOUR);
+    assert.deepEqual(
+      h.prompts.map((request) => request.kind),
+      ["final"],
+    );
+  });
+
+  it("uses one Friday window throughout the weekend", async () => {
+    const fridayEnd = 4 * DAY + 18 * HOUR;
+    const h = makeWatch({
+      time: 5 * DAY + 10 * HOUR,
+      statuses: [running(fridayEnd)],
+      isWeekday: calendarWeekday,
+    });
+    h.watch.start();
+    await flush();
+    assert.deepEqual(
+      h.prompts.map((request) => request.shutdownAt),
+      [fridayEnd],
+    );
+    h.clock.jump(DAY);
+    h.watch.onResume();
+    await flush();
+    assert.equal(h.prompts.length, 1);
+  });
+
+  it("re-reads across days without resume and warns again Tuesday evening", async () => {
+    const h = makeWatch({
+      time: 20 * HOUR,
+      statuses: [running(11 * HOUR)],
+      isWeekday: calendarWeekday,
+    });
+    h.watch.start();
+    await flush();
+    assert.deepEqual(
+      h.prompts.map((request) => request.shutdownAt),
+      [18 * HOUR],
+    );
+    await h.clock.advanceTo(DAY + 17 * HOUR);
+    assert.ok(h.reads > 2);
+    assert.deepEqual(
+      h.prompts.map((request) => request.shutdownAt),
+      [18 * HOUR, DAY + 18 * HOUR],
     );
   });
 
@@ -266,6 +380,51 @@ describe("Arca shutdown watch", () => {
     ]);
   });
 
+  it("waits for an extension failure dialog before the final prompt", async () => {
+    const dialog = deferred();
+    const h = makeWatch({
+      statuses: [running(2 * HOUR), running(2 * HOUR)],
+      prompt: (request) => ({ mode: request.kind === "launch" ? "overnight" : null }),
+      extend: async () => ({ ok: false, errorKind: "network", error: "offline" }),
+      onExtendResult: () => dialog.promise,
+    });
+    h.watch.start();
+    await flush();
+    assert.equal(h.watch.getState().phase, "extending");
+    await h.clock.advance(HOUR);
+    assert.deepEqual(
+      h.prompts.map((request) => request.kind),
+      ["launch"],
+    );
+    dialog.resolve();
+    await flush();
+    assert.deepEqual(
+      h.prompts.map((request) => request.kind),
+      ["launch", "final"],
+    );
+  });
+
+  it("waits for an extension success dialog before re-planning", async () => {
+    const dialog = deferred();
+    const h = makeWatch({
+      statuses: [running(2 * HOUR), running(30 * MINUTE)],
+      prompt: (request) => ({ mode: request.kind === "launch" ? "overnight" : null }),
+      onExtendResult: () => dialog.promise,
+    });
+    h.watch.start();
+    await flush();
+    assert.deepEqual(
+      h.prompts.map((request) => request.kind),
+      ["launch"],
+    );
+    dialog.resolve();
+    await flush();
+    assert.deepEqual(
+      h.prompts.map((request) => request.kind),
+      ["launch", "final"],
+    );
+  });
+
   it("treats a throwing prompt as a decline and keeps the final timer", async () => {
     const h = makeWatch({
       prompt: () => {
@@ -317,8 +476,8 @@ describe("Arca shutdown watch", () => {
     });
     h.watch.start();
     await flush();
-    assert.equal(h.watch.getState().nextCheckAt, 15 * MINUTE);
-    await h.clock.advance(15 * MINUTE);
+    assert.equal(h.watch.getState().nextCheckAt, 2 * MINUTE);
+    await h.clock.advance(2 * MINUTE);
     assert.deepEqual(
       h.prompts.map((p) => p.kind),
       ["launch"],
@@ -331,7 +490,7 @@ describe("Arca shutdown watch", () => {
     });
     h.watch.start();
     await flush();
-    assert.equal(h.watch.getState().nextCheckAt, 15 * MINUTE);
+    assert.equal(h.watch.getState().nextCheckAt, 2 * MINUTE);
     h.watch.onResume();
     await flush();
     assert.equal(h.reads, 2);
@@ -341,7 +500,41 @@ describe("Arca shutdown watch", () => {
     );
   });
 
-  it("stays idle for a stopped instance or missing shutdown time", async () => {
+  it("preserves one launch prompt when resume supersedes the first status read", async () => {
+    const firstRead = deferred();
+    let calls = 0;
+    const h = makeWatch({
+      readStatus: () => (++calls === 1 ? firstRead.promise : running(2 * HOUR)),
+    });
+    h.watch.start();
+    h.watch.onResume();
+    firstRead.resolve(running(2 * HOUR));
+    await flush();
+    assert.equal(h.reads, 2);
+    assert.deepEqual(
+      h.prompts.map((request) => request.kind),
+      ["launch"],
+    );
+  });
+
+  it("uses a two-minute first retry, fifteen-minute later retries, and resets on success", async () => {
+    const failure = { ok: false, errorKind: "network", error: "offline" };
+    const h = makeWatch({
+      statuses: [failure, failure, { ok: true, state: "stopped", shutdownAt: null }, failure],
+    });
+    h.watch.start();
+    await flush();
+    assert.equal(h.watch.getState().nextCheckAt, 2 * MINUTE);
+    await h.clock.advance(2 * MINUTE);
+    assert.equal(h.watch.getState().nextCheckAt, 17 * MINUTE);
+    await h.clock.advance(15 * MINUTE);
+    assert.equal(h.watch.getState().nextCheckAt, 17 * MINUTE + 3 * HOUR);
+    h.watch.onResume();
+    await flush();
+    assert.equal(h.watch.getState().nextCheckAt, 19 * MINUTE);
+  });
+
+  it("refreshes stopped instances and missing shutdown times every three hours", async () => {
     await Promise.all(
       [
         { ok: true, state: "stopped", shutdownAt: 2 * HOUR },
@@ -352,23 +545,35 @@ describe("Arca shutdown watch", () => {
         const h = makeWatch({ statuses: [status], log: (message) => messages.push(message) });
         h.watch.start();
         await flush();
-        assert.equal(h.watch.getState().phase, "idle");
-        assert.equal(h.clock.timers.size, 0);
+        assert.equal(h.watch.getState().phase, "scheduled");
+        assert.equal(h.watch.getState().nextCheckAt, 3 * HOUR);
         assert.equal(h.prompts.length, 0);
         assert.equal(messages.length, 1);
+        await h.clock.advanceTo(6 * HOUR);
+        assert.equal(h.reads, 3);
+        assert.equal(h.prompts.length, 0);
       }),
     );
   });
 
-  it("omits workweek on Friday", async () => {
-    const h = makeWatch({ isFriday: () => true });
-    h.watch.start();
-    await flush();
-    assert.deepEqual(h.prompts[0].modes, ["overnight"]);
+  it("omits workweek on Thursday and Friday", async () => {
+    await Promise.all(
+      [3, 4].map(async (day) => {
+        const time = day * DAY;
+        const h = makeWatch({
+          time,
+          statuses: [running(time + 2 * HOUR)],
+          offersWorkweek: (ms) => ![3, 4].includes(weekdayOf(ms)),
+        });
+        h.watch.start();
+        await flush();
+        assert.deepEqual(h.prompts[0].modes, ["overnight"]);
+      }),
+    );
   });
 
   it("caps timer sleeps without reading status before the target", async () => {
-    const h = makeWatch({ statuses: [running(6 * HOUR)] });
+    const h = makeWatch({ time: 18 * HOUR, statuses: [running(24 * HOUR)] });
     h.watch.start();
     await flush();
     await Array.from({ length: 9 }).reduce(
@@ -376,7 +581,7 @@ describe("Arca shutdown watch", () => {
       Promise.resolve(),
     );
     assert.equal(h.reads, 1);
-    assert.equal(h.watch.getState().nextCheckAt, 5 * HOUR);
+    assert.equal(h.watch.getState().nextCheckAt, 23 * HOUR);
     assert.ok(h.clock.delays.every((delay) => delay <= 30 * MINUTE));
     await h.clock.advance(30 * MINUTE);
     assert.equal(h.reads, 2);
