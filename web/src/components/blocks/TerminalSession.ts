@@ -248,14 +248,12 @@ export const CMD_RIGHT_LINE_END = "\x05"; // Ctrl-E: cursor to line end
 /**
  * True when an in-flight IME composition owns *event*'s printable key.
  *
- * xterm runs the custom key handler before its CompositionHelper, which
- * finalizes a composition on any keydown other than keyCode 229 or a bare
- * modifier. A Shift-typed letter mid-conversion would therefore commit the
- * preedit early, and every later update would re-send the stale textarea.
- * Claiming the key (return ``false`` to xterm, no ``preventDefault``) leaves
- * it to the IME, so the line is committed once at ``compositionend``.
- * Enter/Escape, Ctrl/Meta/Alt chords, and keyCode-229 keydowns stay on
- * xterm's default path.
+ * xterm consults this handler before its CompositionHelper, which would
+ * finalize the preedit on a Shift-typed letter mid-conversion and then
+ * re-send the stale textarea on every later update. Claim such keys (return
+ * ``false`` to xterm) without ``preventDefault``: the IME still needs them,
+ * and the line is committed once at ``compositionend``. Enter/Escape,
+ * Ctrl/Meta/Alt chords, and keyCode-229 keydowns stay on xterm's path.
  *
  * :param event: Browser keyboard event from xterm's custom key handler.
  * :returns: ``true`` when the handler must claim the event for the IME.

@@ -106,6 +106,18 @@ def _wait_for_sent_bytes(page: Page, sent: list[bytes], needle: bytes, timeout_s
     return needle in b"".join(sent)
 
 
+def _wait_for_sent_quiescence(
+    page: Page, sent: list[bytes], quiet_ms: int = 500, timeout_s: float = 3
+) -> None:
+    """Wait until no frame has been sent for *quiet_ms*, giving up after *timeout_s*."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        count = len(sent)
+        page.wait_for_timeout(quiet_ms)
+        if len(sent) == count:
+            return
+
+
 def _begin_composition(textarea, text: str) -> None:
     """Put xterm's CompositionHelper into a real composing state.
 
@@ -330,7 +342,11 @@ def _drive_composition(
               upd(preedits[0]);
               await sleep(90);
               const shiftOk = kd({
-                key: preedits[0], code: codes[0], keyCode: 65, shiftKey: true, isComposing: true,
+                key: preedits[0],
+                code: codes[0],
+                keyCode: preedits[0].toUpperCase().charCodeAt(0),
+                shiftKey: true,
+                isComposing: true,
               });
               uncanceled = uncanceled && shiftOk;
               await sleep(90);
@@ -362,16 +378,13 @@ def test_shift_ascii_run_mid_composition_does_not_resend_preedit(
 
     Journey: open a shell → focus the terminal → begin an IME composition and
     Shift-type a leading ASCII "A" mid-composition → return to kana conversion
-    and convert the tail ``でよいです`` → commit.
+    and convert the tail ``でよいです`` → commit. No fresh ``compositionstart``
+    fires after the Shift+letter, mirroring a native IME.
 
-    Expected: the PTY receives the committed line ``Aでよいです`` exactly once,
-    no fullwidth romaji consonant ever leaks out of the preedit, and the keys
-    the IME owns are never ``preventDefault()``-ed away from it.
-
-    Actual (the bug): the Shift+letter finalizes the composition without a fresh
-    ``compositionstart``, so every later update re-emits the committed prefix
-    plus the growing preedit and the fullwidth consonants leak to the PTY —
-    ``Aでよいです`` arrives as ``AｄAでｙAでよいｄAでよいでｓAでよいですAでよいです``.
+    Expected: the PTY receives ``Aでよいです`` exactly once, no fullwidth romaji
+    leaks out of the preedit, and no composing keydown is ``preventDefault()``-ed
+    away from the IME. The bug re-sent the committed prefix plus the growing
+    preedit on every update (``AｄAでｙAでよ…``).
     """
     base_url, session_id = terminal_session
 
@@ -396,8 +409,8 @@ def test_shift_ascii_run_mid_composition_does_not_resend_preedit(
     assert _wait_for_sent_bytes(page, sent, _COMMITTED_TAIL.encode("utf-8"), timeout_s=10), (
         f"the converted kana never reached the PTY; sent: {b''.join(sent[baseline:])!r}"
     )
-    # Grace period so any erroneous re-sends after the commit are captured too.
-    page.wait_for_timeout(500)
+    # Let any erroneous re-sends that trail the commit land before asserting.
+    _wait_for_sent_quiescence(page, sent)
 
     decoded = b"".join(sent[baseline:]).decode("utf-8", "replace")
     assert decoded.count(_COMMITTED_TAIL) == 1, (
@@ -447,7 +460,7 @@ def test_kana_conversion_without_shift_ascii_sends_once(
     assert _wait_for_sent_bytes(page, sent, _COMMITTED_TAIL.encode("utf-8"), timeout_s=10), (
         f"the converted kana never reached the PTY; sent: {b''.join(sent[baseline:])!r}"
     )
-    page.wait_for_timeout(500)
+    _wait_for_sent_quiescence(page, sent)
 
     decoded = b"".join(sent[baseline:]).decode("utf-8", "replace")
     assert decoded.count(_COMMITTED_TAIL) == 1, (
