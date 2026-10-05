@@ -917,17 +917,12 @@ export function ForkSessionForm({
   const sameFamilyAsSource = !switching || (sourceFamily !== null && sourceFamily === targetFamily);
   const sameAgentAsSource = !switching;
 
-  // Default the host = source host (when online) else the first online
-  // host, once hosts have loaded. Only fills an empty slot so an explicit
-  // pick is never overridden. When the caller's OWN source host is merely
-  // offline nothing is picked: a cross-host clone isn't supported, so
-  // silently re-homing it would create it broken — the hint below asks for
-  // a reconnect instead. (A shared session's host isn't the caller's to
-  // reconnect, so their own host stays the default.) A sandbox is never the
-  // default while any host is online — it costs a fresh provision — but a
-  // sandbox-only deployment with no host online has nothing else to
-  // reproduce the source on, so it defaults to the sandbox rather than
-  // strand the picker empty and unsubmittable.
+  // Default host: the source host when online, else the first online host,
+  // once hosts load; only fills an empty slot. A caller's OWN source host that
+  // is merely offline picks nothing — cross-host clones aren't supported, so
+  // the hint below asks for a reconnect (a shared session's host isn't theirs
+  // to reconnect, so their own host stays the default). With no host online a
+  // sandbox-only deployment falls back to the sandbox rather than strand the picker.
   useEffect(() => {
     if (!isCodingSource || sandboxSelected || selectedHostId !== null) return;
     if (sourceHostId && sourceHostOnline) {
@@ -1096,15 +1091,13 @@ export function ForkSessionForm({
 
   const hostMismatch =
     sourceHostId != null && selectedHostId !== null && selectedHostId !== sourceHostId;
-  // Cross-host clone warning: cloning onto a different machine than the
-  // source isn't supported today — the clone's runner may never start,
-  // leaving a broken session with only a generic failure. Flag it the moment
-  // a different host is picked, before any directory is typed.
+  // Cross-host clone warning: a clone on a different machine than the source
+  // isn't supported today and may never start, so flag it the moment a
+  // different host is picked, before any directory is typed.
   const showCrossHostWarning = isCodingSource && !sandboxSelected && hostMismatch;
   // Mismatched-directory warning: the transcript's file references were
   // grounded in the source's directory, so a different directory on the same
-  // host won't resolve them and the agent must re-orient. On a different
-  // host the cross-host warning above covers this (and more).
+  // host needs the agent to re-orient. Cross-host picks get the warning above.
   const showMismatchWarning =
     isCodingSource &&
     !sandboxSelected &&

@@ -1,20 +1,12 @@
 """Browser e2e: forking a host-bound session must not silently land on a different host.
 
-A coding session ran on host A. Forking it while host A was offline used to
-make the fork dialog default the clone to a *different* online host and let
-the fork proceed with nothing more than the soft file-references note.
-Cross-host forking is unsupported today, so the clone was created, its runner
-launch never came up, and the user's first message in the fork failed with the
-generic "The runner for this session is not available -- it may have failed
-to start."
-
-The dialog must instead make the limitation clear up front: leave the host
-unpicked with a hint naming the offline source host, keep "Clone & start"
-greyed, and warn plainly the moment a different host is picked explicitly.
-
-The two-host state and the session's host/workspace come from network stubs
-(``GET /v1/hosts`` and ``GET /v1/sessions/{id}``) because the harness cannot
-register two real hosts; the dialog logic under test is client-side.
+With the source host offline, the fork dialog used to default the clone to a
+different online host and let it proceed; cross-host forks are unsupported, so
+the clone's runner never started. The dialog must instead leave the host
+unpicked with a reconnect hint, keep "Clone & start" greyed, and warn plainly
+when a different host is picked explicitly. The two-host state and the
+session's host/workspace are network stubs: the harness can't register two
+real hosts, and the logic under test is client-side.
 """
 
 from __future__ import annotations

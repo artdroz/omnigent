@@ -1070,11 +1070,9 @@ describe("ForkSessionDialog", () => {
     });
 
     it("leaves the host unpicked with a reconnect hint when the source host is offline", () => {
-      // The caller's own source host is offline while another of their hosts
-      // is online. A cross-host clone isn't supported (it would be created
-      // broken — runner never starts), so the dialog must NOT silently
-      // default to the other machine: it leaves the host unpicked, explains
-      // why, and keeps submit greyed.
+      // The caller's own source host is offline while another of theirs is
+      // online. A cross-host clone would be created broken, so the dialog must
+      // leave the host unpicked, say why, and keep submit greyed.
       setHosts([
         host({ host_id: "host_1", name: "arca", status: "offline" }),
         host({ host_id: "host_2", name: "other-laptop", status: "online" }),
