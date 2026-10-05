@@ -639,14 +639,15 @@ def event_long_polls_ask(hook_event: str) -> bool:
     """
     Whether the server parks an interactive ASK long-poll for *hook_event*.
 
-    Only ``PreToolUse`` publishes an approval card the server holds open while
-    it waits for a human decision, so only its POST can be severed mid-poll by
-    the gateway's request ceiling and must re-park the same elicitation. A
-    ``UserPromptSubmit`` request gate (and ``PostToolUse``) is answered
-    promptly, so a late failure there is a sick server, not a severed poll: it
-    must fail closed within the transient budget rather than re-park unbounded.
+    The server holds a native ASK gate open for the blocking phases it can
+    elicit on: ``PreToolUse`` (``TOOL_CALL``) and ``UserPromptSubmit``
+    (``REQUEST``). Either POST can therefore be severed mid-poll by the
+    gateway's request ceiling and must re-park the same elicitation rather than
+    drop the prompt. ``PostToolUse`` (``TOOL_RESULT``) is observational and is
+    never parked, so a late failure there must fail within the transient budget
+    rather than re-park unbounded.
     """
-    return hook_event == _PRE_TOOL_USE
+    return hook_event in (_PRE_TOOL_USE, _USER_PROMPT_SUBMIT)
 
 
 def is_transient_connect_error(exc: BaseException) -> bool:

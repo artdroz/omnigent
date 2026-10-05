@@ -11451,6 +11451,13 @@ async def test_hook_evaluate_endpoint_names_resolver_failure_without_errno(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(_PRE_TOOL_USE_PAYLOAD, id="pre-tool-use"),
+        pytest.param(_USER_PROMPT_SUBMIT_PAYLOAD, id="user-prompt-submit"),
+    ],
+)
+@pytest.mark.parametrize(
     "sever",
     [
         pytest.param(504, id="held-504"),
@@ -11458,9 +11465,18 @@ async def test_hook_evaluate_endpoint_names_resolver_failure_without_errno(
     ],
 )
 async def test_hook_evaluate_endpoint_reparks_a_held_poll_the_gateway_severed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sever: int | BaseException
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sever: int | BaseException,
+    payload: dict[str, object],
 ) -> None:
-    """A held 5xx or torn connection re-POSTs the same id without spending budget."""
+    """A held 5xx or torn connection re-POSTs the same id without spending budget.
+
+    The server parks a held ASK gate for both blocking phases it can elicit on
+    (``PreToolUse`` and ``UserPromptSubmit``), so a gateway-severed poll on
+    either must re-attach the same elicitation and recover the allow rather
+    than drop the prompt.
+    """
     from omnigent.native import native_policy_hook
 
     _fast_evaluate_retries(monkeypatch, budget_s=0.0)
@@ -11472,7 +11488,7 @@ async def test_hook_evaluate_endpoint_reparks_a_held_poll_the_gateway_severed(
             _relay_request_raw,
             bridge_dir,
             "/hook/claude/evaluate-policy",
-            _PRE_TOOL_USE_PAYLOAD,
+            payload,
         )
         assert body == "", f"re-parked poll must answer the verdict, got {body!r}"
         assert client.calls == 2
@@ -11486,15 +11502,15 @@ async def test_hook_evaluate_endpoint_reparks_a_held_poll_the_gateway_severed(
 
 
 @pytest.mark.asyncio
-async def test_hook_evaluate_endpoint_does_not_repark_a_block_event(
+async def test_hook_evaluate_endpoint_does_not_repark_an_observational_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A request-gate event never re-parks: a held 5xx fails closed within budget.
+    """An observational event never re-parks: a held 5xx fails open within budget.
 
-    Only PreToolUse parks an interactive ask the gateway can sever. A
-    UserPromptSubmit 5xx that arrives past the held-poll floor is a sick
-    server, so it must fail closed once the budget is spent rather than
-    re-POST without bound (which would hang the prompt forever).
+    The server parks a held ask only for the blocking phases it can elicit on.
+    PostToolUse is observational (the tool already ran), so a held 5xx past the
+    floor must fail open once the budget is spent rather than re-POST without
+    bound.
     """
     from omnigent.native import native_policy_hook
 
@@ -11507,12 +11523,40 @@ async def test_hook_evaluate_endpoint_does_not_repark_a_block_event(
             _relay_request_raw,
             bridge_dir,
             "/hook/claude/evaluate-policy",
+            {**_PRE_TOOL_USE_PAYLOAD, "hook_event_name": "PostToolUse", "tool_output": "x"},
+        )
+        assert body == "", f"PostToolUse must fail open (tool already ran), got {body!r}"
+        assert client.calls == 1, (
+            f"an observational event must not re-park, saw {client.calls} POSTs"
+        )
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_treats_a_non_held_read_timeout_as_final(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read timeout that is not a held poll is final: it fails closed in one POST.
+
+    A ReadTimeout is a mid-stream failure, not a connect-phase blip, and when it
+    arrives well inside the held-poll floor it is not a severed parked poll
+    either. The relay must stop at once rather than retry a timeout that will
+    not clear.
+    """
+    _fast_evaluate_retries(monkeypatch, budget_s=5.0)
+    client = _ScriptedPolicyClient(httpx.ReadTimeout("slow body"))
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
             _USER_PROMPT_SUBMIT_PAYLOAD,
         )
         output = json.loads(body)
         assert output["decision"] == "block", output
-        assert "HTTP 503" in output["reason"], output
-        assert client.calls == 1, f"a block event must not re-park, saw {client.calls} POSTs"
+        assert client.calls == 1, f"a non-held read timeout is final, saw {client.calls} POSTs"
     finally:
         relay.close()
 

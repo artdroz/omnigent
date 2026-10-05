@@ -6635,10 +6635,8 @@ def _tool_relay_handler_factory(
             attempts = 0
             started = time.monotonic()
             # Same transient budget as the direct hook path: a resolver blip
-            # that clears within seconds must not drop the prompt. Only an
-            # event that parks an interactive ASK (PreToolUse) re-attaches a
-            # gateway-severed long-poll; a request gate (UserPromptSubmit) has
-            # no held poll to re-park and must fail closed within the budget.
+            # that clears within seconds must not drop the prompt, and a
+            # severed held ASK poll re-parks (see event_long_polls_ask).
             budget = EvaluateRetryBudget()
             can_repark = event_long_polls_ask(hook_event)
             while True:
