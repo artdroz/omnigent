@@ -1164,3 +1164,64 @@ async def test_control_attach_pins_client_term_over_inherited_dumb(
         )
     finally:
         await _kill_and_join(sock, task)
+
+
+async def _tmux_window_width(sock: Path, target: str) -> int:
+    tmux = shutil.which("tmux")
+    assert tmux
+    proc = await asyncio.create_subprocess_exec(
+        tmux,
+        "-S",
+        str(sock),
+        "display-message",
+        "-p",
+        "-t",
+        target,
+        "#{window_width}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await proc.communicate()
+    return int(out.decode().strip())
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_second_interactive_client_does_not_shrink_first_clients_pane() -> None:
+    """A second owner tab (a phone) attaching narrower leaves the desktop pane wide."""
+    sock, target = await _new_private_tmux("cat")
+    await asyncio.sleep(0.3)
+
+    desktop = _FakeWebSocket(
+        inbound=[{"type": "websocket.receive", "text": '{"type":"resize","cols":160,"rows":40}'}]
+    )
+    phone = _FakeWebSocket(
+        inbound=[{"type": "websocket.receive", "text": '{"type":"resize","cols":45,"rows":20}'}]
+    )
+
+    async def _attach(ws: _FakeWebSocket) -> None:
+        await bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+
+    desktop_task = asyncio.create_task(_attach(desktop))
+    await asyncio.sleep(0.8)
+    assert await _tmux_window_width(sock, target) == 160
+
+    phone_task = asyncio.create_task(_attach(phone))
+    await asyncio.sleep(0.8)
+    width_with_phone = await _tmux_window_width(sock, target)
+
+    phone._recv_gate.set()
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(phone_task, timeout=5)
+    await asyncio.sleep(0.5)
+    width_after_phone_left = await _tmux_window_width(sock, target)
+
+    try:
+        assert width_with_phone == 160, (
+            f"desktop pane shrank to the phone's {width_with_phone} columns while the "
+            f"phone was attached (back to {width_after_phone_left} after it left)"
+        )
+    finally:
+        await _kill_and_join(sock, desktop_task)
