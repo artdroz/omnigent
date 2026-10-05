@@ -489,3 +489,28 @@ def test_fork_does_not_inherit_archived_at_label(
     forked = conversation_store.get_conversation(fork.id)
     assert forked is not None
     assert ARCHIVED_AT_LABEL_KEY not in forked.labels
+
+
+def test_update_conversation_writes_and_deletes_labels_with_the_row(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Label upserts and deletes ride in ``update_conversation``'s transaction.
+
+    A caller that must change a column and its label together (a model
+    override and the routing provenance that qualifies it) gets one write,
+    and the returned row already reflects both.
+    """
+    conv = conversation_store.create_conversation()
+    conversation_store.set_labels(conv.id, {"keep": "1", "drop": "1"})
+    updated = conversation_store.update_conversation(
+        conv.id,
+        model_override="claude-opus-4-7",
+        label_updates={"added": "2"},
+        label_deletes=["drop", "never-set"],
+    )
+    assert updated is not None
+    assert updated.model_override == "claude-opus-4-7"
+    assert updated.labels == {"keep": "1", "added": "2"}
+    got = conversation_store.get_conversation(conv.id)
+    assert got is not None
+    assert got.labels == {"keep": "1", "added": "2"}

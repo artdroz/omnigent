@@ -46,6 +46,7 @@ from omnigent.runner.identity import (
 )
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+from omnigent.runner.subagent_routing import CREATE_ROUTE_PROMPT_LABEL_KEY
 from omnigent.runtime import (
     pending_elicitations,
     user_session_stream,
@@ -170,13 +171,11 @@ from omnigent.server.routes._sessions.orchestration import (
     _ensure_native_terminal_ready,
     _ensure_runner_relay_ready,
     _ensure_runner_session_initialized,
-    _forget_create_route_prompt,
     _get_session_snapshot,
     _is_native_terminal_session,
     _labels_for_viewer,
     _persist_model_change_note,
     _publish_runner_recovered_status,
-    _restore_create_route_prompt,
     _run_managed_launch,
     _spawn_archive_stop,
     _validate_session_model_selection,
@@ -2666,13 +2665,11 @@ def register_core_routes(
                 request, conv, conversation_store, runner_router
             )
 
-        # The user's own model request supersedes a Smart Routing create's pick;
-        # its fingerprint goes first, and a rejected live switch hands it back.
+        # The user's own model request supersedes a Smart Routing create's pick,
+        # so its fingerprint leaves in the same write; a rejected switch hands it back.
         retired_create_route: str | None = None
         if conv is not None and (model_override is not None or clear_model):
-            retired_create_route = await _forget_create_route_prompt(
-                session_id, conv, conversation_store
-            )
+            retired_create_route = conv.labels.get(CREATE_ROUTE_PROMPT_LABEL_KEY)
         updated = await asyncio.to_thread(
             conversation_store.update_conversation,
             session_id,
@@ -2692,6 +2689,7 @@ def register_core_routes(
             share_workspace_files=(body.share_workspace_files if set_share_workspace else None),
             terminal_launch_args=terminal_launch_args,
             archived=body.archived,
+            label_deletes=(CREATE_ROUTE_PROMPT_LABEL_KEY,) if retired_create_route else (),
         )
         if updated is None:
             raise _session_not_found()
@@ -2767,11 +2765,14 @@ def register_core_routes(
                         session_id,
                         model_override=conv.model_override,
                         _unset_model_override=conv.model_override is None,
+                        # The create's fingerprint comes back with its pick in one
+                        # write, so no hook can read the pick as a user pin meanwhile.
+                        label_updates=(
+                            {CREATE_ROUTE_PROMPT_LABEL_KEY: retired_create_route}
+                            if retired_create_route is not None
+                            else None
+                        ),
                     )
-                    if retired_create_route is not None:
-                        await _restore_create_route_prompt(
-                            session_id, retired_create_route, conversation_store
-                        )
                     raise OmnigentError(
                         "The terminal did not apply the model change. "
                         "The previous selection has been restored.",

@@ -4,7 +4,7 @@ import hashlib
 import math
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypedDict
 
@@ -912,6 +912,8 @@ class ConversationStore(ABC):
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
+        label_updates: Mapping[str, str] | None = None,
+        label_deletes: Sequence[str] = (),
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
@@ -967,6 +969,11 @@ class ConversationStore(ABC):
         :param archived: New archived state. ``True`` archives
             (hides from the default listing), ``False`` unarchives,
             ``None`` leaves unchanged.
+        :param label_updates: Labels to upsert in the same transaction as
+            the column updates, for a marker that must change together
+            with a column (routing provenance beside ``model_override``).
+            ``None`` writes none.
+        :param label_deletes: Label keys to delete in that same transaction.
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
         """

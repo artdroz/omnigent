@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from pathlib import PureWindowsPath
 from typing import Any, Protocol, cast
@@ -3308,6 +3308,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
+        label_updates: Mapping[str, str] | None = None,
+        label_deletes: Sequence[str] = (),
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
@@ -3353,6 +3355,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             append). JSON-encoded into the column.
         :param archived: New archived state. ``True`` archives,
             ``False`` unarchives, ``None`` leaves unchanged.
+        :param label_updates: Labels to upsert in the same transaction as
+            the column updates, for a marker that must change together
+            with a column (routing provenance beside ``model_override``).
+            ``None`` writes none.
+        :param label_deletes: Label keys to delete in that same transaction.
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
         """
@@ -3444,6 +3451,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 row.archived = archived
                 ap_changed = True
+            if label_deletes:
+                ap_sess.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id == conversation_id,
+                        SqlConversationLabel.key.in_(list(label_deletes)),
+                    )
+                )
+            if label_updates:
+                _upsert_labels(ap_sess, conversation_id, dict(label_updates), now)
             if ap_changed:
                 row.updated_at = now
             labels = _fetch_labels(ap_sess, conversation_id)

@@ -6,7 +6,7 @@ uses (``POST /v1/sessions``, ``PATCH /v1/sessions/{id}``, and the
 
 1. create a session with Smart Routing on (model-level routing, native pane);
 2. run it on a model — either the router's own first-prompt pick, or a model
-   the user chose themselves (the picker / the pane's ``/model`` persist);
+   the user chose themselves in the composer picker;
 3. close the pane and resume the session — the resumed pane's bridge dir is
    fresh, so its first-prompt hook makes the route-turn round trip again;
 4. type a prompt: the session must stay on the model it was already using.
@@ -135,8 +135,8 @@ async def test_resume_keeps_the_users_pinned_model(
 ) -> None:
     """A resumed session stays on the model the user picked, not a re-pick.
 
-    The user chose a model themselves (picker PATCH / the pane's ``/model``
-    persist) and left Smart Routing on. Resuming and typing must not hand the
+    The user chose a model themselves (the picker PATCH) and left Smart
+    Routing on. Resuming and typing must not hand the
     prompt back to the router: the session already HAS the model the user was
     using, and re-picking switches them off it.
     """
@@ -296,27 +296,25 @@ async def test_a_harness_model_report_is_not_a_pin(
     assert decision["model"] == ROUTER_PICK
 
 
-async def test_a_failed_fingerprint_retirement_leaves_the_model_request_unapplied(
+async def test_a_failed_model_write_leaves_the_create_route_in_place(
     client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A create fingerprint that cannot be retired fails the request whole.
+    """The fingerprint retires inside the model write's own transaction.
 
-    The fingerprint is dropped before the model write, so a store failure
-    there leaves the create's pick and its fingerprint both in place — the
-    user sees an error and retries — rather than a pin the hook would later
-    route over because its fingerprint outlived it.
+    A store failure therefore leaves the create's pick and its fingerprint
+    both in place — the user sees an error and retries — rather than a pick
+    that lost its provenance and would read as the user's pin.
     """
-    session_id = await _smart_routing_session(client, agent_name="routing-resume-retire-fails")
+    session_id = await _smart_routing_session(client, agent_name="routing-resume-write-fails")
     _seed_create_route(db_uri, session_id)
 
-    def _unavailable(self: object, conversation_id: str, key: str) -> None:
-        raise OperationalError("DELETE FROM conversation_labels", {}, Exception("locked"))
+    def _unavailable(self: object, conversation_id: str, **kwargs: object) -> None:
+        raise OperationalError("UPDATE conversations", {}, Exception("locked"))
 
-    monkeypatch.setattr(SqlAlchemyConversationStore, "delete_label", _unavailable)
+    monkeypatch.setattr(SqlAlchemyConversationStore, "update_conversation", _unavailable)
     resp = await client.patch(f"/v1/sessions/{session_id}", json={"model_override": USER_MODEL})
-    # The server maps the store error to a 500 rather than re-raising it.
     assert resp.status_code == 500, resp.text
 
     store = SqlAlchemyConversationStore(db_uri)
@@ -326,3 +324,31 @@ async def test_a_failed_fingerprint_retirement_leaves_the_model_request_unapplie
     assert conv.labels.get(CREATE_ROUTE_PROMPT_LABEL_KEY) == create_route_prompt_fingerprint(
         CREATE_PROMPT
     )
+
+
+async def test_a_stale_fingerprint_from_before_this_fix_still_routes_once(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Documented limitation: a pre-fix repin kept the create's fingerprint.
+
+    Before the picker PATCH retired it, a user's repin over a Smart Routing
+    create left the fingerprint behind. Such a session's override still reads
+    as routing's, so its first edited prompt routes one more time; the
+    decision that pick records then closes the gate for good.
+    """
+    session_id = await _smart_routing_session(client, agent_name="routing-resume-legacy-repin")
+    _seed_create_route(db_uri, session_id)
+    store = SqlAlchemyConversationStore(db_uri)
+    # The pre-fix PATCH: the user's model lands, the fingerprint stays.
+    store.update_conversation(session_id, model_override=USER_MODEL)
+
+    first = await _resume_first_prompt(
+        client, session_id, live_model=USER_MODEL, prompt="an edited prompt the create never saw"
+    )
+    assert first["action"] == "route", first
+    assert len(_routing_decisions(db_uri, session_id)) == 1
+
+    second = await _resume_first_prompt(client, session_id, live_model=ROUTER_PICK)
+    assert second["action"] == "allow", second
+    assert len(_routing_decisions(db_uri, session_id)) == 1

@@ -473,6 +473,15 @@ async def test_rejected_native_switch_restores_saved_model(
     original = env.store.get_conversation(session_id)
     assert original is not None
     assert original.model_override == previous_model
+    # Record every store write so the rollback can be checked for atomicity.
+    writes: list[dict[str, Any]] = []
+    real_update = env.store.update_conversation
+
+    def _record(conversation_id: str, **kwargs: Any) -> Any:
+        writes.append(kwargs)
+        return real_update(conversation_id, **kwargs)
+
+    monkeypatch.setattr(env.store, "update_conversation", _record)
     runner_post = AsyncMock(
         return_value=Response(
             503,
@@ -503,6 +512,15 @@ async def test_rejected_native_switch_restores_saved_model(
     assert saved.model_override == previous_model
     assert saved.inference_snapshot == original.inference_snapshot
     assert saved.labels.get(CREATE_ROUTE_PROMPT_LABEL_KEY) == create_fingerprint
+    # The model and its fingerprint come back in one write, so no hook can
+    # observe the restored pick without its provenance in between.
+    assert [w for w in writes if "label_updates" in w] == [
+        {
+            "model_override": previous_model,
+            "_unset_model_override": previous_model is None,
+            "label_updates": {CREATE_ROUTE_PROMPT_LABEL_KEY: create_fingerprint},
+        }
+    ]
 
     # The restored pick is still routing's, not the user's: an edited first
     # prompt routes as it did before the rejected switch.
