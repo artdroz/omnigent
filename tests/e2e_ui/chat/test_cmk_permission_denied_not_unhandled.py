@@ -48,6 +48,7 @@ from urllib.parse import urlparse
 
 import httpx
 import pytest
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, Response, expect
 
 # The stand-in CMK service and the store hooks it serves need grpcio.
@@ -258,7 +259,8 @@ def _json_body(response: Response) -> dict[str, Any]:
     """
     try:
         body = response.json()
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, PlaywrightError):
+        # Redirects and responses flushed by a navigation have no readable body.
         return {}
     return body if isinstance(body, dict) else {}
 
@@ -411,11 +413,14 @@ def test_cmk_permission_denied_on_read_is_not_an_unhandled_internal_error(
         "CMK PERMISSION_DENIED on item decrypt escaped as an unhandled 500 internal_error on "
         f"{internal_errors[0]}; the SPA showed {shown[:160]!r}"
     )
+    items_path = f"{session_prefix}/items"
     denied = [
-        p for p, status, code in outcomes if (status, code) == (403, "upstream_permission_denied")
+        p
+        for p, status, code in outcomes
+        if p == items_path and (status, code) == (403, "upstream_permission_denied")
     ]
     assert denied, (
-        "the denied CMK decrypt never surfaced as a handled 403 upstream_permission_denied; "
+        f"GET {items_path} never answered the handled 403 upstream_permission_denied; "
         f"session responses: {outcomes!r}; the SPA showed {shown[:160]!r}"
     )
     unhandled = _unhandled_permission_denied(cmk_server.server_log, log_offset)

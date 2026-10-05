@@ -20,11 +20,8 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-# grpcio is not a base dependency; without it there is no backend RpcError to raise.
-grpc = pytest.importorskip("grpc", reason="grpcio is required to build the backend RpcError")
-
-from omnigent.errors import ErrorCategory  # noqa: E402
-from omnigent.stores.conversation_store.sqlalchemy_store import (  # noqa: E402
+from omnigent.errors import ErrorCategory
+from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 
@@ -53,19 +50,29 @@ async def catchall_client(
         yield c
 
 
-class _BackendRpcError(grpc.RpcError):
-    """A gRPC error exposing the ``code()``/``details()`` of a failed call."""
+def _grpcio_rpc_error(status_name: str, details: str) -> Exception:
+    """A failed-call error from pypi grpcio, built only when grpcio is installed.
 
-    def __init__(self, status: grpc.StatusCode, details: str) -> None:
-        super().__init__()
-        self._status = status
-        self._details = details
+    grpcio is not a base dependency: the cases that need a real ``grpc.RpcError``
+    skip without it, while the vendored case below still runs.
 
-    def code(self) -> grpc.StatusCode:
-        return self._status
+    :param status_name: ``grpc.StatusCode`` member name the call failed with.
+    :param details: The failed call's details string.
+    :returns: The exception instance.
+    """
+    grpc = pytest.importorskip("grpc", reason="grpcio is required to build a real grpc.RpcError")
+    status = getattr(grpc.StatusCode, status_name)
 
-    def details(self) -> str:
-        return self._details
+    class _BackendRpcError(grpc.RpcError):
+        """A gRPC error exposing the ``code()``/``details()`` of a failed call."""
+
+        def code(self) -> object:
+            return status
+
+        def details(self) -> str:
+            return details
+
+    return _BackendRpcError()
 
 
 def _make_vendored_rpc_error() -> Exception:
@@ -120,10 +127,7 @@ def _app_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
 @pytest.mark.parametrize(
     "make_error",
     [
-        pytest.param(
-            lambda: _BackendRpcError(grpc.StatusCode.PERMISSION_DENIED, _DENIAL_DETAILS),
-            id="grpcio",
-        ),
+        pytest.param(lambda: _grpcio_rpc_error("PERMISSION_DENIED", _DENIAL_DETAILS), id="grpcio"),
         pytest.param(_make_vendored_rpc_error, id="vendored"),
     ],
 )
@@ -162,17 +166,17 @@ async def test_grpc_permission_denied_maps_to_403(
 
 
 @pytest.mark.parametrize(
-    ("status", "details"),
+    ("status_name", "details"),
     [
-        pytest.param(grpc.StatusCode.UNAVAILABLE, "connection refused", id="unavailable"),
-        pytest.param(grpc.StatusCode.UNAUTHENTICATED, "bad credentials", id="unauthenticated"),
+        pytest.param("UNAVAILABLE", "connection refused", id="unavailable"),
+        pytest.param("UNAUTHENTICATED", "bad credentials", id="unauthenticated"),
     ],
 )
 async def test_other_grpc_errors_keep_the_500_contract(
     catchall_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    status: grpc.StatusCode,
+    status_name: str,
     details: str,
 ) -> None:
     """A non-denial gRPC failure still surfaces as the standard 500 shape.
@@ -183,7 +187,7 @@ async def test_other_grpc_errors_keep_the_500_contract(
     not a caller access outcome. Both keep the ERROR-level unhandled signal
     with its traceback.
     """
-    _fail_listing_with(monkeypatch, _BackendRpcError(status, details))
+    _fail_listing_with(monkeypatch, _grpcio_rpc_error(status_name, details))
     with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
         resp = await catchall_client.get("/v1/sessions", params={"limit": 30})
     assert resp.status_code == 500

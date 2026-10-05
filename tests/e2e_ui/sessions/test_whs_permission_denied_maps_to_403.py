@@ -227,6 +227,7 @@ def test_whs_permission_denied_is_handled_not_500(
     # generic "An internal error occurred." the unhandled 500 produced.
     expect(failure).to_contain_text("/v1/sessions")
     expect(failure).to_contain_text("denied by a backing service")
+    expect(failure).to_contain_text("ask an administrator")
     # Hold the failed state on screen so the recording shows what the user sees.
     page.wait_for_timeout(1_500)
 
