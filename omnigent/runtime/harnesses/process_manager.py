@@ -532,6 +532,36 @@ def _build_harness_spawn_env(env: dict[str, str] | None) -> dict[str, str]:
     return strip_runner_auth_secrets(merged)
 
 
+async def _stop_process(process: asyncio.subprocess.Process | Any) -> None:
+    """
+    Terminate ``process`` and its tree, escalating to a kill after
+    ``_RELEASE_GRACE_S``. Cancellation during the grace wait escalates
+    at once and still reaps the corpse before re-raising, so a cancelled
+    teardown cannot abandon a live process that nothing tracks any more.
+
+    :param process: The subprocess handle; a no-op if it already exited.
+    """
+    if process.returncode is not None:
+        return
+    try:
+        # Tree-aware backstop: this process parents the sandbox
+        # launcher, which forks the real agent. Signalling only the
+        # handle strands both when an executor close() never runs.
+        _proc.terminate_tree(process)
+        await asyncio.wait_for(process.wait(), timeout=_RELEASE_GRACE_S)
+    except BaseException as exc:
+        # Grace expired, the process vanished mid-teardown, or the caller was
+        # cancelled: force-kill best-effort (an already-gone process is done).
+        with contextlib.suppress(Exception):
+            _proc.kill_tree(process)
+        # Shield the corpse-wait so a repeated cancellation interrupts only
+        # this await, not the reap; the kill has already been sent.
+        with contextlib.suppress(Exception):
+            await asyncio.shield(process.wait())
+        if not isinstance(exc, Exception):
+            raise
+
+
 class HarnessProcessManager:
     """
     One subprocess per conversation; lifecycle tied to conversation.
@@ -1414,9 +1444,10 @@ class HarnessProcessManager:
         entry from ``_entries`` before calling this, so a bare
         ``client.aclose()`` raise (a broken transport, a wedged client)
         that skipped the kill would otherwise leak an *un-tracked*
-        subprocess. ``CancelledError`` (a ``BaseException``, not
-        ``Exception``) still propagates, so shutdown cancellation is
-        unaffected.
+        subprocess. ``CancelledError`` still propagates to the caller,
+        but only after the process is killed and reaped and its
+        transport and socket are released: the retired process has no
+        other owner left.
 
         :param entry: The bookkeeping record to tear down.
         """
@@ -1426,28 +1457,16 @@ class HarnessProcessManager:
             # A broken transport must not skip the subprocess kill below.
             _logger.exception("error closing harness client during teardown; continuing")
         finally:
-            if entry.process.returncode is None:
-                try:
-                    # Tree-aware backstop: this process parents the sandbox
-                    # launcher, which forks the real agent. Signalling only the
-                    # handle strands both when an executor close() never runs.
-                    _proc.terminate_tree(entry.process)
-                    await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
-                except Exception:
-                    # Graceful SIGTERM didn't complete — it timed out, or
-                    # send_signal/wait raised (e.g. the process vanished
-                    # mid-teardown). Force-kill best-effort; a process that
-                    # is already gone is already done.
-                    with contextlib.suppress(Exception):
-                        _proc.kill_tree(entry.process)
-                        await entry.process.wait()
-            with contextlib.suppress(Exception):
-                close_subprocess_transport(entry.process)
-            # Best-effort socket cleanup. uvicorn's atexit usually
-            # handles this when SIGTERM lands cleanly, but a
-            # hard-killed runner won't. No-op for TCP endpoints.
-            with contextlib.suppress(Exception):
-                entry.endpoint.cleanup()
+            try:
+                await _stop_process(entry.process)
+            finally:
+                with contextlib.suppress(Exception):
+                    close_subprocess_transport(entry.process)
+                # Best-effort socket cleanup. uvicorn's atexit usually
+                # handles this when SIGTERM lands cleanly, but a
+                # hard-killed runner won't. No-op for TCP endpoints.
+                with contextlib.suppress(Exception):
+                    entry.endpoint.cleanup()
 
     async def _idle_reaper_loop(self) -> None:
         """

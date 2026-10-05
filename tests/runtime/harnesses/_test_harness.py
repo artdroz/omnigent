@@ -29,6 +29,9 @@ verify spawn / health / round-trip behavior:
   task ignores cancellation forever. Used to verify a plain
   SIGTERM has a hard-exit backstop even if graceful shutdown
   wedges before lifespan teardown completes.
+- ``GET /ignore-sigterm`` installs ``SIG_IGN`` for SIGTERM in the
+  runner, modelling a child that survives the graceful signal and
+  only exits on SIGKILL. Used by the teardown-cancellation tests.
 - ``POST /v1/sessions/{conversation_id}/events`` accepts
   interrupt events. Used by cancel-forwarding tests.
 
@@ -42,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import time
 
 from fastapi import FastAPI, HTTPException, Request
@@ -149,6 +153,12 @@ def create_app() -> FastAPI:
 
         app.state.stuck_shutdown_task = asyncio.create_task(_ignore_cancellation())
         return {"status": "stuck_task_started"}
+
+    @app.get("/ignore-sigterm")
+    async def ignore_sigterm() -> dict[str, str]:
+        """Make this runner ignore SIGTERM so only SIGKILL can end it."""
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        return {"status": "sigterm_ignored"}
 
     @app.post("/v1/sessions/{conversation_id}/events")
     async def session_event(

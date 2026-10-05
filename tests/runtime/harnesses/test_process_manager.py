@@ -470,6 +470,156 @@ async def test_close_entry_kills_process_when_aclose_raises(
         await manager.shutdown()
 
 
+async def _pid_exits(pid: int, *, timeout_s: float) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return True
+        await asyncio.sleep(0.05)
+    return not _pid_alive(pid)
+
+
+async def test_release_cancelled_during_sigterm_wait_still_kills_subprocess(
+    manager: HarnessProcessManager,
+) -> None:
+    """Cancelling release() during the SIGTERM grace wait must still kill the child.
+
+    A SIGTERM-ignoring child holds the grace wait open long enough to cancel
+    into it; the entry is already popped, so nothing else would reap it.
+    """
+    await manager.start()
+    pid: int | None = None
+    try:
+        client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        pid = (await client.get("/pid")).json()["pid"]
+        assert (await client.get("/ignore-sigterm")).json()["status"] == "sigterm_ignored"
+        socket_path = manager.instance_dir / "conv-conv_a.sock"
+        assert socket_path.exists()
+
+        release_task = asyncio.create_task(manager.release("conv_a"))
+        for _ in range(200):
+            if not manager.has_session("conv_a"):
+                break
+            await asyncio.sleep(0.01)
+        assert not manager.has_session("conv_a"), "release never unregistered the entry"
+        # The entry is popped; aclose() and SIGTERM follow within milliseconds,
+        # so this lands inside the 5 s grace wait on a child that ignores SIGTERM.
+        await asyncio.sleep(0.5)
+        release_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await release_task
+
+        assert not manager.has_session("conv_a")
+        assert await _pid_exits(pid, timeout_s=3.0), (
+            "subprocess survived a cancelled release and is no longer tracked"
+        )
+        assert not socket_path.exists(), "socket file left behind by a cancelled release"
+    finally:
+        if pid is not None and _pid_alive(pid):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        await manager.shutdown()
+
+
+async def test_release_cancelled_during_sigkill_wait_still_removes_socket(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling release() while it awaits the SIGKILLed child must still clean up.
+
+    The kill is already sent; the transport close and socket removal are the
+    obligations left to honour before the cancellation propagates.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    monkeypatch.setattr(pm_mod, "_RELEASE_GRACE_S", 0.2)
+    killed = asyncio.Event()
+    real_kill_tree = pm_mod._proc.kill_tree
+
+    def _kill_tree_then_signal(process: object) -> None:
+        real_kill_tree(process)  # type: ignore[arg-type]
+        killed.set()
+
+    monkeypatch.setattr(pm_mod._proc, "kill_tree", _kill_tree_then_signal)
+
+    await manager.start()
+    pid: int | None = None
+    try:
+        client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        pid = (await client.get("/pid")).json()["pid"]
+        assert (await client.get("/ignore-sigterm")).json()["status"] == "sigterm_ignored"
+        socket_path = manager.instance_dir / "conv-conv_a.sock"
+        assert socket_path.exists()
+
+        release_task = asyncio.create_task(manager.release("conv_a"))
+        await asyncio.wait_for(killed.wait(), timeout=10.0)
+        release_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await release_task
+
+        assert not manager.has_session("conv_a")
+        assert await _pid_exits(pid, timeout_s=3.0), "SIGKILLed subprocess was never reaped"
+        assert not socket_path.exists(), "socket file left behind by a cancelled forced kill"
+    finally:
+        if pid is not None and _pid_alive(pid):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        await manager.shutdown()
+
+
+async def test_release_cancelled_twice_still_kills_subprocess_and_removes_socket(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second cancellation during the forced reap must not abandon the teardown.
+
+    The first cancel lands in the SIGTERM grace wait and escalates to the kill;
+    the second lands while the killed child is being reaped.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    release_task: asyncio.Task[None] | None = None
+    real_kill_tree = pm_mod._proc.kill_tree
+
+    def _kill_tree_then_cancel_again(process: object) -> None:
+        real_kill_tree(process)  # type: ignore[arg-type]
+        assert release_task is not None
+        release_task.cancel()
+
+    monkeypatch.setattr(pm_mod._proc, "kill_tree", _kill_tree_then_cancel_again)
+
+    await manager.start()
+    pid: int | None = None
+    try:
+        client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        pid = (await client.get("/pid")).json()["pid"]
+        assert (await client.get("/ignore-sigterm")).json()["status"] == "sigterm_ignored"
+        socket_path = manager.instance_dir / "conv-conv_a.sock"
+        assert socket_path.exists()
+
+        release_task = asyncio.create_task(manager.release("conv_a"))
+        for _ in range(200):
+            if not manager.has_session("conv_a"):
+                break
+            await asyncio.sleep(0.01)
+        assert not manager.has_session("conv_a"), "release never unregistered the entry"
+        await asyncio.sleep(0.5)
+        release_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await release_task
+
+        assert not manager.has_session("conv_a")
+        assert await _pid_exits(pid, timeout_s=3.0), (
+            "subprocess survived a twice-cancelled release and is no longer tracked"
+        )
+        assert not socket_path.exists(), "socket file left behind by a twice-cancelled release"
+    finally:
+        if pid is not None and _pid_alive(pid):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        await manager.shutdown()
+
+
 @pytest.mark.parametrize("response_id", [None, "resp_crashed"])
 async def test_get_client_respawns_after_crash(
     manager: HarnessProcessManager,
