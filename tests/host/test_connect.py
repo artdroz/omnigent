@@ -78,7 +78,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
-from omnigent.host.git_worktree import _GIT_TIMEOUT_S, CreatedWorktree
+from omnigent.host.git_worktree import GIT_METADATA_TIMEOUT_S, CreatedWorktree
 from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteUnavailable
@@ -3530,7 +3530,7 @@ async def test_handle_create_worktree_without_server_timeout_keeps_legacy_bound(
 
     assert isinstance(result, HostCreateWorktreeResultFrame)
     assert result.status == "ok"
-    assert captured["checkout_timeout_s"] == _GIT_TIMEOUT_S
+    assert captured["checkout_timeout_s"] == GIT_METADATA_TIMEOUT_S
 
 
 def test_reap_orphans_is_noop_without_wnohang(

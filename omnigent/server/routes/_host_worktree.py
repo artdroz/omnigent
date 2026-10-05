@@ -31,12 +31,9 @@ _logger = logging.getLogger(__name__)
 # surfaces instead of a generic server-side timeout.
 _WORKTREE_TIMEOUT_S: float = 150.0
 
-# A failing create runs up to three size-scaling git commands in sequence: a
-# fallback fetch to resolve the base ref, the checkout that populates the
-# worktree, then a rollback remove that tears the populated tree back down.
-# Each is bounded by GIT_CHECKOUT_TIMEOUT_S on the host, so the server must
-# outwait all three (plus margin) or it abandons a still-running host
-# operation, leaving a half-created worktree and branch behind.
+# A failing create runs three host git commands in sequence — fallback fetch,
+# checkout, rollback remove — each bounded by GIT_CHECKOUT_TIMEOUT_S, so the
+# server must outwait all three (plus margin) rather than abandon one midway.
 _WORKTREE_CREATE_TIMEOUT_S: float = 3 * GIT_CHECKOUT_TIMEOUT_S + 30.0
 
 

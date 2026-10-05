@@ -119,7 +119,7 @@ from omnigent.host.frames import (
     workspace_missing_message,
 )
 from omnigent.host.git_worktree import (
-    _GIT_TIMEOUT_S,
+    GIT_METADATA_TIMEOUT_S,
     WorktreeError,
     create_worktree,
     list_worktrees,
@@ -3666,7 +3666,7 @@ class HostProcess:
             checkout_timeout_s = (
                 frame.checkout_timeout_s
                 if frame.checkout_timeout_s is not None
-                else _GIT_TIMEOUT_S
+                else GIT_METADATA_TIMEOUT_S
             )
             with self._host_subprocess_op():
                 created = await asyncio.to_thread(

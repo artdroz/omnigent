@@ -757,8 +757,8 @@ def test_create_worktree_checkout_outlasting_command_timeout_completes(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A checkout slower than the per-command git bound still populates the worktree."""
-    _commit_slow_smudge_file(git_repo, delay_s=3)
-    monkeypatch.setattr(git_worktree_module, "_GIT_TIMEOUT_S", 1.0)
+    _commit_slow_smudge_file(git_repo, delay_s=5)
+    monkeypatch.setattr(git_worktree_module, "GIT_METADATA_TIMEOUT_S", 2.0)
 
     created = create_worktree(repo_path=str(git_repo), branch_name="feature/slow")
 

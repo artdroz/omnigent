@@ -20,7 +20,7 @@ _logger = logging.getLogger(__name__)
 # Bound every git command so a wedged git cannot pin its worker thread
 # (and the orphan-reaper pause) forever. Metadata commands finish well
 # within this on any repository.
-_GIT_TIMEOUT_S: float = 120.0
+GIT_METADATA_TIMEOUT_S: float = 120.0
 
 # Populating a worktree (``worktree add`` / ``checkout``) and ``fetch``
 # scale with repository size: a large monorepo legitimately takes many
@@ -115,13 +115,13 @@ def _run_git(
     :param cwd: Working directory to run git in, e.g.
         ``"/Users/alice/myrepo"``.
     :param timeout: Seconds to allow before killing git. Defaults to
-        :data:`_GIT_TIMEOUT_S`; commands whose duration scales with
+        :data:`GIT_METADATA_TIMEOUT_S`; commands whose duration scales with
         repository size pass :data:`GIT_CHECKOUT_TIMEOUT_S`.
     :returns: The completed process with captured text stdout/stderr.
     :raises WorktreeError: If git is not installed, or the command
         exceeds ``timeout``.
     """
-    bound = _GIT_TIMEOUT_S if timeout is None else timeout
+    bound = GIT_METADATA_TIMEOUT_S if timeout is None else timeout
     try:
         return subprocess.run(
             ["git", *args],
