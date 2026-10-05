@@ -20,6 +20,10 @@ const {
 } = require("./desktopHarness");
 
 const deps = desktopDepsAvailable();
+// The omnigent CLI shim below is a bash script, so the lane is POSIX-only.
+const SKIP_REASON = deps.ok
+  ? process.platform === "win32" && "the omnigent CLI shim is a bash script"
+  : `missing deps: ${deps.missing.join(", ")}`;
 const RECORD_ROOT =
   process.env.OMNIGENT_DESKTOP_RECORD_DIR ||
   path.join(__dirname, "recordings", "run-on-this-machine");
@@ -141,8 +145,26 @@ function startHostDaemon(cliShim, serverUrl, logPath) {
 
 async function fetchHosts(serverUrl) {
   const res = await fetch(`${serverUrl}/v1/hosts`);
+  if (!res.ok) throw new Error(`GET /v1/hosts failed: ${res.status} ${await res.text()}`);
   const body = await res.json();
   return body.hosts ?? [];
+}
+
+function stopDaemon(child) {
+  // SIGTERM first; SIGKILL if the daemon has not closed its stdio within 5 s.
+  // Resolve only after "close" so nothing is written under HOME after rmSync.
+  return new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+    child.once("close", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    child.kill("SIGTERM");
+  });
 }
 
 async function waitForOnlineHost(serverUrl, timeoutMs = 20_000) {
@@ -212,7 +234,7 @@ async function closeJourney(journey) {
     () => {
       saved = saveRecording(journey.recordDir, journey.name);
     },
-    () => journey.child?.kill("SIGTERM"),
+    () => journey.child && stopDaemon(journey.child),
     () => journey.server?.close(),
     () => journey.userDataDir && fs.rmSync(journey.userDataDir, { recursive: true, force: true }),
     () => journey.home && fs.rmSync(journey.home, { recursive: true, force: true }),
@@ -232,180 +254,180 @@ async function closeJourney(journey) {
   return saved;
 }
 
-describe(
-  "desktop shell — 'Use this machine' selects the local host",
-  { skip: deps.ok ? false : `missing deps: ${deps.missing.join(", ")}` },
-  () => {
-    let tmpDir;
-    let cliShim;
+describe("desktop shell — 'Use this machine' selects the local host", { skip: SKIP_REASON }, () => {
+  let tmpDir;
+  let cliShim;
 
-    before(() => {
-      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "omni-local-host-e2e-"));
-      cliShim = writeCliShim(tmpDir);
-    });
+  before(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "omni-local-host-e2e-"));
+    cliShim = writeCliShim(tmpDir);
+  });
 
-    after(() => {
-      process.env = { ...BASE_ENV };
-      if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
-    });
+  after(() => {
+    process.env = { ...BASE_ENV };
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
 
-    it("connects and selects this machine when 'Use this machine' is clicked", async () => {
-      const recordDir = path.join(RECORD_ROOT, "run-on-this-machine");
-      fs.mkdirSync(recordDir, { recursive: true });
-      const journey = { recordDir, name: "run-on-this-machine" };
-      let saved;
-      try {
-        // Each journey gets its own host registry.
-        journey.server = await spawnServer(fs.mkdtempSync(path.join(tmpDir, "srv-connect-")));
-        Object.assign(journey, prepareProfile("connect", journey.server.serverUrl, cliShim));
-        isolateEnv(journey.home);
-        const launched = await launchDesktop({ recordDir, userDataDir: journey.userDataDir });
-        journey.electronApp = launched.electronApp;
-        journey.stopDisplayCapture = launched.stopDisplayCapture;
-        const window = servedWindow(launched);
-        const chip = window.locator(CHIP);
-        await chip.waitFor({ state: "visible", timeout: 30_000 });
-        await window
-          .locator(`${CHIP}[aria-label*="No host"]`)
-          .waitFor({ state: "visible", timeout: 30_000 });
+  it("connects and selects this machine when 'Use this machine' is clicked", async () => {
+    const recordDir = path.join(RECORD_ROOT, "run-on-this-machine");
+    fs.mkdirSync(recordDir, { recursive: true });
+    const journey = { recordDir, name: "run-on-this-machine" };
+    let saved;
+    try {
+      // Each journey gets its own host registry.
+      journey.server = await spawnServer(fs.mkdtempSync(path.join(tmpDir, "srv-connect-")));
+      Object.assign(journey, prepareProfile("connect", journey.server.serverUrl, cliShim));
+      isolateEnv(journey.home);
+      const launched = await launchDesktop({ recordDir, userDataDir: journey.userDataDir });
+      journey.electronApp = launched.electronApp;
+      journey.stopDisplayCapture = launched.stopDisplayCapture;
+      const window = servedWindow(launched);
+      const chip = window.locator(CHIP);
+      await chip.waitFor({ state: "visible", timeout: 30_000 });
+      await window
+        .locator(`${CHIP}[aria-label*="No host"]`)
+        .waitFor({ state: "visible", timeout: 30_000 });
 
-        await chip.click();
-        const runItem = window.locator(RUN_ON_THIS_MACHINE);
-        await runItem.waitFor({ state: "visible", timeout: 15_000 });
-        await sleep(1000);
-        await runItem.click();
+      await chip.click();
+      const runItem = window.locator(RUN_ON_THIS_MACHINE);
+      await runItem.waitFor({ state: "visible", timeout: 15_000 });
+      await sleep(1000);
+      await runItem.click();
 
-        const outcome = await waitForChipOutcome(window);
-        const hosts = await fetchHosts(journey.server.serverUrl);
-        await settleAndSnapshot(window, recordDir, "outcome", { ...outcome, hosts });
-        assert.equal(
-          outcome.error,
-          null,
-          `"Use this machine" surfaced a connect error: ${outcome.error}`,
-        );
-        assert.ok(
-          !outcome.timedOut,
-          `host chip never settled within ${SELECT_TIMEOUT_MS} ms — it reads ${JSON.stringify(outcome.label)}`,
-        );
-        assert.match(
-          outcome.label,
-          THIS_MACHINE,
-          `host chip never selected this machine — it reads ${JSON.stringify(outcome.label)}`,
-        );
-        const online = hosts.filter((h) => h.status === "online");
-        assert.equal(
-          online.length,
-          1,
-          `expected exactly one online host after the connect, got: ${JSON.stringify(hosts)}`,
-        );
-      } finally {
-        saved = await closeJourney(journey);
-      }
-      assert.ok(saved.length > 0, "no desktop recording was produced");
-    });
+      const outcome = await waitForChipOutcome(window);
+      const hosts = await fetchHosts(journey.server.serverUrl);
+      await settleAndSnapshot(window, recordDir, "outcome", { ...outcome, hosts });
+      assert.equal(
+        outcome.error,
+        null,
+        `"Use this machine" surfaced a connect error: ${outcome.error}`,
+      );
+      assert.ok(
+        !outcome.timedOut,
+        `host chip never settled within ${SELECT_TIMEOUT_MS} ms — it reads ${JSON.stringify(outcome.label)}`,
+      );
+      assert.match(
+        outcome.label,
+        THIS_MACHINE,
+        `host chip never selected this machine — it reads ${JSON.stringify(outcome.label)}`,
+      );
+      const online = hosts.filter((h) => h.status === "online");
+      assert.equal(
+        online.length,
+        1,
+        `expected exactly one online host after the connect, got: ${JSON.stringify(hosts)}`,
+      );
+    } finally {
+      saved = await closeJourney(journey);
+    }
+    assert.ok(saved.length > 0, "no desktop recording was produced");
+  });
 
-    it("auto-selects a local host daemon the user already started in a terminal", async () => {
-      const recordDir = path.join(RECORD_ROOT, "manual-host");
-      fs.mkdirSync(recordDir, { recursive: true });
-      const journey = { recordDir, name: "manual-host" };
-      let saved;
-      try {
-        journey.server = await spawnServer(fs.mkdtempSync(path.join(tmpDir, "srv-manual-")));
-        Object.assign(journey, prepareProfile("manual", journey.server.serverUrl, cliShim));
-        isolateEnv(journey.home);
-        const daemon = await startHostDaemon(
-          cliShim,
-          journey.server.serverUrl,
-          path.join(recordDir, "daemon.log"),
-        );
-        journey.child = daemon.child;
-        assert.ok(daemon.connected, `omnigent host did not connect:\n${daemon.log.slice(-2000)}`);
-        await waitForOnlineHost(journey.server.serverUrl);
+  it("auto-selects a local host daemon the user already started in a terminal", async () => {
+    const recordDir = path.join(RECORD_ROOT, "manual-host");
+    fs.mkdirSync(recordDir, { recursive: true });
+    const journey = { recordDir, name: "manual-host" };
+    let saved;
+    try {
+      journey.server = await spawnServer(fs.mkdtempSync(path.join(tmpDir, "srv-manual-")));
+      Object.assign(journey, prepareProfile("manual", journey.server.serverUrl, cliShim));
+      isolateEnv(journey.home);
+      const daemon = await startHostDaemon(
+        cliShim,
+        journey.server.serverUrl,
+        path.join(recordDir, "daemon.log"),
+      );
+      journey.child = daemon.child;
+      assert.ok(daemon.connected, `omnigent host did not connect:\n${daemon.log.slice(-2000)}`);
+      await waitForOnlineHost(journey.server.serverUrl);
 
-        const launched = await launchDesktop({ recordDir, userDataDir: journey.userDataDir });
-        journey.electronApp = launched.electronApp;
-        journey.stopDisplayCapture = launched.stopDisplayCapture;
-        const window = servedWindow(launched);
-        await window.locator(CHIP).waitFor({ state: "visible", timeout: 30_000 });
+      const launched = await launchDesktop({ recordDir, userDataDir: journey.userDataDir });
+      journey.electronApp = launched.electronApp;
+      journey.stopDisplayCapture = launched.stopDisplayCapture;
+      const window = servedWindow(launched);
+      await window.locator(CHIP).waitFor({ state: "visible", timeout: 30_000 });
 
-        const outcome = await waitForChipOutcome(window);
-        const hosts = await fetchHosts(journey.server.serverUrl);
-        await settleAndSnapshot(window, recordDir, "outcome", { ...outcome, hosts });
-        assert.ok(
-          !outcome.timedOut,
-          `host chip never settled within ${SELECT_TIMEOUT_MS} ms — it reads ${JSON.stringify(outcome.label)}`,
-        );
-        assert.match(
-          outcome.label,
-          THIS_MACHINE,
-          `host chip never picked the running local host — it reads ${JSON.stringify(outcome.label)}`,
-        );
-      } finally {
-        saved = await closeJourney(journey);
-      }
-      assert.ok(saved.length > 0, "no desktop recording was produced");
-    });
+      const outcome = await waitForChipOutcome(window);
+      const hosts = await fetchHosts(journey.server.serverUrl);
+      await settleAndSnapshot(window, recordDir, "outcome", { ...outcome, hosts });
+      assert.ok(
+        !outcome.timedOut,
+        `host chip never settled within ${SELECT_TIMEOUT_MS} ms — it reads ${JSON.stringify(outcome.label)}`,
+      );
+      assert.match(
+        outcome.label,
+        THIS_MACHINE,
+        `host chip never picked the running local host — it reads ${JSON.stringify(outcome.label)}`,
+      );
+    } finally {
+      saved = await closeJourney(journey);
+    }
+    assert.ok(saved.length > 0, "no desktop recording was produced");
+  });
 
-    it("recovers when the persisted last-host choice carries the legacy host_ prefix", async () => {
-      const recordDir = path.join(RECORD_ROOT, "legacy-host-choice");
-      fs.mkdirSync(recordDir, { recursive: true });
-      const journey = { recordDir, name: "legacy-host-choice" };
-      let saved;
-      try {
-        journey.server = await spawnServer(fs.mkdtempSync(path.join(tmpDir, "srv-legacy-")));
-        Object.assign(journey, prepareProfile("legacy", journey.server.serverUrl, cliShim));
-        isolateEnv(journey.home);
-        const daemon = await startHostDaemon(
-          cliShim,
-          journey.server.serverUrl,
-          path.join(recordDir, "daemon.log"),
-        );
-        journey.child = daemon.child;
-        assert.ok(daemon.connected, `omnigent host did not connect:\n${daemon.log.slice(-2000)}`);
-        const { host_id: hostId } = await waitForOnlineHost(journey.server.serverUrl);
+  it("recovers when the persisted last-host choice carries the legacy host_ prefix", async () => {
+    const recordDir = path.join(RECORD_ROOT, "legacy-host-choice");
+    fs.mkdirSync(recordDir, { recursive: true });
+    const journey = { recordDir, name: "legacy-host-choice" };
+    let saved;
+    try {
+      journey.server = await spawnServer(fs.mkdtempSync(path.join(tmpDir, "srv-legacy-")));
+      Object.assign(journey, prepareProfile("legacy", journey.server.serverUrl, cliShim));
+      isolateEnv(journey.home);
+      const daemon = await startHostDaemon(
+        cliShim,
+        journey.server.serverUrl,
+        path.join(recordDir, "daemon.log"),
+      );
+      journey.child = daemon.child;
+      assert.ok(daemon.connected, `omnigent host did not connect:\n${daemon.log.slice(-2000)}`);
+      const { host_id: hostId } = await waitForOnlineHost(journey.server.serverUrl);
 
-        const launched = await launchDesktop({ recordDir, userDataDir: journey.userDataDir });
-        journey.electronApp = launched.electronApp;
-        journey.stopDisplayCapture = launched.stopDisplayCapture;
-        const window = servedWindow(launched);
-        const chip = window.locator(CHIP);
-        await chip.waitFor({ state: "visible", timeout: 30_000 });
-        const beforeSeed = await waitForChipOutcome(window);
+      const launched = await launchDesktop({ recordDir, userDataDir: journey.userDataDir });
+      journey.electronApp = launched.electronApp;
+      journey.stopDisplayCapture = launched.stopDisplayCapture;
+      const window = servedWindow(launched);
+      const chip = window.locator(CHIP);
+      await chip.waitFor({ state: "visible", timeout: 30_000 });
+      const beforeSeed = await waitForChipOutcome(window);
+      assert.ok(
+        !beforeSeed.timedOut && beforeSeed.error === null,
+        `chip did not settle before seeding the legacy choice: ${JSON.stringify(beforeSeed)}`,
+      );
 
-        // Seed the legacy `host_<id>` spelling an older build persisted.
-        await window.evaluate(
-          ([key, id]) => localStorage.setItem(key, `host_${id}`),
-          [LAST_HOST_CHOICE_KEY, hostId],
-        );
-        await window.reload();
-        await chip.waitFor({ state: "visible", timeout: 30_000 });
+      // Seed the legacy `host_<id>` spelling an older build persisted.
+      await window.evaluate(
+        ([key, id]) => localStorage.setItem(key, `host_${id}`),
+        [LAST_HOST_CHOICE_KEY, hostId],
+      );
+      await window.reload();
+      await chip.waitFor({ state: "visible", timeout: 30_000 });
 
-        const outcome = await waitForChipOutcome(window);
-        const hosts = await fetchHosts(journey.server.serverUrl);
-        const storedChoice = await window.evaluate(
-          (key) => localStorage.getItem(key),
-          LAST_HOST_CHOICE_KEY,
-        );
-        await settleAndSnapshot(window, recordDir, "outcome", {
-          beforeSeed,
-          ...outcome,
-          storedChoice,
-          hosts,
-        });
-        assert.ok(
-          !outcome.timedOut,
-          `host chip never settled within ${SELECT_TIMEOUT_MS} ms — it reads ${JSON.stringify(outcome.label)}`,
-        );
-        assert.match(
-          outcome.label,
-          THIS_MACHINE,
-          `host chip never recovered from the legacy-prefixed stored choice — it reads ` +
-            `${JSON.stringify(outcome.label)}`,
-        );
-      } finally {
-        saved = await closeJourney(journey);
-      }
-      assert.ok(saved.length > 0, "no desktop recording was produced");
-    });
-  },
-);
+      const outcome = await waitForChipOutcome(window);
+      const hosts = await fetchHosts(journey.server.serverUrl);
+      const storedChoice = await window.evaluate(
+        (key) => localStorage.getItem(key),
+        LAST_HOST_CHOICE_KEY,
+      );
+      await settleAndSnapshot(window, recordDir, "outcome", {
+        beforeSeed,
+        ...outcome,
+        storedChoice,
+        hosts,
+      });
+      assert.ok(
+        !outcome.timedOut,
+        `host chip never settled within ${SELECT_TIMEOUT_MS} ms — it reads ${JSON.stringify(outcome.label)}`,
+      );
+      assert.match(
+        outcome.label,
+        THIS_MACHINE,
+        `host chip never recovered from the legacy-prefixed stored choice — it reads ` +
+          `${JSON.stringify(outcome.label)}`,
+      );
+    } finally {
+      saved = await closeJourney(journey);
+    }
+    assert.ok(saved.length > 0, "no desktop recording was produced");
+  });
+});
