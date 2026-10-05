@@ -18,15 +18,10 @@ Three defects can bite the embedded terminal's input path:
    every inbound frame now goes through xterm's ordered public write queue,
    the path its composition handling was built against.
 
-3. **A Shift+ASCII run mid-composition makes the committed prefix and the
-   growing preedit re-send to the PTY on every subsequent update.** Because
-   ``terminalKeyEventPayload`` returns null for a composing keydown, the
-   Shift+letter reaches xterm's ``CompositionHelper.keydown``, which
-   ``_finalizeComposition(false)``’s and clears ``_isComposing`` without a
-   fresh ``compositionstart``. ``start`` stays pinned while the textarea keeps
-   growing, so each later keyCode-229 update re-emits the whole buffer and the
-   in-flight (fullwidth, in a fullwidth-latin IME mode) romaji consonants leak
-   straight to the PTY instead of staying in the preedit.
+3. **A Shift+ASCII run mid-composition re-sends the committed prefix and the
+   growing preedit on every later update.** A printable key typed while the
+   IME is composing must not make xterm finalize the preedit early; the
+   composed text is committed once, at ``compositionend``.
 
 The journeys are driven here without a real IME: dispatching
 ``compositionstart`` / ``compositionupdate`` at ``term.textarea`` puts
@@ -327,34 +322,34 @@ def _drive_composition(
             ta.dispatchEvent(
               new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...o })
             );
-          window.__imeDone = (async () => {
+          return (async () => {
             let uncanceled = true;
             ta.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
             let i = 0;
             if (shiftAsciiFirst) {
               upd(preedits[0]);
               await sleep(90);
-              uncanceled &&= kd({
+              const shiftOk = kd({
                 key: preedits[0], code: codes[0], keyCode: 65, shiftKey: true, isComposing: true,
               });
+              uncanceled = uncanceled && shiftOk;
               await sleep(90);
               i = 1;
             }
             for (; i < preedits.length; i++) {
-              uncanceled &&= kd({
-                key: "Process", code: codes[i], keyCode: 229, isComposing: true,
-              });
+              const ok = kd({ key: "Process", code: codes[i], keyCode: 229, isComposing: true });
+              uncanceled = uncanceled && ok;
               upd(preedits[i]);
               await sleep(90);
             }
-            uncanceled &&= kd({ key: "Process", code: "Enter", keyCode: 229, isComposing: true });
+            const enterOk = kd({ key: "Process", code: "Enter", keyCode: 229, isComposing: true });
+            uncanceled = uncanceled && enterOk;
             ta.value = preedits[preedits.length - 1];
             ta.dispatchEvent(
               new CompositionEvent("compositionend", { data: ta.value, bubbles: true })
             );
             return uncanceled;
           })();
-          return window.__imeDone;
         }""",
         [preedits, codes, shift_ascii_first],
     )
