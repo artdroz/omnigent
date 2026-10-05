@@ -116,7 +116,9 @@ function startHostDaemon(cliShim, serverUrl, logPath) {
     env: { ...process.env },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  const closed = new Promise((resolve) => child.once("close", resolve));
+  const closed = new Promise((resolve) => {
+    child.once("close", resolve);
+  });
   let log = "";
   const out = fs.createWriteStream(logPath);
   const closeLog = () => {
