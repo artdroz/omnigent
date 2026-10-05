@@ -439,7 +439,7 @@ async def test_wait_until_ready_bypasses_proxy_env_for_loopback(
     probe = socket.socket()
     probe.bind(("127.0.0.1", 0))
     dead_port = probe.getsockname()[1]
-    probe.close()
+    # Keep probe bound (never listening) so dead_port refuses connects deterministically.
     proxy = f"http://127.0.0.1:{dead_port}"
 
     try:
@@ -460,5 +460,6 @@ async def test_wait_until_ready_bypasses_proxy_env_for_loopback(
 
         await server._wait_until_ready(attempts=5, delay=0.05)
     finally:
+        probe.close()
         httpd.shutdown()
         httpd.server_close()
