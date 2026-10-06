@@ -270,16 +270,18 @@ function liftAboveCreateRoutingChips(committed: Bubble[], end: number): number {
   return start === 0 ? start : end;
 }
 
-// `buildBubbles` can fuse a prior settled answer with the next `live:` preview
-// into one bubble, so match only pure previews with no settled content.
+// A new prompt may lift above only a streaming turn's pure `live:` preview. A
+// settled item (a committed id, or any non-text/reasoning kind, which never
+// stream id-less) or a non-streaming lifecycle keeps the prompt below it.
 function isNativeLivePreviewBubble(bubble: Bubble): boolean {
-  if (bubble.kind !== "assistant") return false;
+  if (bubble.kind !== "assistant" || bubble.lifecycle !== "streaming") return false;
   let hasPreview = false;
   let hasSettled = false;
   for (const item of bubble.items) {
     const itemId = "itemId" in item ? item.itemId : null;
     if (itemId?.startsWith(LIVE_ITEM_PREFIX) ?? false) hasPreview = true;
-    else if (itemId !== null) hasSettled = true;
+    else if (itemId !== null || (item.kind !== "text" && item.kind !== "reasoning"))
+      hasSettled = true;
   }
   return hasPreview && !hasSettled;
 }
@@ -298,10 +300,9 @@ export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bub
     insertAt -= 1;
   }
   insertAt = liftAboveCreateRoutingChips(committed, insertAt);
-  // A known local idle send that merely raced a streaming preview lifts above
-  // it; a steered send and a snapshot-replayed entry (unknown provenance) stay
-  // below. Lift only the FIFO prefix of idle sends so a mixed batch keeps its
-  // original order on each side of the trailing preview.
+  // A known local idle send that raced a streaming preview lifts above it;
+  // other sends stay below. Only the FIFO prefix of idle sends lifts so a mixed
+  // batch keeps its order on each side of the trailing preview.
   const trailingPreview = committed.slice(insertAt).some(isNativeLivePreviewBubble);
   if (!trailingPreview) {
     if (insertAt === committed.length) return [...committed, ...pending];
@@ -312,7 +313,19 @@ export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bub
   const firstKept = pending.findIndex((bubble) => !isIdleLocalSend(bubble));
   const lifted = firstKept === -1 ? pending : pending.slice(0, firstKept);
   const kept = firstKept === -1 ? [] : pending.slice(firstKept);
-  return [...committed.slice(0, insertAt), ...lifted, ...committed.slice(insertAt), ...kept];
+  // Non-idle sends stay below the preview but above a trailing REQUEST card,
+  // matching placement before send provenance was tracked.
+  let keptAt = committed.length;
+  while (keptAt > 0 && isStandaloneElicitationBubble(committed[keptAt - 1]!)) {
+    keptAt -= 1;
+  }
+  return [
+    ...committed.slice(0, insertAt),
+    ...lifted,
+    ...committed.slice(insertAt, keptAt),
+    ...kept,
+    ...committed.slice(keptAt),
+  ];
 }
 
 type ElicitationItem = Extract<RenderItem, { kind: "elicitation" }>;

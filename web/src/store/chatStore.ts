@@ -351,6 +351,9 @@ export function beginLocalConversation(
     content,
     initialDraft: { text, files: files ?? [] },
     createdAtS: Math.floor(Date.now() / 1000),
+    // A new conversation has no reply in flight, so the first send is idle: its
+    // own reply may preview before input.consumed and must stay below it.
+    sentWhileIdle: true,
     ...(selfAuthor !== null ? { author: selfAuthor } : {}),
   };
 

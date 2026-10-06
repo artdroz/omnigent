@@ -1578,11 +1578,9 @@ describe("chatStore — switchTo", () => {
   });
 
   it("keeps a reloaded reply above a hydrated pending message through input.consumed", async () => {
-    // Reload mid-reply: the server replays the queued message in pending_inputs
-    // (no local send provenance) while the native stream re-previews the reply as
-    // a `live:` block. The hydrated message has unknown provenance, so it stays
-    // BELOW that preview before AND after input.consumed names its id -- never
-    // flipping above the reply the way a known idle send would.
+    // Reload mid-reply: pending_inputs hydration has unknown provenance, so the
+    // message stays below the re-previewed reply before and after input.consumed
+    // names its id -- never flipping above the reply like a known idle send.
     const sink = pushableStream();
     seedSession("conv_5555_reload", []);
     seedPendingInputs("conv_5555_reload", [
@@ -1634,6 +1632,54 @@ describe("chatStore — switchTo", () => {
     expect(useChatStore.getState().pendingUserMessages).toHaveLength(0);
     const order = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
     expect(order.indexOf("live:msg_reload")).toBeLessThan(order.indexOf("item_reload_user"));
+    expect(composeNativeRoles()).toEqual(["assistant", "user"]);
+
+    sink.close();
+  });
+
+  it("keeps a fresh send below a stopped turn's lingering preview", async () => {
+    // Stop leaves the interrupted reply's `live:` preview behind without
+    // settling it. A fresh idle send must stay below that prior turn's reply,
+    // not lift above it the way it lifts above its own in-flight reply.
+    const sink = pushableStream();
+    seedSession("conv_5555_stop", []);
+    sessionLabels.set("conv_5555_stop", { "omnigent.wrapper": "claude-code-native-ui" });
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_5555_stop/stream")
+        return mockResponse(null, { bodyStream: sink.stream });
+      return base(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_5555_stop");
+    await useChatStore.getState().send("first question", "agent_xyz");
+
+    // The reply previews, then the user stops it before it settles.
+    sink.push(sse("response.created", { id: "resp_stop", status: "in_progress", output: [] }));
+    sink.push(
+      sse("response.output_text.delta", {
+        delta: "Partial answer so far",
+        message_id: "msg_stop",
+        index: 0,
+      }),
+    );
+    await tick();
+    await tick();
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toContain("live:msg_stop");
+
+    useChatStore.getState().stop();
+    await tick();
+    expect(useChatStore.getState().activeResponse?.state).toBe("cancelled");
+
+    // A fresh idle send after the stop, while the old preview still lingers.
+    await useChatStore.getState().send("second question", "agent_xyz");
+    await tick();
+    const pending = useChatStore.getState().pendingUserMessages;
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.sentWhileIdle).toBe(true);
+    // The lingering preview is no longer the active streaming turn, so the new
+    // prompt stays below the prior reply instead of overtaking it.
     expect(composeNativeRoles()).toEqual(["assistant", "user"]);
 
     sink.close();
@@ -3516,6 +3562,9 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(isTempConvId(tempConvId)).toBe(true);
     // One optimistic bubble is shown under the temp id, entry pre-streaming.
     expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+    // The first send of a new conversation is idle, so its reply cannot overtake
+    // it when the preview races input.consumed.
+    expect(useChatStore.getState().pendingUserMessages[0]!.sentWhileIdle).toBe(true);
 
     hydrateLocalConversation(
       tempConvId,
