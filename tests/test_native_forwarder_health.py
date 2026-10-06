@@ -4,7 +4,8 @@
 native forwarder report a connectivity failure to the harness idle-turn
 watchdog (issue #1119). These cover its record / recency / clear contract; the
 writer (forwarder retry loops) and reader (watchdog) integrations are tested in
-``tests/test_native_post_delivery.py``, ``tests/test_codex_native_forwarder.py``,
+``tests/test_native_post_delivery.py``,
+``tests/harnesses/codex_native/forwarder/``,
 and ``tests/runtime/harnesses/test_scaffold.py``.
 """
 
@@ -13,7 +14,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from omnigent import _native_forwarder_health as health
+from omnigent.native import _native_forwarder_health as health
 
 
 class _FakeClock:
