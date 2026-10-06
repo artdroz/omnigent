@@ -185,7 +185,8 @@ describe("Arca preview manager", () => {
   });
 
   it("verifies the exact server host then starts requested independent forwards", async () => {
-    const fake = successfulSpawner();
+    const serverUrl = "https://srv.example.com/omnigent?o=123";
+    const fake = successfulSpawner({ serverUrl });
     const manager = createArcaPreviewManager({
       resolveArcaPathFn: () => "/usr/local/bin/arca",
       spawnFn: fake.spawn,
@@ -195,17 +196,25 @@ describe("Arca preview manager", () => {
       conversationId: "a",
       url: "http://localhost:5173/app",
       hostId: "host_arca",
-      serverUrl: "https://srv.example.com",
+      serverUrl,
     });
     const second = await manager.prepare({
       conversationId: "b",
       url: "http://localhost:7331/",
       hostId: "host_arca",
-      serverUrl: "https://srv.example.com",
+      serverUrl,
     });
 
     assert.equal(first.origin, "http://localhost:5173");
     assert.equal(second.origin, "http://localhost:7331");
+    const statusCalls = fake.calls.filter((call) => call.args.includes("status"));
+    assert.equal(statusCalls.length, 2);
+    assert.ok(statusCalls.every((call) => call.file === "/usr/local/bin/arca"));
+    assert.ok(
+      statusCalls.every(
+        (call) => call.args[call.args.indexOf("--server") + 1] === `'${serverUrl}'`,
+      ),
+    );
     const forwards = fake.calls.filter((call) => call.args.includes("-L"));
     assert.ok(forwards.every((call) => call.file === "/usr/bin/ssh"));
     assert.ok(forwards.every((call) => call.args.includes("ProxyCommand=/usr/bin/false")));

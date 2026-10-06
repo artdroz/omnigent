@@ -55,6 +55,11 @@ function normalizeSafeServerUrl(serverUrl) {
   return url.toString();
 }
 
+/** Quote a validated server URL for the remote login shell used by `arca ssh`. */
+function quoteRemoteServerUrl(serverUrl) {
+  return `'${normalizeSafeServerUrl(serverUrl)}'`;
+}
+
 /**
  * @typedef {"timeout" | "omni-auth" | "arca-auth" | "missing-remote-cli" | "unreachable" | "unknown"} ArcaErrorKind
  */
@@ -154,7 +159,6 @@ function resolveArcaPathAsync(deps = {}) {
  * @returns {string[]}
  */
 function buildConnectArgs(serverUrl) {
-  const url = normalizeSafeServerUrl(serverUrl);
   return [
     "ssh",
     // Ordinary arca ssh inherits -R 19222 from ~/.ssh/config. Arca Companion
@@ -169,7 +173,7 @@ function buildConnectArgs(serverUrl) {
     "--server",
     // Quoted for the remote shell, which would glob a `?` (zsh fails on no
     // match); SAFE_URL_RE already bars `'`, so the quotes can't be broken out of.
-    `'${url.toString()}'`,
+    quoteRemoteServerUrl(serverUrl),
     "--background",
     "--non-interactive",
   ];
@@ -396,6 +400,7 @@ module.exports = {
   connectArcaHost,
   describeConnectFailure,
   normalizeSafeServerUrl,
+  quoteRemoteServerUrl,
   isExecutableFile,
   resolveArcaPath,
   resolveArcaPathAsync,

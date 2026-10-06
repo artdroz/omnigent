@@ -4,7 +4,7 @@ const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 const { stripVTControlCharacters } = require("node:util");
-const { normalizeSafeServerUrl, resolveArcaPath } = require("./arca");
+const { normalizeSafeServerUrl, quoteRemoteServerUrl, resolveArcaPath } = require("./arca");
 const { ARCA_PREVIEW_TIMEOUT_MS } = require("./arcaPreviewConfig");
 const { WORKSPACE_UI_PATH } = require("./url");
 
@@ -208,7 +208,7 @@ async function verifyArcaHost({ arcaPath, serverUrl, hostId, spawnFn, deadline, 
       "host",
       "status",
       "--server",
-      safeServerUrl,
+      quoteRemoteServerUrl(safeServerUrl),
       "--json",
     ],
     { spawnFn, deadline, onChild },

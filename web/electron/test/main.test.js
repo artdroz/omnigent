@@ -46,6 +46,52 @@ const urlHelpers = require("../src/url");
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 
+/** Load a CommonJS source file with only its runtime boundaries replaced. */
+function loadCommonJsModule(file, fakes) {
+  const realRequire = createRequire(file);
+  const module = { exports: {} };
+  vm.runInNewContext(
+    fs.readFileSync(file, "utf8"),
+    {
+      __dirname: path.dirname(file),
+      __filename: file,
+      AbortController,
+      AbortSignal,
+      Buffer,
+      Error,
+      URL,
+      URLSearchParams,
+      clearTimeout,
+      console,
+      fetch,
+      module,
+      process,
+      require: (specifier) => fakes[specifier] ?? realRequire(specifier),
+      setTimeout,
+    },
+    { filename: file },
+  );
+  return module.exports;
+}
+
+const electronCredentialBoundary = {
+  shell: { openExternal: async () => {} },
+  safeStorage: { isEncryptionAvailable: () => false },
+};
+const tokenStoreModule = loadCommonJsModule(path.join(__dirname, "../src/token_store.js"), {
+  electron: electronCredentialBoundary,
+});
+const oidcCredentialsModule = loadCommonJsModule(
+  path.join(__dirname, "../src/oidc-credentials.js"),
+  {
+    electron: electronCredentialBoundary,
+    "./token_store": tokenStoreModule,
+  },
+);
+const oidcAuthModule = loadCommonJsModule(path.join(__dirname, "../src/oidc-auth.js"), {
+  "./oidc-credentials": oidcCredentialsModule,
+});
+
 /** A fake workspace behind the real databricks-session module: `verdict` answers session-create. */
 function createWorkspaceNetwork(origin, { oauth: oauthOverrides, account = {} } = {}) {
   const network = { verdict: "allow", sessionCreates: 0, browserSignIns: 0 };
@@ -428,7 +474,7 @@ function loadNavigationHarness({
       removeStoredRefreshToken: () => false,
     },
     "./oidc-credentials": {
-      ...require("../src/oidc-credentials"),
+      ...oidcCredentialsModule,
       refreshSession: async (...args) => {
         calls.oidc.refresh++;
         if (!oidc.refresh) throw Object.assign(new Error("none"), { code: "NO_STORED_TOKEN" });
@@ -446,7 +492,7 @@ function loadNavigationHarness({
     },
     "./oidc-auth": {
       createOidcAuth: (options) =>
-        require("../src/oidc-auth").createOidcAuth({
+        oidcAuthModule.createOidcAuth({
           ...options,
           // /v1/me accepts exactly the session tokens the test allows.
           fetchFn: async (_url, init) => ({
