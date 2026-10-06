@@ -814,3 +814,56 @@ def test_subagent_state_reader_keeps_transcript_subdir_inside_subagents(
         path = forwarder._subagent_transcript_path(subagents_dir, entry)
         assert path.resolve().is_relative_to(subagents_dir.resolve()), path
         assert path.name == f"agent-{entry.subagent_id}.jsonl"
+
+
+async def test_subagent_watcher_keeps_first_meta_for_a_duplicated_id(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The same ``agent-<id>`` in two layouts registers once, from the first path."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    for transcript_subdir in (None, "workflows/wf_run_abc123"):
+        _seed_subagent_on_disk(
+            transcript_path=transcript_path,
+            subagent_id="twin",
+            agent_type="general-purpose",
+            description="duplicated id",
+            tool_use_id="toolu_twin",
+            transcript_subdir=transcript_subdir,
+        )
+    starts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("type") != "external_subagent_start":
+            return httpx.Response(202, json={})
+        starts.append(body["data"]["subagent_id"])
+        return httpx.Response(202, json={"queued": False, "child_session_id": "conv_twin"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        with caplog.at_level(logging.WARNING, logger=forwarder._logger.name):
+            state = await forwarder._forward_available_subagents(
+                client=client,
+                parent_session_id="conv_root",
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=forwarder.SubagentForwardState(subagents={}),
+                agent_name="claude-native-ui",
+                start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            )
+
+    assert starts == ["twin"]
+    assert state.subagents["twin"].transcript_subdir == ""
+    warnings = [
+        record
+        for record in caplog.records
+        if "duplicate claude-native sub-agent" in record.message
+    ]
+    assert len(warnings) == 1 and "workflows/wf_run_abc123" in warnings[0].message

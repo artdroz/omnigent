@@ -1471,3 +1471,110 @@ async def test_timed_out_batch_is_split_not_dropped(
     updated = checkpoint.state.subagents["split"]
     assert updated.byte_offset == 30
     assert updated.seen_source_ids == tuple(item.source_id for item in items)
+
+
+async def test_subagent_watcher_relocates_nested_transcript_when_state_lost_its_subdir(
+    tmp_path: Path,
+) -> None:
+    """
+    A tracked nested child whose persisted entry lacks ``transcript_subdir`` (an
+    older runner rewrote the state) is tailed from its nested transcript again,
+    keeping its cursor.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    nested_jsonl = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="nested-worker",
+        agent_type="general-purpose",
+        description="background workflow spawn",
+        tool_use_id="toolu_nested",
+        transcript_subdir="workflows/wf_run_abc123",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "user",
+                "uuid": "nested-user-1",
+                "message": {"role": "user", "content": "go"},
+            },
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "nested-assistant-1",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "phase one"}],
+                },
+            },
+        ],
+    )
+    (bridge_dir / "subagent_forwarder.json").write_text(
+        json.dumps(
+            {
+                "subagents": {
+                    "nested-worker": {"child_conversation_id": "conv_nested", "byte_offset": 0}
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    posted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if not isinstance(body, list):
+            return httpx.Response(202, json={})
+        assert request.url.path == "/v1/sessions/conv_nested/events"
+        for event in body:
+            item_data = event["data"]["item_data"]
+            posted.append(f"{item_data['role']}:{item_data['content'][0]['text']}")
+        return httpx.Response(
+            202,
+            json=[{"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)],
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+
+        async def forward() -> forwarder.SubagentForwardState:
+            return await forwarder._forward_available_subagents(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=forwarder._read_subagent_forward_state(bridge_dir),
+                agent_name="claude-native-ui",
+                start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            )
+
+        first = await forward()
+        assert posted == ["user:go", "assistant:phase one"]
+        entry = first.subagents["nested-worker"]
+        assert entry.transcript_subdir == "workflows/wf_run_abc123"
+        assert entry.byte_offset == nested_jsonl.stat().st_size
+
+        with nested_jsonl.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "isSidechain": True,
+                        "type": "assistant",
+                        "uuid": "nested-assistant-2",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "phase two"}],
+                        },
+                    }
+                )
+                + "\n"
+            )
+        second = await forward()
+
+    assert posted == ["user:go", "assistant:phase one", "assistant:phase two"]
+    assert second.subagents["nested-worker"].byte_offset == nested_jsonl.stat().st_size

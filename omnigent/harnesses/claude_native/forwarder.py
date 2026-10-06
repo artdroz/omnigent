@@ -1600,6 +1600,14 @@ def _subagent_transcript_path(subagents_dir: Path, entry: SubagentEntry) -> Path
     return base / f"agent-{entry.subagent_id}.jsonl"
 
 
+def _recover_subagent_transcript_subdir(subagents_dir: Path, entry: SubagentEntry) -> str | None:
+    """Relocate the unique ``agent-<id>.jsonl`` of an entry whose subdir was not persisted."""
+    matches = sorted(subagents_dir.rglob(f"agent-{entry.subagent_id}.jsonl"))
+    if len(matches) != 1:
+        return None
+    return _subagent_transcript_subdir(subagents_dir, matches[0])
+
+
 def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
     """
     Read the sub-agent forwarder's durable cursor map.
@@ -2131,7 +2139,18 @@ async def _forward_one_subagent(
         return
     jsonl_path = _subagent_transcript_path(subagents_dir, entry)
     if not jsonl_path.exists():
-        return
+        if entry.transcript_subdir:
+            return
+        # An older runner may have checkpointed this entry without its subdir;
+        # relocate a nested transcript instead of waiting for a flat one forever.
+        recovered = await asyncio.to_thread(
+            _recover_subagent_transcript_subdir, subagents_dir, entry
+        )
+        if not recovered:
+            return
+        entry = replace(entry, transcript_subdir=recovered)
+        await checkpoint.put(entry)
+        jsonl_path = _subagent_transcript_path(subagents_dir, entry)
     result = await asyncio.to_thread(
         read_transcript_items_from_offset,
         jsonl_path,
@@ -2548,12 +2567,28 @@ async def _forward_available_subagents(
     # filesystem on the event loop.
     meta_paths = await asyncio.to_thread(lambda: sorted(subagents_dir.rglob(_SUBAGENT_META_GLOB)))
     updated = state
-    candidate_meta_paths = [
-        path
-        for path in meta_paths
-        if (sid := _subagent_id_from_meta_path(path)) not in updated.subagents
-        and start_retry_tracker.retry_delay_s(f"subagent_start:{sid}") is None
-    ]
+    # Agent ids are unique per spawn, so a second meta for the same id (for example
+    # one flat and one nested) is a layout we do not understand; keep the first.
+    candidates_by_id: dict[str, Path] = {}
+    for path in meta_paths:
+        sid = _subagent_id_from_meta_path(path)
+        if (
+            sid in updated.subagents
+            or start_retry_tracker.retry_delay_s(f"subagent_start:{sid}") is not None
+        ):
+            continue
+        if sid in candidates_by_id:
+            _logger.warning(
+                "Ignoring duplicate claude-native sub-agent meta; parent_session=%s "
+                "subagent_id=%s path=%s kept=%s",
+                parent_session_id,
+                sid,
+                path,
+                candidates_by_id[sid],
+            )
+            continue
+        candidates_by_id[sid] = path
+    candidate_meta_paths = list(candidates_by_id.values())
     parents_by_tool_use = (
         await asyncio.to_thread(
             _subagent_parents_by_tool_use,
