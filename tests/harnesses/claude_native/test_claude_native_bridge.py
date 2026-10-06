@@ -3385,13 +3385,15 @@ def test_augment_claude_args_merges_endpoint_disallowed_tools(tmp_path: Path) ->
     )
     assert args[args.index("--disallowedTools") + 1] == "WebSearch"
 
-    merged = augment_claude_args(
-        ("--disallowedTools", "Bash"),
-        bridge_dir=tmp_path,
-        python_executable="/venv/bin/python",
-        disallowed_tools=("WebSearch",),
-    )
-    assert merged[merged.index("--disallowedTools") + 1] == "Bash,WebSearch"
+    for user_flag in (("--disallowedTools", "Bash"), ("--disallowedTools=Bash",)):
+        merged = augment_claude_args(
+            user_flag,
+            bridge_dir=tmp_path,
+            python_executable="/venv/bin/python",
+            disallowed_tools=("WebSearch",),
+        )
+        assert merged.count("--disallowedTools") == 1
+        assert merged[merged.index("--disallowedTools") + 1] == "Bash,WebSearch"
 
 
 def test_generated_claude_subprocesses_pin_runner_tmpdir(

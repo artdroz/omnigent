@@ -437,8 +437,11 @@ class ClaudeNativeUcodeConfig:
 
 
 def _anthropic_api_host(base_url: str) -> bool:
-    """Whether *base_url* points at the first-party Anthropic API."""
-    host = (urlparse(base_url).hostname or "").lower()
+    """Whether *base_url* points at the first-party Anthropic API; unparsable URLs do not."""
+    try:
+        host = (urlparse(base_url).hostname or "").lower()
+    except ValueError:
+        return False
     return host == "anthropic.com" or host.endswith(".anthropic.com")
 
 
@@ -497,9 +500,9 @@ def _effective_claude_env_value(
     """
     if managed_env.get(name):
         return managed_env[name]
-    if claude_config is not None and claude_config.env.get(name):
-        return claude_config.env[name]
-    return os.environ.get(name) or None
+    if claude_config is not None and claude_config.env.get(name, "").strip():
+        return claude_config.env[name].strip()
+    return os.environ.get(name, "").strip() or None
 
 
 def endpoint_disallowed_claude_tools(

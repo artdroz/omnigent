@@ -2746,6 +2746,12 @@ def _merge_disallowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str
     """
     if not extra:
         return args
+    # Claude Code keeps the last repeated flag, so a joined ``--disallowedTools=X``
+    # must be split and merged rather than shadowed by an appended flag.
+    for idx, arg in enumerate(args):
+        if arg.startswith("--disallowedTools="):
+            args[idx : idx + 1] = ["--disallowedTools", arg.partition("=")[2]]
+            break
     try:
         idx = args.index("--disallowedTools")
     except ValueError:

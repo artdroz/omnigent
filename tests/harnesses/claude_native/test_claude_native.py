@@ -457,6 +457,9 @@ def _claude_endpoint_environment(
         (None, {"CLAUDE_CODE_USE_VERTEX": "1", "ANTHROPIC_BASE_URL": _GATEWAY_URL}, None, ()),
         (None, {"CLAUDE_CODE_USE_FOUNDRY": "true", "ANTHROPIC_BASE_URL": _GATEWAY_URL}, None, ()),
         (_GATEWAY_CONFIG, {}, {"CLAUDE_CODE_USE_BEDROCK": "1"}, ()),
+        # An unparsable base URL cannot be first-party and must not crash the launch.
+        (None, {"ANTHROPIC_BASE_URL": "http://[::1"}, None, ("WebSearch",)),
+        (None, {"ANTHROPIC_BASE_URL": "  https://api.anthropic.com  "}, None, ()),
     ],
     ids=[
         "no-config",
@@ -474,6 +477,8 @@ def _claude_endpoint_environment(
         "vertex-flag",
         "foundry-flag",
         "managed-settings-bedrock-flag",
+        "unparsable-url-fails-closed",
+        "padded-first-party-url",
     ],
 )
 def test_endpoint_disallowed_claude_tools(

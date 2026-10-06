@@ -135,6 +135,12 @@ def test_websearch_under_gateway_launch_does_not_surface_us_only_error(
         workspace.mkdir()
         monkeypatch.chdir(workspace)
 
+        for name in (
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+        ):
+            monkeypatch.delenv(name, raising=False)
         bridge_dir = prepare_bridge_dir(f"conv_e2e_{uuid.uuid4().hex[:12]}", workspace=workspace)
         body = _claude_terminal_request(
             (
@@ -192,7 +198,7 @@ def test_websearch_under_gateway_launch_does_not_surface_us_only_error(
     )
 
     # The gateway's region rejection must not surface as the WebSearch outcome.
-    assert "only available in the US" not in output and "API Error" not in output, (
+    assert "only available in the US" not in output and "API Error" not in proc.stdout, (
         "WebSearch under the gateway launch surfaced the US-only region "
         f"restriction to the user: {proc.stdout.strip()[-1500:]!r}"
     )

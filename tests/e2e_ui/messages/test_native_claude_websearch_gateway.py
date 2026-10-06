@@ -174,7 +174,10 @@ def _approve_pending_permission(page: Page) -> bool:
 
 
 def _wait_for_turn(page: Page) -> bool:
-    """Approve any WebSearch permission card until the turn settles; say whether one appeared."""
+    """Approve the first WebSearch permission card and wait for the turn to settle.
+
+    Returns whether a card appeared.
+    """
     deadline = time.monotonic() + _TURN_TIMEOUT_S
     approved = False
     while time.monotonic() < deadline:
