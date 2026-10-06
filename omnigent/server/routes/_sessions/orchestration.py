@@ -7588,10 +7588,8 @@ async def _relay_runner_live_elsewhere(
     without a registered relay.
 
     Uses the freshest of ``runner_last_seen`` and the never-cleared
-    ``runner_last_connected``: the runner may re-tunnel to a sibling whose own
-    tunnel then briefly blips (clearing ``runner_last_seen``), or to an older
-    replica that refreshes only ``runner_last_seen``. Taking the newest of both
-    keeps that liveness visible instead of looking like the runner vanished.
+    ``runner_last_connected`` so a sibling's reconnect blip or an older replica
+    that writes only ``runner_last_seen`` still counts as live.
 
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store used to read runner metadata.

@@ -25,6 +25,7 @@ import re
 import signal
 import socket
 import socketserver
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -62,10 +63,9 @@ _FAILURE_SIGNATURE = re.compile(
 # The relay's outage outcome row: ``(live_elsewhere)``, ``(failed_mid_turn)``, ...
 _RELAY_DECISION = re.compile(r"Relay: runner transport lost for session=(\S+) \((\w+)\)")
 _HEALTH_TIMEOUT_S = 90.0
-# How long the new replica's tunnel stays down on either side of the old
-# replica's deadline, so the blip covers it despite reconnect latency.
+# How long before the old replica's deadline the new replica's tunnel drops,
+# so the blip is already underway when that deadline fires.
 _NEW_REPLICA_BLIP_LEAD_S = 6.0
-_NEW_REPLICA_BLIP_TRAIL_S = 6.0
 
 # Only replica A uses this bootstrap; the file arms its backend outage after
 # the real runner has reconnected to B. The metadata database remains readable.
@@ -549,6 +549,18 @@ def _relay_decisions(log_text: str, session_id: str) -> list[str]:
     return [m.group(2) for m in _RELAY_DECISION.finditer(log_text) if m.group(1) == session_id]
 
 
+def _persisted_runner_liveness(stack: _ReconnectStack) -> tuple[int | None, int | None]:
+    """Read the stack runner's stored ``(runner_last_seen, runner_last_connected)``."""
+    db_path = stack._database_uri.removeprefix("sqlite:///")
+    with contextlib.closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
+        row = conn.execute(
+            "SELECT runner_last_seen, runner_last_connected "
+            "FROM omnigent_conversation_metadata WHERE runner_id = ?",
+            (stack.runner_id,),
+        ).fetchone()
+    return (row[0], row[1]) if row else (None, None)
+
+
 def test_mid_turn_tunnel_blackout_recovers_without_failed_edge(
     reconnect_stack: _ReconnectStack,
     mock_llm_server_url: str,
@@ -828,7 +840,9 @@ def test_new_replica_blip_at_old_deadline_does_not_fail_the_recovered_turn(
         dropped_at = _hand_runner_to_replica(proxy, replica_b)
         assert _session_snapshot(replica_b.client, session_id).get("status") == "running"
 
-        # B's tunnel goes down shortly before A's deadline and stays down past it.
+        # B's tunnel drops just before A's deadline and is held down until A has
+        # resolved the disconnect, so A decides while B has cleared the row's
+        # runner_last_seen and only the durable runner_last_connected survives.
         blip_start = dropped_at + RUNNER_DISCONNECT_GRACE_S - _NEW_REPLICA_BLIP_LEAD_S
         time.sleep(max(0.0, blip_start - time.monotonic()))
         rejected_before = proxy.rejected_connections
@@ -845,28 +859,29 @@ def test_new_replica_blip_at_old_deadline_does_not_fail_the_recovered_turn(
                 timeout=10.0,
                 what="replica B to register the tunnel drop",
             )
-            blip_end = dropped_at + RUNNER_DISCONNECT_GRACE_S + _NEW_REPLICA_BLIP_TRAIL_S
-            time.sleep(max(0.0, blip_end - time.monotonic()))
+            _poll_until(
+                lambda: _persisted_runner_liveness(stack)[0] is None,
+                timeout=_HEALTH_TIMEOUT_S,
+                what="replica B to clear the persisted runner_last_seen on the drop",
+            )
+            seen, connected = _persisted_runner_liveness(stack)
+            assert seen is None and connected is not None, (
+                "the blip must leave only the durable connect stamp, but the row read "
+                f"runner_last_seen={seen!r}, runner_last_connected={connected!r}"
+            )
+            decision_deadline = dropped_at + RUNNER_DISCONNECT_GRACE_S + 30.0
+            _poll_until(
+                lambda: (
+                    bool(_relay_decisions(stack.process_log.read_text(), session_id))
+                    or bool(_FAILURE_SIGNATURE.search(stack.process_log.read_text()))
+                    or time.monotonic() > decision_deadline
+                ),
+                timeout=60.0,
+                what="replica A to resolve the disconnect while runner_last_seen is cleared",
+            )
         finally:
             proxy.end_blackout()
         blip_ended = time.monotonic() - dropped_at
-        _poll_until(
-            replica_b.runner_online,
-            timeout=_HEALTH_TIMEOUT_S,
-            what="the runner to reconnect to replica B after the blip",
-        )
-        assert _gate_pending(mock_llm_server_url), "the held turn ended during the blip"
-
-        decision_deadline = dropped_at + RUNNER_DISCONNECT_GRACE_S + 30.0
-        _poll_until(
-            lambda: (
-                bool(_relay_decisions(stack.process_log.read_text(), session_id))
-                or bool(_FAILURE_SIGNATURE.search(stack.process_log.read_text()))
-                or time.monotonic() > decision_deadline
-            ),
-            timeout=60.0,
-            what="replica A to resolve the disconnect while the turn is still running on B",
-        )
         server_a_log = stack.process_log.read_text()
         failed_edges = _FAILURE_SIGNATURE.findall(server_a_log)
         assert not failed_edges, (
@@ -884,6 +899,13 @@ def test_new_replica_blip_at_old_deadline_does_not_fail_the_recovered_turn(
             f"elapsed. decisions={decisions}\n"
             f"Replica A log tail:\n{server_a_log[-4000:]}"
         )
+
+        _poll_until(
+            replica_b.runner_online,
+            timeout=_HEALTH_TIMEOUT_S,
+            what="the runner to reconnect to replica B after the blip",
+        )
+        assert _gate_pending(mock_llm_server_url), "the held turn ended during the blip"
 
         release_mock_gate(mock_llm_server_url)
         _poll_until(
