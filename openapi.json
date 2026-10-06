@@ -704,6 +704,12 @@
           "status": {
             "anyOf": [
               {
+                "enum": [
+                  "idle",
+                  "running",
+                  "waiting",
+                  "failed"
+                ],
                 "type": "string"
               },
               {

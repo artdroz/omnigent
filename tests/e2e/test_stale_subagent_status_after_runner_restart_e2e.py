@@ -24,8 +24,8 @@ from tests.e2e.helpers import POLL_INTERVAL_S
 
 pytestmark = [
     pytest.mark.timeout(600, method="signal"),
-    # ``ChildSessionSummary.status`` ships with 0.17.0; older servers omit it.
-    pytest.mark.min_server_version("0.17.0"),
+    # ``ChildSessionSummary.status`` ships with 0.18.0; older servers omit it.
+    pytest.mark.min_server_version("0.18.0"),
 ]
 
 _STATUS_TOKEN = "STATUSCHECK"
