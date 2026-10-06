@@ -272,6 +272,60 @@ async def test_codex_native_controls_reject_non_string_effort(
 
 
 @pytest.mark.asyncio
+async def test_codex_native_reset_without_a_current_model_is_rejected_before_connecting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An unsatisfiable native reset is invalid input and must not open a connection."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.native_controls import NativeControls, build_native_controls
+
+    conv_id = uuid.uuid4().hex
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_home = codex_native_bridge.codex_home_for_bridge_dir(bridge_dir)
+    codex_home.mkdir(parents=True)
+    (codex_home / "config.toml").write_text('model_reasoning_effort = "xhigh"\n')
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path=str(tmp_path / "codex.sock"),
+            thread_id="thread_codex",
+            codex_home=str(codex_home),
+        ),
+    )
+    factory = Mock()
+    monkeypatch.setattr(codex_native_app_server, "client_for_transport", factory)
+    remembered_efforts: dict[str, str] = {}
+
+    def capture_controls(**kwargs: Any) -> NativeControls:
+        nonlocal remembered_efforts
+        remembered_efforts = kwargs["_session_reasoning_effort"]
+        return build_native_controls(**kwargs)
+
+    monkeypatch.setattr(runner_app, "build_native_controls", capture_controls)
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native", model="gpt-5.4"))
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": uuid.uuid4().hex}
+        )
+        assert created.status_code == 201, created.text
+        remembered_efforts[conv_id] = "xhigh"
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events", json={"type": "effort_change", "effort": None}
+        )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"] == "invalid_input"
+    assert "requires a current model" in response.json()["detail"]
+    factory.assert_not_called()
+    assert remembered_efforts[conv_id] == "xhigh"
+    assert codex_native_bridge.read_codex_config_effort(bridge_dir) == "xhigh"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stalled", ["connect", "update"])
 async def test_codex_native_settings_update_times_out_and_releases_the_lock(
     monkeypatch: pytest.MonkeyPatch,

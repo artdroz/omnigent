@@ -1047,3 +1047,35 @@ def test_mirror_applied_codex_settings_records_failed_writes_until_the_config_ch
     monkeypatch.setattr(codex_native_bridge, "write_codex_config_model", write_model)
     assert write_model(bridge_dir, "gpt-5.5")
     assert codex_native_bridge.read_unmirrored_codex_settings(bridge_dir) == {}
+
+
+def test_mirror_applied_codex_settings_holds_its_lock_while_writing(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another process cannot interleave between the record's read and its stamp."""
+    import fcntl
+
+    home = codex_home_for_bridge_dir(bridge_dir)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text('model_reasoning_effort = "low"\n')
+    write_effort = codex_native_bridge.write_codex_config_effort
+    held: list[bool] = []
+
+    def probing_write(target: Path, effort: str) -> bool:
+        fd = os.open(target / "unmirrored_settings.lock", os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            held.append(True)
+        else:
+            held.append(False)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+        return write_effort(target, effort)
+
+    monkeypatch.setattr(codex_native_bridge, "write_codex_config_effort", probing_write)
+
+    assert codex_native_bridge.mirror_applied_codex_settings(bridge_dir, {"effort": "high"}) == {}
+    assert held == [True]
+    assert read_codex_config_effort(bridge_dir) == "high"

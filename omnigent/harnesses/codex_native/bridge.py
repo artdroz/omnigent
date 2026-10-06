@@ -60,6 +60,7 @@ _STARTUP_ERROR_FILE = "startup_error.json"
 _STARTUP_TIMEOUT_FILE = "startup_timeout.json"
 # Applied model/effort that config.toml failed to record, for every reader of it.
 _UNMIRRORED_SETTINGS_FILE = "unmirrored_settings.json"
+_UNMIRRORED_SETTINGS_LOCK_FILE = "unmirrored_settings.lock"
 _STARTUP_TIMEOUT_MAX_BYTES = 256
 # Per-MCP-server startup state mirrored from Codex's
 # ``mcpServer/startupStatus/updated`` notifications. Written by the
@@ -862,16 +863,19 @@ def mirror_applied_codex_settings(bridge_dir: Path, applied: Mapping[str, str]) 
     :param applied: Applied values keyed ``"model"`` / ``"effort"``.
     :returns: The values whose write failed.
     """
-    pending = read_unmirrored_codex_settings(bridge_dir)
     writers = {"model": write_codex_config_model, "effort": write_codex_config_effort}
     failed: dict[str, str] = {}
-    for key, write in writers.items():
-        if key in applied:
-            pending.pop(key, None)
-            if not write(bridge_dir, applied[key]):
-                failed[key] = applied[key]
-    # Stamp after these writes, so only a later rewrite supersedes the record.
-    write_unmirrored_codex_settings(bridge_dir, {**pending, **failed})
+    # The runner, hook, and executor run in separate processes; one must not stamp
+    # another's superseded record against the config revision it just wrote.
+    with _bridge_state_lock(bridge_dir, _UNMIRRORED_SETTINGS_LOCK_FILE):
+        pending = read_unmirrored_codex_settings(bridge_dir)
+        for key, write in writers.items():
+            if key in applied:
+                pending.pop(key, None)
+                if not write(bridge_dir, applied[key]):
+                    failed[key] = applied[key]
+        # Stamp after these writes, so only a later rewrite supersedes the record.
+        write_unmirrored_codex_settings(bridge_dir, {**pending, **failed})
     return failed
 
 
@@ -939,11 +943,12 @@ def _upsert_top_level_config_key(
 
 
 @contextlib.contextmanager
-def _bridge_state_lock(bridge_dir: Path) -> Iterator[None]:
+def _bridge_state_lock(bridge_dir: Path, lock_file: str = _STATE_LOCK_FILE) -> Iterator[None]:
     """
     Serialize bridge-state read/modify/write cycles across local processes.
 
     :param bridge_dir: Native Codex bridge directory.
+    :param lock_file: Lock file name, so unrelated cycles do not contend.
     :returns: Context manager holding the bridge's process lock.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -953,7 +958,7 @@ def _bridge_state_lock(bridge_dir: Path) -> Iterator[None]:
         yield
         return
     fd = os.open(
-        bridge_dir / _STATE_LOCK_FILE,
+        bridge_dir / lock_file,
         os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
         0o600,
     )

@@ -10340,6 +10340,40 @@ describe("chatStore — session configuration scope", () => {
     expect(useChatStore.getState().sessionReasoningEffort).toBe("medium");
   });
 
+  it("keeps a newer model pick when an earlier refused change settles", async () => {
+    seedSession("conv_model_refused_race", []);
+    withSnapshot("conv_model_refused_race", {
+      labels: { "omnigent.wrapper": "codex-native-ui" },
+      model_override: "gpt-5.4",
+    });
+    await useChatStore.getState().switchTo("conv_model_refused_race");
+    let release = () => {};
+    refusePatch(
+      "conv_model_refused_race",
+      (body) => body.model_override === "gpt-6-sol",
+      "The terminal did not apply the model change. The previous selection has been restored.",
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    );
+    // The newer pick applies, and the server echoes it like a real PATCH.
+    const serve = fetchMock.getMockImplementation() ?? defaultFetchHandler;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const body = init?.method === "PATCH" ? JSON.parse(String(init.body)) : {};
+      if (body.model_override === "gpt-5.5") {
+        return mockResponse({ id: "conv_model_refused_race", model_override: "gpt-5.5" });
+      }
+      return serve(input, init);
+    });
+
+    const refused = useChatStore.getState().setModel("gpt-6-sol");
+    await useChatStore.getState().setModel("gpt-5.5");
+    release();
+
+    await expect(refused).rejects.toThrow("did not apply the model change");
+    expect(useChatStore.getState().sessionModelOverride).toBe("gpt-5.5");
+  });
+
   it("hydrates Codex Plan mode from the session label", async () => {
     seedSession("conv_plan", []);
     withSnapshot("conv_plan", {
