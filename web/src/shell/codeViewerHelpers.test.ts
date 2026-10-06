@@ -498,6 +498,13 @@ describe("prepareHtmlPreviewDoc", () => {
     expect(prepareHtmlPreviewDoc("<!-- <head> --!><html><head></head></html>")).toBe(
       `<!-- <head> --!><html><head>${HEAD}</head></html>`,
     );
+    // An abruptly closed empty comment ends at once rather than swallowing the document.
+    expect(prepareHtmlPreviewDoc("<!--><html><head></head></html>")).toBe(
+      `<!--><html><head>${HEAD}</head></html>`,
+    );
+    expect(prepareHtmlPreviewDoc("<!---><html><head></head></html>")).toBe(
+      `<!---><html><head>${HEAD}</head></html>`,
+    );
     // A hyphen continues a tag name, so this is script text, not an end tag.
     const fake = "<script>const sample = '</script-not-real><html><head>';</script><p>hi</p>";
     expect(prepareHtmlPreviewDoc(fake)).toBe(`${HEAD}${fake}`);
@@ -688,6 +695,20 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
     expect(scrolled).toHaveLength(2);
     expect(scrolled[0]).toBe(document.querySelector('a[name="spot"]'));
     expect(scrolled[1]).toBe(document.getElementById("café"));
+  });
+
+  it("prefers the literal fragment over its decoded form, like native navigation", () => {
+    // The first click is native navigation, which tries the literal id first; the repeat
+    // scroll must pick the same element whether or not a decoded competitor exists.
+    document.body.innerHTML =
+      '<a id="link" href="#caf%C3%A9">e</a>' +
+      '<h3 id="caf%C3%A9">Literal</h3><h3 id="café">Decoded</h3>';
+    const literal = document.getElementById("caf%C3%A9");
+    location.hash = "#caf%C3%A9";
+    click("#link");
+    document.getElementById("café")?.remove();
+    click("#link");
+    expect(scrolled).toEqual([literal, literal]);
   });
 
   it("scrolls to the top for '#' and '#top' when no element matches", () => {

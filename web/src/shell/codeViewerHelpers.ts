@@ -387,15 +387,21 @@ export const HTML_PREVIEW_SANDBOX =
  * Setting the frame's own hash scrolls like a native anchor (by hand if it is unchanged).
  */
 const SAME_PAGE_ANCHOR_SCRIPT = `<script>(function () {
-  function indicatedElement(fragment) {
-    const raw = fragment.slice(1);
-    let id = raw;
-    try { id = decodeURIComponent(raw); } catch (e) { /* malformed escape: match the raw id */ }
+  function potentialIndicatedElement(id) {
     const byId = document.getElementById(id);
     if (byId) return byId;
     const named = document.getElementsByName(id);
     for (let i = 0; i < named.length; i++) if (named[i].localName === "a") return named[i];
     return null;
+  }
+  function indicatedElement(fragment) {
+    // Native order: the literal fragment first, then its percent-decoded form.
+    const raw = fragment.slice(1);
+    const literal = potentialIndicatedElement(raw);
+    if (literal) return literal;
+    let decoded;
+    try { decoded = decodeURIComponent(raw); } catch (e) { return null; }
+    return decoded === raw ? null : potentialIndicatedElement(decoded);
   }
   function activatedLink(event) {
     const path = event.composedPath ? event.composedPath() : [];
@@ -434,14 +440,15 @@ export const HTML_PREVIEW_HEAD = '<base target="_blank">' + SAME_PAGE_ANCHOR_SCR
  * consumed whole so a look-alike tag inside them cannot attract the injection,
  * whose `</script>` would end the artifact's own script. Like the HTML parser, a
  * tag name must end at whitespace, `/` or `>`, so `</script-x>` is plain text,
- * and a tag or quoted attribute value still open at end of input swallows the
- * rest. This runs on the host page before the sandbox applies, so every
+ * an empty comment may close abruptly (`<!-->`, `<!--->`), and a tag or quoted
+ * attribute value still open at end of input swallows the rest. This runs on
+ * the host page before the sandbox applies, so every
  * alternative succeeds once its opening is found and the scan only moves
  * forward: an incomplete tag is never rescanned, keeping the time linear.
  */
 function startTagEnd(html: string, tag: "head" | "html"): number {
   const scanner =
-    /<!--[\s\S]*?(?:--!?>|$)|<script(?=[\s/>])(?:"[^"]*"|'[^']*'|[^>"'])*(?:>[\s\S]*?(?:<\/script(?=[\s/>])[^>]*(?:>|$)|$)|["'][\s\S]*|$)|<(head|html)(?=[\s/>])(?:"[^"]*"|'[^']*'|[^>"'])*(>|["'][\s\S]*|$)/gi;
+    /<!--(?:-?>|[\s\S]*?(?:--!?>|$))|<script(?=[\s/>])(?:"[^"]*"|'[^']*'|[^>"'])*(?:>[\s\S]*?(?:<\/script(?=[\s/>])[^>]*(?:>|$)|$)|["'][\s\S]*|$)|<(head|html)(?=[\s/>])(?:"[^"]*"|'[^']*'|[^>"'])*(>|["'][\s\S]*|$)/gi;
   for (let match = scanner.exec(html); match; match = scanner.exec(html)) {
     // A start tag left open at end of input is dropped by the parser: no insertion point.
     if (match[1]?.toLowerCase() !== tag || match[2] !== ">") continue;
