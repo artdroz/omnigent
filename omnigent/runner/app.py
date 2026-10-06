@@ -295,6 +295,16 @@ _IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
 _server_version: str | None = None
 
 
+def _invalid_effort_response(effort: object) -> JSONResponse | None:
+    """Return the 400 for a non-string, non-null session-event effort, else ``None``."""
+    if effort is None or isinstance(effort, str):
+        return None
+    return JSONResponse(
+        status_code=400,
+        content={"error": "invalid_input", "detail": "Body 'effort' must be a string or null"},
+    )
+
+
 def _version_supports_waiting_status(server_version: str) -> bool:
     """
     Whether *server_version* can serialize ``session.status: "waiting"``.
@@ -6534,14 +6544,8 @@ def create_runner_app(
         if body_type == "effort_change":
             harness = _session_harness_name(conversation_id)
             effort = body.get("effort") if isinstance(body, dict) else None
-            if effort is not None and not isinstance(effort, str):
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": "invalid_input",
-                        "detail": "Body 'effort' must be a string or null",
-                    },
-                )
+            if (invalid := _invalid_effort_response(effort)) is not None:
+                return invalid
             if harness == "codex-native":
                 # The native handler remembers the applied effort only after
                 # Codex confirms it; a refused reset must retain the old value.
@@ -6598,14 +6602,8 @@ def create_runner_app(
                     settings: _JsonObject = {"model": model.strip()}
                     if "effort" in body:
                         effort = body["effort"]
-                        if effort is not None and not isinstance(effort, str):
-                            return JSONResponse(
-                                status_code=400,
-                                content={
-                                    "error": "invalid_input",
-                                    "detail": "Body 'effort' must be a string or null",
-                                },
-                            )
+                        if (invalid := _invalid_effort_response(effort)) is not None:
+                            return invalid
                         settings["effort"] = effort
                     response = await _handle_codex_native_settings_update(
                         conversation_id, settings

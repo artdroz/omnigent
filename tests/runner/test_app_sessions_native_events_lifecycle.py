@@ -239,6 +239,39 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "event_payload",
+    [
+        {"type": "effort_change", "effort": 5},
+        {"type": "model_change", "model": "gpt-5.4", "effort": ["high"]},
+    ],
+)
+async def test_codex_native_controls_reject_non_string_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    event_payload: dict[str, Any],
+) -> None:
+    """Both settings controls reject a malformed effort before contacting Codex."""
+    conv_id = "8d1f9a3c2b7e4c5d9a0b1c2d3e4f5a6b"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native", model="gpt-5.4"))
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(f"/v1/sessions/{conv_id}/events", json=event_payload)
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json() == {
+        "error": "invalid_input",
+        "detail": "Body 'effort' must be a string or null",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("initial_model", "initial_effort", "event", "expected_model", "expected_effort"),
     [
         ("gpt-6-sol", "max", {"type": "model_change", "model": "gpt-5.4"}, "gpt-5.4", "xhigh"),

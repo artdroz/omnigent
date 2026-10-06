@@ -396,6 +396,12 @@ async def test_rejected_reset_returns_error_and_preserves_applied_settings(
     response = await client.patch(f"/v1/sessions/{session.session_id}", json=body)
 
     assert response.status_code == 503, response.text
+    expected_message = (
+        "did not apply the model and reasoning effort changes"
+        if combined_model_change
+        else "did not apply the reasoning effort change"
+    )
+    assert expected_message in response.text
     snapshot = await client.get(f"/v1/sessions/{session.session_id}")
     assert snapshot.json()["reasoning_effort"] == "xhigh"
     assert snapshot.json()["model_override"] == "gpt-5.4"

@@ -3070,22 +3070,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (queryClient === null) {
         throw new Error("chatStore.setEffort: queryClient not initialized");
       }
-      const session = await queryClient.fetchQuery({
-        queryKey: ["session", conversationId],
-        queryFn: () => getSessionSlim(conversationId),
-        staleTime: Infinity,
-        retry: false,
-      });
-      // Harness has no effort control: undo the optimistic session-scoped write
-      // so this conversation doesn't claim an effort the server will never hold.
-      if (!supportsEffortControl(session)) {
-        setterFor(conversationId)({ sessionReasoningEffort: null });
-        return;
-      }
       try {
+        const session = await queryClient.fetchQuery({
+          queryKey: ["session", conversationId],
+          queryFn: () => getSessionSlim(conversationId),
+          staleTime: Infinity,
+          retry: false,
+        });
+        // Harness has no effort control: undo the optimistic session-scoped write
+        // so this conversation doesn't claim an effort the server will never hold.
+        if (!supportsEffortControl(session)) {
+          setterFor(conversationId)({ sessionReasoningEffort: null });
+          return;
+        }
         await updateSession(conversationId, { reasoningEffort: effort });
       } catch (err) {
-        // A refused change leaves the server on the previous effort; keep a newer pick.
+        // A failed lookup or refused change leaves the server's effort; keep a newer pick.
         setterFor(conversationId)((s) =>
           s.sessionReasoningEffort === effort ? { sessionReasoningEffort: previous } : {},
         );

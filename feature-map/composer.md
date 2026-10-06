@@ -18,9 +18,10 @@ and steers messages while the agent is busy.
   configuration menu.
 - `model-picker`: lists the host's live model catalog, highlights the current
   model, and keeps the selection. States: catalog loading, delayed catalog,
-  alias vs. full model ID.
+  alias vs. full model ID, refused switch (the pill keeps the applied model).
 - `effort-picker`: reasoning effort for harnesses that support it (Codex, Claude,
-  Pi). States: available, unavailable placeholder, max/ultra levels.
+  Pi). States: available, unavailable placeholder, max/ultra levels, refused
+  change (the pill keeps the applied level).
 - `effort-terminal-mirror`: an effort change typed in the Codex terminal shows
   in the composer, and a composer pick is not reverted by later terminal turns.
 - `permission-mode`: the harness's native approval modes; the current mode is
@@ -106,6 +107,11 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   `tests/e2e_ui/start_session/test_composer_transition.py::test_selected_model_survives_delayed_create`
 - **`effort-picker`, new-session composer:**
   `tests/e2e_ui/start_session/test_codex_effort_prelaunch.py::test_new_codex_session_gear_offers_reasoning_effort`
+- **`model-picker`, `effort-picker`, refused change:** the rollback cases in
+  `web/src/store/chatStore.test.ts` and the composer case in
+  `web/src/pages/ChatPage.composer.test.tsx` (`pnpm --dir web test`). Manually,
+  pick another effort in a Codex session right after Start session, while the
+  terminal is still starting: the pill keeps the previous effort.
 - **`effort-terminal-mirror`:**
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_codex_terminal_effort_change_reaches_composer`,
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_composer_effort_pick_survives_terminal_turns`
@@ -153,6 +159,8 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   A tooltip that returns after clicking away is a regression.
 - Effort exists only for some harnesses. Check at least one harness with effort
   and one without, since the pill and tooltip rows change.
+- A refused model or effort change rolls the pill back to the applied setting.
+  There is no separate error control to inspect.
 - Codex effort can change from the terminal as well as the composer. Confirm the
   terminal command actually landed before blaming the mirror.
 - The mock environment configures Claude and Codex only. Other harnesses'

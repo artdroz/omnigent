@@ -2777,17 +2777,22 @@ def register_core_routes(
                     or (effort_forward is not None and not 200 <= effort_forward.status_code < 300)
                 )
             ):
-                # A live refusal must not leave the picker claiming unapplied
-                # settings. No runner response still permits saving for resume.
+                # A live refusal must not leave the picker claiming unapplied settings.
+                # Only a missing first reply saves for resume: once the model applied,
+                # a lost effort reply is a refusal, as turns never re-apply Default.
+                restore_model = live_model_change and not model_applied
                 await asyncio.to_thread(
                     conversation_store.restore_session_settings_if_matches,
                     session_id,
                     previous=conv,
                     attempted=updated,
-                    restore_model=live_model_change and not model_applied,
+                    restore_model=restore_model,
                 )
                 raise OmnigentError(
-                    "The terminal did not apply the reasoning effort change. Please try again.",
+                    "The terminal did not apply the model and reasoning effort changes. "
+                    "The previous selections have been restored."
+                    if restore_model
+                    else "The terminal did not apply the reasoning effort change. Please try again.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
         if live_model_change:
