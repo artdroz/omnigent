@@ -3923,6 +3923,14 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
         "external_session_superseded",
     ]
     assert event_bodies[2].get("data") == {"target_conversation_id": "conv_new"}
+    # The notice payloads match the shared helper: idle status, an assistant
+    # message naming /clear and linking the new chat, and the redirect target.
+    assert event_bodies[0].get("data") == {"status": "idle"}
+    notice_item = event_bodies[1]["data"]["item_data"]
+    assert notice_item["agent"] == "antigravity-native-ui"
+    notice_text = notice_item["content"][0]["text"]
+    assert "`/clear`" in notice_text
+    assert "/c/conv_new" in notice_text
     # No external_session_id PATCH is made anywhere (the loop-bug source): every
     # PATCH body is a runner_id bind/release, never an external_session_id write.
     assert all("external_session_id" not in body for (_m, _p, body) in calls), (

@@ -2396,9 +2396,7 @@ async def _maybe_rotate_session_on_thread_started(
     await old_delta_coalescer.close()
     await old_usage_coalescer.close()
     await old_elicitation_tracker.close()
-    # Tell the superseded conversation it was rotated away: stop its spinner,
-    # persist a link to the new chat, and emit the live redirect event. Fully
-    # best-effort — the rotation is already committed.
+    # Best-effort: notify the superseded conversation and emit the redirect.
     await post_supersession_notice(
         ap_client,
         old_session_id=old_session_id,

@@ -21,7 +21,7 @@ import uuid
 
 import httpx
 import pytest
-from playwright.sync_api import Browser, expect
+from playwright.sync_api import Browser, Locator, expect
 
 from .test_antigravity_tmux_recovery import (  # noqa: F401 (fixtures used by name)
     _BLOCK_LOOPBACK_DIALS,
@@ -76,12 +76,34 @@ def _wait_for_rotation_child(base_url: str, before_ids: set[str], *, timeout_s: 
     while time.monotonic() < deadline:
         new_ids = _session_ids(base_url) - before_ids
         if new_ids:
+            assert len(new_ids) == 1, f"expected exactly one rotation child, got {sorted(new_ids)}"
             return next(iter(new_ids))
         time.sleep(1.0)
     raise AssertionError(
         f"agy /clear never created a rotation child session within {timeout_s:.0f}s; "
         "the cascade rotation did not fire"
     )
+
+
+def _wait_for_terminal_quiescent(
+    terminal: Locator, *, baseline: str, settle_s: float = 1.0, timeout_s: float = 30.0
+) -> None:
+    """Wait until the agy TUI reacts to the last keypress and then stops redrawing.
+
+    ``/clear`` swaps in a fresh cascade asynchronously; sending the next prompt
+    before the swap settles can route it into the old cascade and skip rotation.
+    """
+    deadline = time.monotonic() + timeout_s
+    reacted = False
+    last_text = baseline
+    stable_since = time.monotonic()
+    while time.monotonic() < deadline:
+        time.sleep(0.25)
+        current = terminal.inner_text()
+        if current != last_text:
+            reacted, last_text, stable_since = True, current, time.monotonic()
+        elif reacted and time.monotonic() - stable_since >= settle_s:
+            return
 
 
 # pytest resolves the imported fixtures by parameter name, so the shadowing is intended.
@@ -127,8 +149,9 @@ def test_antigravity_clear_rotation_supersedes_old_conversation(
     expect(xterm_input).to_be_attached(timeout=30_000)
     xterm_input.focus()
     page.keyboard.type("/clear", delay=20)
+    cleared_baseline = terminal.inner_text()
     page.keyboard.press("Enter")
-    time.sleep(2.0)
+    _wait_for_terminal_quiescent(terminal, baseline=cleared_baseline)
 
     follow_up = f"agy-e2e-{uuid.uuid4().hex[:8]}"
     xterm_input.focus()

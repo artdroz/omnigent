@@ -74,7 +74,7 @@ async def post_supersession_notice(
         )
     notice = (
         f"This conversation was ended by `{command}`. "
-        f"Continue in [the new chat](/c/{new_session_id}). "
+        f"Continue in [the new chat](/c/{urllib.parse.quote(new_session_id, safe='')}). "
         "You can also send a message here to resume this conversation."
     )
     try:

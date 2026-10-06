@@ -3203,9 +3203,7 @@ async def _rotate_session_for_cascade(
             exc_info=True,
         )
 
-    # Tell the superseded conversation it was rotated away: stop its spinner,
-    # persist a link to the new chat, and emit the live redirect event. Fully
-    # best-effort — the rotation is already committed.
+    # Best-effort: notify the superseded conversation and emit the redirect.
     await post_supersession_notice(
         client,
         old_session_id=old_session_id,
