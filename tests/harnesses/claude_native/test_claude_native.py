@@ -492,6 +492,34 @@ def test_endpoint_disallowed_claude_tools(
 
 
 @pytest.mark.parametrize(
+    ("higher_priority", "expected"),
+    [
+        # A readable settings object without ``env`` decides, like Claude Code's
+        # own precedence: the lower-priority gateway file is never consulted.
+        (json.dumps({"apiKeyHelper": "printf token"}), ()),
+        # Malformed JSON is skipped, so the lower-priority gateway applies.
+        ("{not json", ("WebSearch",)),
+    ],
+    ids=["object-without-env-stops-fallback", "malformed-json-falls-through"],
+)
+def test_endpoint_disallowed_claude_tools_managed_settings_precedence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    higher_priority: str,
+    expected: tuple[str, ...],
+) -> None:
+    """The first readable managed-settings object decides; unreadable files fall through."""
+    _claude_endpoint_environment(tmp_path, monkeypatch, process_env={}, managed_env=None)
+    high = tmp_path / "high-managed-settings.json"
+    high.write_text(higher_priority, encoding="utf-8")
+    low = tmp_path / "low-managed-settings.json"
+    low.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": _GATEWAY_URL}}), encoding="utf-8")
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (high, low))
+
+    assert claude_native.endpoint_disallowed_claude_tools(None) == expected
+
+
+@pytest.mark.parametrize(
     ("claude_config", "process_env", "withheld"),
     [
         (_GATEWAY_CONFIG, {}, True),

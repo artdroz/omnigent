@@ -21,7 +21,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import reset_mock_llm
+from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm
 
 from .test_message_render_parity import _ASSISTANT, _USER, _WORKING, _select_view_mode
 from .test_native_claude_render_parity import (
@@ -58,73 +58,56 @@ _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[()][0-9A-Za-z]|\x1b[=>]|\r")
 _EVIDENCE_DIR_ENV = "OMNIGENT_E2E_EVIDENCE_DIR"
 
 
-def _configure(mock_url: str, body: dict) -> None:
-    httpx.post(f"{mock_url}/mock/configure", json=body, timeout=10.0).raise_for_status()
-
-
 def _script_gateway(mock_url: str) -> None:
     """Script the mock gateway: call WebSearch when offered, reject its nested server leg."""
     reset_mock_llm(mock_url)
-    _configure(
+    configure_mock_llm(
         mock_url,
-        {
-            "match": _SEARCH_OFFERED_MATCH,
-            "required_tools": ["WebSearch"],
-            "responses": [
-                {
-                    "tool_calls": [
-                        {
-                            "call_id": "toolu_ws_1",
-                            "name": "WebSearch",
-                            "arguments": json.dumps(
-                                {"query": f"Paris weather today {_NESTED_TOKEN}"}
-                            ),
-                        }
-                    ]
-                },
-                {"text": _FINAL_TEXT},
-                {"text": _FINAL_TEXT},
-            ],
-        },
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "toolu_ws_1",
+                        "name": "WebSearch",
+                        "arguments": json.dumps({"query": f"Paris weather today {_NESTED_TOKEN}"}),
+                    }
+                ]
+            },
+            {"text": _FINAL_TEXT},
+            {"text": _FINAL_TEXT},
+        ],
+        match=_SEARCH_OFFERED_MATCH,
+        required_tools=["WebSearch"],
     )
-    _configure(
+    configure_mock_llm(
         mock_url,
-        {
-            "match": _SEARCH_DEFERRED_MATCH,
-            "required_tools": ["ToolSearch"],
-            "responses": [
-                {
-                    "tool_calls": [
-                        {
-                            "call_id": "toolu_ts_1",
-                            "name": "ToolSearch",
-                            "arguments": json.dumps({"query": "WebSearch"}),
-                        }
-                    ]
-                },
-                {"text": _NO_SEARCH_TEXT},
-                {"text": _NO_SEARCH_TEXT},
-            ],
-        },
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "toolu_ts_1",
+                        "name": "ToolSearch",
+                        "arguments": json.dumps({"query": "WebSearch"}),
+                    }
+                ]
+            },
+            {"text": _NO_SEARCH_TEXT},
+            {"text": _NO_SEARCH_TEXT},
+        ],
+        match=_SEARCH_DEFERRED_MATCH,
+        required_tools=["ToolSearch"],
     )
     # Guard on Bash: the main turn always advertises it, while Claude Code's
     # tool-less background requests (title generation) must not consume the reply.
-    _configure(
+    configure_mock_llm(
         mock_url,
-        {
-            "match": _NO_SEARCH_MATCH,
-            "required_tools": ["Bash"],
-            "responses": [{"text": _NO_SEARCH_TEXT}] * 3,
-        },
+        [{"text": _NO_SEARCH_TEXT}] * 3,
+        match=_NO_SEARCH_MATCH,
+        required_tools=["Bash"],
     )
     rejection = [{"error": _RESTRICTION, "status_code": 400}] * 6
-    _configure(
-        mock_url,
-        {"key": _CLAUDE_MOCK_MODEL, "required_tools": ["web_search"], "responses": rejection},
-    )
-    _configure(
-        mock_url, {"key": "default", "required_tools": ["web_search"], "responses": rejection}
-    )
+    configure_mock_llm(mock_url, rejection, key=_CLAUDE_MOCK_MODEL, required_tools=["web_search"])
+    configure_mock_llm(mock_url, rejection, key="default", required_tools=["web_search"])
 
 
 def _is_server_web_search_tool(tool: object) -> bool:
