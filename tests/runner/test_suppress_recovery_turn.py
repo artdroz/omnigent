@@ -33,7 +33,7 @@ from fastapi import FastAPI
 from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runner.session_history import (
-    _CANCELLATION_MARKER_TEXT,
+    CANCELLATION_MARKER_TEXT,
     is_pending_user_prompt,
 )
 from omnigent.runner.session_init_protocol import (
@@ -460,7 +460,7 @@ async def test_catch_up_scan_ignores_trailing_cancellation_marker() -> None:
             {
                 "type": "message",
                 "role": "user",
-                "content": [{"type": "input_text", "text": _CANCELLATION_MARKER_TEXT}],
+                "content": [{"type": "input_text", "text": CANCELLATION_MARKER_TEXT}],
             },
             False,
             id="current-marker",
@@ -480,8 +480,33 @@ async def test_catch_up_scan_ignores_trailing_cancellation_marker() -> None:
         pytest.param(
             {
                 "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Please explain this log:"},
+                    {"type": "input_text", "text": "[System: interrupted]\nworker 3 exited"},
+                ],
+            },
+            True,
+            id="sentinel-opens-a-later-block",
+        ),
+        # Accepted tradeoff: a one-block prompt in the marker's exact shape is
+        # kept in the transcript but is not re-run automatically.
+        pytest.param(
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "[System: interrupted]\nwhat is this?"}
+                ],
+            },
+            False,
+            id="single-block-prompt-in-marker-shape",
+        ),
+        pytest.param(
+            {
+                "type": "message",
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": _CANCELLATION_MARKER_TEXT}],
+                "content": [{"type": "output_text", "text": CANCELLATION_MARKER_TEXT}],
             },
             False,
             id="assistant-message",

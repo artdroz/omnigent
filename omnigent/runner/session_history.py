@@ -25,7 +25,7 @@ _CANCELLATION_TOOL_OUTPUT = "[Cancelled — tool execution was interrupted.]"
 # The marker's first line; older persisted transcripts share it even where the
 # explanatory wording below has since changed.
 _CANCELLATION_MARKER_PREFIX = "[System: interrupted]"
-_CANCELLATION_MARKER_TEXT = (
+CANCELLATION_MARKER_TEXT = (
     f"{_CANCELLATION_MARKER_PREFIX}\n"
     "The user interrupted and abandoned their previous request (the user "
     "message immediately before this one). Do not resume or act on that "
@@ -38,21 +38,23 @@ _CANCELLATION_MARKER_TEXT = (
 def is_cancellation_marker(item: _JsonObject) -> bool:
     """Report whether *item* is the synthetic user message a cancel persists.
 
-    :param item: A history item in harness-input shape, e.g.
-        ``{"type": "message", "role": "user", "content": [...]}``.
-    :returns: ``True`` when a text block opens with the marker's first line.
+    The marker is a single ``input_text`` block whose first line is the
+    sentinel. A real prompt in exactly that shape is treated the same way: it
+    stays in the transcript, but a relaunch will not answer it on its own.
+
+    :param item: A history item in harness-input shape.
+    :returns: ``True`` for the single-block marker message.
     """
     if item.get("type") != "message" or item.get("role") != "user":
         return False
     content = item.get("content")
-    if not isinstance(content, list):
+    if not isinstance(content, list) or len(content) != 1:
         return False
-    return any(
-        isinstance(block, dict)
-        and isinstance(text := block.get("text"), str)
-        and text.split("\n", 1)[0] == _CANCELLATION_MARKER_PREFIX
-        for block in content
-    )
+    block = content[0]
+    if not isinstance(block, dict) or block.get("type") != "input_text":
+        return False
+    text = block.get("text")
+    return isinstance(text, str) and text.split("\n", 1)[0] == _CANCELLATION_MARKER_PREFIX
 
 
 def is_pending_user_prompt(item: _JsonObject) -> bool:
@@ -455,7 +457,7 @@ def build_session_history(
             "content": [
                 {
                     "type": "input_text",
-                    "text": _CANCELLATION_MARKER_TEXT,
+                    "text": CANCELLATION_MARKER_TEXT,
                 }
             ],
         }
