@@ -319,6 +319,15 @@ _SESSION_SETTINGS_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = (
 )
 
 
+def _runner_acknowledged_rollback(body: str) -> bool:
+    """Return whether a runner refusal confirms it did not keep the effort change."""
+    try:
+        result = json.loads(body)
+    except ValueError:
+        return False
+    return isinstance(result, dict) and result.get("rollback_on_refusal") is True
+
+
 def _session_settings_lock(session_id: str) -> asyncio.Lock:
     """Return the lock that orders live settings changes for *session_id*."""
     lock = _SESSION_SETTINGS_LOCKS.get(session_id)
@@ -2812,12 +2821,19 @@ def register_core_routes(
                 and conv is not None
                 and (
                     (effort_forward is None and model_applied)
-                    or (effort_forward is not None and not 200 <= effort_forward.status_code < 300)
+                    or (
+                        effort_forward is not None
+                        and not 200 <= effort_forward.status_code < 300
+                        and (
+                            (combined_model_forward and not model_applied)
+                            or _runner_acknowledged_rollback(effort_forward.body)
+                        )
+                    )
                 )
             ):
                 # A live refusal must not leave the picker claiming unapplied settings.
-                # Only a missing first reply saves for resume: once the model applied,
-                # a lost effort reply is a refusal, as turns never re-apply Default.
+                # Older runners keep a refused effort themselves, so roll back only
+                # when the runner confirms it did not, or after a lost fallback reply.
                 restore_model = live_model_change and not model_applied
                 await asyncio.to_thread(
                     conversation_store.restore_session_settings_if_matches,

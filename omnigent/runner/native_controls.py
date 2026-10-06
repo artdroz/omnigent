@@ -347,16 +347,31 @@ def build_native_controls(
                         codex_client, effort, model, transport=state.socket_path
                     )
                     settings["effort"] = resolved
-            await asyncio.wait_for(
-                codex_client.request(
-                    "thread/settings/update",
-                    {
-                        "threadId": state.thread_id,
-                        **settings,
+            try:
+                await asyncio.wait_for(
+                    codex_client.request(
+                        "thread/settings/update",
+                        {
+                            "threadId": state.thread_id,
+                            **settings,
+                        },
+                    ),
+                    timeout=SETTINGS_UPDATE_TIMEOUT_S,
+                )
+            except TimeoutError:
+                # Codex may still apply the update, so this is not a refusal.
+                _logger.warning(
+                    "Codex-native thread/settings/update timed out for session=%s",
+                    conv_id,
+                    extra={"session_id": conv_id},
+                )
+                return JSONResponse(
+                    status_code=504,
+                    content={
+                        "error": "codex_native_settings_update_timeout",
+                        "detail": "Codex did not confirm the settings update in time.",
                     },
-                ),
-                timeout=SETTINGS_UPDATE_TIMEOUT_S,
-            )
+                )
         except Exception as exc:  # noqa: BLE001 - surface app-server settings failures.
             _logger.warning(
                 "Codex-native thread/settings/update failed for session=%s thread=%s settings=%s",

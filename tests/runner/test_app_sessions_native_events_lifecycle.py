@@ -334,7 +334,8 @@ async def test_codex_native_settings_update_times_out_and_releases_the_lock(
             f"/v1/sessions/{conv_id}/events", json={"type": "effort_change", "effort": "low"}
         )
 
-    assert stalled_resp.status_code == 503, stalled_resp.text
+    # A stalled update may still apply, so it is unconfirmed rather than refused.
+    assert stalled_resp.status_code == (504 if stalled == "update" else 503), stalled_resp.text
     assert next_resp.status_code == 204, next_resp.text
     assert all(stalled_client.closed for stalled_client in clients)
     assert clients[-1].requests == [

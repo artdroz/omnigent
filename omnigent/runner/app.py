@@ -295,6 +295,19 @@ _IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
 _server_version: str | None = None
 
 
+def _acknowledge_settings_rollback(response: Response) -> JSONResponse:
+    """Mark a refused Codex settings response as not kept by this runner."""
+    try:
+        content = json.loads(bytes(response.body))
+    except ValueError:
+        content = None
+    if not isinstance(content, dict):
+        content = {}
+    return JSONResponse(
+        status_code=response.status_code, content={**content, "rollback_on_refusal": True}
+    )
+
+
 def _invalid_effort_response(effort: object) -> JSONResponse | None:
     """Return the 400 for a non-string, non-null session-event effort, else ``None``."""
     if effort is None or isinstance(effort, str):
@@ -6553,8 +6566,14 @@ def create_runner_app(
                     conversation_id,
                     {"effort": effort},
                 )
-                if response.status_code == 503 and body.get("rollback_on_refusal") is not True:
-                    # An older server keeps an unapplied selection, so the next turn applies it.
+                if 200 <= response.status_code < 300:
+                    return response
+                if body.get("rollback_on_refusal") is True and response.status_code != 504:
+                    # Confirm the refusal was not kept, so the server may roll it back.
+                    return _acknowledge_settings_rollback(response)
+                if response.status_code in (503, 504):
+                    # The server keeps this selection (older server or unconfirmed
+                    # update), so the next turn applies it.
                     if effort:
                         _session_reasoning_effort[conversation_id] = effort
                     else:

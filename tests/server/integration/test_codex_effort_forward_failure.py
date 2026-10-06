@@ -484,6 +484,75 @@ async def test_overlapping_refused_changes_restore_the_applied_effort(
     assert bridge.read_codex_config_effort(session.bridge_dir) == "xhigh"
 
 
+async def test_legacy_runner_refusal_keeps_the_effort_it_cached(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An older runner keeps a refused effort for its next turn, so the server keeps it too."""
+    session = native_session
+    session.store.update_conversation(session.session_id, _unset_reasoning_effort=True)
+    session.remembered_efforts.pop(session.session_id, None)
+    original_post = session.runner.post
+
+    async def legacy_runner(url: str, **kwargs: Any) -> httpx.Response:
+        body = dict(kwargs["json"])
+        if body.get("type") != "effort_change":
+            return await original_post(url, **kwargs)
+        # Older runners cache the effort, then report the live failure without an acknowledgement.
+        session.remembered_efforts[session.session_id] = body["effort"]
+        return httpx.Response(
+            503,
+            json={
+                "error": "codex_native_settings_update_failed",
+                "detail": "Codex-native settings update requires a loaded Codex bridge.",
+            },
+        )
+
+    monkeypatch.setattr(session.runner, "post", legacy_runner)
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"reasoning_effort": "high"}
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["reasoning_effort"] == "high"
+    saved = session.store.get_conversation(session.session_id)
+    assert saved is not None
+    assert saved.reasoning_effort == "high"
+    assert session.remembered_efforts[session.session_id] == "high"
+
+
+async def test_unconfirmed_effort_update_is_kept_for_the_next_turn(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out native update may still apply, so it is kept rather than rolled back."""
+    from omnigent.runner import turn_routing
+
+    session = native_session
+    session.codex.failure = None
+    monkeypatch.setattr(turn_routing, "SETTINGS_UPDATE_TIMEOUT_S", 0.05)
+    real_request = session.codex.request
+
+    async def stall_update(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method == "thread/settings/update":
+            await asyncio.Event().wait()
+        return await real_request(method, params)
+
+    monkeypatch.setattr(session.codex, "request", stall_update)
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"reasoning_effort": "high"}
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["reasoning_effort"] == "high"
+    saved = session.store.get_conversation(session.session_id)
+    assert saved is not None
+    assert saved.reasoning_effort == "high"
+    assert session.remembered_efforts[session.session_id] == "high"
+
+
 @pytest.mark.parametrize("silent", [False, True])
 async def test_offline_or_silent_effort_change_is_saved_for_resume(
     client: httpx.AsyncClient,

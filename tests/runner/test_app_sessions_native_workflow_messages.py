@@ -1056,6 +1056,9 @@ async def test_refused_codex_startup_effort_follows_the_server_rollback_contract
             if turn == 2:
                 refused = await client.post(f"/v1/sessions/{session}/events", json=effort_change)
                 assert refused.status_code == 503, refused.text
+                assert refused.json().get("rollback_on_refusal") is (
+                    True if rollback_on_refusal else None
+                )
                 hc.posted_bodies.clear()
             resp = await client.post(f"/v1/sessions/{session}/events", json=message)
             assert resp.status_code == 202
