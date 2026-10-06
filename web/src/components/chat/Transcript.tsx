@@ -50,13 +50,13 @@ import {
   computeIsTurnActive,
   computeIsWorking,
   extractUserText,
-  isBackgroundTasksOnly,
   isSystemBubble,
   mergePendingBubbles,
   reorderCommittedRequestElicitations,
   shouldShowWorkingIndicator,
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
+  workingIndicatorPaints,
 } from "@/components/chat/chatBubbleParts";
 import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
 
@@ -300,7 +300,7 @@ function TranscriptImpl({
   // a marker row would reserve blank space in the virtualized list.
   const workingIndicatorRenders =
     showWorkingIndicator &&
-    !isBackgroundTasksOnly(
+    workingIndicatorPaints(
       backgroundTaskCount,
       blockedOn,
       computeIsTurnActive(sessionStatus, status === "streaming"),

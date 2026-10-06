@@ -578,9 +578,8 @@ export function workingIndicatorInsertIndex(
   if (!showWorking) return -1;
   const isFollowUp = (b: Bubble): boolean => b.kind === "user" && !isSystemUserContent(b.content);
   // End of the active turn's content: the LAST bubble of its streaming reply
-  // when it has rendered one (a single turn can split across bubbles), else the
-  // prompt that opened it (the first unanswered user turn after the last
-  // rendered assistant turn — FIFO, so the earliest wins).
+  // when it has rendered one (a turn can split across bubbles), else the first
+  // unanswered prompt after the last rendered assistant turn (FIFO).
   const streamingIndex =
     activeResponse?.state === "streaming"
       ? bubbles.findLastIndex(
@@ -593,6 +592,12 @@ export function workingIndicatorInsertIndex(
   let activeTurnEnd: number;
   if (streamingIndex !== -1) {
     activeTurnEnd = streamingIndex;
+    // The active turn can trail non-assistant rows after its last assistant
+    // fragment (subagent activity, routing). Keep the marker below those too,
+    // so it stays with the turn and above the follow-up, never mid-turn.
+    while (activeTurnEnd + 1 < bubbles.length && !isFollowUp(bubbles[activeTurnEnd + 1]!)) {
+      activeTurnEnd += 1;
+    }
   } else {
     const lastAssistant = lastRenderableAssistantIndex(bubbles);
     activeTurnEnd = bubbles.findIndex((b, i) => i > lastAssistant && isFollowUp(b));

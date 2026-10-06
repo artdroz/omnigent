@@ -81,12 +81,14 @@ def _working_sits_above_follow_up(page: Page) -> bool:
 
     The fix keeps the shimmer with the active turn, so while the first request
     runs there is exactly one visible indicator and it precedes the steered
-    follow-up. A vanished indicator (count 0) must not read as success.
+    follow-up. Visibility is checked explicitly: a hidden or vanished indicator
+    (count 0) must not read as success.
     """
     return bool(
         page.evaluate(
             """([workingSel, bubbleSel, followUp]) => {
-              const workings = [...document.querySelectorAll(workingSel)];
+              const visible = (el) => el.checkVisibility() && el.getClientRects().length > 0;
+              const workings = [...document.querySelectorAll(workingSel)].filter(visible);
               if (workings.length !== 1) return false;
               const followUpBubble = [...document.querySelectorAll(bubbleSel)].find((b) =>
                 b.innerText.includes(followUp),

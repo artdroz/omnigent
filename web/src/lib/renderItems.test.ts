@@ -4105,9 +4105,8 @@ describe("workingIndicatorInsertIndex", () => {
   });
 
   it("anchors below the LAST fragment when the streaming turn splits across bubbles", () => {
-    // One streaming turn can render as several assistant bubbles sharing a
-    // responseId — here an answered AskUserQuestion card splits r1 into
-    // work / card / work. The marker must land after the turn's LAST fragment,
+    // An answered AskUserQuestion card splits one streaming turn (r1) into
+    // several assistant bubbles. The marker must land after the LAST fragment,
     // above the steered follow-up, not between the turn's own fragments.
     const blocks: AnyBlock[] = [
       {
@@ -4155,10 +4154,9 @@ describe("workingIndicatorInsertIndex", () => {
       },
     ];
     const bubbles = buildBubbles(blocks, streaming("r1"));
-    // [user, assistant r1 (tool), assistant r1 (card), assistant r1 (text), user u2]:
-    // findLastIndex anchors to the last r1 fragment (index 3), so the marker
-    // splices at 4 — the old findIndex would wrongly splice at 2, between the
-    // turn's own fragments.
+    // [user, assistant r1 x3 (tool, card, text), user u2]: the anchor is the
+    // last r1 fragment (index 3), so the marker splices at 4 — above the
+    // follow-up and below every fragment of the turn, not between them.
     expect(bubbles.map((b) => b.kind)).toEqual([
       "user",
       "assistant",
@@ -4167,6 +4165,27 @@ describe("workingIndicatorInsertIndex", () => {
       "user",
     ]);
     expect(workingIndicatorInsertIndex(bubbles, streaming("r1"), true)).toBe(4);
+  });
+
+  it("anchors below trailing same-turn rows before the steered follow-up", () => {
+    const blocks: AnyBlock[] = [
+      userMsg("u1", "q"),
+      textDone("a1", "r1", "working…"),
+      {
+        type: "native_tool",
+        ctx: ctx({ itemId: "sub_1", responseId: "r1" }),
+        toolType: "subagent_activity",
+        label: "Sub-agent activity",
+        data: {},
+      },
+      userMsg("u2", "follow-up"),
+    ];
+    const bubbles = buildBubbles(blocks, streaming("r1"));
+    // A subagent-activity row trails the streaming turn's last assistant
+    // fragment. The marker lands after that row (index 3), above the follow-up,
+    // not between the fragment and its own trailing row.
+    expect(bubbles.map((b) => b.kind)).toEqual(["user", "assistant", "subagent_activity", "user"]);
+    expect(workingIndicatorInsertIndex(bubbles, streaming("r1"), true)).toBe(3);
   });
 
   it("anchors to the active prompt when its reply has not streamed yet", () => {
