@@ -3846,7 +3846,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     meta.runner_last_connected = None
                 meta.runner_id = runner_id
             else:
-                new_values: dict[str, str | None] = {"runner_id": runner_id}
+                new_values: dict[str, str | int | None] = {"runner_id": runner_id}
                 if expected_runner_id != runner_id:
                     new_values["runner_last_seen"] = None
                     new_values["runner_last_connected"] = None

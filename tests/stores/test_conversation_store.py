@@ -6897,6 +6897,28 @@ def test_unbinding_a_runner_resets_liveness_stamps(
     assert conversation_store.get_runner_liveness(conv2.id) == (None, None, None)
 
 
+def test_set_runner_id_resets_stale_liveness_stamps(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A first binding must not inherit stamps an older writer left on the row.
+
+    Before unbinding reset liveness, ``clear_runner_id`` left both stamps in
+    place, so an unbound row can still carry them when a new runner is pinned.
+    """
+    from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
+
+    conv = conversation_store.create_conversation(title="bind-clears-stale-liveness")
+    with conversation_store._session_immediate("test_seed_stale_liveness") as session:
+        meta = session.get(SqlConversationMetadata, (current_workspace_id(), conv.id))
+        assert meta is not None
+        meta.runner_last_seen = 7_000_000
+        meta.runner_last_connected = 7_000_000
+    assert conversation_store.get_runner_liveness(conv.id) == (None, 7_000_000, 7_000_000)
+
+    assert conversation_store.set_runner_id(conv.id, "runner_first")
+    assert conversation_store.get_runner_liveness(conv.id) == ("runner_first", None, None)
+
+
 def test_live_state_writes_via_chokepoint_land_in_scoped_workspace(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
