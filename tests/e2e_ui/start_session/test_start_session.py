@@ -16,8 +16,8 @@ before sending:
 1. **Permission mode** — native permission/approval choices, in the
    hand dropdown. A non-default pick rides along as
    ``terminal_launch_args``.
-2. **Working directory** — the file-browser popover behind the working-
-   directory chip. Browsing into a folder sets the session's
+2. **Working directory** — the full-screen file-browser dialog behind the
+   working-directory chip. Confirming a browsed folder sets the session's
    ``workspace``.
 3. **Git worktree** — the branch chip's popover. Naming a branch attaches
    a ``git`` worktree spec to the create.
@@ -48,13 +48,12 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import threading
-from collections.abc import Coroutine
 from typing import Any
 
 import pytest
 from playwright.async_api import Request, Route, async_playwright, expect
 
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
 from tests.e2e_ui.start_session.helpers import (
     commit_landing_workspace_picker,
     open_landing_workspace_picker,
@@ -79,33 +78,6 @@ _FILESYSTEM_RE = re.compile(r"/v1/hosts/[^/]+/filesystem")
 _WORKTREES_RE = re.compile(r"/v1/hosts/[^/]+/worktrees")
 
 
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* to completion in a dedicated thread with its own event loop.
-
-    The e2e_ui suite runs many pytest-playwright **sync** tests in the same
-    session; once one has run, pytest-asyncio can't start a loop on the main
-    thread. Running the coroutine from a fresh thread via :func:`asyncio.run`
-    sidesteps that. Any exception (including assertion failures) is captured
-    and re-raised on the calling thread so the test fails normally.
-
-    :param coro: The coroutine to run to completion.
-    :raises Exception: Whatever the coroutine raised, re-raised here.
-    """
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
-
-
 async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:
     """Poll ``predicate`` on the event loop until true or timeout.
 
@@ -128,8 +100,8 @@ def _agents_body() -> str:
     ``claude-native-ui`` is the only built-in the picker needs here — its
     name is what gates the permission-mode UI (``isClaudeNativeAgent``) and,
     ranked first by display name, it auto-selects so no explicit pick is
-    required. ``harness: null`` keeps the "needs setup" badge off regardless
-    of the (stubbed) host's readiness map.
+    required. The host fixture explicitly reports the harness ready so the row
+    remains selectable under readiness-aware picker behavior.
     """
     return json.dumps(
         {
@@ -139,7 +111,7 @@ def _agents_body() -> str:
                     "name": "claude-native-ui",
                     "display_name": "Claude Code",
                     "description": "Anthropic's coding agent",
-                    "harness": None,
+                    "harness": "claude-native",
                     "skills": [],
                 }
             ]
@@ -412,6 +384,16 @@ def _hosts_body() -> str:
                     "name": "e2e-host",
                     "owner": "e2e",
                     "status": "online",
+                    "configured_harnesses": {
+                        "antigravity-native": True,
+                        "claude-native": True,
+                        "codex-native": True,
+                        "cursor-native": True,
+                        "devin-native": True,
+                        "kimi-native": True,
+                        "opencode-native": True,
+                        "pi-native": True,
+                    },
                 }
             ]
         }
@@ -764,7 +746,8 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
             composer = page.get_by_role("textbox", name="Message the agent")
             await expect(composer).to_be_editable()
             await expect(composer).to_have_attribute("placeholder", re.compile("Send a follow-up"))
-            await expect(page.get_by_role("button", name="Send", exact=True)).to_be_disabled()
+            await expect(page.get_by_role("button", name="Interrupt", exact=True)).to_be_enabled()
+            await expect(page.get_by_role("button", name="Send", exact=True)).to_have_count(0)
             await expect(
                 page.get_by_test_id("message-bubble").get_by_text("set up the project", exact=True)
             ).to_be_visible()
@@ -1550,6 +1533,80 @@ def test_start_session_managed_remembers_host_over_sandbox_default(
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_managed_remembers_host(base_url, session_id))
+
+
+@pytest.mark.parametrize("viewport_width", [1440, 390], ids=["desktop", "mobile"])
+def test_start_session_managed_repository_uses_workspace_bar(
+    seeded_session: tuple[str, str],
+    viewport_width: int,
+) -> None:
+    """The managed repository picker lives in the responsive workspace bar."""
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(
+        _drive_managed_repository_workspace_bar(base_url, session_id, viewport_width)
+    )
+
+
+async def _drive_managed_repository_workspace_bar(
+    base_url: str, session_id: str, viewport_width: int
+) -> None:
+    repo_url = "https://github.com/omnigent-ai/a-very-long-sandbox-repository-name.git"
+    repo_name = "a-very-long-sandbox-repository-name"
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page(
+            viewport={"width": viewport_width, "height": 844 if viewport_width == 390 else 900}
+        )
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            await page.route(
+                "**/v1/info",
+                lambda route: route.fulfill(
+                    status=200, content_type="application/json", body=_managed_info_body()
+                ),
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            controls = page.get_by_test_id("new-chat-landing-workspace-controls")
+            repository = controls.get_by_test_id("new-chat-landing-repo-chip")
+            await expect(controls).to_be_visible()
+            await expect(repository).to_have_attribute(
+                "aria-label", "Sandbox repositories: None selected"
+            )
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_have_count(0)
+            await expect(page.get_by_test_id("new-chat-landing-worktree-chip")).to_have_count(0)
+
+            await repository.click()
+            await page.get_by_test_id("new-chat-landing-repo-input").fill(repo_url)
+            await page.get_by_test_id("new-chat-landing-repo-add").click()
+            await expect(repository).to_have_attribute(
+                "aria-label", f"Sandbox repositories: {repo_name}"
+            )
+            repository_label = repository.locator("[data-workspace-collapse-label]")
+            if viewport_width == 390:
+                await expect(controls).to_have_attribute("data-labels", "collapsed")
+                await expect(repository_label).to_be_hidden()
+            else:
+                await expect(controls).not_to_have_attribute("data-labels", "collapsed")
+                await expect(repository_label).to_be_visible()
+
+            await page.keyboard.press("Escape")
+            await page.get_by_test_id("new-chat-landing-input").fill("audit the repository")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["host_type"] == "managed", body
+            assert body["workspaces"] == [repo_url], body
+        finally:
+            await browser.close()
 
 
 async def _drive_managed_remembers_host(base_url: str, session_id: str) -> None:
@@ -2531,6 +2588,10 @@ async def _drive_pi_native_start(base_url: str, session_id: str) -> None:
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "pi-native-ui",
                 "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
+                "omnigent.composer_context.v1.0": (
+                    '{"version":1,"working_directory":{"path":"/work/repo"},'
+                    '"worktree":{"mode":"none"}}'
+                ),
             }, body
             assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
         finally:
@@ -2617,6 +2678,10 @@ async def _drive_antigravity_native_start(base_url: str, session_id: str) -> Non
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "antigravity-native-ui",
                 "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
+                "omnigent.composer_context.v1.0": (
+                    '{"version":1,"working_directory":{"path":"/work/repo"},'
+                    '"worktree":{"mode":"none"}}'
+                ),
             }, body
             assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
         finally:
@@ -2713,6 +2778,10 @@ async def _drive_opencode_native_start(base_url: str, session_id: str) -> None:
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "opencode-native-ui",
                 "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
+                "omnigent.composer_context.v1.0": (
+                    '{"version":1,"working_directory":{"path":"/work/repo"},'
+                    '"worktree":{"mode":"none"}}'
+                ),
             }, body
             assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
         finally:
@@ -2804,6 +2873,10 @@ async def _drive_kimi_native_start(base_url: str, session_id: str) -> None:
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "kimi-native-ui",
                 "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
+                "omnigent.composer_context.v1.0": (
+                    '{"version":1,"working_directory":{"path":"/work/repo"},'
+                    '"worktree":{"mode":"none"}}'
+                ),
             }, body
             assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
         finally:
@@ -2960,11 +3033,21 @@ async def _drive_folder_selection(base_url: str, session_id: str) -> None:
                 "e2e"
             )
 
-            # Open the file browser and navigate into the "projects" folder.
+            # Every entry point uses the same viewport-safe full-screen browser.
             await open_landing_workspace_picker(page)
+            picker_dialog = page.get_by_test_id("workspace-picker-dialog")
+            await expect(picker_dialog).to_be_visible()
+            picker = page.get_by_test_id("workspace-picker")
+            await expect(picker).to_have_css("width", "800px")
+            await expect(picker).to_have_css("height", "600px")
+
+            # Navigate into "projects"; the landing chip remains unchanged
+            # until the explicit Confirm action commits the provisional path.
             await page.get_by_test_id("workspace-picker-entry-projects").click()
-            # The child listing confirms we navigated in.
             await expect(page.get_by_test_id("workspace-picker-entry-src")).to_be_visible()
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
+                "e2e"
+            )
             await commit_landing_workspace_picker(page)
 
             # The explicit Select action commits the navigated folder.
@@ -3339,6 +3422,7 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
+            await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_have_text("None")
 
             # Open the worktree chip and name a branch + base branch.
             await page.get_by_test_id("new-chat-landing-branch-chip").click()
@@ -3368,10 +3452,11 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
 def test_start_session_select_existing_worktree(seeded_session: tuple[str, str]) -> None:
     """Picking an existing worktree starts in its directory in git bind mode.
 
-    The branch chip's input doubles as a combobox: focusing it lists the
-    repo's existing worktrees (``GET /v1/hosts/{id}/worktrees``). Selecting
-    one must (a) point the workspace at that worktree's directory and
-    (b) send the ``git`` spec in bind mode on ``POST /v1/sessions`` —
+    The branch chip lists the repo's existing worktrees
+    (``GET /v1/hosts/{id}/worktrees``). Selecting one must (a) point the
+    workspace at that worktree's directory, (b) close the selector without
+    copying the branch into the ``New`` input, and (c) send the ``git`` spec
+    in bind mode on ``POST /v1/sessions`` —
     ``existing_worktree: true`` with the worktree's branch as
     ``branch_name`` — so no worktree is created but the sidebar shows the
     branch and the delete flow can offer to remove it.
@@ -3432,22 +3517,29 @@ async def _drive_select_existing_worktree(base_url: str, session_id: str) -> Non
                 state="visible", timeout=30_000
             )
 
-            # Open the worktree chip; focusing the branch combobox reveals the
-            # repo's existing (linked) worktrees. The main tree is filtered out,
-            # so only the one linked worktree is offered.
+            # Open the worktree chip. The main tree is filtered out, so only
+            # the one linked worktree is offered.
             await page.get_by_test_id("new-chat-landing-branch-chip").click()
-            await page.get_by_test_id("new-chat-landing-branch-input").focus()
             option = page.get_by_test_id("new-chat-landing-worktree-option")
             await expect(option).to_have_count(1)
             await expect(option).to_contain_text("feature-x")
             await option.click()
-            await expect(option.get_by_role("radio")).to_be_checked()
+            await expect(page.get_by_test_id("new-chat-landing-worktree-dropdown")).to_have_count(
+                0
+            )
+            await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_contain_text(
+                "feature-x"
+            )
 
-            # The warning confirms the session will start in the existing
-            # worktree (rather than creating a new one).
+            # Reopening keeps the existing row selected while reserving New
+            # exclusively for creating a different worktree.
+            await page.get_by_test_id("new-chat-landing-branch-chip").click()
+            await expect(page.get_by_test_id("new-chat-landing-branch-input")).to_have_value("")
+            option = page.get_by_test_id("new-chat-landing-worktree-option")
+            await expect(option.get_by_role("radio")).to_be_checked()
             await expect(
                 page.get_by_test_id("new-chat-landing-existing-worktree-warning")
-            ).to_be_visible()
+            ).to_have_count(0)
 
             await page.get_by_test_id("new-chat-landing-input").fill("work in the worktree")
             await page.get_by_test_id("new-chat-landing-submit").click()
@@ -3593,10 +3685,10 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
             await expect(page.get_by_test_id("new-chat-landing-agent-ag_forkfork")).to_have_count(
                 0
             )
-            # Top level: the built-in Claude row + the "Custom agents" submenu
+            # Top level: the built-in Claude row + the custom-agent "Other..." submenu
             # trigger — no duplicate "Claude Code" sneaks in via a leaked clone.
             await expect(page.locator("[data-harness-menu-row]")).to_have_count(1)
-            # The genuinely custom agent survives, inside the Custom agents submenu.
+            # The genuinely custom agent survives inside that submenu.
             await page.get_by_test_id("new-chat-landing-custom-agents").click()
             await expect(page.get_by_test_id("new-chat-landing-agent-ag_doc")).to_be_visible()
         finally:
