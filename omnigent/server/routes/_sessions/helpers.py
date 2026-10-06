@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import PurePath
 from typing import Any, Final, Literal, cast
 
+import cachetools
 import httpx
 from fastapi import (
     HTTPException,
@@ -5027,109 +5028,77 @@ def reconcile_orphaned_running_status(
     return True
 
 
-# Strong refs so the loop can't collect these fire-and-forget settle tasks
-# before they finish; the in-flight set coalesces repeat polls of the same
-# still-stuck session onto a single runner probe.
-_live_runner_reconcile_tasks: set[asyncio.Task[bool]] = set()
-_live_runner_reconcile_inflight: set[str] = set()
+# Strong refs so the loop can't collect these fire-and-forget probe tasks
+# before they finish.
+# custom-lint: disable-next=workspace-scoped-cache -- set of unique Task objects, not tenant-keyed
+_live_runner_reconcile_tasks: set[asyncio.Task[None]] = set()
+
+# A confirmed-running or unreachable session is re-probed only after this
+# cooldown, so a genuinely running session is not probed on every hot list poll.
+# The entry self-expires after the cooldown, so the map stays bounded.
+_LIVE_RUNNER_PROBE_COOLDOWN_S: Final[float] = 30.0
+_live_runner_probe_cooldown: WorkspaceScopedCache[str, float] = WorkspaceScopedCache(
+    lambda: cachetools.TTLCache(
+        maxsize=math.inf, ttl=_LIVE_RUNNER_PROBE_COOLDOWN_S, timer=lambda: time.monotonic()
+    )
+)
 
 
-async def reconcile_live_runner_idle_status(
+def spawn_live_runner_idle_reconcile(
     session_id: str,
     runner_id: str,
-    conversation_store: ConversationStore,
     runner_router: RunnerRouter,
-) -> bool:
+) -> None:
     """
-    Settle a session stuck ``running`` whose live runner confirms no turn.
+    Re-probe a session stuck ``running`` whose live runner may hold no turn.
 
     The confirmed-gone backstop (``reconcile_orphaned_running_status``)
     deliberately leaves a fresh-runner row running so a real in-flight turn is
     never falsely idled. But a terminal ``idle`` edge can be lost while the
     runner stays alive — a dropped relay frame, a failed stop hook, replica lag
     — stranding the row ``running`` with no turn behind it, so the sidebar
-    spinner never stops. The runner is the authority on whether a turn is in
-    flight, so probe its session snapshot: settle only when it reports no active
-    turn, and leave the row running when it reports a turn or cannot be reached.
+    spinner never stops. ``GET /v1/sessions`` is a hot poll, so this fires the
+    shared, backed-off runner status probe in the background rather than
+    blocking the list: the probe rewrites ``_session_status_cache`` (and the
+    persisted relay status) from the runner's authoritative status, settling a
+    lost-edge row to idle or confirming a still-running turn for the next poll.
+    A per-session cooldown keeps a genuinely running session off the probe on
+    every poll, and the task is held in a module set until it finishes so the
+    loop cannot collect it early.
 
     :param session_id: Session/conversation identifier to reconcile.
-    :param runner_id: The runner bound on the list row; the settle is guarded on
-        this id so a rebind to a different runner is not overwritten.
-    :param conversation_store: Store performing the conditional transition.
-    :param runner_router: Router used to reach the pinned runner.
-    :returns: Whether this call settled the row to idle.
-    """
-    try:
-        routed = await asyncio.to_thread(
-            runner_router.client_for_existing_conversation, session_id
-        )
-    except OmnigentError:
-        # Runner offline, or pinned to another replica — can't confirm here.
-        return False
-    if routed is None:
-        return False
-    try:
-        resp = await routed.client.get(f"/v1/sessions/{session_id}", timeout=5.0)
-    except httpx.HTTPError:
-        return False
-    if resp.status_code == 200:
-        try:
-            runner_status = resp.json().get("status")
-        except ValueError:
-            return False
-        # running/waiting = a real in-flight turn; failed = terminal and owned
-        # by the runner. Only an explicit idle means the turn is gone.
-        if runner_status != "idle":
-            return False
-    elif resp.status_code != 404:
-        # 404 = the runner never initialized this session, so it holds no turn.
-        # Any other status is inconclusive, so don't settle on uncertainty.
-        return False
-    if not await asyncio.to_thread(
-        conversation_store.settle_live_runner_idle_status, session_id, runner_id
-    ):
-        return False
-    _publish_status(session_id, "idle", persist_live_status=False)
-    return True
-
-
-def spawn_live_runner_idle_reconcile(
-    session_id: str,
-    runner_id: str,
-    conversation_store: ConversationStore,
-    runner_router: RunnerRouter,
-) -> None:
-    """
-    Schedule :func:`reconcile_live_runner_idle_status` as a background task.
-
-    ``GET /v1/sessions`` is a hot poll, so the runner probe must not block it:
-    the list returns the current status immediately and this settles any
-    lost-edge ``running`` row for the next poll. The task inherits the request's
-    workspace context from ``create_task``, repeat polls of a still-stuck
-    session coalesce onto one probe, and the task is held in a module set until
-    it finishes so the loop cannot collect it early.
-
-    :param session_id: Session/conversation identifier to reconcile.
-    :param runner_id: The runner bound on the list row.
-    :param conversation_store: Store performing the conditional transition.
+    :param runner_id: The runner bound on the list row, passed to the probe so a
+        skip window recorded against a different runner is discarded on rebind.
     :param runner_router: Router used to reach the pinned runner.
     """
-    if session_id in _live_runner_reconcile_inflight:
+    if _live_runner_probe_cooldown.get(session_id) is not None:
         return
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
+    _live_runner_probe_cooldown[session_id] = time.monotonic()
 
-    async def _run() -> bool:
+    async def _run() -> None:
         try:
-            return await reconcile_live_runner_idle_status(
-                session_id, runner_id, conversation_store, runner_router
+            routed = await asyncio.to_thread(
+                runner_router.client_for_existing_conversation, session_id
             )
-        finally:
-            _live_runner_reconcile_inflight.discard(session_id)
+            if routed is None:
+                return
+            from omnigent.server.routes._sessions.orchestration import (
+                _probe_runner_live_status,
+            )
 
-    _live_runner_reconcile_inflight.add(session_id)
+            await _probe_runner_live_status(routed.client, session_id, runner_id)
+        except OmnigentError:
+            # Runner offline, or pinned to another replica — can't confirm here.
+            return
+        except Exception:  # noqa: BLE001
+            # A fire-and-forget probe failure must not surface only as an
+            # unretrieved task exception at GC.
+            _logger.exception("live-runner idle reconcile failed for %s", session_id)
+
     task = loop.create_task(_run())
     _live_runner_reconcile_tasks.add(task)
     task.add_done_callback(_live_runner_reconcile_tasks.discard)

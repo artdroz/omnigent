@@ -29,7 +29,7 @@ OBSERVE_SECONDS = 80.0
 
 
 def _list_status(base_url: str, session_id: str) -> str | None:
-    resp = httpx.get(f"{base_url}/v1/sessions", timeout=10.0)
+    resp = httpx.get(f"{base_url}/v1/sessions", params={"visibility": "all"}, timeout=10.0)
     resp.raise_for_status()
     item = next((s for s in resp.json()["data"] if s["id"] == session_id), None)
     return item["status"] if item else None

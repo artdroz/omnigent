@@ -1475,24 +1475,6 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def settle_live_runner_idle_status(self, conversation_id: str, runner_id: str) -> bool:
-        """Settle a running/waiting row to idle after its live runner reports no turn.
-
-        For a session whose runner is still fresh but whose terminal ``idle``
-        edge was lost, the staleness-guarded orphan settle never fires. The
-        caller probes the live runner for the authoritative turn state and, when
-        it confirms none, calls this to clear the stuck status. Match the
-        current runner binding so a rebind or a ``failed`` status is not
-        overwritten, transition only ``running``/``waiting``, and do not bump
-        ``updated_at``.
-
-        :param conversation_id: Session/conversation identifier.
-        :param runner_id: The runner that was probed and confirmed idle.
-        :returns: Whether this call performed the transition.
-        """
-        ...
-
-    @abstractmethod
     def set_pending_elicitation_count(self, conversation_id: str, count: int) -> None:
         """
         Persist the outstanding elicitation count for one session.

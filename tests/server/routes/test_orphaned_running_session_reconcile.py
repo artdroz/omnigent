@@ -19,13 +19,16 @@ proving the grace-window guard.
 
 A separate backstop covers the opposite case: a session stuck ``running`` whose
 runner is still *alive* but whose terminal ``idle`` edge was lost. The confirmed-
-gone path never fires for it, so ``list_sessions`` probes the live runner's turn
-snapshot and settles only when it confirms no in-flight turn
-(:func:`reconcile_live_runner_idle_status` / ``settle_live_runner_idle_status``).
+gone path never fires for it, so ``list_sessions`` fires a background runner
+status probe (:func:`spawn_live_runner_idle_reconcile`) that reuses the shared,
+backed-off ``_probe_runner_live_status``. The runner's native-aware status read
+rewrites the cached relay status — settling a lost-edge row to idle, or
+confirming a still-running turn — for the next poll to serve.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Iterator
 from typing import cast
@@ -36,11 +39,17 @@ import pytest
 from omnigent.db.utils import generate_agent_id
 from omnigent.errors import OmnigentError
 from omnigent.runner.routing import RoutedRunner, RunnerRouter
+from omnigent.server.routes._sessions.common import (
+    _runner_status_probe_backoff,
+    _runner_status_probe_inflight,
+)
 from omnigent.server.routes._sessions.helpers import (
+    _live_runner_probe_cooldown,
+    _live_runner_reconcile_tasks,
     _session_active_response_cache,
     _session_status_cache,
-    reconcile_live_runner_idle_status,
     reconcile_orphaned_running_status,
+    spawn_live_runner_idle_reconcile,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -84,11 +93,19 @@ def _isolate_status_cache() -> Iterator[None]:
     """Keep the module-level relay status caches from leaking across tests."""
     status_snapshot = dict(_session_status_cache)
     response_snapshot = dict(_session_active_response_cache)
+    _live_runner_probe_cooldown.clear()
+    _live_runner_reconcile_tasks.clear()
+    _runner_status_probe_backoff.clear()
+    _runner_status_probe_inflight.clear()
     yield
     _session_status_cache.clear()
     _session_status_cache.update(status_snapshot)
     _session_active_response_cache.clear()
     _session_active_response_cache.update(response_snapshot)
+    _live_runner_probe_cooldown.clear()
+    _live_runner_reconcile_tasks.clear()
+    _runner_status_probe_backoff.clear()
+    _runner_status_probe_inflight.clear()
 
 
 def _seed_live_idle_suspect(db_uri: str) -> tuple[str, str]:
@@ -120,7 +137,7 @@ def _seed_live_idle_suspect(db_uri: str) -> tuple[str, str]:
     return conv.id, runner_id
 
 
-# ── reconcile_orphaned_running_status helper ─────────────────────────────
+# ── reconcile_orphaned_running_status helper ───────────────────────────────
 
 
 def test_reconcile_is_conditional_and_marks_scheduled_run_incomplete(
@@ -159,7 +176,7 @@ def test_reconcile_is_conditional_and_marks_scheduled_run_incomplete(
     assert fresh.live_status == "running"
 
 
-# ── Facet 1: GET /v1/sessions settles orphaned "running" rows ────────────
+# ── Facet 1: GET /v1/sessions settles orphaned "running" rows ───────────────
 
 
 async def test_list_reconciles_orphaned_running_session(
@@ -191,7 +208,7 @@ async def test_list_leaves_running_session_with_fresh_runner(
     assert item["status"] == "running"
 
 
-# ── Facet 2: stop_session settles instead of false-succeeding ────────────
+# ── Facet 2: stop_session settles instead of false-succeeding ───────────────
 
 
 async def test_stop_reconciles_orphaned_running_session(
@@ -232,36 +249,7 @@ async def test_stop_leaves_running_session_with_fresh_runner(
     assert _session_status_cache.get(session_id) != "idle"
 
 
-# ── settle_live_runner_idle_status store method ─────────────────────────────
-
-
-def test_settle_live_runner_idle_status_transitions_on_runner_match(db_uri: str) -> None:
-    """A running row settles to idle on a matching runner, and the transition
-    is idempotent once the row is no longer running."""
-    sid, runner_id = _seed_live_idle_suspect(db_uri)
-    store = SqlAlchemyConversationStore(db_uri)
-
-    assert store.settle_live_runner_idle_status(sid, runner_id)
-    assert store.get_conversation(sid).live_status == "idle"  # type: ignore[union-attr]
-    assert not store.settle_live_runner_idle_status(sid, runner_id)
-
-
-def test_settle_live_runner_idle_status_guards_runner_and_failure(db_uri: str) -> None:
-    """A rebind to a different runner, or a terminal failed status, survives:
-    neither is overwritten by the probe-driven settle."""
-    store = SqlAlchemyConversationStore(db_uri)
-
-    sid, _ = _seed_live_idle_suspect(db_uri)
-    assert not store.settle_live_runner_idle_status(sid, "runner_other")
-    assert store.get_conversation(sid).live_status == "running"  # type: ignore[union-attr]
-
-    failed_sid, failed_runner = _seed_live_idle_suspect(db_uri)
-    store.set_session_live_status(failed_sid, "failed")
-    assert not store.settle_live_runner_idle_status(failed_sid, failed_runner)
-    assert store.get_conversation(failed_sid).live_status == "failed"  # type: ignore[union-attr]
-
-
-# ── reconcile_live_runner_idle_status helper (runner probe is the arbiter) ──
+# ── spawn_live_runner_idle_reconcile fires the shared runner status probe ───
 
 
 class _StubRunnerRouter:
@@ -277,84 +265,106 @@ class _StubRunnerRouter:
         return self._routed
 
 
-def _runner_client(status_code: int, runner_status: str | None = None) -> httpx.AsyncClient:
-    """An httpx client whose GET /v1/sessions/{id} returns a fixed snapshot."""
+def _runner_client(runner_status: str) -> httpx.AsyncClient:
+    """An httpx client whose GET /v1/sessions/{id} returns a fixed status."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         del request
-        if status_code == 404:
-            return httpx.Response(404, json={"error": "not_found"})
-        return httpx.Response(status_code, json={"status": runner_status})
+        return httpx.Response(200, json={"status": runner_status})
 
     return httpx.AsyncClient(base_url="http://runner", transport=httpx.MockTransport(handler))
 
 
+async def _drain_reconcile_tasks() -> None:
+    """Await every spawned fire-and-forget reconcile task."""
+    await asyncio.gather(*list(_live_runner_reconcile_tasks))
+
+
 @pytest.mark.parametrize(
-    ("status_code", "runner_status", "expect_settled"),
+    ("runner_status", "expected_cache"),
     [
-        (404, None, True),  # never initialized on the runner → no turn → settle
-        (200, "idle", True),  # initialized, no active turn → settle
-        (200, "running", False),  # a real in-flight turn → leave running
-        (200, "failed", False),  # terminal failure owned by the runner → leave
-        (500, None, False),  # inconclusive probe → leave running
+        ("idle", "idle"),  # the lost idle edge → settle the stuck row
+        ("waiting", "waiting"),
+        ("failed", "failed"),  # the runner owns a terminal failure → relay it
+        ("running", "running"),  # a real in-flight turn → leave running
     ],
 )
-async def test_reconcile_live_runner_idle_status_probe_outcomes(
+async def test_spawn_reconcile_relays_runner_status_to_cache(
     db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
-    status_code: int,
-    runner_status: str | None,
-    expect_settled: bool,
+    runner_status: str,
+    expected_cache: str,
 ) -> None:
-    """The runner's turn snapshot decides the settle: only a confirmed no-turn
-    state clears the stuck row; a live turn or any uncertainty leaves it."""
-    from omnigent.server import session_live_state
-
+    """The background probe rewrites the cached relay status from the runner's
+    own native-aware status read, so a lost-edge row settles to idle while a
+    genuinely running turn is confirmed and left running."""
     sid, runner_id = _seed_live_idle_suspect(db_uri)
-    store = SqlAlchemyConversationStore(db_uri)
-    completions: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        session_live_state,
-        "persist_scheduled_run_completion",
-        lambda conversation_id, status, **_: completions.append((conversation_id, status)),
+    client = _runner_client(runner_status)
+    router = cast(
+        RunnerRouter,
+        _StubRunnerRouter(RoutedRunner(runner_id=runner_id, client=client)),
     )
-
-    client = _runner_client(status_code, runner_status)
-    routed = RoutedRunner(runner_id=runner_id, client=client)
-    router = cast(RunnerRouter, _StubRunnerRouter(routed))
     try:
-        settled = await reconcile_live_runner_idle_status(sid, runner_id, store, router)
+        spawn_live_runner_idle_reconcile(sid, runner_id, router)
+        await _drain_reconcile_tasks()
     finally:
         await client.aclose()
 
-    assert settled is expect_settled
-    assert store.get_conversation(sid).live_status == (  # type: ignore[union-attr]
-        "idle" if expect_settled else "running"
-    )
-    if expect_settled:
-        assert _session_status_cache[sid] == "idle"
-        # The turn completed (its idle edge was lost), so the scheduled run
-        # succeeded — unlike the confirmed-gone path, which marks it incomplete.
-        assert completions == [(sid, "succeeded")]
-    else:
-        assert completions == []
+    assert _session_status_cache.get(sid) == expected_cache
 
 
-async def test_reconcile_live_runner_idle_status_leaves_unconfirmable_runner(
+async def test_spawn_reconcile_leaves_row_when_runner_unreachable(
     db_uri: str,
 ) -> None:
     """An offline runner (or one pinned to another replica) and an unpinned
-    conversation both leave the row running: no confirmation, no settle."""
+    conversation both leave the cached row running: no confirmation, no
+    rewrite, and the fire-and-forget task never raises out."""
     sid, runner_id = _seed_live_idle_suspect(db_uri)
-    store = SqlAlchemyConversationStore(db_uri)
 
     offline = cast(RunnerRouter, _StubRunnerRouter(OmnigentError("runner offline")))
-    assert not await reconcile_live_runner_idle_status(sid, runner_id, store, offline)
-    assert store.get_conversation(sid).live_status == "running"  # type: ignore[union-attr]
+    spawn_live_runner_idle_reconcile(sid, runner_id, offline)
+    await _drain_reconcile_tasks()
+    assert _session_status_cache.get(sid) == "running"
 
+    # Clear the cooldown the first spawn recorded so the unpinned control is
+    # actually dispatched rather than skipped as a repeat probe.
+    _live_runner_probe_cooldown.clear()
     unpinned = cast(RunnerRouter, _StubRunnerRouter(None))
-    assert not await reconcile_live_runner_idle_status(sid, runner_id, store, unpinned)
-    assert store.get_conversation(sid).live_status == "running"  # type: ignore[union-attr]
+    spawn_live_runner_idle_reconcile(sid, runner_id, unpinned)
+    await _drain_reconcile_tasks()
+    assert _session_status_cache.get(sid) == "running"
+
+
+async def test_spawn_reconcile_backs_off_within_cooldown(
+    db_uri: str,
+) -> None:
+    """A probe sets a per-session cooldown, so the next hot list poll within
+    the window skips re-probing the still-busy runner."""
+    sid, runner_id = _seed_live_idle_suspect(db_uri)
+    probes = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal probes
+        del request
+        probes += 1
+        return httpx.Response(200, json={"status": "running"})
+
+    client = httpx.AsyncClient(base_url="http://runner", transport=httpx.MockTransport(handler))
+    router = cast(
+        RunnerRouter,
+        _StubRunnerRouter(RoutedRunner(runner_id=runner_id, client=client)),
+    )
+    try:
+        spawn_live_runner_idle_reconcile(sid, runner_id, router)
+        await _drain_reconcile_tasks()
+        assert probes == 1
+        assert _live_runner_probe_cooldown.get(sid) is not None
+
+        # A second poll within the cooldown must not re-probe the busy runner.
+        spawn_live_runner_idle_reconcile(sid, runner_id, router)
+        await _drain_reconcile_tasks()
+        assert probes == 1
+    finally:
+        await client.aclose()
 
 
 # ── Facet 3: GET /v1/sessions hands lost-edge suspects to the probe ─────────

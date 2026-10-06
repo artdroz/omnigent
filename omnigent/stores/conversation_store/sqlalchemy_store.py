@@ -3773,34 +3773,6 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         return run_write_transaction(self._session_immediate, "settle_orphaned_live_status", write)
 
-    def settle_live_runner_idle_status(self, conversation_id: str, runner_id: str) -> bool:
-        """Settle a running/waiting row to idle after its live runner reports no turn."""
-
-        def write(session: Session) -> bool:
-            result = cast(
-                _RowCountResult,
-                session.execute(
-                    update(SqlConversationMetadata)
-                    .where(
-                        SqlConversationMetadata.workspace_id == current_workspace_id(),
-                        SqlConversationMetadata.id == conversation_id,
-                        SqlConversationMetadata.runner_id == runner_id,
-                        SqlConversationMetadata.live_status.in_(
-                            [
-                                encode_session_live_status("running"),
-                                encode_session_live_status("waiting"),
-                            ]
-                        ),
-                    )
-                    .values(live_status=encode_session_live_status("idle"))
-                ),
-            )
-            return result.rowcount == 1
-
-        return run_write_transaction(
-            self._session_immediate, "settle_live_runner_idle_status", write
-        )
-
     def set_pending_elicitation_count(self, conversation_id: str, count: int) -> None:
         """
         Persist the outstanding elicitation count for one session.

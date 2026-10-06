@@ -1589,14 +1589,9 @@ def register_core_routes(
             for conv in page.data
             if conv.agent_id is not None
         ]
-        # Fire-and-forget settle for a live runner whose terminal "idle" edge
-        # was lost (see reconcile_live_runner_idle_status). A suspect still
-        # reads running/waiting from THIS replica's relay cache (the lost-edge
-        # signature; a stale-runner cross-replica mirror miss is the orphan
-        # path's job above), tracks NO in-flight response id (a real turn always
-        # names one), has a fresh-heartbeat runner (the live case the orphan
-        # path skips), and is owned by the caller. The runner probe is the
-        # arbiter and runs off this hot poll, settling the row for the next poll.
+        # Fire-and-forget re-probe for a lost terminal-idle edge: a row still
+        # relay-cached running/waiting with no tracked response id, a fresh
+        # runner, owned by the caller (see spawn_live_runner_idle_reconcile).
         if runner_router is not None:
             for conv in page.data:
                 if (
@@ -1615,9 +1610,7 @@ def register_core_routes(
                         == LEVEL_OWNER
                     )
                 ):
-                    spawn_live_runner_idle_reconcile(
-                        conv.id, conv.runner_id, conversation_store, runner_router
-                    )
+                    spawn_live_runner_idle_reconcile(conv.id, conv.runner_id, runner_router)
         # Apart from the bounded orphan-suspect probe above, the list does not
         # compute per-item liveness
         # (runner_online / host_online). No list consumer reads it: the
