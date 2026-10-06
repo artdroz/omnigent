@@ -166,7 +166,9 @@ def _expect_take_ended(page: Page, **facts: Any) -> None:
             f"voice take survived the send: mic still listening after {_STOP_TIMEOUT_MS} ms;"
             f" observed {observed}"
         ) from exc
-    assert "live" not in page.evaluate(_MIC_TRACK_STATES_JS), "microphone tracks still live"
+    track_states = page.evaluate(_MIC_TRACK_STATES_JS)
+    assert track_states, "no microphone tracks were captured, so release is unverifiable"
+    assert "live" not in track_states, f"microphone tracks still live: {track_states}"
 
 
 def test_web_speech_take_ends_when_message_is_sent(
@@ -210,12 +212,15 @@ def test_web_speech_take_ends_when_message_is_sent(
             f"() => window.__fakeSpeechSay({json.dumps(_AFTER_SEND)})"
         )
 
+        # Confirm the take ended before snapshotting the recognizer, so the
+        # stop/abort it triggers is already recorded and the read can't race it.
+        _expect_take_ended(page, heard_after_send=heard_after_send)
+        assert not heard_after_send, "recognizer was still listening after the send"
+
         recognizer = page.evaluate(
             "() => ({starts: __fakeSpeech.starts, stops: __fakeSpeech.stops,"
             " aborts: __fakeSpeech.aborts, active: __fakeSpeech.active})"
         )
-        _expect_take_ended(page, heard_after_send=heard_after_send, recognizer=recognizer)
-        assert not heard_after_send, "recognizer was still listening after the send"
         assert recognizer["stops"] + recognizer["aborts"] >= 1, recognizer
         expect(composer).to_have_value("")
     finally:

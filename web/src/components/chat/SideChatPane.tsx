@@ -421,7 +421,6 @@ function SideChatComposer({
     const trimmed = text.trim();
     if (pending) {
       if (trimmed.length === 0 || starting || !onStart) return;
-      // A send ends any live voice take so the mic stops recording.
       micRef.current?.endTake();
       // Keep the text so a failed fork can be retried without re-typing.
       void onStart(
@@ -433,7 +432,6 @@ function SideChatComposer({
     }
     if (busy || (trimmed.length === 0 && files.length === 0) || agentId === null) return;
     const outgoing = files;
-    // A sent message ends any live voice take so the mic stops recording.
     micRef.current?.endTake();
     clearComposer(childId);
     void send(trimmed, agentId, outgoing.length > 0 ? outgoing : undefined, {

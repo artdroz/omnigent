@@ -671,9 +671,12 @@ describe("ComposerMicButton (server dictation)", () => {
 // Enter-commit handler, so without this the mic keeps recording after send.
 describe("ComposerMicButton (endTake)", () => {
   it("aborts a Web Speech take and keeps the dictated text (no discard)", () => {
+    const onTranscript = vi.fn();
     const onVoiceDiscard = vi.fn();
     const ref = createRef<ComposerMicButtonHandle>();
-    render(<ComposerMicButton ref={ref} onTranscript={vi.fn()} onVoiceDiscard={onVoiceDiscard} />);
+    render(
+      <ComposerMicButton ref={ref} onTranscript={onTranscript} onVoiceDiscard={onVoiceDiscard} />,
+    );
     const button = screen.getByRole("button", { name: "Voice dictation" });
     fireEvent.click(button);
     act(() => handlers.start?.({}));
@@ -691,6 +694,11 @@ describe("ComposerMicButton (endTake)", () => {
     // button settles back to idle.
     act(() => handlers.end?.({}));
     expect(button).toHaveAttribute("aria-pressed", "false");
+
+    // A final the engine had already queued before abort() must be dropped, not
+    // flushed into the composer the parent just cleared on send.
+    act(() => handlers.result?.(resultEvent("trailing words")));
+    expect(onTranscript).not.toHaveBeenCalled();
   });
 
   it("is a no-op when no take is in progress", () => {
@@ -727,6 +735,13 @@ describe("ComposerMicButton (endTake)", () => {
     expect(sessionStopMock).not.toHaveBeenCalled();
     expect(onTranscript).not.toHaveBeenCalledWith("tail words");
     expect(button).toHaveAttribute("aria-pressed", "false");
+
+    // A final the session had already queued before cancel() must not flush
+    // into the composer the parent just cleared on send.
+    act(() => {
+      sessionEvents?.onFinal("late final");
+    });
+    expect(onTranscript).not.toHaveBeenCalled();
   });
 
   it("discards a server take ended mid-handshake instead of letting it go live", async () => {
@@ -763,6 +778,47 @@ describe("ComposerMicButton (endTake)", () => {
     expect(sessionCancelMock).toHaveBeenCalledTimes(1);
     expect(sessionStopMock).not.toHaveBeenCalled();
     expect(button).toHaveAttribute("aria-busy", "false");
+    expect(button).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("drops the tail from an in-flight server stop ended on send", async () => {
+    vi.stubGlobal("SpeechRecognition", undefined);
+    vi.stubGlobal("webkitSpeechRecognition", undefined);
+    const onTranscript = vi.fn();
+    // Hold session.stop() open so the send (endTake) lands while the stop is
+    // still pending and no session is attached — the race the fix closes.
+    let resolveStop!: (tail: string) => void;
+    sessionStopMock = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveStop = resolve;
+        }),
+    );
+    const ref = createRef<ComposerMicButtonHandle>();
+    render(
+      <CapabilitiesContext.Provider value={DICTATION_INFO}>
+        <ComposerMicButton ref={ref} onTranscript={onTranscript} />
+      </CapabilitiesContext.Provider>,
+    );
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+    await clickMic();
+    expect(button).toHaveAttribute("aria-pressed", "true");
+
+    // Tap the mic again to end the take: this begins the stop, but its promise
+    // stays pending, so the session is detached and serverBusyRef stays set.
+    await act(async () => {
+      fireEvent.click(button);
+    });
+    expect(sessionStopMock).toHaveBeenCalledTimes(1);
+
+    // The parent's Send lands while the stop is still in flight.
+    act(() => ref.current?.endTake());
+
+    // Resolving the stop with a trailing tail must not repopulate the composer.
+    await act(async () => {
+      resolveStop("tail words");
+    });
+    expect(onTranscript).not.toHaveBeenCalledWith("tail words");
     expect(button).toHaveAttribute("aria-pressed", "false");
   });
 });

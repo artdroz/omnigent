@@ -389,9 +389,10 @@ function ComposerMicButtonImpl(
     if (session) {
       sessionRef.current = null;
       const tail = (await session.stop()).trim();
-      if (!disabledRef.current) {
-        // A non-empty tail supersedes the pending interim via
-        // onTranscript; an empty one just clears the interim region.
+      if (!disabledRef.current && !discardingRef.current) {
+        // A non-empty tail supersedes the pending interim via onTranscript; an
+        // empty one just clears the interim region. discardingRef suppresses the
+        // tail when the take was ended on send while this stop was in flight.
         if (tail) onTranscriptRef.current(tail);
         else onInterimRef.current?.("");
       }
@@ -461,10 +462,11 @@ function ComposerMicButtonImpl(
       );
       setIsListening(false);
     }
-    // Reached only by the start path (the stop branch returns earlier), so this
-    // clears the handshake spinner on both success and failure.
+    // Reached only by the start path (the stop branch returns earlier). Clear
+    // the handshake spinner and reconcile endPendingRef on success and failure.
     setConnecting(false);
     serverBusyRef.current = false;
+    endPendingRef.current = false;
   }, [reportError]);
   toggleServerRef.current = toggleServer;
 
@@ -500,25 +502,31 @@ function ComposerMicButtonImpl(
   }, [isListening, Ctor, serverAvailable, toggleServer]);
 
   // End an in-progress take without flushing a trailing utterance into the
-  // composer the parent just cleared on send.
+  // composer the parent just cleared on send. discardingRef drops a result that
+  // lands after teardown; the next take clears it (like the Esc discard).
   const endTake = useCallback(() => {
     const session = sessionRef.current;
     if (session) {
       sessionRef.current = null;
       serverBusyRef.current = false;
+      discardingRef.current = true;
       session.cancel();
       setIsListening(false);
       return;
     }
-    // A server take may still be mid-handshake (session not yet attached):
-    // flag it so toggleServer discards the session it is about to open.
+    // No session attached yet: the take is mid-handshake or mid-stop.
+    // endPendingRef discards a session about to open; discardingRef drops an
+    // in-flight stop's trailing tail.
     if (serverBusyRef.current) {
       endPendingRef.current = true;
+      discardingRef.current = true;
       return;
     }
     if (!isListening && !transitionRef.current) return;
     try {
-      // abort() discards buffered audio so a trailing final can't flush.
+      // abort() discards buffered audio; discardingRef drops a final that still
+      // fires before the abort lands.
+      discardingRef.current = true;
       recognitionRef.current?.abort();
     } catch {
       // Already stopping — the end event will reconcile state.
