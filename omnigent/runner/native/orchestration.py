@@ -8698,6 +8698,13 @@ async def _auto_create_claude_terminal(
                         str(catalog_default.get("model") or catalog_default.get("id") or "")
                         or None
                     )
+    # Opt a managed 1M-capable Opus/Sonnet launch into the [1m] window Claude Code
+    # otherwise caps at 200K. It marks only the resolved launch model, never the
+    # config env pins or the probe/catalog the launch gate folds bare picks against.
+    if claude_config is not None and launch_model:
+        from omnigent.models.claude_model_vocabulary import model_id_with_1m_marker
+
+        launch_model = model_id_with_1m_marker(launch_model)
     # Give an exact launch model (a Smart Routing pick is resolved before the
     # terminal exists) a spelling of its own in the picker, so a later
     # ``/model`` can return to it instead of stepping onto whatever the family
