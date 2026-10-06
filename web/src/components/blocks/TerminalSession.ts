@@ -266,11 +266,8 @@ export const CTRL_SLASH_UNIT_SEPARATOR = "\x1f";
  *   Each maps to the Ctrl control character a native terminal sends. Only
  *   bare Cmd combos are mapped: Cmd+C/V/K/R and friends keep their
  *   browser/xterm meaning (copy/paste/clear/reload).
- * - **Ctrl+/** — xterm's Ctrl table covers letters, Space, 3–8 and the
- *   bracket keys but not `/`, so the chord yields no bytes and its keydown
- *   bubbles on to the app's Ctrl+/ shortcuts-dialog hotkey. A native terminal
- *   sends `0x1F`, the byte TUIs such as Codex bind (its side-conversation
- *   toggle, aliased to Ctrl+7 for that reason).
+ * - **Ctrl+/** — xterm's Ctrl table has no entry for `/`, so the chord yields
+ *   no bytes. Send `0x1F`, the native terminal byte shared with Ctrl+7 / Ctrl+_.
  *
  * :param event: Browser keyboard event from xterm's custom key handler.
  * :returns: Bytes to send instead of xterm's default handling, or ``null``
@@ -855,10 +852,9 @@ export class TerminalSession {
     this.term.attachCustomKeyEventHandler((e) => {
       const payload = terminalKeyEventPayload(e);
       if (payload === null) return true;
-      // xterm invokes this handler for keydown, keypress, and keyup.
-      // Suppress all three so xterm cannot also send its own bytes; emit
-      // the payload once, on keydown. preventDefault also marks the chord
-      // as claimed for the app's window-level hotkeys, which yield to it.
+      // xterm invokes this handler for keydown, keypress, and keyup. Suppress
+      // all three so xterm cannot also send its own bytes; emit the payload once,
+      // on keydown. preventDefault also tells the window-level hotkeys to yield.
       if (e.type === "keydown") {
         e.preventDefault();
         onInput?.();
