@@ -2209,20 +2209,6 @@ def register_core_routes(
         body: UpdateSessionRequest,
         include_usage: bool = Query(default=True),
     ) -> SessionResponse:
-        """Apply a session PATCH; see :func:`_update_session` for the field semantics."""
-        # A live effort/model change must read the settings its predecessor confirmed
-        # or restored; otherwise a refusal can restore a value Codex never applied.
-        if not body.silent and {"reasoning_effort", "model_override"} & body.model_fields_set:
-            async with _session_settings_lock(session_id):
-                return await _update_session(request, session_id, body, include_usage)
-        return await _update_session(request, session_id, body, include_usage)
-
-    async def _update_session(
-        request: Request,
-        session_id: str,
-        body: UpdateSessionRequest,
-        include_usage: bool,
-    ) -> SessionResponse:
         """
         Update a session's mutable fields. When ``runner_id`` is
         provided, this is the mutable affinity primitive for the Alpha
@@ -2246,6 +2232,20 @@ def register_core_routes(
         :raises OmnigentError: 400 if the runner is not
             registered; 404 if no session exists.
         """
+        # A live effort/model change must read the settings its predecessor confirmed
+        # or restored; otherwise a refusal can restore a value Codex never applied.
+        if not body.silent and {"reasoning_effort", "model_override"} & body.model_fields_set:
+            async with _session_settings_lock(session_id):
+                return await _update_session(request, session_id, body, include_usage)
+        return await _update_session(request, session_id, body, include_usage)
+
+    async def _update_session(
+        request: Request,
+        session_id: str,
+        body: UpdateSessionRequest,
+        include_usage: bool,
+    ) -> SessionResponse:
+        """Apply the PATCH that :func:`update_session` documents."""
         user_id = _get_user_id(request, auth_provider)
         if body.delete_worktree and body.archived is not True:
             raise OmnigentError(
