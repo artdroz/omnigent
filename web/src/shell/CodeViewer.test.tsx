@@ -7,7 +7,7 @@ import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 import { highlightCode } from "@/components/ai-elements/code-block";
 
-const pdfRendering = vi.hoisted(() => ({ error: null as Error | null }));
+const pdfRendering = vi.hoisted(() => ({ error: null as Error | null, mounts: 0 }));
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
@@ -28,14 +28,20 @@ vi.mock("./MonacoCodeEditor", () => ({
 // Stub the lazy PdfViewer so react-pdf / the pdf.js worker (no PDF engine in
 // jsdom) never load; its testid presence is the signal that a file was routed
 // to the PDF surface.
-vi.mock("./PdfViewer", () => ({
-  PdfViewer: ({ comments }: { comments: Comment[] }) => {
-    if (pdfRendering.error) throw pdfRendering.error;
-    return (
-      <div data-testid="pdf-viewer-stub" data-comment-ids={comments.map((c) => c.id).join(",")} />
-    );
-  },
-}));
+vi.mock("./PdfViewer", async () => {
+  const { useEffect } = await import("react");
+  return {
+    PdfViewer: ({ comments }: { comments: Comment[] }) => {
+      useEffect(() => {
+        pdfRendering.mounts += 1;
+      }, []);
+      if (pdfRendering.error) throw pdfRendering.error;
+      return (
+        <div data-testid="pdf-viewer-stub" data-comment-ids={comments.map((c) => c.id).join(",")} />
+      );
+    },
+  };
+});
 // Stub the lazy ModelViewer so the heavy three.js bundle isn't loaded in jsdom
 // (which has no WebGL); its presence in the DOM is the signal that a model file
 // was routed to the 3D preview instead of the binary-rejection placeholder.
@@ -878,10 +884,10 @@ describe("CodeViewer image rendering", () => {
 });
 
 describe("CodeViewer PDF routing", () => {
-  function brokenPdfProps(): CodeViewerProps {
+  function pdfProps(): CodeViewerProps {
     return {
       conversationId: "conv_1",
-      path: "broken.pdf",
+      path: "report.pdf",
       fileQuery: makePdfQuery(),
       comments: [],
       activeSelection: null,
@@ -904,14 +910,19 @@ describe("CodeViewer PDF routing", () => {
       if (event.error === error) event.preventDefault();
     };
     window.addEventListener("error", suppressExpectedError);
-    const view = render(<CodeViewer {...props} />);
-    expect(await screen.findByRole("alert")).toHaveTextContent("Unable to render PDF.");
-    pdfRendering.error = null;
     const teardown = () => {
       pdfRendering.error = null;
       window.removeEventListener("error", suppressExpectedError);
       log.mockRestore();
     };
+    const view = render(<CodeViewer {...props} />);
+    try {
+      expect(await screen.findByRole("alert")).toHaveTextContent("Unable to render PDF.");
+    } catch (failure) {
+      teardown();
+      throw failure;
+    }
+    pdfRendering.error = null;
     return { ...view, teardown };
   }
 
@@ -923,7 +934,7 @@ describe("CodeViewer PDF routing", () => {
     ],
     ["new content arrives for the same file", (props) => ({ ...props, fileQuery: makePdfQuery() })],
   ])("recovers from a PDF render failure when %s", async (_case, next) => {
-    const props = brokenPdfProps();
+    const props = pdfProps();
     const { rerender, teardown } = await renderFailedPdf(props);
     try {
       rerender(<CodeViewer {...next(props)} />);
@@ -935,7 +946,7 @@ describe("CodeViewer PDF routing", () => {
   });
 
   it("keeps a PDF render failure when the same file re-renders unchanged", async () => {
-    const props = brokenPdfProps();
+    const props = pdfProps();
     const { rerender, teardown } = await renderFailedPdf(props);
     try {
       rerender(<CodeViewer {...props} />);
@@ -944,6 +955,18 @@ describe("CodeViewer PDF routing", () => {
     } finally {
       teardown();
     }
+  });
+
+  it("keeps a healthy PDF viewer mounted when new content arrives for the same file", async () => {
+    const props = pdfProps();
+    pdfRendering.mounts = 0;
+    const { rerender } = render(<CodeViewer {...props} />);
+    expect(await screen.findByTestId("pdf-viewer-stub")).toBeInTheDocument();
+    expect(pdfRendering.mounts).toBe(1);
+
+    rerender(<CodeViewer {...props} fileQuery={makePdfQuery()} />);
+    expect(await screen.findByTestId("pdf-viewer-stub")).toBeInTheDocument();
+    expect(pdfRendering.mounts).toBe(1);
   });
 
   function renderPdf(
