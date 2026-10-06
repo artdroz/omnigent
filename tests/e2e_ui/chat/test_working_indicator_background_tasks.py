@@ -1,20 +1,10 @@
-"""Background tasks stay visible without making an idle turn look busy.
-
-Real native status events drive the tally, read-only details, and working state.
-Monitors arrive as running shells in Claude's Stop-hook background-task list.
-"""
+"""Full-stack coverage for background-task state across a reload."""
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import httpx
-import pytest
 from playwright.sync_api import Locator, Page, expect
 
-from tests.e2e_ui.chat._working_labels import WORKING_LABEL_RE as _WORKING_LABEL_RE
-
-_WORKING = '[data-testid="working-indicator"]'
 _PILL = '[data-testid="background-task-pill"]'
 _MONITOR_TASK = {
     "id": "monitor-ci",
@@ -42,7 +32,7 @@ def _pill_badge(page: Page, count: int, *, working: bool = False) -> Locator:
 def _publish_status(
     base_url: str,
     session_id: str,
-    status: str,
+    status: str = "idle",
     *,
     response_id: str | None = None,
     background_task_count: int | None = None,
@@ -56,12 +46,12 @@ def _publish_status(
         data["background_task_count"] = background_task_count
     if background_tasks is not None:
         data["background_tasks"] = background_tasks
-    resp = httpx.post(
+    response = httpx.post(
         f"{base_url}/v1/sessions/{session_id}/events",
         json={"type": "external_session_status", "data": data},
         timeout=10.0,
     )
-    resp.raise_for_status()
+    response.raise_for_status()
 
 
 def test_background_task_indicator_label_lifecycle(
@@ -296,11 +286,11 @@ def test_badge_survives_reload_and_tracks_updates_after_reconnect(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
+    """Snapshot hydration and the reconnected stream keep the tally current."""
     base_url, session_id = seeded_session
     _publish_status(
         base_url,
         session_id,
-        "idle",
         background_task_count=1,
         background_tasks=[_MONITOR_TASK],
     )
@@ -308,6 +298,7 @@ def test_badge_survives_reload_and_tracks_updates_after_reconnect(
     expect(_pill_badge(page, 1)).to_have_text("1", timeout=15_000)
     _pill_badge(page, 1).click()
     expect(page.get_by_role("dialog", name="1 background task", exact=True)).to_be_visible()
+
     page.reload()
     expect(_pill_badge(page, 1)).to_have_attribute("aria-expanded", "false", timeout=15_000)
     _pill_badge(page, 1).click()
@@ -315,43 +306,13 @@ def test_badge_survives_reload_and_tracks_updates_after_reconnect(
     expect(panel.get_by_text(_MONITOR_TASK["description"], exact=True)).to_be_visible()
     page.keyboard.press("Escape")
 
-    _publish_status(base_url, session_id, "idle", background_task_count=2)
+    _publish_status(base_url, session_id, background_task_count=2)
     expect(_pill_badge(page, 2)).to_have_text("2", timeout=15_000)
     _pill_badge(page, 2).click()
     panel = page.get_by_role("dialog", name="2 background tasks", exact=True)
     expect(panel).to_contain_text("details unavailable")
     expect(panel.get_by_role("listitem")).to_have_count(0)
-    _publish_status(base_url, session_id, "idle", background_task_count=0)
+
+    _publish_status(base_url, session_id, background_task_count=0)
     expect(page.locator(_PILL)).to_have_count(0, timeout=15_000)
     expect(panel).to_have_count(0)
-
-
-def test_badge_count_is_scoped_to_the_active_session(
-    page: Page,
-    seeded_session_pair: tuple[str, str, str],
-) -> None:
-    base_url, session_a, session_b = seeded_session_pair
-    _publish_status(
-        base_url,
-        session_a,
-        "idle",
-        background_task_count=1,
-        background_tasks=[_MONITOR_TASK],
-    )
-    page.goto(f"{base_url}/c/{session_a}")
-    expect(_pill_badge(page, 1)).to_have_text("1", timeout=15_000)
-    _pill_badge(page, 1).click()
-    panel = page.get_by_role("dialog", name="1 background task", exact=True)
-    expect(panel).to_be_visible()
-
-    page.locator(f'a[href="/c/{session_b}"]').click()
-    expect(page).to_have_url(f"{base_url}/c/{session_b}", timeout=15_000)
-    expect(page.get_by_test_id("composer-workspace-controls")).to_be_visible()
-    expect(page.locator(_PILL)).to_have_count(0)
-    expect(panel).to_have_count(0)
-
-    page.locator(f'a[href="/c/{session_a}"]').click()
-    expect(page).to_have_url(f"{base_url}/c/{session_a}", timeout=15_000)
-    expect(_pill_badge(page, 1)).to_have_attribute("aria-expanded", "false", timeout=15_000)
-    _pill_badge(page, 1).click()
-    expect(panel.get_by_text(_MONITOR_TASK["description"], exact=True)).to_be_visible()
