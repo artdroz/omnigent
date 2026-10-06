@@ -14,6 +14,14 @@ LAST_TASK_ERROR_MESSAGE_LABEL_KEY = "omnigent.last_task_error_message"
 session_status_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
+def has_durable_task_error(labels: Mapping[str, str]) -> bool:
+    """Whether a failure is recorded as both a durable code and message label."""
+    return bool(
+        labels.get(LAST_TASK_ERROR_CODE_LABEL_KEY)
+        and labels.get(LAST_TASK_ERROR_MESSAGE_LABEL_KEY)
+    )
+
+
 def resolve_child_session_status(
     session_id: str,
     durable_status: str | None,
@@ -22,9 +30,7 @@ def resolve_child_session_status(
     cached_status: str | None = None,
 ) -> SessionLiveStatus | None:
     """Prefer a durable failure, then a known relay-cache value, then the stored row."""
-    if labels.get(LAST_TASK_ERROR_CODE_LABEL_KEY) and labels.get(
-        LAST_TASK_ERROR_MESSAGE_LABEL_KEY
-    ):
+    if has_durable_task_error(labels):
         return "failed"
     if cached_status is None:
         cached_status = session_status_cache.get(session_id)

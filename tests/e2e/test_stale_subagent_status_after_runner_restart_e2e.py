@@ -187,10 +187,10 @@ def test_supervisor_sees_stopped_subagent_status_after_runner_restart(
     restart_live_runner()
 
     def child_settled() -> bool:
-        for child in _child_sessions(http_client, parent_id):
-            if str(child["id"]) == child_id:
-                return not child.get("busy") and child.get("current_task_status") != "in_progress"
-        return False
+        children = _child_sessions(http_client, parent_id)
+        row = next((c for c in children if str(c["id"]) == child_id), None)
+        assert row is not None, f"child {child_id} vanished from the parent's listing: {children}"
+        return not row.get("busy") and row.get("current_task_status") != "in_progress"
 
     _wait(child_settled, timeout=120, what="the interrupted child to leave the running state")
 

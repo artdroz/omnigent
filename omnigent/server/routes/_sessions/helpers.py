@@ -100,7 +100,10 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.engine import PolicyEngine
-from omnigent.runtime.session_status import resolve_child_session_status
+from omnigent.runtime.session_status import (
+    has_durable_task_error,
+    resolve_child_session_status,
+)
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server import presence, session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
@@ -5121,25 +5124,25 @@ def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | 
         field (``agent_name``, ``title``, ``cause``, ``remediation``, ``item_id``),
         or ``None`` when either required value is absent/cleared.
     """
-    raw_error_code = labels.get(_LAST_TASK_ERROR_CODE_LABEL_KEY)
-    raw_error_message = labels.get(_LAST_TASK_ERROR_MESSAGE_LABEL_KEY)
-    if raw_error_code and raw_error_message:
-        error: dict[str, str] = {
-            "code": classify_native_turn_error(raw_error_code, raw_error_message),
-            "message": raw_error_message,
-        }
-        for key, label in (
-            ("agent_name", _LAST_TASK_ERROR_AGENT_NAME_LABEL_KEY),
-            ("title", _LAST_TASK_ERROR_TITLE_LABEL_KEY),
-            ("cause", _LAST_TASK_ERROR_CAUSE_LABEL_KEY),
-            ("remediation", _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY),
-            ("item_id", _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY),
-        ):
-            value = labels.get(label)
-            if value:
-                error[key] = value
-        return error
-    return None
+    if not has_durable_task_error(labels):
+        return None
+    raw_error_code = labels[_LAST_TASK_ERROR_CODE_LABEL_KEY]
+    raw_error_message = labels[_LAST_TASK_ERROR_MESSAGE_LABEL_KEY]
+    error: dict[str, str] = {
+        "code": classify_native_turn_error(raw_error_code, raw_error_message),
+        "message": raw_error_message,
+    }
+    for key, label in (
+        ("agent_name", _LAST_TASK_ERROR_AGENT_NAME_LABEL_KEY),
+        ("title", _LAST_TASK_ERROR_TITLE_LABEL_KEY),
+        ("cause", _LAST_TASK_ERROR_CAUSE_LABEL_KEY),
+        ("remediation", _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY),
+        ("item_id", _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY),
+    ):
+        value = labels.get(label)
+        if value:
+            error[key] = value
+    return error
 
 
 def _publish_terminal_pending(session_id: str, pending: bool) -> None:
