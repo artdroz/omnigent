@@ -176,6 +176,9 @@ _CODEX_HOME_HARDLINK_FILES = (".credentials.json",)
 _CODEX_CREDENTIAL_COPY_FALLBACK_ERRNOS = frozenset(
     {errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP, errno.EMLINK}
 )
+# Sidecar recording the inode Omnigent bridged for a credential store, so a
+# store Codex created inside the session is never relinked or removed.
+_CODEX_CREDENTIAL_BRIDGE_MARKER_SUFFIX = ".omnigent-bridge"
 # Lock-dir companion for ``.credentials.json``, symlinked into the private
 # home; its target parent is the durable pointer to a custom source home,
 # since a hard-linked store records no path back to its source.
@@ -1084,13 +1087,70 @@ def codex_minimal_config_requested() -> bool:
     return os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {"1", "true", "yes"}
 
 
+def _codex_credential_bridge_marker(dest_path: Path) -> Path:
+    """
+    Return the provenance marker path for a bridged credential store.
+
+    :param dest_path: The store inside the private ``CODEX_HOME``.
+    :returns: Its sidecar, e.g. ``<home>/.credentials.json.omnigent-bridge``.
+    """
+    return dest_path.with_name(f"{dest_path.name}{_CODEX_CREDENTIAL_BRIDGE_MARKER_SUFFIX}")
+
+
+def _record_codex_credential_bridge(dest_path: Path) -> None:
+    """
+    Record ``dest_path``'s inode as a store Omnigent bridged.
+
+    Codex rewrites the store in place, so the inode survives token refreshes,
+    while a store Codex creates itself gets a new one. Best effort: without a
+    record the store is only ever preserved, never relinked or removed.
+
+    :param dest_path: The bridged store inside the private ``CODEX_HOME``.
+    """
+    marker = _codex_credential_bridge_marker(dest_path)
+    try:
+        identity = dest_path.stat()
+        fd, tmp_name = tempfile.mkstemp(prefix=f"{marker.name}.", dir=str(marker.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"dev": identity.st_dev, "ino": identity.st_ino}, handle)
+            os.replace(tmp_name, marker)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+    except OSError as exc:
+        logger.warning("could not record credential bridge %s (%s)", marker, exc)
+
+
+def _is_recorded_codex_credential_bridge(dest_path: Path) -> bool:
+    """
+    Report whether ``dest_path`` is still the store Omnigent bridged there.
+
+    :param dest_path: A regular-file store inside the private ``CODEX_HOME``.
+    :returns: ``True`` only when the recorded inode matches; a missing or
+        unreadable record means the store's provenance is unknown.
+    """
+    try:
+        recorded = json.loads(_codex_credential_bridge_marker(dest_path).read_text())
+        identity = dest_path.stat()
+    except (OSError, ValueError):
+        return False
+    return (
+        isinstance(recorded, dict)
+        and recorded.get("dev") == identity.st_dev
+        and recorded.get("ino") == identity.st_ino
+    )
+
+
 def _bridge_codex_credential_store(source_file: Path, dest_path: Path) -> None:
     """
     Bridge a Codex credential store that Codex rewrites with ``O_NOFOLLOW``.
 
     A hard link keeps both names on one inode, so a token refresh in either
     place is visible to both, as the former symlink was. When hard links are
-    impossible on this filesystem fall back to a private copy.
+    impossible on this filesystem fall back to a private copy. Either way the
+    bridged inode is recorded so later populates can tell it apart from a
+    store Codex creates inside the session.
 
     :param source_file: The real store, e.g. ``~/.codex/.credentials.json``.
     :param dest_path: Its path inside the private ``CODEX_HOME``.
@@ -1130,18 +1190,19 @@ def _bridge_codex_credential_store(source_file: Path, dest_path: Path) -> None:
         except OSError:
             staging.unlink(missing_ok=True)
             raise
+    _record_codex_credential_bridge(dest_path)
 
 
 def _relink_rotated_codex_credential_store(source_file: Path, dest_path: Path) -> None:
     """
     Re-point a bridged credential store orphaned by a source rotation.
 
-    An intact hard link already shares the source inode and is left alone. A
-    cross-filesystem copy holds tokens refreshed only in this session, so it is
-    preserved. A same-filesystem store on a different inode is a hard link
-    orphaned by a delete-then-recreate login; relink it to the current store so
-    the session stops serving revoked tokens. Linking succeeds only in that
-    same-filesystem case, which is exactly when relinking is the right choice.
+    An intact hard link already shares the source inode and is left alone.
+    Otherwise only a store recorded as Omnigent's bridge is replaced: a hard
+    link orphaned by a delete-then-recreate login is relinked so the session
+    stops serving revoked tokens, while a recorded copy stays because linking
+    fails on its filesystem. A store Codex created inside the session has no
+    record and keeps its own tokens.
 
     This repairs the link at population time; a session already running on an
     orphaned link keeps it until restart, while in-place refreshes stay shared
@@ -1152,7 +1213,12 @@ def _relink_rotated_codex_credential_store(source_file: Path, dest_path: Path) -
     """
     with suppress(OSError):
         if os.path.samefile(source_file, dest_path):
+            if not _is_recorded_codex_credential_bridge(dest_path):
+                # Sharing the source inode proves the bridge; restore its record.
+                _record_codex_credential_bridge(dest_path)
             return
+    if not _is_recorded_codex_credential_bridge(dest_path):
+        return
     staging = dest_path.with_name(f"{dest_path.name}.relink")
     staging.unlink(missing_ok=True)
     try:
@@ -1164,6 +1230,7 @@ def _relink_rotated_codex_credential_store(source_file: Path, dest_path: Path) -
     except OSError:
         staging.unlink(missing_ok=True)
         raise
+    _record_codex_credential_bridge(dest_path)
 
 
 def _populate_codex_home_config(
@@ -1290,6 +1357,12 @@ def _populate_codex_home_config(
                 dest_path.unlink()
             source_file = source_dir / filename
             if not source_file.is_file():
+                if _is_recorded_codex_credential_bridge(dest_path):
+                    # The host store was removed (e.g. a logout): stop serving its
+                    # tokens, as the former symlink would have. Unrecorded stores
+                    # were created inside the session and are kept.
+                    dest_path.unlink(missing_ok=True)
+                _codex_credential_bridge_marker(dest_path).unlink(missing_ok=True)
                 continue
             if dest_path.exists():
                 _relink_rotated_codex_credential_store(source_file, dest_path)

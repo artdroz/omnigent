@@ -3858,6 +3858,84 @@ def test_populate_codex_home_config_rebridges_rotated_remote_mcp_oauth_store(
     assert json.loads(bridged.read_text()) == {"linear|abc": {"access_token": "new"}}
 
 
+def test_populate_codex_home_config_preserves_session_created_oauth_store_when_source_absent(
+    tmp_path: Path,
+) -> None:
+    """A store Codex created inside the session survives a cold-resume repopulate.
+
+    With no host store to bridge, a remote-MCP login inside the session makes
+    Codex create its own ``.credentials.json`` in the private home, on the same
+    filesystem. Nothing records it as a bridge, so repopulating the reused home
+    must keep its contents and inode instead of treating it as orphaned.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    target = tmp_path / "persistent_codex_home"
+    target.mkdir()
+    _populate_codex_home_config(target, source)
+    session_store = target / ".credentials.json"
+    session_store.write_text('{"linear|abc": {"access_token": "session"}}')
+    inode = session_store.stat().st_ino
+
+    _populate_codex_home_config(target, source)
+
+    assert session_store.read_text() == '{"linear|abc": {"access_token": "session"}}'
+    assert session_store.stat().st_ino == inode
+
+
+def test_populate_codex_home_config_keeps_session_created_store_when_host_logs_in(
+    tmp_path: Path,
+) -> None:
+    """A later host login does not replace a store Codex created in the session.
+
+    The session store holds its own MCP logins, so swapping in the host's
+    store would drop them. Without a bridge record it is left alone.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    target = tmp_path / "persistent_codex_home"
+    target.mkdir()
+    session_store = target / ".credentials.json"
+    session_store.write_text('{"linear|abc": {"access_token": "session"}}')
+    (source / ".credentials.json").write_text('{"github|def": {"access_token": "host"}}')
+
+    _populate_codex_home_config(target, source)
+
+    assert session_store.read_text() == '{"linear|abc": {"access_token": "session"}}'
+    assert not os.path.samefile(session_store, source / ".credentials.json")
+
+
+def test_populate_codex_home_config_discards_orphaned_bridge_after_source_removal(
+    tmp_path: Path,
+) -> None:
+    """A recorded bridge is dropped once the host store it mirrors is removed.
+
+    After a host-side logout deletes ``~/.codex/.credentials.json``, a reused
+    home's hard link would keep serving those tokens. The former symlink
+    would have dangled instead, so the recorded bridge and its marker go.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    store = source / ".credentials.json"
+    store.write_text('{"linear|abc": {"access_token": "t"}}')
+    target = tmp_path / "persistent_codex_home"
+    target.mkdir()
+    _populate_codex_home_config(target, source)
+    assert os.path.samefile(target / ".credentials.json", store)
+
+    store.unlink()
+    _populate_codex_home_config(target, source)
+
+    assert not (target / ".credentials.json").exists()
+    assert not (target / ".credentials.json.omnigent-bridge").exists()
+
+
 @pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="requires O_NOFOLLOW")
 def test_populate_codex_home_config_migrates_legacy_credential_symlink(
     tmp_path: Path,
@@ -4193,7 +4271,10 @@ def test_relink_rotated_credential_store_cleans_staging_on_replace_failure(
     orphaned store. If the rename fails, the ``.relink`` staging file must not
     be left behind, and the error must surface.
     """
-    from omnigent.inner.codex_executor import _relink_rotated_codex_credential_store
+    from omnigent.inner.codex_executor import (
+        _record_codex_credential_bridge,
+        _relink_rotated_codex_credential_store,
+    )
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
@@ -4202,6 +4283,7 @@ def test_relink_rotated_credential_store_cleans_staging_on_replace_failure(
     dest = tmp_path / "persistent_codex_home" / ".credentials.json"
     dest.parent.mkdir()
     dest.write_text('{"linear|old": {"access_token": "t1"}}')
+    _record_codex_credential_bridge(dest)
 
     def _blocked_replace(*args: object, **kwargs: object) -> None:
         raise OSError(errno.EACCES, "permission denied")
