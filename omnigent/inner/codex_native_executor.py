@@ -34,6 +34,7 @@ from omnigent.harnesses.codex_native.bridge import (
     cancel_pending_mcp_startup,
     clear_active_turn_id_if_matches,
     mcp_startup_waiting_detail,
+    mirror_applied_codex_settings,
     read_bridge_startup_error,
     read_bridge_startup_failure,
     read_bridge_startup_timeout,
@@ -43,8 +44,6 @@ from omnigent.harnesses.codex_native.bridge import (
     read_mcp_startup,
     read_unmirrored_codex_settings,
     update_active_turn_id,
-    write_codex_config_effort,
-    write_codex_config_model,
 )
 from omnigent.inner.codex_goal_command import (
     goal_objective_from_content,
@@ -216,26 +215,16 @@ async def _start_codex_turn(
                 **settings_overrides,
             },
         )
-        switched_model = settings_overrides.get("model")
-        if isinstance(switched_model, str) and switched_model:
-            if not write_codex_config_model(bridge_dir, switched_model):
-                _logger.warning(
-                    "Failed to mirror codex model switch into config.toml: model=%s",
-                    switched_model,
-                )
-        # Mirror an applied effort the same way (after the model write, whose
-        # clamp may have rewritten the stale effort line): the forwarder's
-        # effort mirror treats config.toml as the source of truth, and a fresh
-        # forwarder state (thread resume / reconnect) re-reads it — without
-        # this write it would revert a composer-picked effort to the stale
-        # launch value.
-        switched_effort = settings_overrides.get("effort")
-        if isinstance(switched_effort, str) and switched_effort:
-            if not write_codex_config_effort(bridge_dir, switched_effort):
-                _logger.warning(
-                    "Failed to mirror codex effort switch into config.toml: effort=%s",
-                    switched_effort,
-                )
+        # The forwarder and a fresh forwarder state (thread resume / reconnect)
+        # re-read config.toml, so mirror what applied; without it they would
+        # revert a composer pick to the stale launch value.
+        switched = {
+            key: value
+            for key in ("model", "effort")
+            if isinstance(value := settings_overrides.get(key), str) and value
+        }
+        for key, value in mirror_applied_codex_settings(bridge_dir, switched).items():
+            _logger.warning("Failed to mirror codex %s switch into config.toml: %s", key, value)
     response = await client.request(
         "turn/start",
         {

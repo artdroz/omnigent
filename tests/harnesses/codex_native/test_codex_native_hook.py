@@ -1183,6 +1183,32 @@ def test_routed_model_switch_keeps_an_effort_whose_config_write_failed(
     )
 
 
+def test_routed_model_switch_records_an_effort_it_could_not_mirror(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A routed switch whose effort write fails leaves the applied effort for later readers."""
+    from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+
+    home = codex_home_for_bridge_dir(bridge_dir)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text('model = "gpt-5.6-sol"\nmodel_reasoning_effort = "max"\n')
+    catalog = [
+        {
+            "id": "gpt-5.4",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": value} for value in ("low", "medium", "high", "xhigh")
+            ],
+        }
+    ]
+    _install_fake_client(monkeypatch, _FakeAppServerClient(catalog))
+    monkeypatch.setattr(codex_native_bridge, "write_codex_config_effort", lambda *_: False)
+
+    assert codex_native_hook._apply_thread_model(bridge_dir, "databricks-gpt-5-4") is None
+
+    assert codex_native_bridge.read_unmirrored_codex_settings(bridge_dir) == {"effort": "xhigh"}
+
+
 def test_apply_thread_model_declines_a_model_this_pane_cannot_serve(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,

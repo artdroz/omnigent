@@ -852,6 +852,29 @@ def write_codex_config_effort(bridge_dir: Path, effort: str) -> bool:
     )
 
 
+def mirror_applied_codex_settings(bridge_dir: Path, applied: Mapping[str, str]) -> dict[str, str]:
+    """Write a model and effort Codex applied into ``config.toml``, recording any that fail.
+
+    The model is written first, since that write clamps a stale effort. Settings
+    recorded earlier that *applied* does not replace stay recorded.
+
+    :param bridge_dir: The session's native-Codex bridge directory.
+    :param applied: Applied values keyed ``"model"`` / ``"effort"``.
+    :returns: The values whose write failed.
+    """
+    pending = read_unmirrored_codex_settings(bridge_dir)
+    writers = {"model": write_codex_config_model, "effort": write_codex_config_effort}
+    failed: dict[str, str] = {}
+    for key, write in writers.items():
+        if key in applied:
+            pending.pop(key, None)
+            if not write(bridge_dir, applied[key]):
+                failed[key] = applied[key]
+    # Stamp after these writes, so only a later rewrite supersedes the record.
+    write_unmirrored_codex_settings(bridge_dir, {**pending, **failed})
+    return failed
+
+
 def _upsert_top_level_config_key(
     config_path: Path,
     key: str,

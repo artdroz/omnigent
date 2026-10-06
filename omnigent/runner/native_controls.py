@@ -294,20 +294,14 @@ def build_native_controls(
     def _unmirrored_codex_settings(bridge_dir: Path) -> dict[str, str]:
         """Return applied settings the config still lacks, retrying their writes."""
         from omnigent.harnesses.codex_native.bridge import (
+            mirror_applied_codex_settings,
             read_unmirrored_codex_settings,
-            write_codex_config_effort,
-            write_codex_config_model,
-            write_unmirrored_codex_settings,
         )
 
         # Any later rewrite, such as a terminal switch, makes the config current.
         pending = read_unmirrored_codex_settings(bridge_dir)
         if pending:
-            writers = {"model": write_codex_config_model, "effort": write_codex_config_effort}
-            failed = {
-                key: value for key, value in pending.items() if not writers[key](bridge_dir, value)
-            }
-            write_unmirrored_codex_settings(bridge_dir, failed)
+            mirror_applied_codex_settings(bridge_dir, pending)
         return pending
 
     async def _apply_codex_native_settings_update(
@@ -323,12 +317,9 @@ def build_native_controls(
         )
         from omnigent.harnesses.codex_native.bridge import (
             bridge_dir_for_codex_home,
+            mirror_applied_codex_settings,
             read_codex_config_effort,
             read_codex_config_model,
-            read_unmirrored_codex_settings,
-            write_codex_config_effort,
-            write_codex_config_model,
-            write_unmirrored_codex_settings,
         )
         from omnigent.runner.turn_routing import SETTINGS_UPDATE_TIMEOUT_S
         from omnigent.util.reasoning_effort import effort_for_model_switch
@@ -452,24 +443,17 @@ def build_native_controls(
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
-        # This update's values replace pending ones; a rewrite since supersedes the rest.
-        pending = read_unmirrored_codex_settings(bridge_dir)
+        applied: dict[str, str] = {}
         model = settings.get("model")
         if isinstance(model, str):
-            pending.pop("model", None)
-            if not write_codex_config_model(bridge_dir, model):
-                _logger.warning("Could not mirror Codex model for session=%s", conv_id)
-                pending["model"] = model
+            applied["model"] = model
         effort = settings.get("effort")
         if isinstance(effort, str) and effort:
             _session_reasoning_effort[conv_id] = effort
-            pending.pop("effort", None)
-            if not write_codex_config_effort(bridge_dir, effort):
-                _logger.warning("Could not mirror Codex effort for session=%s", conv_id)
-                pending["effort"] = effort
-        if "model" in settings or "effort" in settings:
-            # Record after this update's own writes, so only later rewrites supersede them.
-            write_unmirrored_codex_settings(bridge_dir, pending)
+            applied["effort"] = effort
+        if applied:
+            for key in mirror_applied_codex_settings(bridge_dir, applied):
+                _logger.warning("Could not mirror Codex %s for session=%s", key, conv_id)
         if isinstance(effort, str) and effort:
             # Codex emits no settings notification when normalization leaves
             # its effort unchanged, so confirm the applied value explicitly.

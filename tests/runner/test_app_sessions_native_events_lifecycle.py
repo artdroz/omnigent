@@ -278,7 +278,7 @@ async def test_codex_native_settings_update_times_out_and_releases_the_lock(
     tmp_path: Path,
     stalled: str,
 ) -> None:
-    """A hung app-server call returns 503 instead of blocking later settings updates."""
+    """A hung connect is refused (503) and a hung update is unconfirmed (504); neither blocks."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.runner import turn_routing
 

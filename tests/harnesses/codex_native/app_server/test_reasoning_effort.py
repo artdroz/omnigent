@@ -400,6 +400,48 @@ async def test_resume_applies_and_mirrors_supported_effort(
     client.close.assert_awaited_once()
 
 
+async def test_resume_records_an_effort_its_config_write_lost(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A resumed effort whose config write fails stays recorded for later updates."""
+    from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    (home / "config.toml").write_text('model = "gpt-5.4"\nmodel_reasoning_effort = "minimal"\n')
+    client = AsyncMock(spec=app_server.CodexAppServerClient)
+    client.request.side_effect = lambda method, params: (
+        {
+            "result": {
+                "data": [
+                    {
+                        "id": "gpt-5.4",
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": value}
+                            for value in ("low", "medium", "high", "xhigh")
+                        ],
+                    }
+                ]
+            }
+        }
+        if method == "model/list"
+        else {"result": {}}
+    )
+    monkeypatch.setattr(app_server, "client_for_transport", lambda *args, **kwargs: client)
+    monkeypatch.setattr(codex_native_bridge, "write_codex_config_effort", lambda *_: False)
+
+    await app_server.apply_codex_thread_effort(
+        str(tmp_path / "app-server.sock"), "thread_resumed", "minimal", bridge_dir=tmp_path
+    )
+
+    client.request.assert_awaited_with(
+        "thread/settings/update", {"threadId": "thread_resumed", "effort": "low"}
+    )
+    assert read_codex_config_effort(tmp_path) == "minimal"
+    assert codex_native_bridge.read_unmirrored_codex_settings(tmp_path) == {"effort": "low"}
+
+
 @pytest.mark.parametrize("stalled_phase", ["connect", "update", "close"])
 async def test_resume_effort_update_times_out_and_closes_client(
     monkeypatch: pytest.MonkeyPatch,
@@ -425,6 +467,7 @@ async def test_resume_effort_update_times_out_and_closes_client(
     monkeypatch.setattr(app_server, "client_for_transport", lambda *args, **kwargs: client)
     monkeypatch.setattr(app_server, "_EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(app_server, "_EFFORT_CONNECT_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(app_server, "_EFFORT_CLOSE_TIMEOUT_SECONDS", 0.01)
 
     task = asyncio.create_task(
         app_server.apply_codex_thread_effort(

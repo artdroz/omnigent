@@ -1020,3 +1020,30 @@ def test_prune_orphaned_bridge_dirs_keeps_live_and_unmarked_bridges(
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+
+
+def test_mirror_applied_codex_settings_records_failed_writes_until_the_config_changes(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed write stays recorded beside the config, and a later rewrite supersedes it."""
+    home = codex_home_for_bridge_dir(bridge_dir)
+    home.mkdir(parents=True, exist_ok=True)
+    config = home / "config.toml"
+    config.write_text('model = "gpt-5.4"\nmodel_reasoning_effort = "low"\n')
+    write_model = codex_native_bridge.write_codex_config_model
+    monkeypatch.setattr(codex_native_bridge, "write_codex_config_model", lambda *_: False)
+
+    failed = codex_native_bridge.mirror_applied_codex_settings(
+        bridge_dir, {"effort": "high", "model": "gpt-6-sol"}
+    )
+
+    assert failed == {"model": "gpt-6-sol"}
+    assert read_codex_config_effort(bridge_dir) == "high"
+    assert codex_native_bridge.read_unmirrored_codex_settings(bridge_dir) == {"model": "gpt-6-sol"}
+    # A later effort write keeps the model it does not replace recorded.
+    assert codex_native_bridge.mirror_applied_codex_settings(bridge_dir, {"effort": "xhigh"}) == {}
+    assert codex_native_bridge.read_unmirrored_codex_settings(bridge_dir) == {"model": "gpt-6-sol"}
+    # Another writer replacing the config, such as a terminal /model, supersedes it.
+    monkeypatch.setattr(codex_native_bridge, "write_codex_config_model", write_model)
+    assert write_model(bridge_dir, "gpt-5.5")
+    assert codex_native_bridge.read_unmirrored_codex_settings(bridge_dir) == {}

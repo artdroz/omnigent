@@ -189,7 +189,9 @@ Cross-harness journeys:
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_resume_clamps_persisted_effort`
   (own environment, real Codex with mock model replies).
   `tests/harnesses/codex_native/app_server/test_reasoning_effort.py::test_resume_effort_update_times_out_and_closes_client`
-  checks that a stalled settings connection or write cannot block resume.
+  checks that a stalled settings connection, write, or close cannot block resume;
+  `tests/harnesses/codex_native/app_server/test_reasoning_effort.py::test_resume_records_an_effort_its_config_write_lost`
+  keeps a resumed effort whose config write failed for later updates.
 - **`chat-render`, `steer`, per harness:** use the matrix.
 - **`skill-contents`:** run `tests/host/test_skill_content.py`,
   `tests/server/routes/test_skill_content.py`, and the real-host test

@@ -470,10 +470,9 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> str | None:
         client_for_transport,
     )
     from omnigent.harnesses.codex_native.bridge import (
+        mirror_applied_codex_settings,
         read_codex_config_effort,
         read_unmirrored_codex_settings,
-        write_codex_config_effort,
-        write_codex_config_model,
     )
     from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug
     from omnigent.runner.turn_routing import SETTINGS_UPDATE_TIMEOUT_S
@@ -526,13 +525,15 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> str | None:
         return declined
     if applied is None:
         return f"could not switch to {model}"
-    if not write_codex_config_model(bridge_dir, applied):
+    switched = {"model": applied}
+    if applied_effort is not None:
+        switched["effort"] = applied_effort
+    # A failed write is recorded beside config.toml, so later readers keep the applied value.
+    for key, value in mirror_applied_codex_settings(bridge_dir, switched).items():
         print(
-            f"omnigent codex route-turn hook: could not mirror {applied} into config.toml",
+            f"omnigent codex route-turn hook: could not mirror {key} {value} into config.toml",
             file=sys.stderr,
         )
-    if applied_effort is not None and not write_codex_config_effort(bridge_dir, applied_effort):
-        print("omnigent codex route-turn hook: could not mirror reasoning effort", file=sys.stderr)
     return None
 
 

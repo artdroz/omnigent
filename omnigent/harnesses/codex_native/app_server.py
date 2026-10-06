@@ -36,10 +36,10 @@ if TYPE_CHECKING:
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.harnesses.codex_native.bridge import (
+    mirror_applied_codex_settings,
     read_codex_config_model,
     read_codex_home_config_effort,
     read_codex_home_config_model,
-    write_codex_config_effort,
     write_policy_hook_config,
 )
 from omnigent.harnesses.codex_native.launch_args import (
@@ -120,6 +120,7 @@ _EFFORT_CATALOG_TIMEOUT_SECONDS = 2.0
 _EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS = 2.0
 _EFFORT_CONNECT_TIMEOUT_SECONDS = 2.0
 _EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS = 2.0
+_EFFORT_CLOSE_TIMEOUT_SECONDS = 2.0
 # Model discovery is a best-effort side process whose callers fall back to a
 # cached or bundled catalog, so it keeps a short readiness budget.
 _CONNECT_TIMEOUT_SECONDS = 10.0
@@ -4473,7 +4474,9 @@ async def apply_codex_thread_effort(
             ),
             timeout=_EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS,
         )
-        if bridge_dir is not None and not write_codex_config_effort(bridge_dir, applied_effort):
+        if bridge_dir is not None and mirror_applied_codex_settings(
+            bridge_dir, {"effort": applied_effort}
+        ):
             _logger.warning(
                 "Failed to mirror resumed Codex reasoning effort %s into config.toml "
                 "(thread=%s, bridge=%s)",
@@ -4484,7 +4487,7 @@ async def apply_codex_thread_effort(
     finally:
         # A wedged server can stall the closing handshake; it must not mask the result.
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(client.close(), timeout=_EFFORT_CONNECT_TIMEOUT_SECONDS)
+            await asyncio.wait_for(client.close(), timeout=_EFFORT_CLOSE_TIMEOUT_SECONDS)
 
 
 def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
