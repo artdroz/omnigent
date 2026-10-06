@@ -130,22 +130,41 @@ LONG_CONTEXT_MARKER = "[1m]"
 
 _LONG_CONTEXT_FAMILIES: frozenset[str] = frozenset({"opus", "sonnet"})
 
+#: First Opus/Sonnet generation that serves the 1M context-1m-2025-08-07 beta.
+#: A 3.x or earlier Opus/Sonnet caps at 200K, so marking it [1m] would size the
+#: session past what the model accepts and overflow mid-session.
+_MIN_LONG_CONTEXT_VERSION = 4
+
+
+def _supports_long_context(canonical: str) -> bool:
+    """Whether a canonical Claude id names a 1M-capable Opus/Sonnet generation."""
+    segments = _SEGMENT_RE.split(canonical)
+    if _LONG_CONTEXT_FAMILIES.isdisjoint(segments):
+        return False
+    for segment in segments:
+        # The first numeric segment is the generation in either naming
+        # (``claude-opus-4-8`` and ``claude-3-5-sonnet`` both lead with it).
+        if segment.isdigit():
+            return int(segment) >= _MIN_LONG_CONTEXT_VERSION
+    return False
+
 
 def model_id_with_1m_marker(model_id: str) -> str:
     """Add the ``[1m]`` window marker to a 1M-capable Opus/Sonnet id, else return it unchanged.
 
-    Non-Claude ids, bare family aliases, 200K-only families (Haiku, Fable), and
-    already-marked ids all pass through untouched.
+    Non-Claude ids, bare family aliases, pre-4 Opus/Sonnet generations, the
+    200K-only families (Haiku, Fable), and already-marked ids all pass through
+    unchanged.
     """
     spelled = model_id.strip()
-    if not spelled or spelled.lower().endswith(LONG_CONTEXT_MARKER):
-        return model_id
     canonical = canonical_claude_id(spelled)
-    if canonical is None:
+    if (
+        canonical is None
+        or spelled.lower().endswith(LONG_CONTEXT_MARKER)
+        or not _supports_long_context(canonical)
+    ):
         return model_id
-    if _LONG_CONTEXT_FAMILIES.isdisjoint(_SEGMENT_RE.split(canonical)):
-        return model_id
-    return f"{spelled}{LONG_CONTEXT_MARKER}"
+    return f"{model_id}{LONG_CONTEXT_MARKER}"
 
 
 def alias_pins(env: Mapping[str, str] | None = None) -> dict[str, str]:

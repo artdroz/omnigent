@@ -348,7 +348,8 @@ def open_terminal(page: Page, base_url: str, session_id: str) -> None:
     expect(terminal).to_have_attribute(
         "data-state", "connected", timeout=_TERMINAL_READY_TIMEOUT_MS
     )
-    wait_pane(base_url, session_id, "manual mode", timeout_s=90.0)
+    pane = wait_pane(base_url, session_id, "manual mode", timeout_s=90.0)
+    assert "manual mode" in pane.lower(), f"terminal never reached manual mode:\n{pane[-1500:]}"
 
 
 def type_slash_command(page: Page, command: str) -> None:

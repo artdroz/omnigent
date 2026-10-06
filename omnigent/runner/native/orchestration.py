@@ -8698,10 +8698,9 @@ async def _auto_create_claude_terminal(
                         str(catalog_default.get("model") or catalog_default.get("id") or "")
                         or None
                     )
-    # Claude Code sizes a session's context window client-side from the model id
-    # and caps a bare custom gateway id at 200K; the [1m] marker opts a 1M-capable
-    # Opus/Sonnet launch into its real 1M window. Marking only the launch model
-    # keeps the config env pins and the probe/catalog bare.
+    # Claude Code sizes the context window client-side from the model id and caps
+    # a bare custom gateway id at 200K; the [1m] marker opts a 1M-capable
+    # Opus/Sonnet launch into its real 1M window.
     if claude_config is not None and launch_model:
         from omnigent.models.claude_model_vocabulary import model_id_with_1m_marker
 
