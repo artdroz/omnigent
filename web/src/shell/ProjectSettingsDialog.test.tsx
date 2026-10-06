@@ -327,6 +327,37 @@ describe("ProjectSettingsDialog", () => {
     ).toBe(true);
   });
 
+  it("lets the stored default agent be reset to no default from the agent dropdown", async () => {
+    // The Host and Model fields offer "No default" inside their dropdowns; the
+    // Agent dropdown must offer the same way back to an unset default.
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { agent_id: "ag_1" } });
+    renderDialog();
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+    const trigger = screen.getByTestId("new-chat-landing-agent-select");
+    expect(trigger).toHaveTextContent("Hello");
+
+    fireEvent.pointerDown(trigger, { button: 0 });
+    const reset = screen.getByRole("menuitem", { name: /no default/i });
+    // The stored agent is the current choice, not the reset row.
+    expect(reset).not.toHaveAttribute("data-active");
+    fireEvent.click(reset);
+    expect(trigger).toHaveTextContent("No default");
+
+    // Reopened, the reset row now marks the unset default as current.
+    fireEvent.pointerDown(trigger, { button: 0 });
+    expect(screen.getByRole("menuitem", { name: /no default/i })).toHaveAttribute(
+      "data-active",
+      "true",
+    );
+
+    fireEvent.submit(screen.getByTestId("project-settings-save").closest("form")!);
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
+  });
+
   // A model default belongs only to a native harness that takes a model
   // override (Claude Code / Codex). These pin the control's visibility, its
   // round-trip through save, and the data-safety edges around it.

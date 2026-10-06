@@ -23,6 +23,7 @@ from __future__ import annotations
 import uuid
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 
@@ -57,6 +58,15 @@ def _open_project_settings(page: Page, project: str) -> None:
     # The dialog's Save button confirms the editor mounted + the config fetch
     # settled (Save is disabled while loading).
     expect(page.get_by_test_id("project-settings-save")).to_be_enabled()
+
+
+def _resolve_builtin_agent(base_url: str, name: str) -> dict:
+    """Resolve a packaged built-in agent (e.g. ``claude-native-ui``) by name."""
+    resp = httpx.get(f"{base_url}/v1/agents", params={"limit": 100}, timeout=30.0)
+    resp.raise_for_status()
+    agent = next((a for a in resp.json()["data"] if a["name"] == name), None)
+    assert agent is not None, f"{name} built-in not registered on the test server"
+    return agent
 
 
 def test_project_settings_worktree_toggle_persists(
@@ -150,6 +160,57 @@ def test_project_settings_preserves_icon_on_save(
     expect(page.get_by_test_id("project-settings-save")).to_have_count(0)
 
     assert _get_project_config(base_url, project_id) == {"icon": "🔥", "use_worktree": True}
+
+
+def test_project_settings_resets_default_agent_from_dropdown(
+    request: pytest.FixtureRequest,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The Agent dropdown offers "No default", like the Host and Model dropdowns.
+
+    Starts from a project whose ``config`` pins Claude Code as the default
+    agent, opens settings, picks "No default" in the Agent dropdown and Saves.
+    The stored config drops ``agent_id`` and reopening seeds "No default".
+    """
+    base_url, session_id = seeded_session
+    project = f"Project {uuid.uuid4().hex[:6]}"
+    project_id = _create_project(base_url, project)
+    claude = _resolve_builtin_agent(base_url, "claude-native-ui")
+    _set_project_config(base_url, project_id, {"agent_id": claude["id"]})
+
+    # Requested after the API setup so a recording starts at the navigation.
+    page: Page = request.getfixturevalue("page")
+    page.goto(f"{base_url}/c/{session_id}")
+
+    _open_project_settings(page, project)
+    trigger = page.get_by_test_id("project-settings-agent").get_by_test_id(
+        "new-chat-landing-agent-select"
+    )
+    expect(trigger).to_contain_text("Claude Code")
+
+    # The Host dropdown's "No default" row is the pattern the Agent dropdown
+    # follows; re-pick its current value to close it.
+    page.get_by_test_id("project-settings-host").click()
+    host_none = page.get_by_role("option", name="No default", exact=True)
+    expect(host_none).to_be_visible()
+    host_none.click()
+    expect(page.get_by_role("listbox")).to_have_count(0)
+
+    trigger.click()
+    menu = page.get_by_role("menu").first
+    expect(menu).to_be_visible()
+    reset_row = menu.get_by_role("menuitem", name="No default", exact=True)
+    expect(reset_row).to_be_visible()
+    reset_row.click()
+    expect(trigger).to_contain_text("No default")
+
+    page.get_by_test_id("project-settings-save").click()
+    expect(page.get_by_test_id("project-settings-save")).to_have_count(0)
+    assert "agent_id" not in _get_project_config(base_url, project_id)
+
+    # Reopen — no stored default, the Agent field seeds "No default".
+    _open_project_settings(page, project)
+    expect(trigger).to_contain_text("No default")
 
 
 def test_project_settings_base_branch_persists(

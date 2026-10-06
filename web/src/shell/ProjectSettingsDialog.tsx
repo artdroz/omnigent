@@ -457,7 +457,7 @@ export function ProjectSettingsDialog({
           )}
 
           <Field label="Agent" hint="Default agent / harness for new sessions">
-            <div className="flex flex-col items-end gap-1" data-testid="project-settings-agent">
+            <div data-testid="project-settings-agent">
               <AgentHarnessPicker
                 agentEntries={agentEntries}
                 harnessEntries={harnessEntries}
@@ -478,6 +478,15 @@ export function ProjectSettingsDialog({
                 // agent" action and leave the handler inert.
                 onCreateCustomAgent={() => {}}
                 allowCreateCustomAgent={false}
+                // Reset from inside the dropdown, like the Host / Model selects;
+                // a cleared agent takes its model default with it.
+                clearSelection={{
+                  label: "No default",
+                  onSelect: () => {
+                    setAgentId(null);
+                    setModel(NONE);
+                  },
+                }}
                 sandboxSelected={hostId === SANDBOX_HOST_CHOICE}
                 // Modal so the menu establishes its own scroll context and can
                 // scroll inside the Dialog's scroll-lock (a non-modal dropdown
@@ -496,20 +505,6 @@ export function ProjectSettingsDialog({
                 triggerClassName="h-8 w-full justify-between rounded-md border border-input bg-transparent px-3 text-foreground hover:bg-transparent hover:text-foreground"
                 triggerLabelClassName="max-w-none text-ui"
               />
-              {agentId && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  className="h-auto p-0 text-muted-foreground text-sm hover:bg-transparent"
-                  onClick={() => {
-                    setAgentId(null);
-                    setModel(NONE);
-                  }}
-                >
-                  Clear
-                </Button>
-              )}
             </div>
           </Field>
 

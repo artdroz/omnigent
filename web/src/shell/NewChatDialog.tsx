@@ -1392,6 +1392,7 @@ export function AgentHarnessPicker({
   autoHarnessAvailable = false,
   autoHarnessActive = false,
   onSelectAutoHarness,
+  clearSelection,
   openNonce = 0,
 }: {
   agentEntries: AvailableAgent[];
@@ -1461,6 +1462,9 @@ export function AgentHarnessPicker({
    *  would look selected at once. */
   autoHarnessActive?: boolean;
   onSelectAutoHarness?: () => void;
+  /** Offer a top row that clears the selection, for an embedder whose field
+   *  is optional (project settings' "No default"). Omitted → no such row. */
+  clearSelection?: { label: string; onSelect: () => void };
   /** Bump to open the menu imperatively (the landing's model-picker hotkey). */
   openNonce?: number;
 }) {
@@ -1907,6 +1911,27 @@ export function AgentHarnessPicker({
         </div>
       ) : (
         <>
+          {clearSelection && (
+            <>
+              <DropdownMenuItem
+                data-testid="new-chat-landing-agent-none"
+                data-active={effectiveAgentId === null && !autoHarnessActive ? "true" : undefined}
+                onSelect={() => {
+                  clearSelection.onSelect();
+                  setOpen(false);
+                }}
+                className="items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
+              >
+                <span
+                  data-harness-menu-choice-label=""
+                  className="min-w-0 flex-1 truncate text-left"
+                >
+                  {clearSelection.label}
+                </span>
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+            </>
+          )}
           {/* Smart Routing sits in its own unlabeled group above the
             harnesses: it routes over them rather than being one of them. */}
           {autoHarnessAvailable && (
