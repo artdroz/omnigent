@@ -155,15 +155,9 @@ def test_click_after_peek_card_appears_opens_sidebar(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A click on the toggle's spot after the hover-preview has appeared must still open it.
+    """Clicking the toggle's spot once the hover-preview is fully visible still pins the sidebar.
 
-    Journey: collapse the sidebar → hover the top-left "Open sidebar" toggle
-    until the peek card has fully faded in → click where the toggle is → the
-    sidebar must pin open on the same session. The card floats below the chat
-    header, so once visible it must not sit over the toggle: a click there has
-    to reach the toggle rather than the card's brand link (which navigates to
-    ``/``) or inert card chrome.
-    """
+    The card floats below the chat header, so the click must reach the toggle, not the card."""
     base_url, session_id = seeded_session
     page.set_viewport_size({"width": 1280, "height": 800})
     page.goto(f"{base_url}/c/{session_id}")
