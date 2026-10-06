@@ -907,12 +907,12 @@ describe("CodeViewer PDF routing", () => {
     const view = render(<CodeViewer {...props} />);
     expect(await screen.findByRole("alert")).toHaveTextContent("Unable to render PDF.");
     pdfRendering.error = null;
-    const cleanup = () => {
+    const teardown = () => {
       pdfRendering.error = null;
       window.removeEventListener("error", suppressExpectedError);
       log.mockRestore();
     };
-    return { ...view, cleanup };
+    return { ...view, teardown };
   }
 
   it.each<[string, (props: CodeViewerProps) => CodeViewerProps]>([
@@ -924,25 +924,25 @@ describe("CodeViewer PDF routing", () => {
     ["new content arrives for the same file", (props) => ({ ...props, fileQuery: makePdfQuery() })],
   ])("recovers from a PDF render failure when %s", async (_case, next) => {
     const props = brokenPdfProps();
-    const { rerender, cleanup } = await renderFailedPdf(props);
+    const { rerender, teardown } = await renderFailedPdf(props);
     try {
       rerender(<CodeViewer {...next(props)} />);
       expect(await screen.findByTestId("pdf-viewer-stub")).toBeInTheDocument();
       expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     } finally {
-      cleanup();
+      teardown();
     }
   });
 
   it("keeps a PDF render failure when the same file re-renders unchanged", async () => {
     const props = brokenPdfProps();
-    const { rerender, cleanup } = await renderFailedPdf(props);
+    const { rerender, teardown } = await renderFailedPdf(props);
     try {
       rerender(<CodeViewer {...props} />);
       expect(screen.getByRole("alert")).toHaveTextContent("Unable to render PDF.");
       expect(screen.queryByTestId("pdf-viewer-stub")).not.toBeInTheDocument();
     } finally {
-      cleanup();
+      teardown();
     }
   });
 
