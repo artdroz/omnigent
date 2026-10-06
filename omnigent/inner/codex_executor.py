@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import errno
 import json
 import logging
 import os
@@ -1008,16 +1009,21 @@ def _private_codex_home_config_source(path: Path) -> Path | None:
     source_dirs: set[Path] = set()
     for filename in _CODEX_HOME_SYMLINK_FILES:
         config_file = path / filename
-        # A dangling symlink points at a deleted source and is not a usable
-        # pointer; ``exists()`` follows the link and is False when it dangles.
-        if not config_file.is_symlink() or not config_file.exists():
+        if not config_file.is_symlink():
             continue
         with suppress(OSError):
-            source_dirs.add(config_file.resolve().parent)
+            # The symlink still identifies the source home when its own file
+            # was removed (e.g. a logged-out ``auth.json``); only skip it when
+            # the whole source home is gone, which a nested launch can't read.
+            source_home = config_file.resolve().parent
+            if source_home.is_dir():
+                source_dirs.add(source_home)
     companion = path / _CODEX_HOME_CREDENTIAL_COMPANION_DIR
-    if companion.is_symlink() and companion.exists():
+    if companion.is_symlink():
         with suppress(OSError):
-            source_dirs.add(companion.resolve().parent)
+            source_home = companion.resolve().parent
+            if source_home.is_dir():
+                source_dirs.add(source_home)
     if len(source_dirs) == 1:
         return next(iter(source_dirs))
     return None
@@ -1086,6 +1092,12 @@ def _bridge_codex_credential_store(source_file: Path, dest_path: Path) -> None:
     try:
         os.link(source_file, dest_path)
     except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            # Only a cross-filesystem link is truly impossible. Any other link
+            # failure must surface rather than silently degrade to a private
+            # copy: a same-filesystem copy is indistinguishable from an orphaned
+            # hard link and a later relink would clobber its refreshed tokens.
+            raise
         logger.info(
             "could not hard-link %r into %s (%s); copying instead, so token "
             "refreshes stay in this session home",
@@ -1136,6 +1148,24 @@ def _relink_rotated_codex_credential_store(source_file: Path, dest_path: Path) -
     except OSError:
         return
     os.replace(staging, dest_path)
+
+
+def _discard_orphaned_bridge_credential_store(dest_path: Path, source_dir: Path) -> None:
+    """
+    Drop a bridged credential store whose source has been removed.
+
+    After a full remote-MCP logout the source ``.credentials.json`` is gone, but
+    a reused private home can still hold the bridge. A hard link on the source
+    filesystem is an orphaned pointer to signed-out tokens and is removed; a
+    cross-filesystem copy carries session-only tokens the source never had, so
+    it is preserved.
+
+    :param dest_path: The bridged store inside the private home.
+    :param source_dir: The source home whose store is now absent.
+    """
+    with suppress(OSError):
+        if dest_path.stat().st_dev == source_dir.stat().st_dev:
+            dest_path.unlink()
 
 
 def _populate_codex_home_config(
@@ -1262,6 +1292,7 @@ def _populate_codex_home_config(
                 dest_path.unlink()
             source_file = source_dir / filename
             if not source_file.is_file():
+                _discard_orphaned_bridge_credential_store(dest_path, source_dir)
                 continue
             if dest_path.exists():
                 _relink_rotated_codex_credential_store(source_file, dest_path)

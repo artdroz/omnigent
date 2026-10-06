@@ -3897,7 +3897,6 @@ def test_populate_codex_home_config_migrates_legacy_credential_symlink(
     assert store.read_text() == refreshed
 
 
-@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="requires O_NOFOLLOW")
 def test_populate_codex_home_config_recovers_from_failed_fallback_copy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3999,6 +3998,97 @@ def test_private_codex_home_config_source_ignores_dangling_companion(
     assert _private_codex_home_config_source(private) is None
     default_home = tmp_path / "default-home" / ".codex"
     assert _resolve_codex_home_config_source(private, default_home) == default_home
+
+
+def test_private_codex_home_config_source_resolves_home_with_missing_pointer_file(
+    tmp_path: Path,
+) -> None:
+    """A pointer whose own file was removed still identifies the custom home.
+
+    A custom source home can keep its ``config.toml`` while its ``auth.json`` is
+    deleted (e.g. a logout). The private home's ``auth.json`` symlink then
+    dangles, but it still names the custom home. The resolver must map a nested
+    launch back to that home, not silently fall back to ``~/.codex`` and bridge
+    a different account's configuration.
+    """
+    from omnigent.inner.codex_executor import (
+        _private_codex_home_config_source,
+        _resolve_codex_home_config_source,
+    )
+
+    source = tmp_path / "custom-codex-home"
+    source.mkdir()
+    (source / "config.toml").write_text('model_provider = "custom"')
+    private = tmp_path / ".omnigent" / "codex-native" / "abc123" / "codex-home"
+    private.mkdir(parents=True)
+    dangling = private / "auth.json"
+    dangling.symlink_to(source / "auth.json")
+    assert dangling.is_symlink()
+    assert not dangling.exists()
+
+    assert _private_codex_home_config_source(private) == source
+    default_home = tmp_path / "default-home" / ".codex"
+    assert _resolve_codex_home_config_source(private, default_home) == source
+
+
+def test_populate_codex_home_config_discards_orphaned_bridge_after_source_removal(
+    tmp_path: Path,
+) -> None:
+    """A bridged hard link is dropped once its source store is removed.
+
+    After logging out of every remote MCP the source ``.credentials.json`` is
+    deleted, but a reused private home still holds the hard link to the orphaned
+    inode. Repopulating must remove it so the session cannot keep serving
+    credentials the user has signed out of.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    store = source / ".credentials.json"
+    store.write_text('{"linear|abc": {"access_token": "t"}}')
+    target = tmp_path / "persistent_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+    bridged = target / ".credentials.json"
+    assert os.path.samefile(bridged, store)
+
+    store.unlink()
+    _populate_codex_home_config(target, source)
+
+    assert not bridged.exists()
+    assert not bridged.is_symlink()
+
+
+def test_populate_codex_home_config_propagates_non_cross_device_link_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-filesystem link failure surfaces instead of degrading to a copy.
+
+    A private copy is only safe cross-filesystem, where a later relink can never
+    replace it. For a same-filesystem link failure (e.g. a hard-link hardening
+    policy) a copy would be indistinguishable from an orphaned hard link and
+    could be clobbered on repopulate, so the failure must propagate and leave no
+    partial store behind.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    def _blocked_link(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.EPERM, "operation not permitted")
+
+    monkeypatch.setattr(os, "link", _blocked_link)
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    with pytest.raises(OSError):
+        _populate_codex_home_config(target, source)
+
+    assert not (target / ".credentials.json").exists()
+    assert not (target / ".credentials.json.copy").exists()
 
 
 def test_populate_codex_home_config_symlinks_memories(tmp_path: Path) -> None:
