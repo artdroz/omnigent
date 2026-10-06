@@ -16,7 +16,7 @@ import secrets
 import time
 import urllib.parse
 import weakref
-from collections import Counter, deque
+from collections import deque
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -2572,15 +2572,35 @@ def _validate_external_reasoning_effort(body: SessionEventInput) -> str | None:
 
 
 class _LiveSettingsChange:
-    """Orders one session's live effort/model changes and counts writes made meanwhile."""
+    """Orders one session's live effort/model changes and records writes made meanwhile."""
 
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
-        self.writes: Counter[str] = Counter()
+        self._position = 0
+        # Setting → (position, value) of the latest write by another request.
+        self._writes: dict[str, tuple[int, str | None]] = {}
 
-    def rewritten(self, before: Counter[str]) -> set[str]:
-        """Return the settings that other requests wrote after *before* was taken."""
-        return {key for key, count in self.writes.items() if count != before[key]}
+    def note_write(self, key: str, value: str | None) -> None:
+        """Record another request's write, or a terminal report, of *key*."""
+        self._position += 1
+        self._writes[key] = (self._position, value)
+
+    def position(self) -> int:
+        """Return the position that later writes are ordered after."""
+        return self._position
+
+    def restore_target(
+        self, key: str, previous: str | None, *, began: int, saved: int
+    ) -> tuple[bool, str | None]:
+        """Return whether a refused change may restore *key*, and the value to restore.
+
+        A write after the change was saved is a newer selection, so it stays. One
+        between the change's start and its save is what the change replaced.
+        """
+        position, value = self._writes.get(key, (0, None))
+        if position > saved:
+            return False, None
+        return True, value if position > began else previous
 
 
 # Live forwards run on the replica that holds the session's runner, so this
@@ -2599,11 +2619,12 @@ def _live_settings_change(session_id: str) -> _LiveSettingsChange:
     return change
 
 
-def _note_settings_write(session_id: str, keys: Iterable[str]) -> None:
-    """Record a settings write that an active live change must not roll back over."""
+def _note_settings_write(session_id: str, values: Mapping[str, str | None]) -> None:
+    """Record settings another request wrote while a live change may be active."""
     change = _live_settings_changes.get(session_id)
     if change is not None:
-        change.writes.update(keys)
+        for key, value in values.items():
+            change.note_write(key, value)
 
 
 async def _persist_external_reasoning_effort_change(
@@ -2628,9 +2649,9 @@ async def _persist_external_reasoning_effort_change(
     :returns: None.
     """
     effort = _validate_external_reasoning_effort(body)
-    # The terminal reports what it runs, even when the saved value already matches.
-    _note_settings_write(session_id, ("reasoning_effort",))
     if conv.reasoning_effort == effort:
+        # The terminal still reports what it runs when the saved value matches.
+        _note_settings_write(session_id, {"reasoning_effort": effort})
         return
     await asyncio.to_thread(
         conversation_store.update_conversation,
@@ -2638,7 +2659,7 @@ async def _persist_external_reasoning_effort_change(
         reasoning_effort=effort,
         _unset_reasoning_effort=effort is None,
     )
-    _note_settings_write(session_id, ("reasoning_effort",))
+    _note_settings_write(session_id, {"reasoning_effort": effort})
     event = SessionReasoningEffortEvent(
         type="session.reasoning_effort",
         conversation_id=session_id,

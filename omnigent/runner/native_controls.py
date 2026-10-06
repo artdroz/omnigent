@@ -277,14 +277,15 @@ def build_native_controls(
             lock = _codex_settings_locks[conv_id] = asyncio.Lock()
         # The lock also covers the public mirror so the server sees efforts in apply order.
         async with lock:
-            response = await _apply_codex_native_settings_update(
+            response, resolved = await _apply_codex_native_settings_update(
                 conv_id, settings, legacy_server=legacy_server
             )
             if "effort" in settings and (
                 response.status_code == 504 or (legacy_server and response.status_code == 503)
             ):
-                # The server keeps this selection, so the next turn applies it.
-                effort = settings["effort"]
+                # The server keeps this selection, so the next turn applies it; a
+                # resolved Default must stay explicit, as Codex reads null as unchanged.
+                effort = resolved.get("effort", settings["effort"])
                 if isinstance(effort, str) and effort:
                     _session_reasoning_effort[conv_id] = effort
                 else:
@@ -316,7 +317,8 @@ def build_native_controls(
         settings: _JsonObject,
         *,
         legacy_server: bool,
-    ) -> Response:
+    ) -> tuple[Response, _JsonObject]:
+        """Apply *settings* and return the response with the settings as resolved."""
         from omnigent.harnesses.codex_native.app_server import (
             client_for_transport,
             resolve_codex_effort_for_model,
@@ -343,7 +345,7 @@ def build_native_controls(
                     "error": "codex_native_settings_update_failed",
                     "detail": "Codex-native settings update requires a loaded Codex bridge.",
                 },
-            )
+            ), settings
 
         bridge_dir = bridge_dir_for_codex_home(Path(state.codex_home))
         settings = dict(settings)
@@ -364,7 +366,7 @@ def build_native_controls(
                     "error": "invalid_input",
                     "detail": "Codex effort reset requires a current model",
                 },
-            )
+            ), settings
         if isinstance(settings.get("effort"), str) and not isinstance(model, str):
             _logger.warning(
                 "Codex-native effort change without a known model skips validation for session=%s",
@@ -429,7 +431,7 @@ def build_native_controls(
                         "error": "codex_native_settings_update_timeout",
                         "detail": "Codex did not confirm the settings update in time.",
                     },
-                )
+                ), settings
         except Exception as exc:  # noqa: BLE001 - surface app-server settings failures.
             _logger.warning(
                 "Codex-native thread/settings/update failed for session=%s thread=%s settings=%s",
@@ -447,7 +449,7 @@ def build_native_controls(
                         exc, context="codex-native settings update"
                     ),
                 },
-            )
+            ), settings
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
@@ -494,7 +496,7 @@ def build_native_controls(
                         conv_id,
                         exc_info=True,
                     )
-        return Response(status_code=204)
+        return Response(status_code=204), settings
 
     async def _codex_native_model_and_effort_for_settings_update(
         conv_id: str,

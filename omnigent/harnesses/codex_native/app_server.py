@@ -820,7 +820,8 @@ async def resolve_codex_effort_for_model(
             log_once(
                 _logger,
                 logging.WARNING,
-                "Could not read Codex model capabilities for effort validation",
+                "Could not read Codex model capabilities for effort validation (transport=%s)",
+                transport,
                 exc_info=True,
             )
     if effort is None:

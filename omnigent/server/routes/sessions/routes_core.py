@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import secrets
 import time
-from collections import Counter
 from collections.abc import Callable
 from typing import Any
 
@@ -330,6 +330,39 @@ def _runner_reply_field(body: str, key: str) -> object:
     except ValueError:
         return None
     return result.get(key) if isinstance(result, dict) else None
+
+
+async def _restore_refused_settings(
+    conversation_store: ConversationStore,
+    session_id: str,
+    *,
+    previous: Conversation,
+    attempted: Conversation,
+    restore_model: bool,
+    live_change: _LiveSettingsChange | None,
+    began: int,
+    saved: int,
+) -> None:
+    """Undo a refused live change, keeping newer writes and restoring what it replaced."""
+    restore = {"reasoning_effort": True, "model_override": restore_model}
+    replaced = {
+        "reasoning_effort": previous.reasoning_effort,
+        "model_override": previous.model_override,
+    }
+    if live_change is not None:
+        for key, wanted in restore.items():
+            if wanted:
+                restore[key], replaced[key] = live_change.restore_target(
+                    key, replaced[key], began=began, saved=saved
+                )
+    await asyncio.to_thread(
+        conversation_store.restore_session_settings_if_matches,
+        session_id,
+        previous=dataclasses.replace(previous, **replaced),
+        attempted=attempted,
+        restore_effort=restore["reasoning_effort"],
+        restore_model=restore["model_override"],
+    )
 
 
 def _codex_update_unconfirmed(result: _RunnerForwardResult) -> bool:
@@ -2258,7 +2291,7 @@ def register_core_routes(
         live_change: _LiveSettingsChange | None = None,
     ) -> SessionResponse:
         """Apply the PATCH that :func:`update_session` documents."""
-        writes_before = Counter(live_change.writes) if live_change is not None else Counter()
+        began = live_change.position() if live_change is not None else 0
         user_id = _get_user_id(request, auth_provider)
         if body.delete_worktree and body.archived is not True:
             raise OmnigentError(
@@ -2706,14 +2739,6 @@ def register_core_routes(
                 request, conv, conversation_store, runner_router
             )
 
-        silent_settings = (
-            {"reasoning_effort", "model_override"} & body.model_fields_set
-            if body.silent
-            else set()
-        )
-        # A refusal of an active live change must not roll back over this write,
-        # whether that change began before or during it.
-        _note_settings_write(session_id, silent_settings)
         updated = await asyncio.to_thread(
             conversation_store.update_conversation,
             session_id,
@@ -2736,7 +2761,17 @@ def register_core_routes(
         )
         if updated is None:
             raise _session_not_found()
-        _note_settings_write(session_id, silent_settings)
+        saved = live_change.position() if live_change is not None else 0
+        if body.silent:
+            # An active live change orders this write against its own when refused.
+            _note_settings_write(
+                session_id,
+                {
+                    key: getattr(updated, key)
+                    for key in ("reasoning_effort", "model_override")
+                    if key in body.model_fields_set
+                },
+            )
         # Archiving hides the session from the default view (and its unread
         # dot), so drop its per-user read-state to bound in-memory growth.
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).
@@ -2842,14 +2877,15 @@ def register_core_routes(
                         "The terminal did not apply the settings change.",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     )
-                rewritten = live_change.rewritten(writes_before) if live_change else set()
-                await asyncio.to_thread(
-                    conversation_store.restore_session_settings_if_matches,
+                await _restore_refused_settings(
+                    conversation_store,
                     session_id,
                     previous=conv,
                     attempted=updated,
-                    restore_effort="reasoning_effort" not in rewritten,
-                    restore_model=restore_model and "model_override" not in rewritten,
+                    restore_model=restore_model,
+                    live_change=live_change,
+                    began=began,
+                    saved=saved,
                 )
                 raise OmnigentError(
                     _CODEX_SETTINGS_RESTORED_MESSAGE
@@ -2889,14 +2925,15 @@ def register_core_routes(
                 ):
                     if combined_model_forward:
                         # The lost request also carried the effort, so restore both.
-                        rewritten = live_change.rewritten(writes_before) if live_change else set()
-                        await asyncio.to_thread(
-                            conversation_store.restore_session_settings_if_matches,
+                        await _restore_refused_settings(
+                            conversation_store,
                             session_id,
                             previous=conv,
                             attempted=updated,
-                            restore_effort="reasoning_effort" not in rewritten,
-                            restore_model="model_override" not in rewritten,
+                            restore_model=True,
+                            live_change=live_change,
+                            began=began,
+                            saved=saved,
                         )
                         raise OmnigentError(
                             _CODEX_SETTINGS_RESTORED_MESSAGE, code=ErrorCode.RUNNER_UNAVAILABLE

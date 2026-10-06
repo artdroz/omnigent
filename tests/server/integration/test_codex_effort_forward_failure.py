@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -499,6 +500,47 @@ async def test_rejected_change_keeps_an_effort_the_terminal_reported_meanwhile(
     assert saved.reasoning_effort == "high"
 
 
+async def test_rejected_change_restores_an_effort_the_terminal_reported_before_saving(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A report that precedes the refused write confirms the old effort, so it is restored."""
+    session = native_session
+    session.codex.failure = "update_refused"
+    real_update = SqlAlchemyConversationStore.update_conversation
+    saving = threading.Event()
+    resume = threading.Event()
+
+    def pause_before_saving(store: SqlAlchemyConversationStore, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("reasoning_effort") == "high" and not resume.is_set():
+            saving.set()
+            resume.wait(timeout=5.0)
+        return real_update(store, *args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "update_conversation", pause_before_saving)
+    url = f"/v1/sessions/{session.session_id}"
+    pending = asyncio.create_task(client.patch(url, json={"reasoning_effort": "high"}))
+    try:
+        assert await asyncio.to_thread(saving.wait, 5.0)
+        reported = await client.post(
+            f"{url}/events",
+            json={
+                "type": "external_reasoning_effort_change",
+                "data": {"reasoning_effort": "xhigh"},
+            },
+        )
+        assert reported.status_code < 300, reported.text
+    finally:
+        resume.set()
+    response = await asyncio.wait_for(pending, timeout=5.0)
+
+    assert response.status_code == 503, response.text
+    saved = session.store.get_conversation(session.session_id)
+    assert saved is not None
+    assert saved.reasoning_effort == "xhigh"
+
+
 async def test_overlapping_refused_changes_restore_the_applied_effort(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
@@ -566,13 +608,24 @@ async def test_legacy_runner_refusal_keeps_the_effort_it_cached(
     assert session.remembered_efforts[session.session_id] == "high"
 
 
-@pytest.mark.parametrize("combined_model_change", [False, True])
+@pytest.mark.parametrize(
+    ("requested", "combined_model_change", "next_turn_effort"),
+    [
+        ("high", False, "high"),
+        ("high", True, "high"),
+        # Default keeps the target model's resolved level, as Codex reads null as unchanged.
+        ("default", False, "medium"),
+        ("default", True, "low"),
+    ],
+)
 async def test_unconfirmed_effort_update_is_kept_for_the_next_turn(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    requested: str,
     combined_model_change: bool,
+    next_turn_effort: str,
 ) -> None:
     """A timed-out native update may still apply, so it is kept rather than rolled back."""
     from omnigent.runner import turn_routing
@@ -593,18 +646,20 @@ async def test_unconfirmed_effort_update_is_kept_for_the_next_turn(
         return await real_request(method, params)
 
     monkeypatch.setattr(session.codex, "request", stall_update)
-    body = {"reasoning_effort": "high"}
+    body = {"reasoning_effort": requested}
     if combined_model_change:
         body["model_override"] = "gpt-6-sol"
     response = await client.patch(f"/v1/sessions/{session.session_id}", json=body)
 
     assert response.status_code == 200, response.text
-    assert response.json()["reasoning_effort"] == "high"
+    saved_effort = None if requested == "default" else requested
+    assert response.json()["reasoning_effort"] == saved_effort
     saved = session.store.get_conversation(session.session_id)
     assert saved is not None
-    assert saved.reasoning_effort == "high"
+    assert saved.reasoning_effort == saved_effort
     assert saved.model_override == ("gpt-6-sol" if combined_model_change else "gpt-5.4")
-    assert session.remembered_efforts[session.session_id] == "high"
+    # The next turn sends this explicitly instead of the private config's old level.
+    assert session.remembered_efforts[session.session_id] == next_turn_effort
     notices.assert_not_called()
 
 
