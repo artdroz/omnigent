@@ -1,11 +1,17 @@
-import { cleanup, render } from "@testing-library/react";
+import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { getEmbedRoot } from "@/lib/host";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
 
 // Permissions gate the floating "Add comment" button; default to editable.
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn(() => true) }));
+vi.mock("@/lib/host", () => ({ getEmbedRoot: vi.fn(() => null) }));
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+  vi.mocked(getEmbedRoot).mockReturnValue(null);
+});
 
 function renderViewer(content: string, truncated = false) {
   return render(
@@ -32,14 +38,40 @@ describe("HtmlCommentViewer", () => {
     expect(sandbox).not.toContain("allow-same-origin");
   });
 
-  it("injects the comment bridge (and base-target) into the iframe srcDoc", () => {
+  it("injects the bridge inline in standalone mode without a network fetch", () => {
+    const { container } = renderViewer("<html><head></head><body><p>doc</p></body></html>");
+    const iframe = container.querySelector('iframe[title="HTML preview"]') as HTMLIFrameElement;
+    const srcDoc = iframe.getAttribute("srcdoc") ?? "";
+    expect(srcDoc).toContain("<script data-omni-nonce=");
+    expect(srcDoc).not.toContain("htmlCommentBridgeRuntime.js");
+    expect(srcDoc).toContain("omni-html-comment");
+    expect(srcDoc).toContain('<base target="_blank">');
+  });
+
+  it("loads the static bridge runtime externally in embed mode", () => {
+    vi.mocked(getEmbedRoot).mockReturnValue(document.body);
     const { container } = renderViewer("<html><head></head><body><p>doc</p></body></html>");
     const iframe = container.querySelector('iframe[title="HTML preview"]') as HTMLIFrameElement;
     const srcDoc = iframe.getAttribute("srcdoc") ?? "";
     expect(srcDoc).toContain("<script src=");
-    expect(srcDoc).toContain("htmlCommentBridgeLoader.js");
-    expect(srcDoc).toContain("omni-html-comment");
-    expect(srcDoc).toContain('<base target="_blank">');
+    expect(srcDoc).toContain("htmlCommentBridgeRuntime.js");
+    expect(srcDoc).toContain("data-omni-nonce=");
+    expect(srcDoc).not.toContain("new Function");
+  });
+
+  it("warns and retries externally when the inline bridge never becomes ready", () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { container } = renderViewer("<body><p>doc</p></body>");
+    const iframe = container.querySelector('iframe[title="HTML preview"]') as HTMLIFrameElement;
+
+    act(() => iframe.dispatchEvent(new Event("load")));
+    act(() => vi.advanceTimersByTime(5_000));
+
+    expect(warn).toHaveBeenCalledWith(
+      "HTML comment bridge did not become ready; retrying the external runtime.",
+    );
+    warn.mockRestore();
   });
 
   it("shows the truncated banner only when truncated", () => {

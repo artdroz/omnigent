@@ -27,10 +27,11 @@ import {
 } from "./htmlCommentBridge";
 import { TruncatedBanner } from "./TruncatedBanner";
 
-const HTML_COMMENT_BRIDGE_LOADER_URL = new URL(
-  "./htmlCommentBridgeLoader.js?no-inline",
+const HTML_COMMENT_BRIDGE_RUNTIME_URL = new URL(
+  "./htmlCommentBridgeRuntime.js?no-inline",
   import.meta.url,
 ).href;
+const BRIDGE_READY_TIMEOUT_MS = 5_000;
 
 interface HtmlCommentViewerProps {
   conversationId: string;
@@ -86,6 +87,8 @@ export function HtmlCommentViewer({
   onSetActiveSelection,
 }: HtmlCommentViewerProps) {
   const canEdit = useCanEdit(conversationId);
+  const [externalRetryContent, setExternalRetryContent] = useState<string | null>(null);
+  const useExternalBridge = getEmbedRoot() !== null || externalRetryContent === content;
 
   // A fresh nonce + srcDoc per content load. Changing srcDoc reloads the iframe
   // document, which re-runs the bridge and (via the new nonce) re-establishes
@@ -94,9 +97,13 @@ export function HtmlCommentViewer({
     const n = genNonce();
     return {
       nonce: n,
-      srcDoc: injectCommentBridge(content, n, HTML_COMMENT_BRIDGE_LOADER_URL),
+      srcDoc: injectCommentBridge(
+        content,
+        n,
+        useExternalBridge ? HTML_COMMENT_BRIDGE_RUNTIME_URL : undefined,
+      ),
     };
-  }, [content]);
+  }, [content, useExternalBridge]);
 
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const portRef = useRef<MessagePort | null>(null);
@@ -118,11 +125,18 @@ export function HtmlCommentViewer({
     const iframe = iframeRef.current;
     if (!iframe) return;
     let channel: MessageChannel | null = null;
+    let readyTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const clearReadyTimer = () => {
+      if (readyTimer !== null) clearTimeout(readyTimer);
+      readyTimer = null;
+    };
 
     const handleInbound = (raw: unknown) => {
       const msg = parseBridgeMessage(raw, nonce);
       if (!msg) return;
       if (msg.type === BRIDGE_MSG.ready) {
+        clearReadyTimer();
         // Flush current state now that the frame is connected.
         postState();
       } else if (msg.type === BRIDGE_MSG.selection) {
@@ -202,15 +216,27 @@ export function HtmlCommentViewer({
       win.postMessage({ source: BRIDGE_SOURCE, nonce, type: BRIDGE_MSG.init }, "*", [
         channel.port2,
       ]);
+      clearReadyTimer();
+      readyTimer = setTimeout(() => {
+        if (useExternalBridge) {
+          console.warn("HTML comment bridge did not become ready; comments are unavailable.");
+        } else {
+          console.warn("HTML comment bridge did not become ready; retrying the external runtime.");
+          setExternalRetryContent(content);
+        }
+      }, BRIDGE_READY_TIMEOUT_MS);
     };
 
     iframe.addEventListener("load", onLoad);
+    // The srcDoc can finish before this effect attaches on a fast reload.
+    onLoad();
     return () => {
       iframe.removeEventListener("load", onLoad);
+      clearReadyTimer();
       channel?.port1.close();
       portRef.current = null;
     };
-  }, [nonce]);
+  }, [content, nonce, useExternalBridge]);
 
   // Push comment-list changes into the frame.
   useEffect(() => {
@@ -244,6 +270,7 @@ export function HtmlCommentViewer({
 
   const preview = (
     <iframe
+      key={nonce}
       ref={iframeRef}
       srcDoc={srcDoc}
       sandbox={HTML_PREVIEW_SANDBOX}

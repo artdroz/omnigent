@@ -81,6 +81,7 @@ _HTML_CONTENT = f"""\
     <title>Design doc</title>
   </head>
   <body>
+    <script>window.__omniCspInlineCanary = true;</script>
     <h1>Design Doc</h1>
     <h2 id="repeated-title">{_REPEATED_PHRASE}</h2>
     <p id="anchor">{_ANCHOR_SENTENCE}</p>
@@ -186,13 +187,17 @@ def test_html_preview_add_comment_with_inherited_csp(
     page: Page,
     seeded_html: tuple[str, str, str],
 ) -> None:
-    """The external bridge starts when srcdoc inherits a strict script CSP."""
+    """The static runtime starts when srcdoc inherits a strict script CSP."""
     base_url, session_id, file_path = seeded_html
+    # The local test server is loopback; managed serves the runtime from a CDN.
+    page.context.grant_permissions(["local-network-access"], origin=base_url)
     console_errors: list[str] = []
+    page_errors: list[str] = []
     page.on(
         "console",
         lambda message: console_errors.append(message.text) if message.type == "error" else None,
     )
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
     document_url = re.compile(rf"^{re.escape(base_url)}/c/{re.escape(session_id)}(?:\?|$)")
 
     def add_managed_csp(route: Route) -> None:
@@ -200,32 +205,30 @@ def test_html_preview_add_comment_with_inherited_csp(
         headers = {
             **response.headers,
             "content-security-policy": (
-                "default-src 'self'; script-src 'self' 'unsafe-eval'; "
+                "default-src 'self'; script-src 'self'; "
                 "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
                 "font-src 'self' data:"
             ),
         }
         route.fulfill(response=response, headers=headers)
 
-    def allow_opaque_frame_asset(route: Route) -> None:
-        response = route.fetch()
-        route.fulfill(
-            response=response,
-            headers={
-                **response.headers,
-                "access-control-allow-origin": "*",
-                "access-control-allow-private-network": "true",
-            },
-        )
-
     page.route(document_url, add_managed_csp)
-    page.route(re.compile(r".*/assets/htmlCommentBridgeLoader-.*\.js$"), allow_opaque_frame_asset)
     file_viewer, preview = _open_preview(page, base_url, session_id)
     expect(preview.locator("#anchor")).to_have_text(_ANCHOR_SENTENCE, timeout=10_000)
+    expect(preview.locator('script[src][data-omni-loaded="true"]')).to_have_count(
+        1, timeout=10_000
+    )
+    canary_ran = preview.locator("body").evaluate("() => window.__omniCspInlineCanary === true")
+    assert not canary_ran, "fixture inline script ran; CSP did not reach the srcdoc frame"
     preview.locator("#anchor").select_text()
     add_btn = page.get_by_role("button", name="Add comment")
-    page.wait_for_timeout(1_000)
-    assert add_btn.is_visible(), "\n".join(console_errors)
+    try:
+        expect(add_btn).to_be_visible(timeout=10_000)
+    except AssertionError as error:
+        diagnostics = "\n".join([*console_errors, *page_errors])
+        raise AssertionError(
+            f"HTML comment bridge did not become ready:\n{diagnostics}"
+        ) from error
     add_btn.click()
     textarea = file_viewer.locator("textarea[placeholder='Add a comment…']")
     expect(textarea).to_be_visible()

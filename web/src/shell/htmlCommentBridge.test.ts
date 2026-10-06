@@ -3,8 +3,8 @@ import {
   anchorOccurrence,
   BRIDGE_MSG,
   BRIDGE_SOURCE,
-  buildBridgeScript,
   findAnchorInSource,
+  HTML_COMMENT_BRIDGE_RUNTIME,
   injectCommentBridge,
   parseBridgeMessage,
 } from "./htmlCommentBridge";
@@ -53,33 +53,40 @@ describe("injectCommentBridge", () => {
     expect(out).toContain("::highlight(omni-comment-active)");
   });
 
-  it("loads the bridge through an external CSP-compatible bootstrap", () => {
+  it("loads the static runtime externally for a no-inline CSP", () => {
     const out = injectCommentBridge("<body></body>", NONCE, LOADER_URL);
     expect(out).toContain(`src="${LOADER_URL}"`);
-    expect(out).toContain('data-omni-bridge="');
-    expect(out).not.toContain("<script>(function");
+    expect(out).toContain(`data-omni-nonce="${NONCE}"`);
+    expect(out).not.toContain(HTML_COMMENT_BRIDGE_RUNTIME);
   });
 
-  it("escapes loader URLs and bridge source as HTML attributes", () => {
-    const out = injectCommentBridge("<body></body>", NONCE, 'https://app.example/a?x=1&y="2"');
+  it("injects the same runtime inline without a network dependency", () => {
+    const out = injectCommentBridge("<body></body>", NONCE);
+    expect(out).toContain(`<script data-omni-nonce="${NONCE}">`);
+    expect(out).toContain(HTML_COMMENT_BRIDGE_RUNTIME);
+    expect(out).not.toContain("<script src=");
+  });
+
+  it("escapes runtime URLs and nonces as HTML attributes", () => {
+    const out = injectCommentBridge(
+      "<body></body>",
+      'nonce&"value',
+      'https://app.example/a?x=1&y="2"',
+    );
     expect(out).toContain('src="https://app.example/a?x=1&amp;y=&quot;2&quot;"');
-    expect(out).toContain("&quot;test-nonce-123&quot;");
+    expect(out).toContain('data-omni-nonce="nonce&amp;&quot;value"');
   });
 
-  it("substitutes the nonce, source tag, and message types into the script", () => {
-    const script = buildBridgeScript(NONCE);
-    expect(script).toContain(NONCE);
-    expect(script).toContain(BRIDGE_SOURCE);
-    expect(script).toContain(BRIDGE_MSG.selection);
-    // Placeholders must be fully replaced.
-    expect(script).not.toContain("__OMNI_NONCE__");
-    expect(script).not.toContain("__OMNI_TYPES__");
+  it("keeps protocol constants in sync without dynamic compilation", () => {
+    expect(HTML_COMMENT_BRIDGE_RUNTIME).not.toMatch(/\b(?:eval|Function)\s*\(/);
+    expect(HTML_COMMENT_BRIDGE_RUNTIME).toContain(`var SRC = "${BRIDGE_SOURCE}"`);
+    for (const [name, value] of Object.entries(BRIDGE_MSG)) {
+      expect(HTML_COMMENT_BRIDGE_RUNTIME).toContain(`${name}: "${value}"`);
+    }
   });
 
-  it("produces a syntactically valid script (guards template-literal escaping)", () => {
-    // The script body is a template literal; regex/backslash content in it can
-    // silently break parsing. new Function throws on a syntax error.
-    expect(() => new Function(buildBridgeScript(NONCE))).not.toThrow();
+  it("ships a syntactically valid classic script", () => {
+    expect(() => new Function(HTML_COMMENT_BRIDGE_RUNTIME)).not.toThrow();
   });
 });
 
