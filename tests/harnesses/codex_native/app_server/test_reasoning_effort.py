@@ -400,7 +400,7 @@ async def test_resume_applies_and_mirrors_supported_effort(
     client.close.assert_awaited_once()
 
 
-@pytest.mark.parametrize("stalled_phase", ["connect", "update"])
+@pytest.mark.parametrize("stalled_phase", ["connect", "update", "close"])
 async def test_resume_effort_update_times_out_and_closes_client(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -416,8 +416,12 @@ async def test_resume_effort_update_times_out_and_closes_client(
 
     if stalled_phase == "connect":
         client.connect.side_effect = stalled
-    else:
+    elif stalled_phase == "update":
         client.request.side_effect = stalled
+    else:
+        # The update times out, then the closing handshake hangs too.
+        client.request.side_effect = stalled
+        client.close.side_effect = stalled
     monkeypatch.setattr(app_server, "client_for_transport", lambda *args, **kwargs: client)
     monkeypatch.setattr(app_server, "_EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(app_server, "_EFFORT_CONNECT_TIMEOUT_SECONDS", 0.01)

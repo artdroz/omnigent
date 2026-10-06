@@ -136,6 +136,8 @@ Cross-harness journeys:
   `tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_model_switch_inherits_an_effort_whose_config_write_failed`
   cover a model or effort whose private-config write failed: later updates
   still use it and retry the write until a terminal switch rewrites the config.
+  Routed switches and turns read the same record
+  (`tests/harnesses/codex_native/test_codex_native_hook.py::test_routed_model_switch_keeps_an_effort_whose_config_write_failed`).
 - **`model-and-effort`, rejected Codex reset (server/runner integration):**
   `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_reset_returns_error_and_preserves_applied_settings`,
   `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_change_preserves_concurrent_selection_and_sibling_settings`,
@@ -165,7 +167,7 @@ Cross-harness journeys:
   runners apply the model first and then the effort; if that second step
   fails, the error preserves the model already applied. A failed immediate
   mirror is retried when the forwarder next reads the private config.
-  Target-model Default requires the updated server's combined-update path.
+  Target-model Default requires both the updated server and the updated runner.
   An older server resets the previous model first, even with an updated runner;
   its default is then inherited if the target supports it. On older servers,
   switch models first and select Default as a separate action afterward.

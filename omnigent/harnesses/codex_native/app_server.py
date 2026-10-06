@@ -4482,7 +4482,9 @@ async def apply_codex_thread_effort(
                 bridge_dir,
             )
     finally:
-        await client.close()
+        # A wedged server can stall the closing handshake; it must not mask the result.
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(client.close(), timeout=_EFFORT_CONNECT_TIMEOUT_SECONDS)
 
 
 def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:

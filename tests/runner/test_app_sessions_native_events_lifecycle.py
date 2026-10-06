@@ -624,12 +624,21 @@ async def test_codex_native_settings_change_clamps_and_mirrors_effort(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("mirror_recovers", "terminal_model", "expected_effort", "expected_config_model"),
+    (
+        "mirror_recovers",
+        "terminal_model",
+        "plan_toggle",
+        "expected_effort",
+        "expected_config_model",
+    ),
     [
-        pytest.param(False, None, "max", "gpt-5.4", id="mirror_still_failing"),
-        pytest.param(True, None, "max", "gpt-6-sol", id="mirror_retried"),
-        pytest.param(True, "gpt-5.5", "high", "gpt-5.5", id="terminal_switched_model"),
-        pytest.param(True, "gpt-5.4", "xhigh", "gpt-5.4", id="terminal_switched_back"),
+        pytest.param(False, None, False, "max", "gpt-5.4", id="mirror_still_failing"),
+        pytest.param(True, None, False, "max", "gpt-6-sol", id="mirror_retried"),
+        pytest.param(True, "gpt-5.5", False, "high", "gpt-5.5", id="terminal_switched_model"),
+        pytest.param(True, "gpt-5.4", False, "xhigh", "gpt-5.4", id="terminal_switched_back"),
+        pytest.param(
+            False, "gpt-5.5", True, "high", "gpt-5.5", id="terminal_switched_then_plan_toggled"
+        ),
     ],
 )
 async def test_codex_native_effort_uses_the_applied_model_after_a_failed_mirror(
@@ -637,6 +646,7 @@ async def test_codex_native_effort_uses_the_applied_model_after_a_failed_mirror(
     tmp_path: Path,
     mirror_recovers: bool,
     terminal_model: str | None,
+    plan_toggle: bool,
     expected_effort: str,
     expected_config_model: str,
 ) -> None:
@@ -708,6 +718,13 @@ async def test_codex_native_effort_uses_the_applied_model_after_a_failed_mirror(
             rewritten = config.with_name("config.toml.terminal")
             rewritten.write_text(config.read_text().replace('"gpt-5.4"', f'"{terminal_model}"'))
             os.replace(rewritten, config)
+        if plan_toggle:
+            # A settings update without a model or effort must not revive the stale model.
+            toggled = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "plan_mode_change", "enabled": True},
+            )
+            assert toggled.status_code == 204, toggled.text
         picked = await client.post(
             f"/v1/sessions/{conv_id}/events", json={"type": "effort_change", "effort": "max"}
         )

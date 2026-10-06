@@ -1141,6 +1141,48 @@ def test_routed_model_switch_checks_inherited_effort(
     assert read_codex_config_effort(bridge_dir) == expected
 
 
+@pytest.mark.parametrize(("config_rewritten", "expected"), [(False, "high"), (True, "low")])
+def test_routed_model_switch_keeps_an_effort_whose_config_write_failed(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_rewritten: bool,
+    expected: str,
+) -> None:
+    """Routing inherits the applied effort, not a stale config, until the config is replaced."""
+    import os
+
+    from omnigent.harnesses.codex_native.bridge import write_unmirrored_codex_settings
+
+    home = codex_home_for_bridge_dir(bridge_dir)
+    home.mkdir(parents=True, exist_ok=True)
+    config = home / "config.toml"
+    config.write_text('model = "gpt-5.6-sol"\nmodel_reasoning_effort = "low"\n')
+    # The runner applied high, but its config write failed.
+    write_unmirrored_codex_settings(bridge_dir, {"effort": "high"})
+    if config_rewritten:
+        # A later terminal pick replaces the config and supersedes the record.
+        replacement = home / "config.toml.terminal"
+        replacement.write_text(config.read_text())
+        os.replace(replacement, config)
+    catalog = [
+        {
+            "id": "gpt-5.4",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": value} for value in ("low", "medium", "high", "xhigh")
+            ],
+        }
+    ]
+    client = _FakeAppServerClient(catalog)
+    _install_fake_client(monkeypatch, client)
+
+    assert codex_native_hook._apply_thread_model(bridge_dir, "databricks-gpt-5-4") is None
+
+    assert client.requests[-1] == (
+        "thread/settings/update",
+        {"threadId": "thread_abc", "model": "gpt-5.4", "effort": expected},
+    )
+
+
 def test_apply_thread_model_declines_a_model_this_pane_cannot_serve(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,

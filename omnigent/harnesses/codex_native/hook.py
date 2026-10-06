@@ -471,6 +471,7 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> str | None:
     )
     from omnigent.harnesses.codex_native.bridge import (
         read_codex_config_effort,
+        read_unmirrored_codex_settings,
         write_codex_config_effort,
         write_codex_config_model,
     )
@@ -501,7 +502,10 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> str | None:
             if slug is None:
                 declined = f"routed model not in this pane's catalog ({model})"
                 return
-            inherited_effort = read_codex_config_effort(bridge_dir)
+            # An effort applied while its config write failed is recorded beside the config.
+            inherited_effort = read_unmirrored_codex_settings(bridge_dir).get(
+                "effort"
+            ) or read_codex_config_effort(bridge_dir)
             effort = clamp_codex_effort_for_model(
                 effort_for_model_switch(inherited_effort, slug), slug, rows
             )

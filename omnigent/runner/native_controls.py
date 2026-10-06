@@ -227,7 +227,6 @@ def build_native_controls(
     _begin_turn_slot: Callable[[str], None],
     _claude_model_options_rows: dict[str, tuple[float, list[dict[str, object]]]],
     _codex_native_bridge_state_for_session: _CodexNativeBridgeStateForSessionFn,
-    _codex_unmirrored_settings: dict[str, tuple[dict[str, str], tuple[int, int] | None]],
     _ensure_comment_relay_started: _EnsureCommentRelayStartedFn,
     _ensure_native_terminal_for_turn: Callable[[str, str | None], Coroutine[Any, Any, None]],
     _fetch_session_model_override: Callable[[str], Coroutine[Any, Any, str | None]],
@@ -292,25 +291,24 @@ def build_native_controls(
                     _session_reasoning_effort.pop(conv_id, None)
             return response
 
-    def _unmirrored_codex_settings(conv_id: str, bridge_dir: Path) -> dict[str, str]:
+    def _unmirrored_codex_settings(bridge_dir: Path) -> dict[str, str]:
         """Return applied settings the config still lacks, retrying their writes."""
         from omnigent.harnesses.codex_native.bridge import (
-            codex_config_revision,
+            read_unmirrored_codex_settings,
             write_codex_config_effort,
             write_codex_config_model,
+            write_unmirrored_codex_settings,
         )
 
-        entry = _codex_unmirrored_settings.pop(conv_id, None)
         # Any later rewrite, such as a terminal switch, makes the config current.
-        if entry is None or entry[1] != codex_config_revision(bridge_dir):
-            return {}
-        writers = {"model": write_codex_config_model, "effort": write_codex_config_effort}
-        failed = {
-            key: value for key, value in entry[0].items() if not writers[key](bridge_dir, value)
-        }
-        if failed:
-            _codex_unmirrored_settings[conv_id] = (failed, codex_config_revision(bridge_dir))
-        return entry[0]
+        pending = read_unmirrored_codex_settings(bridge_dir)
+        if pending:
+            writers = {"model": write_codex_config_model, "effort": write_codex_config_effort}
+            failed = {
+                key: value for key, value in pending.items() if not writers[key](bridge_dir, value)
+            }
+            write_unmirrored_codex_settings(bridge_dir, failed)
+        return pending
 
     async def _apply_codex_native_settings_update(
         conv_id: str,
@@ -325,11 +323,12 @@ def build_native_controls(
         )
         from omnigent.harnesses.codex_native.bridge import (
             bridge_dir_for_codex_home,
-            codex_config_revision,
             read_codex_config_effort,
             read_codex_config_model,
+            read_unmirrored_codex_settings,
             write_codex_config_effort,
             write_codex_config_model,
+            write_unmirrored_codex_settings,
         )
         from omnigent.runner.turn_routing import SETTINGS_UPDATE_TIMEOUT_S
         from omnigent.util.reasoning_effort import effort_for_model_switch
@@ -353,7 +352,7 @@ def build_native_controls(
         unmirrored: dict[str, str] = {}
         if "model" in settings or "effort" in settings:
             # A failed config write must not make the stale value the next update's base.
-            unmirrored = _unmirrored_codex_settings(conv_id, bridge_dir)
+            unmirrored = _unmirrored_codex_settings(bridge_dir)
             model = (
                 settings.get("model")
                 or unmirrored.get("model")
@@ -453,8 +452,8 @@ def build_native_controls(
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
-        # This update's values replace older pending ones; untouched keys stay pending.
-        pending = dict(_codex_unmirrored_settings.pop(conv_id, ({}, None))[0])
+        # This update's values replace pending ones; a rewrite since supersedes the rest.
+        pending = read_unmirrored_codex_settings(bridge_dir)
         model = settings.get("model")
         if isinstance(model, str):
             pending.pop("model", None)
@@ -468,9 +467,9 @@ def build_native_controls(
             if not write_codex_config_effort(bridge_dir, effort):
                 _logger.warning("Could not mirror Codex effort for session=%s", conv_id)
                 pending["effort"] = effort
-        if pending:
-            # Stamp after this update's own writes, so only later rewrites supersede them.
-            _codex_unmirrored_settings[conv_id] = (pending, codex_config_revision(bridge_dir))
+        if "model" in settings or "effort" in settings:
+            # Record after this update's own writes, so only later rewrites supersede them.
+            write_unmirrored_codex_settings(bridge_dir, pending)
         if isinstance(effort, str) and effort:
             # Codex emits no settings notification when normalization leaves
             # its effort unchanged, so confirm the applied value explicitly.
@@ -840,7 +839,6 @@ def build_native_controls(
         from omnigent.entities.session_resources import terminal_resource_id
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
 
-        _codex_unmirrored_settings.pop(conv_id, None)
         terminal_registry = resource_registry.terminal_registry
         if terminal_registry is None:
             return

@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 import math
 import os
 import secrets
@@ -12,7 +13,7 @@ import stat
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator, MutableMapping
+from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -24,6 +25,8 @@ from omnigent.native import native_bridge_common
 
 if TYPE_CHECKING:
     from omnigent.inner.terminal import TerminalInstance
+
+_logger = logging.getLogger(__name__)
 
 CODEX_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.codex_native.bridge_id"
 CODEX_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_CODEX_NATIVE_BRIDGE_DIR"
@@ -55,6 +58,8 @@ _STATE_FILE = "state.json"
 _STATE_LOCK_FILE = "state.lock"
 _STARTUP_ERROR_FILE = "startup_error.json"
 _STARTUP_TIMEOUT_FILE = "startup_timeout.json"
+# Applied model/effort that config.toml failed to record, for every reader of it.
+_UNMIRRORED_SETTINGS_FILE = "unmirrored_settings.json"
 _STARTUP_TIMEOUT_MAX_BYTES = 256
 # Per-MCP-server startup state mirrored from Codex's
 # ``mcpServer/startupStatus/updated`` notifications. Written by the
@@ -493,6 +498,53 @@ def codex_home_for_bridge_dir(bridge_dir: Path) -> Path:
 def bridge_dir_for_codex_home(codex_home: Path) -> Path:
     """Invert :func:`codex_home_for_bridge_dir` for a private session home."""
     return codex_home.parent
+
+
+def write_unmirrored_codex_settings(bridge_dir: Path, settings: Mapping[str, str]) -> None:
+    """Record applied settings that ``config.toml`` lacks, against its current revision.
+
+    An empty mapping clears the record. Readers trust it only until another writer,
+    such as an in-terminal ``/model``, replaces the config.
+    """
+    path = bridge_dir / _UNMIRRORED_SETTINGS_FILE
+    if not settings:
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
+        return
+    revision = codex_config_revision(bridge_dir)
+    payload = {"settings": dict(settings), "config_revision": list(revision or ())}
+    try:
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f"{_UNMIRRORED_SETTINGS_FILE}.", dir=str(bridge_dir)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, sort_keys=True)
+            os.replace(tmp_name, path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+    except OSError:
+        _logger.warning("Could not record unmirrored Codex settings in %s", bridge_dir)
+
+
+def read_unmirrored_codex_settings(bridge_dir: Path) -> dict[str, str]:
+    """Return applied settings ``config.toml`` still lacks, or ``{}`` once it was replaced."""
+    try:
+        payload = json.loads((bridge_dir / _UNMIRRORED_SETTINGS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    revision = codex_config_revision(bridge_dir)
+    settings = payload.get("settings")
+    if payload.get("config_revision") != list(revision or ()) or not isinstance(settings, dict):
+        return {}
+    return {
+        key: value
+        for key, value in settings.items()
+        if key in ("model", "effort") and isinstance(value, str) and value
+    }
 
 
 def codex_config_revision(bridge_dir: Path) -> tuple[int, int] | None:

@@ -41,6 +41,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_effort,
     read_codex_config_model,
     read_mcp_startup,
+    read_unmirrored_codex_settings,
     update_active_turn_id,
     write_codex_config_effort,
     write_codex_config_model,
@@ -182,8 +183,18 @@ async def _start_codex_turn(
 ) -> None:
     """Apply optional settings and start one Codex turn on an idle thread."""
     settings_overrides = dict(settings_overrides)
-    model = settings_overrides.get("model") or read_codex_config_model(bridge_dir)
-    effort = settings_overrides.get("effort") or read_codex_config_effort(bridge_dir)
+    # Settings applied while their config write failed are recorded beside the config.
+    unmirrored = read_unmirrored_codex_settings(bridge_dir)
+    model = (
+        settings_overrides.get("model")
+        or unmirrored.get("model")
+        or read_codex_config_model(bridge_dir)
+    )
+    effort = (
+        settings_overrides.get("effort")
+        or unmirrored.get("effort")
+        or read_codex_config_effort(bridge_dir)
+    )
     if isinstance(model, str) and isinstance(effort, str):
         resolved_effort = await resolve_codex_effort_for_model(
             client, effort, model, transport=state.socket_path
