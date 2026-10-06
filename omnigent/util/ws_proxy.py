@@ -167,10 +167,12 @@ def _matches_url_pattern(host: str, port: int | None, http_scheme: str, pattern:
         return False
     if pattern_port == _DEFAULT_PORT_BY_HTTP_SCHEME.get(parts.scheme):
         pattern_port = None
-    if pattern_port != port:
+    if pattern_port is not None and pattern_port != port:
         return False
     if pattern_host == "*":
-        return True
+        # In httpx only a port-qualified wildcard outranks the scheme-specific
+        # proxy mounts; a bare ``all://*`` or ``http://*`` bypasses nothing.
+        return pattern_port is not None
     if pattern_host.startswith("*."):
         return host.endswith(pattern_host[1:])
     if pattern_host.startswith("*"):
