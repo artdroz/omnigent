@@ -245,10 +245,13 @@ export const CMD_BACKSPACE_LINE_KILL = "\x15"; // Ctrl-U: kill to line start
 export const CMD_LEFT_LINE_START = "\x01"; // Ctrl-A: cursor to line start
 export const CMD_RIGHT_LINE_END = "\x05"; // Ctrl-E: cursor to line end
 
+/** Control byte a native terminal sends for Ctrl+/ (shared with Ctrl+7 / Ctrl+_). */
+export const CTRL_SLASH_UNIT_SEPARATOR = "\x1f";
+
 /**
  * Return the terminal bytes to send for a browser key event.
  *
- * Two key families need synthesized bytes because neither xterm.js nor the
+ * Three key families need synthesized bytes because neither xterm.js nor the
  * browser produces them:
  *
  * - **Shift+Enter** — xterm does not emit Kitty Keyboard Protocol sequences
@@ -263,6 +266,11 @@ export const CMD_RIGHT_LINE_END = "\x05"; // Ctrl-E: cursor to line end
  *   Each maps to the Ctrl control character a native terminal sends. Only
  *   bare Cmd combos are mapped: Cmd+C/V/K/R and friends keep their
  *   browser/xterm meaning (copy/paste/clear/reload).
+ * - **Ctrl+/** — xterm's Ctrl table covers letters, Space, 3–8 and the
+ *   bracket keys but not `/`, so the chord yields no bytes and its keydown
+ *   bubbles on to the app's Ctrl+/ shortcuts-dialog hotkey. A native terminal
+ *   sends `0x1F`, the byte TUIs such as Codex bind (its side-conversation
+ *   toggle, aliased to Ctrl+7 for that reason).
  *
  * :param event: Browser keyboard event from xterm's custom key handler.
  * :returns: Bytes to send instead of xterm's default handling, or ``null``
@@ -289,6 +297,9 @@ export function terminalKeyEventPayload(event: KeyboardEvent): string | null {
     if (event.key === "Backspace") return CMD_BACKSPACE_LINE_KILL;
     if (event.key === "ArrowLeft") return CMD_LEFT_LINE_START;
     if (event.key === "ArrowRight") return CMD_RIGHT_LINE_END;
+  }
+  if (event.key === "/" && event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey) {
+    return CTRL_SLASH_UNIT_SEPARATOR;
   }
   return null;
 }
@@ -845,8 +856,9 @@ export class TerminalSession {
       const payload = terminalKeyEventPayload(e);
       if (payload === null) return true;
       // xterm invokes this handler for keydown, keypress, and keyup.
-      // Suppress all three so xterm cannot also send a bare Enter; emit
-      // the CSI-u sequence once, on keydown.
+      // Suppress all three so xterm cannot also send its own bytes; emit
+      // the payload once, on keydown. preventDefault also marks the chord
+      // as claimed for the app's window-level hotkeys, which yield to it.
       if (e.type === "keydown") {
         e.preventDefault();
         onInput?.();
