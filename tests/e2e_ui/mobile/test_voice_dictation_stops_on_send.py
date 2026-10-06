@@ -151,7 +151,7 @@ def _dictate_then_send(page: Page, dictated: str) -> None:
     expect(mic).to_be_enabled()
 
 
-def _expect_take_ended(page: Page, **facts: Any) -> None:
+def _expect_take_ended(page: Page) -> None:
     mic = page.get_by_role("button", name="Voice dictation")
     try:
         expect(mic).to_have_attribute("aria-pressed", "false", timeout=_STOP_TIMEOUT_MS)
@@ -159,7 +159,6 @@ def _expect_take_ended(page: Page, **facts: Any) -> None:
         observed = {
             "mic_tracks": page.evaluate(_MIC_TRACK_STATES_JS),
             "composer": page.locator(_COMPOSER).input_value(),
-            **facts,
         }
         raise AssertionError(
             f"voice take survived the send: mic still listening after {_STOP_TIMEOUT_MS} ms;"

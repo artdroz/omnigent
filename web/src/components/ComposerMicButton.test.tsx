@@ -785,6 +785,42 @@ describe("ComposerMicButton (endTake)", () => {
     expect(button).toHaveAttribute("aria-pressed", "false");
   });
 
+  it("stays silent when the handshake fails after the take is ended mid-send", async () => {
+    vi.stubGlobal("SpeechRecognition", undefined);
+    vi.stubGlobal("webkitSpeechRecognition", undefined);
+    // Hold the handshake open so the send (endTake) lands while start is still
+    // pending, then fail it. The failure is for a take the user already ended,
+    // so it must clear the spinner without warning about a dropped take.
+    let rejectStart!: (reason: unknown) => void;
+    sessionStartMock = vi.fn((events: DictationSessionEvents) => {
+      sessionEvents = events;
+      return new Promise<SessionStub>((_resolve, reject) => {
+        rejectStart = reject;
+      });
+    });
+    const ref = createRef<ComposerMicButtonHandle>();
+    render(
+      <CapabilitiesContext.Provider value={DICTATION_INFO}>
+        <ComposerMicButton ref={ref} onTranscript={vi.fn()} />
+      </CapabilitiesContext.Provider>,
+    );
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+
+    await act(async () => {
+      fireEvent.click(button);
+    });
+    expect(button).toHaveAttribute("aria-busy", "true");
+    act(() => ref.current?.endTake());
+
+    await act(async () => {
+      rejectStart(new Error("socket refused"));
+    });
+    expect(button).toHaveAttribute("aria-busy", "false");
+    expect(button).toHaveAttribute("aria-pressed", "false");
+    expect(button).toHaveAttribute("title", "Voice dictation");
+    expect(showToastMock).not.toHaveBeenCalled();
+  });
+
   it("drops the tail from an in-flight server stop ended on send", async () => {
     vi.stubGlobal("SpeechRecognition", undefined);
     vi.stubGlobal("webkitSpeechRecognition", undefined);

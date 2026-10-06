@@ -516,14 +516,14 @@ function ComposerMicButtonImpl(
       setIsListening(false);
       return;
     }
-    // No session attached yet: the take is mid-handshake or mid-stop.
-    // endPendingRef discards a session about to open; discardingRef drops an
-    // in-flight stop's trailing tail.
+    // No session yet: the take is mid-handshake or mid-stop. discardingRef drops
+    // the late result or trailing tail in either case. endPendingRef only matters
+    // on the start path, which cancels the resolved session and clears the
+    // connecting spinner (so the button isn't idle-looking while it still rejects
+    // taps); the stop path returns before reading it, so the flag is inert there.
     if (serverBusyRef.current) {
       endPendingRef.current = true;
       discardingRef.current = true;
-      // Keep the connecting indicator until toggleServer cancels the pending
-      // session, so the button isn't idle-looking while it still rejects taps.
       return;
     }
     if (!isListening && !transitionRef.current) return;
