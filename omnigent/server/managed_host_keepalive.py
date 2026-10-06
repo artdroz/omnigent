@@ -71,6 +71,8 @@ class _KeepAliveOutcome(StrEnum):
     RESOLUTION_ERROR = "resolution_error"
     SUBMISSION_FAILED = "submission_failed"
     CANCELLED = "cancelled"
+    WORKER_CRASHED = "worker_crashed"
+    STALLED = "stalled"
 
 
 # runner_id -> its provider's keepalive cadence (seconds), filled by
@@ -127,11 +129,11 @@ def configure(
         managed sandboxes are not configured.
     """
     global _conversation_store, _host_store, _sandbox_config, _executor
-    _conversation_store = conversation_store
-    _host_store = host_store
-    _sandbox_config = sandbox_config
     stale: ThreadPoolExecutor | None = None
     with _state_lock:
+        _conversation_store = conversation_store
+        _host_store = host_store
+        _sandbox_config = sandbox_config
         enabled = sandbox_config is not None and host_store is not None
         if enabled and _executor is None:
             _executor = ThreadPoolExecutor(
@@ -195,16 +197,24 @@ def touch(runner_id: str) -> None:
         last = _last_kept.get(runner_id)
         if last is not None and now - last < interval:
             return
-        if runner_id in _inflight:
-            # A reservation spans both queued and running work. Do not let a
-            # slow provider accumulate duplicate jobs for one runner; _last_kept
-            # stays untouched so the next tick retries once this one clears.
-            return
-        _inflight.add(runner_id)
-        # Stamp the tick, not the worker start: the tunnel loop sleeps exactly
-        # one interval after this call, so a later stamp would drop its next tick.
-        _last_kept[runner_id] = now
+        in_flight = runner_id in _inflight
+        if not in_flight:
+            _inflight.add(runner_id)
+            # Stamp the tick, not the worker start: the tunnel loop sleeps exactly
+            # one interval after this call, so a later stamp would drop its next tick.
+            _last_kept[runner_id] = now
         should_prune = len(_last_kept) > _THROTTLE_MAX_ENTRIES
+    if in_flight:
+        # A reservation spans queued and running work, so a refresh still in
+        # flight a whole interval later means a hung provider call: log it, do
+        # not stack a duplicate, and leave _last_kept so the next tick retries.
+        since_tick = "" if last is None else f" {now - last:.0f}s after its tick"
+        _emit_outcome(
+            runner_id,
+            _KeepAliveOutcome.STALLED,
+            message=f"keepalive still in flight for runner {runner_id}{since_tick}",
+        )
+        return
     if should_prune:
         _prune_throttle(now)
     try:
@@ -220,7 +230,7 @@ def touch(runner_id: str) -> None:
             exc=exc,
         )
         return
-    future.add_done_callback(lambda completed: _finalize_job(completed, runner_id))
+    future.add_done_callback(lambda completed: _finalize_job(completed, runner_id, now))
 
 
 def _prune_throttle(now: float) -> None:
@@ -241,11 +251,13 @@ def _release_reservation(runner_id: str) -> None:
         _runner_interval_s.pop(runner_id, None)
 
 
-def _finalize_job(future: Future[None], runner_id: str) -> None:
+def _finalize_job(future: Future[None], runner_id: str, queued_at: float) -> None:
     """Release a cancelled job's reservation; only record a crash (the job released its own)."""
     if future.cancelled():
         _release_reservation(runner_id)
-        _emit_outcome(runner_id, _KeepAliveOutcome.CANCELLED, queue_delay_s=0.0)
+        _emit_outcome(
+            runner_id, _KeepAliveOutcome.CANCELLED, queue_delay_s=time.monotonic() - queued_at
+        )
         return
     exc = future.exception()
     if exc is not None:
@@ -253,7 +265,7 @@ def _finalize_job(future: Future[None], runner_id: str) -> None:
         # crashed job's own cleanup; _run_keepalive_job always runs that cleanup.
         _emit_outcome(
             runner_id,
-            _KeepAliveOutcome.RESOLUTION_ERROR,
+            _KeepAliveOutcome.WORKER_CRASHED,
             error_type=_bounded_error_type(exc),
             exc=exc,
         )
@@ -301,6 +313,8 @@ def _emit_outcome(
         _KeepAliveOutcome.PROVIDER_ERROR,
         _KeepAliveOutcome.RESOLUTION_ERROR,
         _KeepAliveOutcome.SUBMISSION_FAILED,
+        _KeepAliveOutcome.WORKER_CRASHED,
+        _KeepAliveOutcome.STALLED,
     }:
         level = logging.WARNING
     else:
@@ -337,11 +351,12 @@ def _keep_alive_for_runner(runner_id: str) -> None:
     """Resolve *runner_id* to its managed sandbox and extend it. Never raises."""
     queue_delay_s = _queue_delay_s.get()
     try:
-        conversation_store, host_store, deployment = (
-            _conversation_store,
-            _host_store,
-            _sandbox_config,
-        )
+        with _state_lock:
+            conversation_store, host_store, deployment = (
+                _conversation_store,
+                _host_store,
+                _sandbox_config,
+            )
         if conversation_store is None or host_store is None or deployment is None:
             return
         host_ids = {
