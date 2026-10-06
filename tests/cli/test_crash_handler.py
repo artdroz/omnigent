@@ -17,6 +17,7 @@ import io
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -128,6 +129,63 @@ def test_rotate_keeps_current_report_when_mtimes_tie(data_dir: Path) -> None:
     ch._rotate(crashes, 2, current=current)
 
     assert current.exists()
+    assert len(list(crashes.glob("crash-*.md"))) == 2
+
+
+_TIE_MTIME_NS = 1_577_836_800_000_000_000
+
+
+def _seed_prior_reports(crashes: Path, count: int, mtime_ns: int) -> list[Path]:
+    crashes.mkdir(parents=True, exist_ok=True)
+    seeds = [crashes / f"crash-20200101T00000{i}Z.md" for i in range(count)]
+    for seed in seeds:
+        seed.write_text("prior\n", encoding="utf-8")
+        os.utime(seed, ns=(mtime_ns, mtime_ns))
+    return seeds
+
+
+def test_save_report_survives_rotation_when_mtimes_tie(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent", keep_reports=2)
+    crashes = data_dir / "crashes"
+    _seed_prior_reports(crashes, 2, _TIE_MTIME_NS)
+
+    # Coarse filesystem clock: the new report lands in the seeds' mtime granule,
+    # and directory order (name order here) lists it last among the ties.
+    real_write_text = Path.write_text
+    real_glob = Path.glob
+
+    def write_in_granule(
+        self: Path,
+        data: str,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> int:
+        written = real_write_text(self, data, encoding, errors, newline)
+        os.utime(self, ns=(_TIE_MTIME_NS, _TIE_MTIME_NS))
+        return written
+
+    monkeypatch.setattr(Path, "write_text", write_in_granule)
+    monkeypatch.setattr(
+        Path, "glob", lambda self, *args, **kwargs: iter(sorted(real_glob(self, *args, **kwargs)))
+    )
+
+    path = ch._save_report("current\n")
+
+    assert path.exists()
+    assert len(list(crashes.glob("crash-*.md"))) == 2
+
+
+def test_save_report_survives_rotation_when_prior_reports_sort_newer(data_dir: Path) -> None:
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent", keep_reports=2)
+    crashes = data_dir / "crashes"
+    _seed_prior_reports(crashes, 2, time.time_ns() + 10 * 24 * 3600 * 1_000_000_000)
+
+    path = ch._save_report("current\n")
+
+    assert path.exists()
     assert len(list(crashes.glob("crash-*.md"))) == 2
 
 
