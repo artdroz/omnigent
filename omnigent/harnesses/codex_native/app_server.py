@@ -777,6 +777,8 @@ def clamp_codex_effort_for_model(
 
 
 _effort_catalog_cache: TTLCache[str, list[_JsonObject]] = TTLCache(maxsize=128, ttl=60.0)
+# Models a fresh catalog lacked, so an unlisted model does not refetch on every turn.
+_effort_catalog_misses: TTLCache[tuple[str, str], bool] = TTLCache(maxsize=256, ttl=60.0)
 
 
 async def resolve_codex_effort_for_model(
@@ -795,8 +797,14 @@ async def resolve_codex_effort_for_model(
     treats a null effort in ``thread/settings/update`` as unchanged.
     """
     catalog = _effort_catalog_cache.get(transport) if transport is not None else None
-    if catalog is not None and model and _codex_model_catalog_entry(catalog, model) is None:
-        catalog = None  # The cached rows predate this model, so refetch them.
+    if (
+        catalog is not None
+        and transport is not None
+        and model
+        and _codex_model_catalog_entry(catalog, model) is None
+        and (transport, model) not in _effort_catalog_misses
+    ):
+        catalog = None  # The cached rows may predate this model, so refetch them.
     if model and catalog is None:
         try:
             catalog = await asyncio.wait_for(
@@ -806,6 +814,8 @@ async def resolve_codex_effort_for_model(
             # Empty startup catalogs can recover; retry instead of hiding later metadata.
             if transport is not None and catalog:
                 _effort_catalog_cache[transport] = catalog
+                if _codex_model_catalog_entry(catalog, model) is None:
+                    _effort_catalog_misses[(transport, model)] = True
         except Exception:  # noqa: BLE001 — discovery must not prevent a turn
             log_once(
                 _logger,

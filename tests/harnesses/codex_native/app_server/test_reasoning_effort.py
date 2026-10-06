@@ -218,6 +218,7 @@ async def test_cached_catalog_without_the_model_is_read_again(
 ) -> None:
     """A model missing from the cached rows is looked up again instead of failing its reset."""
     monkeypatch.setattr(app_server, "_effort_catalog_cache", TTLCache(maxsize=2, ttl=60))
+    monkeypatch.setattr(app_server, "_effort_catalog_misses", TTLCache(maxsize=2, ttl=60))
     client = AsyncMock(spec=app_server.CodexAppServerClient)
     first = {
         "id": "gpt-5.4",
@@ -251,6 +252,15 @@ async def test_cached_catalog_without_the_model_is_read_again(
         == "high"
     )
     assert client.request.await_count == 2
+    # A model the fresh rows still lack keeps the gateway fallback without refetching each turn.
+    for _ in range(2):
+        assert (
+            await app_server.resolve_codex_effort_for_model(
+                client, "ultra", "glm-5-2", transport=transport
+            )
+            == "medium"
+        )
+    assert client.request.await_count == 3
 
 
 @pytest.mark.parametrize("failure", ["unavailable", "malformed", "empty", "timeout"])
