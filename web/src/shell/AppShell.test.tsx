@@ -3270,10 +3270,8 @@ describe("AppShell URL sync — file param", () => {
     renderShell("/c/conv_abc?file=README.md");
 
     // jsdom's matchMedia stub never matches the mobile query, so this is the
-    // desktop layout: only the inline rail viewer mounts; the mobile push-panel
-    // (file-viewer) must not, or it would load and render the file again.
-    // Failure: the conversationId effect did not read searchParams.get("file")
-    // and call setSelectedFilePath with it.
+    // desktop layout: only the inline rail viewer may mount — a mobile push-panel
+    // (file-viewer) here would load and render the file again.
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
     expect(screen.queryByTestId("file-viewer")).toBeNull();
   });

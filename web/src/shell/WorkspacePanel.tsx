@@ -1426,23 +1426,26 @@ function WorkspacePanelImpl({
               readOnly={!isOwnerLevel(permissionLevel)}
               autoFocus={autoFocusSelectedTerminal}
             />
-          ) : selectedFilePath !== null && !isMobile ? (
-            // Desktop rail only: below md, AppShell's push panel renders the
-            // file, so mounting here too would double-fetch and double-render.
-            <FileViewer
-              viewport="desktop"
-              frameless
-              open
-              conversationId={conversationId}
-              path={selectedFilePath}
-              position={filePosition}
-              onClose={onShowScopeView}
-              onCloseTab={handleCloseTab}
-              onNavigateTo={openFileViewer}
-              permissionLevel={permissionLevel}
-              onCommentsOpenChange={onCommentsOpenChange}
-              sort={filesPanelSort}
-            />
+          ) : selectedFilePath !== null ? (
+            // Desktop rail only: below md, AppShell's push panel owns the file,
+            // so this slot renders nothing rather than a second viewer or a
+            // hidden fall-through panel that would fetch.
+            isMobile ? null : (
+              <FileViewer
+                viewport="desktop"
+                frameless
+                open
+                conversationId={conversationId}
+                path={selectedFilePath}
+                position={filePosition}
+                onClose={onShowScopeView}
+                onCloseTab={handleCloseTab}
+                onNavigateTo={openFileViewer}
+                permissionLevel={permissionLevel}
+                onCommentsOpenChange={onCommentsOpenChange}
+                sort={filesPanelSort}
+              />
+            )
           ) : sideChatSelected && !isMobile ? (
             // A side chat: a forked child conversation streamed here in its own
             // scoped surface, beside the still-active main chat. Phones show it
