@@ -10163,24 +10163,52 @@ describe("chatStore — session configuration scope", () => {
     expect(useChatStore.getState().sessionReasoningEffort).toBe("high");
   });
 
-  const refuseEffortPatch = (sessionId: string, gate?: Promise<void>) =>
+  const refusePatch = (
+    sessionId: string,
+    refuses: (body: Record<string, unknown>) => boolean,
+    message: string,
+    gate?: Promise<void>,
+  ) =>
     fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       const body = init?.method === "PATCH" ? JSON.parse(String(init.body)) : {};
-      if (url.split("?")[0] === `/v1/sessions/${sessionId}` && body.reasoning_effort === "high") {
+      if (url.split("?")[0] === `/v1/sessions/${sessionId}` && refuses(body)) {
         await gate;
         return mockResponse(
-          {
-            error: {
-              code: "runner_unavailable",
-              message: "The terminal did not apply the reasoning effort change. Please try again.",
-            },
-          },
+          { error: { code: "runner_unavailable", message } },
           { ok: false, status: 503 },
         );
       }
       return defaultFetchHandler(input, init);
     });
+  const refuseEffortPatch = (sessionId: string, gate?: Promise<void>) =>
+    refusePatch(
+      sessionId,
+      (body) => body.reasoning_effort === "high",
+      "The terminal did not apply the reasoning effort change. Please try again.",
+      gate,
+    );
+
+  it("rolls back a model pick the server refuses to apply", async () => {
+    seedSession("conv_model_refused", []);
+    withSnapshot("conv_model_refused", {
+      labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      model_override: "claude-sonnet-4-6",
+    });
+    await useChatStore.getState().switchTo("conv_model_refused");
+    refusePatch(
+      "conv_model_refused",
+      (body) => "model_override" in body,
+      "The terminal did not apply the model change. The previous selection has been restored.",
+    );
+
+    await expect(
+      useChatStore.getState().setModel("claude-opus-4-7", { expectConfirmation: true }),
+    ).rejects.toThrow("did not apply the model change");
+
+    expect(useChatStore.getState().sessionModelOverride).toBe("claude-sonnet-4-6");
+    expect(useChatStore.getState().pendingModelChange).toBeNull();
+  });
 
   it("rolls back a Codex effort the server refuses to apply", async () => {
     seedSession("conv_codex_refused", []);

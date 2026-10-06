@@ -27,10 +27,9 @@ import {
   FileTextIcon,
   Loader2Icon,
   MessagesSquareIcon,
-  TriangleAlertIcon,
   XIcon,
 } from "lucide-react";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { Tooltip, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   composerSendShortcutKeys,
   KeyboardShortcutTooltipContent,
@@ -4657,7 +4656,6 @@ function SessionHarnessPicker({
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const appliedOpenNonce = useRef(0);
   const conversationId = useChatStore((state) => state.conversationId);
   const sessionHarness = useChatStore((state) => state.sessionHarness);
@@ -4728,21 +4726,15 @@ function SessionHarnessPicker({
   useEffect(() => {
     setMenuOpen(false);
     setConfigOpen(false);
-    setError(null);
   }, [conversationId]);
   const apply = async (change: () => Promise<unknown>) => {
     if (disabled || busyRef.current || pendingModelChange !== null) return;
     busyRef.current = true;
     setBusy(true);
-    setError(null);
-    const sourceSessionId = useChatStore.getState().conversationId;
     try {
       await change();
-    } catch (failure) {
-      if (useChatStore.getState().conversationId === sourceSessionId)
-        setError(
-          failure instanceof Error ? failure.message : "Unable to update session configuration",
-        );
+    } catch {
+      // The store rolls back a refused change, so the pill shows what applied.
     } finally {
       busyRef.current = false;
       setBusy(false);
@@ -4894,83 +4886,55 @@ function SessionHarnessPicker({
     </>
   );
   return (
-    <>
-      <HarnessPicker
-        open={menuOpen}
-        onOpenChange={(next) => {
-          if (!next || (!disabled && !busy && configurable)) setMenuOpen(next);
-          if (!next) setConfigOpen(false);
-        }}
-        trigger={{
-          label: "Configure session",
-          model: label,
-          effort: effortLabel ?? undefined,
-          icon: <ComposerAgentIcon agent={iconAgent} />,
-          disabled: busy || !configurable,
-          "aria-disabled": disabled || busy || !configurable,
-          className: disabled ? "cursor-default opacity-50" : undefined,
-          testIdPrefix: "composer",
-          "data-testid": "composer-config-gear",
-          loading: modelLabelLoading && !routingOn,
-          pending:
-            (sessionModelSeeded || pendingModelChange !== null) &&
-            (modelPickerKind === "claude" || modelPickerKind === "codex"),
-        }}
-        tooltip={<ComposerConfigTooltipRows rows={summary} />}
-        tooltipTestId="composer-config-gear-tooltip"
-        testId="composer-agent-menu"
-      >
-        {isMobile && configOpen ? (
-          <HarnessPickerConfigPage
-            backTestId="composer-agent-config-back"
-            testId="composer-agent-config-menu"
-            onBack={() => setConfigOpen(false)}
-          >
-            {configContent}
-          </HarnessPickerConfigPage>
-        ) : (
-          <HarnessPickerConfigRow
-            label={nativeAgent?.displayName ?? harnessLabel ?? "Session"}
-            value={routingOn ? SMART_ROUTING_LABEL : (modelSummary ?? "Default")}
-            open={configOpen}
-            onOpenChange={setConfigOpen}
-            isMobile={isMobile}
-            disabled={busy || pendingModelChange !== null}
-            valueTestId="composer-agent-model-summary"
-            testId="composer-agent-edit"
-            configTestId="composer-agent-config-menu"
-          >
-            {configContent}
-          </HarnessPickerConfigRow>
-        )}
-      </HarnessPicker>
-      {error && (
-        <TooltipProvider delayDuration={0}>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                aria-label={`Couldn't update configuration: ${error}`}
-                className="flex size-7 shrink-0 items-center justify-center rounded-lg text-destructive hover:bg-destructive/10"
-                data-testid="composer-config-error"
-              >
-                <TriangleAlertIcon className="size-4" aria-hidden="true" />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent
-              side="top"
-              className="w-72 max-w-[calc(100vw-2rem)] flex-col items-start gap-1 rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-menu"
-              data-testid="composer-config-error-tooltip"
-            >
-              <strong className="font-medium">Couldn’t update configuration</strong>
-              <span className="text-xs leading-5 text-muted-foreground">
-                {error} Try again, or reconnect the session if the problem continues.
-              </span>
-            </TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
+    <HarnessPicker
+      open={menuOpen}
+      onOpenChange={(next) => {
+        if (!next || (!disabled && !busy && configurable)) setMenuOpen(next);
+        if (!next) setConfigOpen(false);
+      }}
+      trigger={{
+        label: "Configure session",
+        model: label,
+        effort: effortLabel ?? undefined,
+        icon: <ComposerAgentIcon agent={iconAgent} />,
+        disabled: busy || !configurable,
+        "aria-disabled": disabled || busy || !configurable,
+        className: disabled ? "cursor-default opacity-50" : undefined,
+        testIdPrefix: "composer",
+        "data-testid": "composer-config-gear",
+        loading: modelLabelLoading && !routingOn,
+        pending:
+          (sessionModelSeeded || pendingModelChange !== null) &&
+          (modelPickerKind === "claude" || modelPickerKind === "codex"),
+      }}
+      tooltip={<ComposerConfigTooltipRows rows={summary} />}
+      tooltipTestId="composer-config-gear-tooltip"
+      testId="composer-agent-menu"
+    >
+      {isMobile && configOpen ? (
+        <HarnessPickerConfigPage
+          backTestId="composer-agent-config-back"
+          testId="composer-agent-config-menu"
+          onBack={() => setConfigOpen(false)}
+        >
+          {configContent}
+        </HarnessPickerConfigPage>
+      ) : (
+        <HarnessPickerConfigRow
+          label={nativeAgent?.displayName ?? harnessLabel ?? "Session"}
+          value={routingOn ? SMART_ROUTING_LABEL : (modelSummary ?? "Default")}
+          open={configOpen}
+          onOpenChange={setConfigOpen}
+          isMobile={isMobile}
+          disabled={busy || pendingModelChange !== null}
+          valueTestId="composer-agent-model-summary"
+          testId="composer-agent-edit"
+          configTestId="composer-agent-config-menu"
+        >
+          {configContent}
+        </HarnessPickerConfigRow>
       )}
-    </>
+    </HarnessPicker>
   );
 }
 
