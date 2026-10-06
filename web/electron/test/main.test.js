@@ -24,6 +24,7 @@ const { createRequire } = require("node:module");
 const path = require("node:path");
 const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
+const { arcaConnectTarget } = require("../src/arca_autoconnect");
 
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
 const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
@@ -704,6 +705,12 @@ function loadNavigationHarness({
       const contents = Object.assign(new EventEmitter(), {
         id: additionalWindows.size + 2,
         getURL: () => url,
+        send: (channel, data) => calls.progress.push({ channel, data }),
+        stop() {},
+        reload() {
+          calls.reloads++;
+        },
+        setWindowOpenHandler() {},
         isDestroyed: () => destroyed,
         destroy() {
           destroyed = true;
@@ -1191,7 +1198,7 @@ describe("Arca shutdown warning wiring", () => {
   });
 
   for (const trueFirst of [true, false]) {
-    it(`keeps the true window's gate when another SPoG workspace reports false (${trueFirst ? "true first" : "false first"})`, async (t) => {
+    it(`gates same-origin SPoG workspaces independently (${trueFirst ? "true first" : "false first"})`, async (t) => {
       const picked = "https://accounts.cloud.databricks.com/omnigent?o=123";
       const otherPick = "https://accounts.cloud.databricks.com/omnigent?o=456";
       const h = loadNavigationHarness({
@@ -1206,7 +1213,10 @@ describe("Arca shutdown warning wiring", () => {
       await h.api.loadServerUrl(h.win, picked);
       await until(() => h.calls.arcaConnects.length === 1, "Arca auto-connect");
       const other = h.addWindow(otherPick);
+      await h.api.loadServerUrl(other, otherPick);
+      await until(() => h.calls.arcaConnects.length === 2, "second Arca auto-connect");
       assert.equal(new URL(picked).origin, new URL(otherPick).origin);
+      assert.notEqual(arcaConnectTarget(picked), arcaConnectTarget(otherPick));
       if (trueFirst) {
         await reportGate(h, true);
         await reportGate(h, false, other);
@@ -1214,9 +1224,27 @@ describe("Arca shutdown warning wiring", () => {
         await reportGate(h, false, other);
         await reportGate(h, true);
       }
+      assert.equal(
+        h.api.arcaShutdownFeaturesByWindow.get(h.win.webContents.id).target,
+        arcaConnectTarget(picked),
+      );
+      assert.equal(
+        h.api.arcaShutdownFeaturesByWindow.get(other.webContents.id).target,
+        arcaConnectTarget(otherPick),
+      );
       await until(() => h.calls.arcaStatusReads.length === 1, "first Arca status read");
       h.powerEvents.get("resume")();
       await until(() => h.calls.arcaStatusReads.length === 2, "resumed Arca status read");
+      await reportGate(h, false);
+      h.powerEvents.get("resume")();
+      await wait(10);
+      assert.equal(h.calls.arcaStatusReads.length, 2);
+      await reportGate(h, true, other);
+      await until(() => h.calls.arcaStatusReads.length === 3, "second workspace status read");
+      await reportGate(h, false, other);
+      h.powerEvents.get("resume")();
+      await wait(10);
+      assert.equal(h.calls.arcaStatusReads.length, 3);
     });
   }
 
@@ -1290,7 +1318,7 @@ describe("Arca shutdown warning wiring", () => {
     h.emitWindow("closed");
     assert.equal(h.api.windows.has(h.win), false);
     assert.equal(h.api.arcaShutdownFeaturesByWindow.size, 0);
-    assert.equal(h.api.arcaShutdownClosedReports.get(new URL(picked).origin), true);
+    assert.equal(h.api.arcaShutdownClosedReports.get(arcaConnectTarget(picked)), true);
     h.powerEvents.get("resume")();
     await until(() => h.calls.arcaStatusReads.length === 2, "status read after close");
   });
@@ -1311,7 +1339,7 @@ describe("Arca shutdown warning wiring", () => {
     await reportGate(h, true);
     await until(() => h.calls.arcaStatusReads.length === 1, "first Arca status read");
     h.emitWindow("closed");
-    assert.equal(h.api.arcaShutdownClosedReports.get(new URL(picked).origin), true);
+    assert.equal(h.api.arcaShutdownClosedReports.get(arcaConnectTarget(picked)), true);
 
     const replacement = h.addWindow(picked);
     await reportGate(h, false, replacement);

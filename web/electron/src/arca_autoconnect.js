@@ -22,6 +22,15 @@ const { normalizeServerUrl } = require("./omnigent_cli");
 /** Keep the tail of the command output for failure diagnostics. */
 const OUTPUT_TAIL_CHARS = 8000;
 
+/** @param {string | null | undefined} serverUrl */
+function arcaConnectTarget(serverUrl) {
+  try {
+    return normalizeServerUrl(new URL(serverUrl).href);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * @typedef {{
  *   state: "unavailable" | "idle" | "starting" | "online" | "failed",
@@ -57,14 +66,6 @@ function createArcaAutoConnect({
   /** @type {Map<string, { status: ArcaStatus, run: Promise<ArcaStatus> | null }>} */
   const byTarget = new Map();
 
-  function targetOf(serverUrl) {
-    try {
-      return normalizeServerUrl(new URL(serverUrl).href);
-    } catch {
-      return null;
-    }
-  }
-
   function baseStatus(serverUrl) {
     if (!isEligible(serverUrl)) return { state: "unavailable", command: null };
     return { state: "idle", command: commandLine(serverUrl) };
@@ -87,7 +88,7 @@ function createArcaAutoConnect({
    * @returns {ArcaStatus}
    */
   function getStatus(serverUrl) {
-    const target = serverUrl ? targetOf(serverUrl) : null;
+    const target = serverUrl ? arcaConnectTarget(serverUrl) : null;
     if (!target) return { state: "unavailable", command: null };
     const base = baseStatus(serverUrl);
     if (base.state === "unavailable") return base;
@@ -148,10 +149,10 @@ function createArcaAutoConnect({
   function ensure(serverUrl, onOutput) {
     const current = getStatus(serverUrl);
     if (current.state !== "idle") {
-      const entry = byTarget.get(targetOf(serverUrl));
+      const entry = byTarget.get(arcaConnectTarget(serverUrl));
       return entry?.run ?? Promise.resolve(current);
     }
-    return runConnect(serverUrl, targetOf(serverUrl), onOutput);
+    return runConnect(serverUrl, arcaConnectTarget(serverUrl), onOutput);
   }
 
   /**
@@ -167,7 +168,7 @@ function createArcaAutoConnect({
     if (running) return running;
     const current = getStatus(serverUrl);
     if (current.state !== "failed") return Promise.resolve(current);
-    return runConnect(serverUrl, targetOf(serverUrl), onOutput);
+    return runConnect(serverUrl, arcaConnectTarget(serverUrl), onOutput);
   }
 
   /**
@@ -178,11 +179,11 @@ function createArcaAutoConnect({
    * @returns {Promise<ArcaStatus> | null}
    */
   function inFlight(serverUrl) {
-    const target = serverUrl ? targetOf(serverUrl) : null;
+    const target = serverUrl ? arcaConnectTarget(serverUrl) : null;
     return (target && byTarget.get(target)?.run) || null;
   }
 
   return { ensure, retry, getStatus, inFlight };
 }
 
-module.exports = { OUTPUT_TAIL_CHARS, createArcaAutoConnect };
+module.exports = { OUTPUT_TAIL_CHARS, arcaConnectTarget, createArcaAutoConnect };

@@ -81,7 +81,7 @@ const arca = require("./arca");
 const cliInstall = require("./cli_install");
 const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
-const { createArcaAutoConnect } = require("./arca_autoconnect");
+const { arcaConnectTarget, createArcaAutoConnect } = require("./arca_autoconnect");
 const { createArcaShutdownWatch } = require("./arca_shutdown");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { ensureDatabricksSession } = require("./databricks-session");
@@ -556,19 +556,19 @@ let arcaResumeListenerRegistered = false;
 const arcaShutdownFeaturesByWindow = new Map();
 const arcaShutdownClosedReports = new Map();
 const arcaShutdownObservedContents = new WeakSet();
-const arcaOnlineOrigins = new Set();
+const arcaOnlineTargets = new Set();
 
 /** Require a true live report, or the last closed report when no window remains. */
 function arcaShutdownServerGateEnabled() {
   if (!arcaAutoConnectFeatureEnabled()) return false;
-  for (const origin of arcaOnlineOrigins) {
+  for (const target of arcaOnlineTargets) {
     let hasLiveReport = false;
     for (const report of arcaShutdownFeaturesByWindow.values()) {
-      if (report.origin !== origin) continue;
+      if (report.target !== target) continue;
       hasLiveReport = true;
       if (report.enabled) return true;
     }
-    if (!hasLiveReport && arcaShutdownClosedReports.get(origin) === true) return true;
+    if (!hasLiveReport && arcaShutdownClosedReports.get(target) === true) return true;
   }
   return false;
 }
@@ -579,11 +579,11 @@ function arcaShutdownEnabled() {
 }
 
 /** Apply a gate change without reading Arca status when warnings are off. */
-function updateArcaShutdownWatchGate(wasEnabled, wasServerEnabled, origin) {
+function updateArcaShutdownWatchGate(wasEnabled, wasServerEnabled, target) {
   const serverEnabled = arcaShutdownServerGateEnabled();
   if (serverEnabled !== wasServerEnabled) {
     console.log(
-      `[omnigent] arca shutdown: server gate ${serverEnabled ? "on" : "off"} (${origin})`,
+      `[omnigent] arca shutdown: server gate ${serverEnabled ? "on" : "off"} (${target})`,
     );
   }
   if (arcaShutdownEnabled()) {
@@ -606,18 +606,18 @@ function clearArcaShutdownFeatureReport(win) {
   const wasEnabled = arcaShutdownEnabled();
   const wasServerEnabled = arcaShutdownServerGateEnabled();
   arcaShutdownFeaturesByWindow.delete(win.webContents.id);
-  updateArcaShutdownWatchGate(wasEnabled, wasServerEnabled, report.origin);
+  updateArcaShutdownWatchGate(wasEnabled, wasServerEnabled, report.target);
 }
 
-/** Keep one origin report when its last renderer or window goes away. */
+/** Keep one target report when its last renderer or window goes away. */
 function retireArcaShutdownFeatureReport(webContentsId) {
   const report = arcaShutdownFeaturesByWindow.get(webContentsId);
   if (!report) return;
   const wasEnabled = arcaShutdownEnabled();
   const wasServerEnabled = arcaShutdownServerGateEnabled();
   arcaShutdownFeaturesByWindow.delete(webContentsId);
-  arcaShutdownClosedReports.set(report.origin, report.enabled);
-  updateArcaShutdownWatchGate(wasEnabled, wasServerEnabled, report.origin);
+  arcaShutdownClosedReports.set(report.target, report.enabled);
+  updateArcaShutdownWatchGate(wasEnabled, wasServerEnabled, report.target);
 }
 
 /** Launch-time Arca auto-connect, behind the feature flag above. */
@@ -637,12 +637,12 @@ const arcaAutoConnect = createArcaAutoConnect({
       return null;
     }
   },
-  onStatus: (origin, status) => {
+  onStatus: (target, status) => {
     const wasEnabled = arcaShutdownEnabled();
     const wasServerEnabled = arcaShutdownServerGateEnabled();
-    if (status.state === "online") arcaOnlineOrigins.add(origin);
-    else arcaOnlineOrigins.delete(origin);
-    updateArcaShutdownWatchGate(wasEnabled, wasServerEnabled, origin);
+    if (status.state === "online") arcaOnlineTargets.add(target);
+    else arcaOnlineTargets.delete(target);
+    updateArcaShutdownWatchGate(wasEnabled, wasServerEnabled, target);
   },
   log: (message) => console.log(`[omnigent] ${message}`),
 });
@@ -4809,8 +4809,10 @@ function registerIpc() {
     if (!features || typeof features !== "object" || Array.isArray(features)) return null;
     const enabled = features.desktop_arca_shutdown_warnings;
     if (typeof enabled !== "boolean") return null;
-    const origin = originOf(windowArcaServerUrl(BrowserWindow.fromWebContents(event.sender)));
-    if (!origin) return null;
+    const target = arcaConnectTarget(
+      windowArcaServerUrl(BrowserWindow.fromWebContents(event.sender)),
+    );
+    if (!target) return null;
     if (event.sender.isDestroyed?.()) return null;
     const wasEnabled = arcaShutdownEnabled();
     const wasServerEnabled = arcaShutdownServerGateEnabled();
@@ -4818,9 +4820,9 @@ function registerIpc() {
       event.sender.on("destroyed", () => retireArcaShutdownFeatureReport(event.sender.id));
       arcaShutdownObservedContents.add(event.sender);
     }
-    arcaShutdownClosedReports.delete(origin);
-    arcaShutdownFeaturesByWindow.set(event.sender.id, { origin, enabled });
-    updateArcaShutdownWatchGate(wasEnabled, wasServerEnabled, origin);
+    arcaShutdownClosedReports.delete(target);
+    arcaShutdownFeaturesByWindow.set(event.sender.id, { target, enabled });
+    updateArcaShutdownWatchGate(wasEnabled, wasServerEnabled, target);
     return null;
   });
 
