@@ -3877,6 +3877,23 @@ async def test_session_agent_terminals_follow_selected_host(
     assert custom_response.json()["terminals"] == ["bash"]
 
 
+async def test_session_agent_offers_default_shell_when_agent_declares_none(
+    client: httpx.AsyncClient,
+) -> None:
+    """A custom agent without ``terminals:`` still reports the default user shell.
+
+    The Web UI's rail "+" menu and new-shell hotkey key off this list, so an
+    empty list would leave such sessions with no way to open a shell.
+    """
+    agent = await create_test_agent(client, name="plain-agent")
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.get(f"/v1/sessions/{session['id']}/agent")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["terminals"] == ["bash"]
+
+
 @pytest.mark.parametrize("cached_inventory", [False, True])
 async def test_host_shell_inventory_miss_returns_wrong_replica(
     client: httpx.AsyncClient,

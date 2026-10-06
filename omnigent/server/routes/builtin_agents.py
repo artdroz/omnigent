@@ -31,6 +31,7 @@ from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user as _require_user
 from omnigent.server.schemas import AgentObject, MCPServerSummary, PaginatedList, SkillSummary
 from omnigent.stores import AgentStore
+from omnigent.terminals.user_shells import user_shell_terminals
 
 _logger = logging.getLogger(__name__)
 
@@ -69,9 +70,9 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         )
         if description is None:
             description = loaded.spec.description
-        # Declared terminal names, in spec order (mirrors the
-        # session-agent endpoint so both report it consistently).
-        terminals = list(loaded.spec.terminals or {})
+        # Terminal names a user may open (mirrors the session-agent
+        # endpoint so both report it consistently).
+        terminals = list(user_shell_terminals(loaded.spec))
         # Bundled suggestions stay available while the host catalog loads.
         skills = [
             SkillSummary(name=s.name, description=s.description)
