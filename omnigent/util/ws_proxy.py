@@ -9,12 +9,12 @@ resolution" forever, so the host and runner tunnels never come up.
 
 This module gives those tunnels the same env-proxy semantics as the HTTP
 clients: :func:`ws_env_proxy_url` picks the proxy the standard environment
-variables configure for a ``ws(s)://`` URL (honoring ``NO_PROXY``), and
-:func:`open_proxy_connect_socket` establishes the CONNECT tunnel so the
-connected socket can be handed to ``websockets`` via its ``sock=``
-parameter. No dependency bump is required, nothing changes when no proxy
-is configured, and the explicit socket keeps working if the ``websockets``
-pin is ever lifted.
+variables configure for a ``ws(s)://`` URL (honoring ``NO_PROXY`` and never
+proxying loopback), and :func:`open_proxy_connect_socket` establishes the
+CONNECT tunnel so the connected socket can be handed to ``websockets`` via
+its ``sock=`` parameter. No dependency bump is required, nothing changes when
+no proxy is configured, and the explicit socket keeps working if the
+``websockets`` pin is ever lifted.
 """
 
 from __future__ import annotations
@@ -27,6 +27,8 @@ import os
 import socket
 from collections.abc import Mapping
 from urllib.parse import unquote, urlsplit
+
+from omnigent_client._http import is_loopback_url
 
 _logger = logging.getLogger(__name__)
 
@@ -47,16 +49,20 @@ _warned_unsupported_schemes: set[str] = set()
 
 
 def _env(environ: Mapping[str, str], name: str) -> str | None:
-    """Read a proxy env var, preferring the conventional lowercase form.
+    """Read a proxy env var with urllib's precedence: lowercase wins when set.
+
+    A lowercase variable that is present but empty deliberately suppresses
+    its uppercase form (``http_proxy=""`` disables ``HTTP_PROXY``), exactly
+    as it does for the HTTP clients.
 
     :param environ: Environment mapping to read.
     :param name: Lowercase variable name, e.g. ``"http_proxy"``.
-    :returns: The first non-empty value of ``name``/``NAME``, or None.
+    :returns: The value of the first form present, or None when that form
+        is empty or neither is set.
     """
     for key in (name, name.upper()):
-        value = environ.get(key)
-        if value:
-            return value
+        if key in environ:
+            return environ[key] or None
     return None
 
 
@@ -110,12 +116,14 @@ def ws_env_proxy_url(ws_url: str, environ: Mapping[str, str] | None = None) -> s
     Mirrors the standard env semantics the host's own HTTP calls already
     honor: ``ws://`` follows ``http_proxy``, ``wss://`` follows
     ``https_proxy``, both fall back to ``all_proxy``, and ``no_proxy``
-    bypasses matching hosts.
+    bypasses matching hosts. Loopback targets always dial direct, matching
+    the ``trust_env`` guard on the server-bound HTTP clients.
 
     :param ws_url: Tunnel URL, e.g. ``"wss://server/v1/hosts/h/tunnel"``.
     :param environ: Environment mapping (defaults to ``os.environ``).
     :returns: The proxy URL to CONNECT through, or None to dial direct
-        (no proxy configured, target bypassed, or unsupported scheme).
+        (no proxy configured, loopback or bypassed target, or unsupported
+        scheme).
     """
     if environ is None:
         environ = os.environ
@@ -127,6 +135,10 @@ def ws_env_proxy_url(ws_url: str, environ: Mapping[str, str] | None = None) -> s
     except ValueError:
         return None
     if proxy_env is None or not host:
+        return None
+    # A proxy resolves loopback against itself and can never reach this
+    # machine's local server, so a local host must keep dialing direct.
+    if is_loopback_url(ws_url):
         return None
     proxy = _env(environ, proxy_env) or _env(environ, "all_proxy")
     if not proxy:

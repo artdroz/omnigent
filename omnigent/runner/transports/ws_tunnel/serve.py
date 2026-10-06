@@ -960,7 +960,7 @@ async def _serve_tunnel_once(
             proxy_url, tunnel_url, timeout=_PROXY_CONNECT_TIMEOUT_S
         )
     connection_id = connection_id or uuid.uuid4().hex
-    async with websockets.connect(
+    connect_cm = websockets.connect(
         tunnel_url,
         additional_headers=headers,
         close_timeout=close_timeout,
@@ -974,7 +974,17 @@ async def _serve_tunnel_once(
         # Also the runner's only liveness probe for a silently-dead server.
         ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
         ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
-    ) as ws:
+    )
+    async with contextlib.AsyncExitStack() as stack:
+        try:
+            ws = await stack.enter_async_context(connect_cm)
+        except BaseException:
+            # The event loop owns the proxied socket once create_connection is
+            # reached; close it for failures before that hand-off.
+            if proxy_sock is not None:
+                with contextlib.suppress(OSError):
+                    proxy_sock.close()
+            raise
         if on_connected is not None:
             on_connected()
         downtime_s = (

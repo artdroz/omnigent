@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from types import SimpleNamespace, TracebackType
 from typing import Any, TypedDict
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from typing_extensions import Unpack
@@ -2161,6 +2161,35 @@ async def test_serve_tunnel_proxy_socket(
             )
         else:
             dial.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_closes_proxy_socket_when_connect_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connect failure before the loop adopts the proxied socket must not leak it."""
+    import websockets
+
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:3128")
+    monkeypatch.setattr("omnigent.cli_auth.databricks_request_headers", lambda *_a, **_k: {})
+    connect = Mock(return_value=AsyncMock())
+    connect.return_value.__aenter__.side_effect = ConnectionError("test rejection")
+    monkeypatch.setattr(websockets, "connect", connect)
+
+    with socket.socket() as proxy_sock:
+        monkeypatch.setattr(
+            serve_module, "open_proxy_connect_socket", AsyncMock(return_value=proxy_sock)
+        )
+        with pytest.raises(ConnectionError, match="test rejection"):
+            await _serve_tunnel_once(
+                None,  # type: ignore[arg-type]
+                tunnel_url="ws://server.sandbox.test:8000/v1/runners/runner_test/tunnel",
+                server_url="https://example.databricks.com",
+                runner_id="runner_test",
+                runner_version="0.1.0",
+            )
+        assert connect.call_args.kwargs["sock"] is proxy_sock
+        assert proxy_sock.fileno() == -1
 
 
 @pytest.mark.asyncio

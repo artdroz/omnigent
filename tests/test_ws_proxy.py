@@ -4,9 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import datetime
+import ssl
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
+from websockets.asyncio.client import connect
+from websockets.asyncio.server import serve
 
 from omnigent.util.ws_proxy import (
     open_proxy_connect_socket,
@@ -14,7 +23,8 @@ from omnigent.util.ws_proxy import (
     ws_env_proxy_url,
 )
 
-_TUNNEL_URL = "ws://server.sandbox.test:8000/v1/hosts/h/tunnel"
+_TLS_HOST = "server.sandbox.test"
+_TUNNEL_URL = f"ws://{_TLS_HOST}:8000/v1/hosts/h/tunnel"
 _OK = b"HTTP/1.1 200 Connection Established\r\n\r\n"
 
 
@@ -32,6 +42,22 @@ _OK = b"HTTP/1.1 200 Connection Established\r\n\r\n"
         (_TUNNEL_URL, {"http_proxy": "socks5://p:1"}, None),
         ("unix:///tmp/sock", {"all_proxy": "http://p:1"}, None),
         ("not a url", {"all_proxy": "http://p:1"}, None),
+        # A lowercase variable that is set but empty suppresses its uppercase
+        # form, as it does for urllib and httpx.
+        (_TUNNEL_URL, {"HTTP_PROXY": "http://p:2", "http_proxy": ""}, None),
+        (_TUNNEL_URL, {"HTTP_PROXY": "", "http_proxy": "http://p:1"}, "http://p:1"),
+        (_TUNNEL_URL, {"HTTP_PROXY": ""}, None),
+        (_TUNNEL_URL, {"http_proxy": "", "all_proxy": "http://p:1"}, "http://p:1"),
+        (_TUNNEL_URL, {"http_proxy": "http://p:1", "NO_PROXY": "server.sandbox.test"}, None),
+        (
+            _TUNNEL_URL,
+            {"http_proxy": "http://p:1", "NO_PROXY": "server.sandbox.test", "no_proxy": ""},
+            "http://p:1",
+        ),
+        # Loopback never goes through a proxy, even without a no_proxy entry.
+        ("ws://localhost:8000/t", {"http_proxy": "http://p:1"}, None),
+        ("ws://127.0.0.1:8000/t", {"ALL_PROXY": "http://p:1"}, None),
+        ("wss://[::1]:8443/t", {"https_proxy": "http://p:1"}, None),
     ],
 )
 def test_proxy_selection(url, env, expected):
@@ -49,10 +75,10 @@ def test_proxy_selection(url, env, expected):
         ("anything.test", "*", True),
         ("example.com:8443", "example.com:8443", True),
         ("example.com:8000", "example.com:8443", False),
-        ("127.0.0.1:8000", "localhost,127.0.0.1,::1", True),
-        ("localhost:8000", "localhost,127.0.0.1,::1", True),
-        ("[::1]:8000", "localhost,127.0.0.1,::1", True),
-        ("server.sandbox.test:8000", "localhost,127.0.0.1,::1", False),
+        ("10.1.2.3:8000", "localhost,10.1.2.3,fd00::1", True),
+        ("[fd00::1]:8000", "localhost,10.1.2.3,fd00::1", True),
+        ("[fd00::1]:8000", "[fd00::1]:8000", True),
+        ("server.sandbox.test:8000", "localhost,10.1.2.3,fd00::1", False),
     ],
 )
 def test_no_proxy(host, no_proxy, bypass):
@@ -123,3 +149,93 @@ async def test_connect_error(reply, error):
     async with _connect_proxy(reply) as (port, _requests):
         with pytest.raises(OSError, match=error):
             await open_proxy_connect_socket(f"http://127.0.0.1:{port}", _TUNNEL_URL, timeout=5)
+
+
+def _self_signed_cert(directory: Path, hostname: str) -> Path:
+    """Write a self-signed certificate and key for *hostname*; return the cert path."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(hostname)]), critical=False)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    (directory / "key.pem").write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    cert_path = directory / "cert.pem"
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    return cert_path
+
+
+@asynccontextmanager
+async def _forwarding_proxy(upstream_port):
+    """CONNECT proxy that resolves the tunnel host itself and relays raw bytes."""
+    authorities = []
+
+    async def relay(reader, writer):
+        try:
+            while data := await reader.read(65536):
+                writer.write(data)
+                await writer.drain()
+        finally:
+            writer.close()
+
+    async def handle(reader, writer):
+        head = await reader.readuntil(b"\r\n\r\n")
+        authorities.append(head.split(b" ", 2)[1].decode())
+        upstream_reader, upstream_writer = await asyncio.open_connection(
+            "127.0.0.1", upstream_port
+        )
+        writer.write(_OK)
+        await writer.drain()
+        await asyncio.gather(
+            relay(reader, upstream_writer), relay(upstream_reader, writer), return_exceptions=True
+        )
+
+    async with await asyncio.start_server(handle, "127.0.0.1", 0) as server:
+        yield server.sockets[0].getsockname()[1], authorities
+
+
+@pytest.mark.parametrize("certified_host", [_TLS_HOST, "other.sandbox.test"])
+async def test_connect_tunnel_wss(tmp_path, certified_host):
+    """TLS rides the CONNECT tunnel and is verified against the tunnel URL's host."""
+    cert = _self_signed_cert(tmp_path, certified_host)
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.load_cert_chain(cert, tmp_path / "key.pem")
+    seen_sni = []
+    server_ctx.sni_callback = lambda _sock, name, _ctx: seen_sni.append(name)
+
+    async def echo(ws):
+        async for message in ws:
+            await ws.send(message)
+
+    async with serve(echo, "127.0.0.1", 0, ssl=server_ctx) as server:
+        port = server.sockets[0].getsockname()[1]
+        url = f"wss://{_TLS_HOST}:{port}/t"
+        async with _forwarding_proxy(port) as (proxy_port, authorities):
+            sock = await open_proxy_connect_socket(
+                f"http://127.0.0.1:{proxy_port}", url, timeout=5
+            )
+            client_ctx = ssl.create_default_context(cafile=str(cert))
+            if certified_host == _TLS_HOST:
+                async with connect(url, sock=sock, ssl=client_ctx, open_timeout=5) as ws:
+                    await ws.send("ping")
+                    assert await ws.recv() == "ping"
+            else:
+                with pytest.raises(ssl.SSLCertVerificationError):
+                    await connect(url, sock=sock, ssl=client_ctx, open_timeout=5)
+    assert authorities == [f"{_TLS_HOST}:{port}"]
+    assert seen_sni == [_TLS_HOST]
