@@ -166,12 +166,8 @@ def test_project_settings_resets_default_agent_from_dropdown(
     request: pytest.FixtureRequest,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The Agent dropdown offers "No default", like the Host and Model dropdowns.
-
-    Starts from a project whose ``config`` pins Claude Code as the default
-    agent, opens settings, picks "No default" in the Agent dropdown and Saves.
-    The stored config drops ``agent_id`` and reopening seeds "No default".
-    """
+    """Picking "No default" in the Agent dropdown clears the stored default
+    agent: the saved config drops ``agent_id`` and reopening seeds "No default"."""
     base_url, session_id = seeded_session
     project = f"Project {uuid.uuid4().hex[:6]}"
     project_id = _create_project(base_url, project)
