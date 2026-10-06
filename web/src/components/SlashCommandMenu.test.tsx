@@ -1,6 +1,11 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { skillMenuDescription, SlashCommandMenu } from "./SlashCommandMenu";
+import {
+  rankedSlashCommandNames,
+  skillDisplayNames,
+  skillMenuDescription,
+  SlashCommandMenu,
+} from "./SlashCommandMenu";
 
 afterEach(cleanup);
 
@@ -110,5 +115,43 @@ describe("skill display names", () => {
       skillMenuDescription({ name: "review", description: "Review code", display_name: "review" }),
     ).toBe("Review code");
     expect(skillMenuDescription({ name: "ste", description: "", display_name: "STE" })).toBe("STE");
+  });
+});
+
+describe("skill display name matching", () => {
+  const skills = [
+    {
+      name: "asd-ste100",
+      description: "STE",
+      display_name: "Simplified Technical English (ASD-STE100)",
+    },
+    { name: "english-tutor", description: "Tutor", display_name: null },
+  ];
+  const commands = Object.fromEntries(skills.map((s) => [`/${s.name}`, s.description]));
+  const labels = skillDisplayNames(skills, "/");
+
+  it("finds a skill by its display name and selects the command", () => {
+    expect(labels).toEqual({ "/asd-ste100": "Simplified Technical English (ASD-STE100)" });
+    const onSelect = vi.fn();
+    render(
+      <SlashCommandMenu
+        {...props}
+        query="simplified"
+        onSelect={onSelect}
+        commands={commands}
+        labels={labels}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("slash-menu-item-asd-ste100"));
+    expect(onSelect).toHaveBeenCalledWith("/asd-ste100");
+  });
+
+  it("ranks command-name matches ahead of display-name-only matches", () => {
+    expect(rankedSlashCommandNames(commands, "english", new Set(), labels)).toEqual([
+      "/english-tutor",
+      "/asd-ste100",
+    ]);
+    // Without labels, the display name is not searchable.
+    expect(rankedSlashCommandNames(commands, "simplified", new Set())).toEqual([]);
   });
 });

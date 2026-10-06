@@ -122,6 +122,7 @@ import { isFeatureEnabled, sandboxOptionLabel, sandboxProviderOptions } from "@/
 import { useHeading, usePoweredBy } from "@/lib/branding";
 import {
   isSlashCommandText,
+  skillDisplayNames,
   skillMenuDescription,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
@@ -4624,6 +4625,10 @@ export function NewChatLandingScreen() {
       ),
     [availableSkills, skillPrefix],
   );
+  const skillLabels = useMemo(
+    () => skillDisplayNames(availableSkills, skillPrefix),
+    [availableSkills, skillPrefix],
+  );
   // Insert the selected skill at the caret while preserving surrounding text.
   function applySlashSelection(cmd: string) {
     setMessage(slashCompletion.complete(cmd).text);
@@ -4632,6 +4637,7 @@ export function NewChatLandingScreen() {
     text: message,
     commands: skillCommands,
     skills: skillCommands,
+    labels: skillLabels,
     textareaRef,
     prefix: skillPrefix,
     status: skillsStatus,
@@ -6385,6 +6391,7 @@ export function NewChatLandingScreen() {
                         onSelect={applySlashSelection}
                         commands={slashCompletion.commands}
                         builtinNames={slashCompletion.builtinNames}
+                        labels={slashCompletion.labels}
                         skillsStatus={skillsStatus}
                         skillsUnavailableMessage={skillsUnavailableMessage}
                         onRetrySkills={() => void refreshSkills()}

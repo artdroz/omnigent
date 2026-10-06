@@ -2230,6 +2230,31 @@ def test_completer_substring_filters_real_registry() -> None:
     assert 0 < len(names) < len(all_names)
 
 
+def test_completer_matches_skill_display_name_after_name_hits() -> None:
+    """A skill is reachable by its display name, ranked after command-name hits."""
+    from omnigent.repl import _repl as repl_mod
+
+    registered = repl_mod.register_skill_commands(
+        [
+            SkillSpec(
+                name="asd-ste100",
+                description="STE",
+                content="c",
+                display_name="Simplified Technical English (ASD-STE100)",
+            ),
+            SkillSpec(name="english-tutor", description="Tutor", content="c"),
+        ]
+    )
+    try:
+        # Completing inserts the command, not the label.
+        assert "/asd-ste100" in [name for name, _, _ in _completions_for("/simplified")]
+        names = [name for name, _, _ in _completions_for("/english")]
+        assert names.index("/english-tutor") < names.index("/asd-ste100")
+    finally:
+        repl_mod.unregister_skill_commands(registered)
+    assert "/asd-ste100" not in repl_mod._SKILL_DISPLAY_NAMES
+
+
 def test_completer_ranks_prefix_before_substring(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Claim: prefix matches surface before mid-string matches (mirrors the

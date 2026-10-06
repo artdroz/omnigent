@@ -203,6 +203,7 @@ import { HostBadge } from "@/components/HostBadge";
 import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
+  skillDisplayNames,
   skillMenuDescription,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
@@ -3192,12 +3193,14 @@ function ComposerImpl(
       ),
     [skills, skillPrefix],
   );
+  const skillLabels = useMemo(() => skillDisplayNames(skills, skillPrefix), [skills, skillPrefix]);
 
   // Complete the token at the caret; inline suggestions only insert skills.
   const slashCompletion = useSlashCompletion({
     text: value,
     commands: slashCommands,
     skills: skillCommands,
+    labels: skillLabels,
     textareaRef,
     prefix: skillPrefix,
     status: skillsStatus,
@@ -3817,6 +3820,7 @@ function ComposerImpl(
                   onSelect={applyMenuSelection}
                   commands={slashCompletion.commands}
                   builtinNames={slashCompletion.builtinNames}
+                  labels={slashCompletion.labels}
                   skillsStatus={skillsStatus}
                   onRetrySkills={() => void refreshSkills()}
                 />
