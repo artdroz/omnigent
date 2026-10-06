@@ -134,7 +134,7 @@ export const SettingsHarnessesSection = () => {
       ) : (
         <>
           <div className="flex flex-wrap items-center justify-between gap-4 pb-6">
-            <h1 className="text-2xl font-semibold">Harnesses</h1>
+            <h1 className="settings-page-title text-2xl font-semibold">Harnesses</h1>
             <HostSelect hosts={sortedHosts} selected={host} onSelect={setSelectedHostId} />
           </div>
           <div className="mb-6 flex items-center gap-2">
@@ -293,9 +293,11 @@ function HarnessStatusText({ status }: { status: ReturnType<typeof harnessStatus
     return <span className="text-xs text-green-600 dark:text-green-400">Configured</span>;
   }
   if (status.needsSetup) {
+    // Sentence case to match "Configured"; the picker keeps the shared lowercase badge.
+    const text = harnessWarningBadgeText(status.reason);
     return (
       <span className="text-xs text-amber-600 dark:text-amber-500">
-        {harnessWarningBadgeText(status.reason)}
+        {text.charAt(0).toUpperCase() + text.slice(1)}
       </span>
     );
   }
@@ -373,11 +375,15 @@ function HarnessCard({
     </>
   );
   const className =
-    "flex flex-col gap-2 rounded-[20px] border border-border bg-card p-4 transition-colors hover:border-foreground/20";
+    "flex flex-col gap-2 rounded-[20px] border border-border bg-card p-4 transition-colors";
   return status.ready ? (
     <Link
       to={`/settings/harnesses/${entry.harness}`}
-      className={className}
+      // Only cards that open a details page get the hover, so it reads as clickable.
+      className={cn(
+        className,
+        "hover:border-foreground/20 hover:bg-muted/50 focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none",
+      )}
       data-testid={`harness-card-${entry.harness}`}
       componentId="settings.harnesses.open"
     >
@@ -410,7 +416,7 @@ function HarnessDetail({
         <div className="flex min-w-0 items-center gap-3">
           <HarnessIcon entry={entry} />
           <div className="flex min-w-0 flex-col">
-            <h1 className="truncate text-2xl font-semibold">{entry.name}</h1>
+            <h1 className="settings-page-title truncate text-2xl font-semibold">{entry.name}</h1>
             <HarnessStatusText status={status} />
           </div>
         </div>
