@@ -290,7 +290,9 @@ describe("useBrowserAgentRelay — claim-first protocol", () => {
     await runAction(actionEvent("navigate", { url: "http://localhost:5173" }));
 
     expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
-    expect((postedResult().result as { error: string }).error).toMatch(/timed out/);
+    expect((postedResult().result as { error: string }).error).toBe(
+      "localhost preview request expired",
+    );
   });
 });
 

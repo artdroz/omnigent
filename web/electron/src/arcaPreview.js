@@ -3,12 +3,35 @@
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
+const { stripVTControlCharacters } = require("node:util");
 const { normalizeSafeServerUrl, resolveArcaPath } = require("./arca");
+const { ARCA_PREVIEW_TIMEOUT_MS } = require("./arcaPreviewConfig");
 const { WORKSPACE_UI_PATH } = require("./url");
 
-const PREPARE_TIMEOUT_MS = 25_000;
 const OUTPUT_LIMIT = 8_192;
+const SYSTEM_SSH_PATH = "/usr/bin/ssh";
+const CONTROL_DESTINATION = "arca-preview.invalid";
 const WORKSPACE_API_PATHS = new Set(["/api/2.0/omnigent", "/api/2.0/omnigents"]);
+
+function muxControlArgs(socketPath, operation, forwardSpec) {
+  const args = [
+    "-F",
+    "/dev/null",
+    "-o",
+    "ProxyCommand=/usr/bin/false",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ControlMaster=no",
+    "-S",
+    socketPath,
+    "-O",
+    operation,
+  ];
+  if (forwardSpec) args.push("-o", "ExitOnForwardFailure=yes", "-L", forwardSpec);
+  args.push(CONTROL_DESTINATION);
+  return args;
+}
 
 function loopbackPreview(url) {
   try {
@@ -56,6 +79,18 @@ function parseStatusJson(stdout) {
     }
   }
   return null;
+}
+
+function safeCommandDetail(value) {
+  const printable = [...stripVTControlCharacters(String(value ?? ""))]
+    .filter((character) => {
+      const code = character.codePointAt(0);
+      return (
+        code === 9 || code === 10 || code === 13 || (code >= 32 && !(code >= 127 && code <= 159))
+      );
+    })
+    .join("");
+  return printable.trim().slice(-OUTPUT_LIMIT);
 }
 
 function terminate(child) {
@@ -178,7 +213,11 @@ async function verifyArcaHost({ arcaPath, serverUrl, hostId, spawnFn, deadline, 
     ],
     { spawnFn, deadline, onChild },
   );
-  if (result.code !== 0) throw new Error(result.stderr.trim() || "could not read Arca host status");
+  if (result.code !== 0) {
+    throw Object.assign(new Error("could not verify the Arca preview host"), {
+      commandDetail: safeCommandDetail(result.stderr),
+    });
+  }
   const daemon = parseStatusJson(result.stdout)?.daemons?.find(
     (item) =>
       item?.host_id === hostId &&
@@ -204,7 +243,8 @@ function waitForSocket(socketPath, deadline, isSocketReady) {
 function createArcaPreviewManager({
   resolveArcaPathFn = resolveArcaPath,
   spawnFn = spawn,
-  timeoutMs = PREPARE_TIMEOUT_MS,
+  sshPath = SYSTEM_SSH_PATH,
+  timeoutMs = ARCA_PREVIEW_TIMEOUT_MS,
   socketReady = fs.existsSync,
   unlinkSocket = (socketPath) => fs.rmSync(socketPath, { force: true }),
   removeSocketDir = (socketDir) => fs.rmSync(socketDir, { recursive: true, force: true }),
@@ -215,6 +255,7 @@ function createArcaPreviewManager({
     return { socketPath: path.join(socketDir, "s"), socketDir };
   },
   onExit = () => {},
+  logError = (...args) => console.warn(...args),
 } = {}) {
   const owned = new Map();
   const shuttingDown = new Set();
@@ -244,11 +285,10 @@ function createArcaPreviewManager({
         try {
           // Keep the socket reachable until the exact owned mux master has
           // acknowledged exit or the bounded fallback takes ownership.
-          control = spawnFn(
-            state.arcaPath,
-            ["ssh", "-F", "/dev/null", "-S", state.socketPath, "-O", "exit"],
-            { stdio: ["ignore", "ignore", "ignore"], detached: true },
-          );
+          control = spawnFn(sshPath, muxControlArgs(state.socketPath, "exit"), {
+            stdio: ["ignore", "ignore", "ignore"],
+            detached: true,
+          });
         } catch {
           /* fall through to process-group termination */
         }
@@ -319,7 +359,12 @@ function createArcaPreviewManager({
         [...shuttingDown].filter((shutdown) => shutdown !== state.shutdownPromise),
       );
       if (owned.get(conversationId)?.token !== token) throw new Error("preview was superseded");
-      await verifyArcaHost({ arcaPath, serverUrl, hostId, spawnFn, deadline, onChild });
+      try {
+        await verifyArcaHost({ arcaPath, serverUrl, hostId, spawnFn, deadline, onChild });
+      } catch (error) {
+        if (error.commandDetail) logError("[arca preview] status failed:", error.commandDetail);
+        throw error;
+      }
       if (owned.get(conversationId)?.token !== token) throw new Error("preview was superseded");
       const socket = socketPathFn();
       const socketPath = typeof socket === "string" ? socket : socket.socketPath;
@@ -367,36 +412,30 @@ function createArcaPreviewManager({
         // tears down the master and therefore rolls back the other forward.
         // eslint-disable-next-line no-await-in-loop
         const acknowledged = await Promise.race([
-          run(
-            arcaPath,
-            [
-              "ssh",
-              "-F",
-              "/dev/null",
-              "-S",
-              socketPath,
-              "-O",
-              "forward",
-              "-o",
-              "ExitOnForwardFailure=yes",
-              "-L",
-              spec,
-            ],
-            {
-              spawnFn,
-              deadline,
-              onChild: (child, cancel) => {
-                state.cancel = () => {
-                  terminate(child);
-                  cancel();
-                };
-              },
+          run(sshPath, muxControlArgs(socketPath, "forward", spec), {
+            spawnFn,
+            deadline,
+            onChild: (child, cancel) => {
+              state.cancel = () => {
+                terminate(child);
+                cancel();
+              };
             },
-          ),
+          }),
           masterExit,
         ]);
         if (acknowledged.code !== 0) {
-          throw new Error(acknowledged.stderr.trim() || "Arca rejected the localhost forward");
+          const detail = safeCommandDetail(acknowledged.stderr);
+          if (detail) logError(`[arca preview] ${bindHost} forward failed:`, detail);
+          const family = bindHost.includes(":") ? "IPv6" : "IPv4";
+          if (/address already in use/i.test(detail)) {
+            throw new Error(
+              `localhost preview port ${preview.port} is already in use on ${family} (${bindHost})`,
+            );
+          }
+          throw new Error(
+            `could not bind localhost preview port ${preview.port} on ${family} (${bindHost})`,
+          );
         }
         if (owned.get(conversationId)?.token !== token) {
           throw new Error("preview was superseded");
@@ -434,5 +473,6 @@ module.exports = {
   createArcaPreviewManager,
   loopbackPreview,
   parseStatusJson,
+  safeCommandDetail,
   sameServer,
 };

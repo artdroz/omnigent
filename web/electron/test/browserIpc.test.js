@@ -340,7 +340,33 @@ describe("browserIpc — url live-tracking", () => {
       previewRequestId: begun.requestId,
     });
     assert.equal(opened.ok, false);
+    assert.equal(opened.error, "localhost preview request expired");
     assert.equal(prepares, 0);
+  });
+
+  it("does not grant forged or superseded preview request IDs authority", async () => {
+    const ctx = setup();
+    const forged = await ctx.ipcMain.invoke("omnigent:browser-open-or-navigate", ctx.event, {
+      conversationId: "conv_arca",
+      url: "http://localhost:5173",
+      opts: { agent: true },
+      previewRequestId: "not-a-minted-request",
+    });
+    assert.equal(forged.error, "navigation was superseded");
+    assert.equal(ctx.registry.opened.length, 0);
+
+    const begun = await ctx.ipcMain.invoke("omnigent:browser-begin-preview-navigation", ctx.event, {
+      conversationId: "conv_arca",
+    });
+    ctx.registry.beginNavigation("conv_arca");
+    const superseded = await ctx.ipcMain.invoke("omnigent:browser-open-or-navigate", ctx.event, {
+      conversationId: "conv_arca",
+      url: "http://localhost:5173",
+      opts: { agent: true },
+      previewRequestId: begun.requestId,
+    });
+    assert.equal(superseded.error, "navigation was superseded");
+    assert.equal(ctx.registry.opened.length, 0);
   });
 
   it("prepares an agent navigation before opening and surfaces preparation failure", async () => {

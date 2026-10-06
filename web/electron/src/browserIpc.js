@@ -8,11 +8,13 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { ARCA_PREVIEW_TIMEOUT_MS } = require("./arcaPreviewConfig");
 const { buildDesignModeScript } = require("./designModeScript");
 
 // Max age of a real native input event for a design-mode submit marker to be
 // honored (see the gesture gate below). Covers click/Enter → console.log.
 const DESIGN_MODE_GESTURE_WINDOW_MS = 1500;
+const PREVIEW_REQUEST_TOMBSTONE_MS = 60_000;
 
 /**
  * Detach design-mode listeners (console-message + input-event) off an entry and
@@ -261,7 +263,7 @@ function registerBrowserIpc({
   isPinnedOriginSender,
   getRegistryForEvent,
   prepareAgentNavigation = async (_event, _conversationId, _url, opts) => opts,
-  previewTimeoutMs = 25_000,
+  previewTimeoutMs = ARCA_PREVIEW_TIMEOUT_MS,
 }) {
   const previewRequests = new Map();
   /**
@@ -301,10 +303,15 @@ function registerBrowserIpc({
     const timer = setTimeout(() => {
       const request = previewRequests.get(requestId);
       if (!request) return;
-      previewRequests.delete(requestId);
+      request.expired = true;
       if (request.registry.isNavigationCurrent(conversationId, intentToken)) {
         request.registry.beginNavigation(conversationId);
       }
+      request.retentionTimer = setTimeout(
+        () => previewRequests.delete(requestId),
+        PREVIEW_REQUEST_TOMBSTONE_MS,
+      );
+      request.retentionTimer.unref?.();
     }, previewTimeoutMs);
     timer.unref?.();
     previewRequests.set(requestId, {
@@ -313,6 +320,8 @@ function registerBrowserIpc({
       intentToken,
       deadline,
       timer,
+      expired: false,
+      retentionTimer: null,
     });
     return { ok: true, requestId, deadline };
   });
@@ -338,11 +347,15 @@ function registerBrowserIpc({
       request = previewRequests.get(previewRequestId) ?? null;
       previewRequests.delete(previewRequestId);
       if (request) clearTimeout(request.timer);
+      if (request?.retentionTimer) clearTimeout(request.retentionTimer);
+      const requestMatchesSender =
+        request?.registry === g.registry && request?.conversationId === conversationId;
+      if (requestMatchesSender && (request.expired || request.deadline <= Date.now())) {
+        return { ok: false, created: false, error: "localhost preview request expired" };
+      }
       if (
         !request ||
-        request.registry !== g.registry ||
-        request.conversationId !== conversationId ||
-        request.deadline <= Date.now() ||
+        !requestMatchesSender ||
         !g.registry.isNavigationCurrent(conversationId, request.intentToken)
       ) {
         return { ok: false, created: false, error: "navigation was superseded" };

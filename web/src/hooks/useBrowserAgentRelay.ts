@@ -253,14 +253,16 @@ async function dispatch(
           }
           previewRequestId = request.requestId;
           const remaining = request.deadline - Date.now();
-          if (remaining <= 0) return { ok: false, error: "localhost preview timed out" };
+          if (remaining <= 0) {
+            return { ok: false, error: "localhost preview request expired" };
+          }
           let timer: ReturnType<typeof setTimeout> | undefined;
           try {
             await Promise.race([
               prefetchSessionHostChain(queryClient, conversationId),
               new Promise<never>((_, reject) => {
                 timer = setTimeout(
-                  () => reject(new Error("localhost preview timed out")),
+                  () => reject(new Error("localhost preview request expired")),
                   remaining,
                 );
               }),
@@ -269,7 +271,7 @@ async function dispatch(
             if (timer) clearTimeout(timer);
           }
           if (Date.now() >= request.deadline) {
-            return { ok: false, error: "localhost preview timed out" };
+            return { ok: false, error: "localhost preview request expired" };
           }
         }
         const openArgs = [

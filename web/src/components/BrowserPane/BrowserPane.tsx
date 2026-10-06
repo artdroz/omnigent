@@ -132,6 +132,14 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
   const [designMode, setDesignMode] = useState(false);
   const designModeRef = useRef(false);
 
+  useEffect(() => {
+    setViewActive(false);
+    setCurrentUrl("");
+    setNavigationError(null);
+    setCanGoBack(false);
+    setCanGoForward(false);
+  }, [conversationId]);
+
   // Feed `viewActive` from three signals so the placeholder mounts exactly when
   // a view exists: (1) browser-view-created — first navigate (often detached,
   // no host-active event; breaks the activation deadlock); (2) browserHasView
@@ -147,6 +155,7 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
     void bridge.browserHasView?.(conversationId).then((r) => {
       if (!cancelled && r?.exists) {
         setViewActive(true);
+        setNavigationError(null);
         if (!urlEditingRef.current && r.url) setCurrentUrl(r.url);
         setCanGoBack(!!r.canGoBack);
         setCanGoForward(!!r.canGoForward);
@@ -155,7 +164,10 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
 
     // (1) A view was just created for this conversation (first navigate).
     const unsubCreated = bridge.onBrowserViewCreated?.((payload) => {
-      if (payload.conversationId === conversationId) setViewActive(true);
+      if (payload.conversationId === conversationId) {
+        setViewActive(true);
+        setNavigationError(null);
+      }
     });
     // (3) Attach/detach transitions. An attach for another conversation, or a
     // detach (null), means this pane's view is no longer the visible one.
@@ -164,7 +176,20 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
       else if (payload.conversationId === null) setViewActive(false);
     });
     const unsubClosed = bridge.onBrowserViewClosed?.((payload) => {
-      if (payload.conversationId === conversationId) setViewActive(false);
+      if (payload.conversationId !== conversationId) return;
+      setViewActive(false);
+      setCurrentUrl("");
+      setCanGoBack(false);
+      setCanGoForward(false);
+      if (payload.reason === "preview-expired") {
+        setNavigationError("This localhost preview expired. Ask the agent to open it again.");
+      } else if (payload.reason === "preview-exited") {
+        setNavigationError(
+          "This localhost preview is unavailable because its secure connection closed. Ask the agent to open it again.",
+        );
+      } else {
+        setNavigationError(null);
+      }
     });
     return () => {
       cancelled = true;

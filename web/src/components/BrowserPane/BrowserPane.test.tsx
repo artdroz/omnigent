@@ -160,6 +160,73 @@ describe("BrowserPane cold-start (no view yet)", () => {
   });
 });
 
+describe("BrowserPane localhost preview lifecycle", () => {
+  function installLifecycleBridge() {
+    let fireCreated: ((p: { conversationId: string }) => void) | undefined;
+    let fireClosed: ((p: { conversationId: string; reason: string | null }) => void) | undefined;
+    installBridge({
+      browserHasView: vi.fn().mockResolvedValue({
+        exists: true,
+        url: "http://localhost:5173/stale",
+        canGoBack: true,
+        canGoForward: true,
+      }),
+      onBrowserViewCreated: vi.fn((cb: (p: { conversationId: string }) => void) => {
+        fireCreated = cb;
+        return () => {};
+      }),
+      onBrowserViewClosed: vi.fn(
+        (cb: (p: { conversationId: string; reason: string | null }) => void) => {
+          fireClosed = cb;
+          return () => {};
+        },
+      ),
+    });
+    return { fireCreated: () => fireCreated, fireClosed: () => fireClosed };
+  }
+
+  it("marks an expired preview unavailable without affecting another conversation", async () => {
+    const events = installLifecycleBridge();
+    render(<BrowserPane conversationId="conv_preview" />);
+    const address = await screen.findByRole("textbox", { name: "Address bar" });
+    await waitFor(() => expect(address).toHaveValue("http://localhost:5173/stale"));
+
+    act(() => {
+      events.fireClosed()?.({ conversationId: "conv_other", reason: "preview-expired" });
+    });
+    expect(address).toHaveValue("http://localhost:5173/stale");
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    act(() => {
+      events.fireClosed()?.({ conversationId: "conv_preview", reason: "preview-expired" });
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "This localhost preview expired. Ask the agent to open it again.",
+    );
+    expect(address).toHaveValue("");
+    expect(screen.getByRole("button", { name: "Go back" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Go forward" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reload" })).toBeDisabled();
+
+    act(() => {
+      events.fireCreated()?.({ conversationId: "conv_preview" });
+    });
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  });
+
+  it("explains when the preview connection exits", async () => {
+    const events = installLifecycleBridge();
+    render(<BrowserPane conversationId="conv_preview" />);
+    await screen.findByRole("textbox", { name: "Address bar" });
+    act(() => {
+      events.fireClosed()?.({ conversationId: "conv_preview", reason: "preview-exited" });
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "This localhost preview is unavailable because its secure connection closed.",
+    );
+  });
+});
+
 describe("BrowserPane design-mode toggle", () => {
   it("renders the design-mode toggle in the toolbar", async () => {
     render(<BrowserPane conversationId="conv_dm1" />);

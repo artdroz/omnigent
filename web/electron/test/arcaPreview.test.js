@@ -4,12 +4,24 @@ const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
+const { MessageChannel } = require("node:worker_threads");
+const { ARCA_PREVIEW_TIMEOUT_MS } = require("../src/arcaPreviewConfig");
 const {
   createArcaPreviewManager,
   loopbackPreview,
   parseStatusJson,
+  safeCommandDetail,
   sameServer,
 } = require("../src/arcaPreview");
+
+function holdFakeChildProcessOpen(t) {
+  const channel = new MessageChannel();
+  channel.port1.on("message", () => {});
+  t.after(() => {
+    channel.port1.close();
+    channel.port2.close();
+  });
+}
 
 function child({ exitOnKill = true } = {}) {
   const value = new EventEmitter();
@@ -72,6 +84,10 @@ function successfulSpawner({
 }
 
 describe("Arca localhost preview URL", () => {
+  it("shares a bounded budget that accommodates cold Arca startup", () => {
+    assert.equal(ARCA_PREVIEW_TIMEOUT_MS, 60_000);
+  });
+
   it("accepts explicit loopback previews and preserves their exact origin", () => {
     assert.deepEqual(loopbackPreview("http://localhost:5173/app"), {
       origin: "http://localhost:5173",
@@ -89,6 +105,13 @@ describe("Arca localhost preview URL", () => {
 
   it("parses status JSON after Arca startup notices", () => {
     assert.deepEqual(parseStatusJson('Starting Arca…\n{"daemons":[]}'), { daemons: [] });
+  });
+
+  it("strips terminal escape and control sequences from command details", () => {
+    assert.equal(
+      safeCommandDetail("\u001b[31mbind failed\u001b[0m\u0000\u001b]0;secret\u0007"),
+      "bind failed",
+    );
   });
 
   it("matches workspace UI and API mounts without relaxing host or explicit selectors", () => {
@@ -136,8 +159,22 @@ describe("Arca preview manager", () => {
     assert.equal(fs.statSync(require("node:path").dirname(socketPath)).mode & 0o777, 0o700);
     const shutdown = owned.release();
     const exit = fake.calls.at(-1);
-    assert.deepEqual(exit.args.slice(0, 6), ["ssh", "-F", "/dev/null", "-S", socketPath, "-O"]);
-    assert.equal(exit.args[6], "exit");
+    assert.equal(exit.file, "/usr/bin/ssh");
+    assert.deepEqual(exit.args, [
+      "-F",
+      "/dev/null",
+      "-o",
+      "ProxyCommand=/usr/bin/false",
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "ControlMaster=no",
+      "-S",
+      socketPath,
+      "-O",
+      "exit",
+      "arca-preview.invalid",
+    ]);
     assert.equal(fs.existsSync(require("node:path").dirname(socketPath)), true);
     await shutdown;
     assert.equal(fs.existsSync(require("node:path").dirname(socketPath)), false);
@@ -166,6 +203,10 @@ describe("Arca preview manager", () => {
     assert.equal(first.origin, "http://localhost:5173");
     assert.equal(second.origin, "http://localhost:7331");
     const forwards = fake.calls.filter((call) => call.args.includes("-L"));
+    assert.ok(forwards.every((call) => call.file === "/usr/bin/ssh"));
+    assert.ok(forwards.every((call) => call.args.includes("ProxyCommand=/usr/bin/false")));
+    assert.ok(forwards.every((call) => call.args.includes("BatchMode=yes")));
+    assert.ok(forwards.every((call) => call.args.includes("ControlMaster=no")));
     assert.deepEqual(
       forwards.map((call) => call.args[call.args.indexOf("-L") + 1]),
       [
@@ -176,7 +217,10 @@ describe("Arca preview manager", () => {
       ],
     );
     assert.ok(forwards.every((call) => call.args.includes("/dev/null")));
+    assert.ok(forwards.every((call) => call.args.at(-1) === "arca-preview.invalid"));
     const masters = fake.calls.filter((call) => call.args.includes("-M"));
+    assert.ok(masters.every((call) => call.file === "/usr/local/bin/arca"));
+    assert.ok(masters.every((call) => call.args[0] === "ssh"));
     assert.ok(masters.every((call) => call.args.includes("ClearAllForwardings=yes")));
     assert.ok(masters.every((call) => call.args.includes("ControlPersist=no")));
     assert.equal(
@@ -368,6 +412,7 @@ describe("Arca preview manager", () => {
       resolveArcaPathFn: () => "/arca",
       spawnFn: spawn,
       socketReady: () => true,
+      logError: () => {},
     });
     await assert.rejects(
       manager.prepare({
@@ -376,7 +421,7 @@ describe("Arca preview manager", () => {
         hostId: "host_arca",
         serverUrl: "https://srv.example.com",
       }),
-      /Address already in use/,
+      /port 5173 is already in use on IPv4 \(127\.0\.0\.1\)/,
     );
   });
 
@@ -386,6 +431,7 @@ describe("Arca preview manager", () => {
       resolveArcaPathFn: () => "/arca",
       spawnFn: fake.spawn,
       socketReady: () => true,
+      logError: () => {},
     });
     await assert.rejects(
       manager.prepare({
@@ -394,7 +440,7 @@ describe("Arca preview manager", () => {
         hostId: "host_arca",
         serverUrl: "https://srv.example.com",
       }),
-      /Address already in use/,
+      /port 5173 is already in use on IPv6 \(\[::1\]\)/,
     );
     const masterIndex = fake.calls.findIndex((call) => call.args.includes("-M"));
     assert.equal(fake.children[masterIndex].killed, true);
@@ -441,7 +487,8 @@ describe("Arca preview manager", () => {
     owned.release();
   });
 
-  it("settles a preparation deadline and terminates the owned status process", async () => {
+  it("settles a preparation deadline and terminates the owned status process", async (t) => {
+    holdFakeChildProcessOpen(t);
     const proc = child();
     const manager = createArcaPreviewManager({
       resolveArcaPathFn: () => "/arca",
@@ -462,8 +509,10 @@ describe("Arca preview manager", () => {
 
   it("bounds captured command output", async () => {
     const proc = child();
+    const logged = [];
     const manager = createArcaPreviewManager({
       resolveArcaPathFn: () => "/arca",
+      logError: (...args) => logged.push(args.join(" ")),
       spawnFn: () => {
         queueMicrotask(() => {
           proc.stderr.emit("data", "x".repeat(20_000));
@@ -481,6 +530,7 @@ describe("Arca preview manager", () => {
       }),
       (error) => error.message.length <= 8_192,
     );
+    assert.ok(logged[0].length <= 8_240);
   });
 
   it("directly settles cancellation while waiting for the owned control socket", async () => {
