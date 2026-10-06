@@ -3021,8 +3021,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   setEffort: async (effort) => {
+    const { conversationId, sessionReasoningEffort: previous } = get();
     setActive({ sessionReasoningEffort: effort });
-    const { conversationId } = get();
     if (conversationId) {
       if (queryClient === null) {
         throw new Error("chatStore.setEffort: queryClient not initialized");
@@ -3039,7 +3039,15 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         setterFor(conversationId)({ sessionReasoningEffort: null });
         return;
       }
-      await updateSession(conversationId, { reasoningEffort: effort });
+      try {
+        await updateSession(conversationId, { reasoningEffort: effort });
+      } catch (err) {
+        // A refused change leaves the server on the previous effort; keep a newer pick.
+        setterFor(conversationId)((s) =>
+          s.sessionReasoningEffort === effort ? { sessionReasoningEffort: previous } : {},
+        );
+        throw err;
+      }
     }
   },
 
