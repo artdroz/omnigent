@@ -312,8 +312,7 @@ export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bub
   const firstKept = pending.findIndex((bubble) => !isIdleLocalSend(bubble));
   const lifted = firstKept === -1 ? pending : pending.slice(0, firstKept);
   const kept = firstKept === -1 ? [] : pending.slice(firstKept);
-  // Non-idle sends stay below the preview but above a trailing REQUEST card,
-  // matching placement before send provenance was tracked.
+  // Non-idle sends stay below the preview but above a trailing REQUEST card.
   let keptAt = committed.length;
   while (keptAt > 0 && isStandaloneElicitationBubble(committed[keptAt - 1]!)) {
     keptAt -= 1;

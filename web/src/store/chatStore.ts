@@ -7527,11 +7527,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         //    append below any streaming preview instead of guessing a lift.
         if (eventContent === null) return {};
         return {
-          blocks: blocksWithPromotedUserMessage(
-            s.blocks,
+          blocks: [
+            ...s.blocks,
             committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
-            false,
-          ),
+          ],
         };
       });
       return;

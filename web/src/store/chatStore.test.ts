@@ -1354,51 +1354,10 @@ describe("chatStore — switchTo", () => {
     expect(userIdx, `${label}: user renders above the reply`).toBeLessThan(assistantIdx);
   };
 
-  it("keeps the user message above a native reply that previews before input.consumed", async () => {
-    // A claude-native reply previews as a `live:` block before input.consumed
-    // promotes the just-sent user message; pending bubbles render after committed
-    // blocks, so the streaming reply would otherwise show above the user's input.
-    const sink = pushableStream();
-    seedSession("conv_omni5555", []);
-    sessionLabels.set("conv_omni5555", { "omnigent.wrapper": "claude-code-native-ui" });
-    const base = fetchMock.getMockImplementation()!;
-    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (url === "/v1/sessions/conv_omni5555/stream")
-        return mockResponse(null, { bodyStream: sink.stream });
-      return base(input, init);
-    });
-
-    await useChatStore.getState().switchTo("conv_omni5555");
-    expect(useChatStore.getState().isNativeTerminalSession).toBe(true);
-
-    await useChatStore.getState().send("what is the capital of France?", "agent_xyz");
-    expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
-
-    // The reply previews before input.consumed acks the user's message.
-    sink.push(sse("response.created", { id: "resp_5555", status: "in_progress", output: [] }));
-    sink.push(
-      sse("response.output_text.delta", {
-        delta: "The capital of France is Paris.",
-        message_id: "msg_5555",
-        index: 0,
-      }),
-    );
-    await tick();
-    await tick();
-
-    const state = useChatStore.getState();
-    expect(state.blocks.map((b) => b.ctx.itemId)).toContain("live:msg_5555");
-    expect(state.pendingUserMessages).toHaveLength(1);
-    expectUserAboveReply("preview before input.consumed");
-
-    sink.close();
-  });
-
-  it("keeps the user message above a native reply through input.consumed and the committed item", async () => {
-    // Full forwarder ordering: delta preview, then input.consumed, then the
-    // committed assistant item. The reply must stay below the user's input at every
-    // step, including after input.consumed when no pending bubble remains to lift.
+  it("keeps the user message above a native reply that previews before input.consumed, through consumption and the committed item", async () => {
+    // Forwarder ordering: the reply's `live:` preview, then input.consumed, then
+    // the committed assistant item. The user's input must stay above the reply at
+    // every step, including after input.consumed when no pending bubble remains.
     const sink = pushableStream();
     seedSession("conv_omni5555_full", []);
     sessionLabels.set("conv_omni5555_full", { "omnigent.wrapper": "claude-code-native-ui" });
@@ -1411,6 +1370,7 @@ describe("chatStore — switchTo", () => {
     });
 
     await useChatStore.getState().switchTo("conv_omni5555_full");
+    expect(useChatStore.getState().isNativeTerminalSession).toBe(true);
     await useChatStore.getState().send("what is the capital of France?", "agent_xyz");
     expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
 
@@ -1681,6 +1641,63 @@ describe("chatStore — switchTo", () => {
     // The lingering preview is no longer the active streaming turn, so the new
     // prompt stays below the prior reply instead of overtaking it.
     expect(composeNativeRoles()).toEqual(["assistant", "user"]);
+
+    // The forwarder then mirrors the transcript in order: the stopped turn's
+    // partial answer, Claude's own interrupt marker, and only then the new input.
+    sink.push(
+      sse("response.output_item.done", {
+        message_id: "msg_stop",
+        item: {
+          type: "message",
+          role: "assistant",
+          id: "item_asst_stop",
+          response_id: "resp_stop",
+          content: [{ type: "output_text", text: "Partial answer so far" }],
+        },
+      }),
+    );
+    sink.push(
+      sse("session.input.consumed", {
+        data: {
+          item_id: "item_interrupt_marker",
+          type: "message",
+          data: {
+            role: "user",
+            content: [{ type: "input_text", text: "[Request interrupted by user]" }],
+          },
+        },
+      }),
+    );
+    sink.push(
+      sse("session.input.consumed", {
+        data: {
+          item_id: "item_user_2",
+          type: "message",
+          data: { role: "user", content: [{ type: "input_text", text: "second question" }] },
+        },
+      }),
+    );
+    await tick();
+    await tick();
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(0);
+    let order = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
+    expect(order).not.toContain("live:msg_stop");
+    expect(order.indexOf("item_asst_stop")).toBeLessThan(order.indexOf("item_interrupt_marker"));
+    expect(order.indexOf("item_interrupt_marker")).toBeLessThan(order.indexOf("item_user_2"));
+
+    // The new reply's preview races in: the promoted prompt stays above its own
+    // reply, and the stopped turn's answer stays above everything that followed.
+    sink.push(sse("response.created", { id: "resp_2", status: "in_progress", output: [] }));
+    sink.push(
+      sse("response.output_text.delta", { delta: "Second answer", message_id: "msg_2", index: 0 }),
+    );
+    await tick();
+    await tick();
+    order = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
+    expect(order.indexOf("item_user_2")).toBeLessThan(order.indexOf("live:msg_2"));
+    expect(order.indexOf("item_asst_stop")).toBeLessThan(order.indexOf("item_user_2"));
+    // The interrupt marker renders as a (system-styled) user bubble.
+    expect(composeNativeRoles()).toEqual(["assistant", "user", "user", "assistant"]);
 
     sink.close();
   });
@@ -4393,6 +4410,8 @@ describe("chatStore — sendSlashCommand", () => {
     const pending = useChatStore.getState().pendingUserMessages;
     expect(pending).toHaveLength(1);
     expect(pending[0]!.content).toEqual([{ type: "input_text", text: "/grill-me review this" }]);
+    // Sent while idle, so a racing native reply preview cannot overtake the echo.
+    expect(pending[0]!.sentWhileIdle).toBe(true);
 
     resolvePost();
     await p;
