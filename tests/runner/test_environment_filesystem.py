@@ -15,9 +15,14 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
-from omnigent.entities.environment_filesystem import FilesystemPathNotFound
+from omnigent.entities.environment_filesystem import (
+    FilesystemPathNotFound,
+    InvalidPath,
+    PathUnreachable,
+)
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
+from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.runner import create_runner_app
 from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
 from omnigent.runner.resource_registry import SessionResourceRegistry
@@ -2440,3 +2445,40 @@ async def test_scoped_search_reaches_snapshot_files_past_the_budget(
 
     assert [e["path"] for e in body["data"]] == ["zzz/new.txt"], body
     assert body["truncated"] is True
+
+
+def _confined_fs(
+    ws: Path, *, read_roots: list[Path] | None = None, follow_outward_links: bool = True
+) -> CallerProcessFilesystem:
+    """A filesystem view over *ws* under an active (confined) policy.
+
+    Only path resolution is exercised, so no helper is spawned.
+    """
+    policy = SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=True,
+        read_roots=read_roots,
+        write_roots=[],
+        write_files=[],
+        allow_network=False,
+    )
+    os_env = SimpleNamespace(cwd=str(ws), sandbox=policy)
+    return CallerProcessFilesystem(os_env, follow_outward_links=follow_outward_links)  # type: ignore[arg-type]
+
+
+def test_outward_symlink_under_a_confined_policy_needs_a_grant(tmp_path: Path) -> None:
+    """A link out of the workspace is authorized like the absolute path it points
+    at: a confined environment admits it only when a grant covers the target, and
+    nothing is admitted unless outward links were asked for."""
+    outside = (tmp_path / "outside").resolve()
+    outside.mkdir()
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "linked").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(PathUnreachable):
+        _confined_fs(ws)._resolve("linked")
+    with pytest.raises(InvalidPath):
+        _confined_fs(ws, read_roots=[outside], follow_outward_links=False)._resolve("linked")
+
+    assert _confined_fs(ws, read_roots=[outside])._resolve("linked") == outside

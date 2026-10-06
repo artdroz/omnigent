@@ -229,6 +229,46 @@ async def test_read_through_symlinked_directory_blocked(
 
 
 @pytest.mark.asyncio
+async def test_reach_scope_follows_a_symlinked_directory_out_of_the_workspace(
+    client: httpx.AsyncClient,
+) -> None:
+    """``scope=reach`` is the server vouching for the owner, who may already
+    browse the link's target by absolute path. The link then lists and reads
+    like any folder; entries keep their workspace-relative paths so the tree
+    can keep requesting them the same way.
+    """
+    listed = await client.get(f"{_BASE}/filesystem/vendor", params={"scope": "reach"})
+    assert listed.status_code == 200, listed.text
+    assert [e["path"] for e in listed.json()["data"]] == ["vendor/id_rsa"]
+
+    read = await client.get(f"{_BASE}/filesystem/vendor/id_rsa", params={"scope": "reach"})
+    assert read.status_code == 200, read.text
+    assert read.json()["content"] == _SECRET
+
+    download = await client.get(
+        f"{_BASE}/filesystem/vendor/id_rsa", params={"scope": "reach", "download": "true"}
+    )
+    assert download.status_code == 200, download.text
+    assert download.content == _SECRET.encode()
+
+
+@pytest.mark.asyncio
+async def test_reach_scope_does_not_unlock_writes_through_a_symlink(
+    client: httpx.AsyncClient,
+    planted: Path,
+) -> None:
+    """Only reads take the scope: a write through the outward link is still refused."""
+    outside = planted / "outside_secret.txt"
+    resp = await client.put(
+        f"{_BASE}/filesystem/escape.txt",
+        params={"scope": "reach"},
+        json={"content": "OVERWRITTEN-BY-ATTACKER", "encoding": "utf-8"},
+    )
+    assert resp.status_code != 200, resp.text
+    assert outside.read_text() == _SECRET
+
+
+@pytest.mark.asyncio
 async def test_in_workspace_read_still_works(
     client: httpx.AsyncClient,
 ) -> None:

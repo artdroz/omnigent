@@ -30,7 +30,9 @@ need ``LEVEL_EDIT`` too, UNLESS the session owner opted into sharing files
 ``LEVEL_READ``. A plain read grant otherwise shares the conversation, not the
 raw filesystem — which routinely holds secrets (``.env`` / key files). The
 share opt-in never widens absolute-path browsing, which stays owner-only.
-``conv_share`` has sharing off; ``conv_open`` has it on.
+The same owner bar decides whether a workspace symlink may lead outside the
+workspace: only the owner's workspace-relative reads reach the runner marked
+``scope=reach``. ``conv_share`` has sharing off; ``conv_open`` has it on.
 """
 
 from __future__ import annotations
@@ -445,6 +447,37 @@ async def test_filesystem_allows_the_owner_outside_the_workspace(
     assert resp.status_code == 200, resp.text
     assert len(runner_client.gets) == 1
     assert runner_client.gets[0].startswith(f"{_FS_BASE}/%2Fetc/passwd")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller,url,marked",
+    [
+        ("real-owner@example.com", _FS_RELATIVE, True),
+        ("admin@example.com", _FS_RELATIVE, True),
+        ("owner@example.com", _FS_RELATIVE, False),
+        ("viewer@example.com", _FS_RELATIVE.replace("conv_share", "conv_open"), False),
+        ("real-owner@example.com", _FS_ABSOLUTE, False),
+    ],
+    ids=["owner", "admin", "edit-collaborator", "shared-viewer", "owner-absolute"],
+)
+async def test_filesystem_marks_reach_scope_for_the_owner_only(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    caller: str,
+    url: str,
+    marked: bool,
+) -> None:
+    """A workspace symlink may lead outside the workspace. The runner follows
+    it only when the request carries ``scope=reach``, which is added for the
+    owner alone -- the bar an absolute path already needs -- so a shared
+    session cannot reach past the workspace through a link. An absolute path
+    needs no mark; it is authorized as itself."""
+    resp = await client.get(url, headers={"X-Forwarded-Email": caller})
+
+    assert resp.status_code == 200, resp.text
+    assert len(runner_client.gets) == 1
+    assert ("scope=reach" in runner_client.gets[0]) is marked
 
 
 @pytest.mark.asyncio
