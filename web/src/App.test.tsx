@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { useOmnigentPageView } from "@/lib/analytics";
+import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 
 vi.mock("@/lib/analytics", () => ({
   useOmnigentPageView: vi.fn(),
@@ -236,6 +237,24 @@ describe("Settings routes", () => {
 
     expect(await screen.findByTestId("settings-location")).toHaveTextContent(
       "/settings/appearance",
+    );
+  });
+
+  it("canonicalizes bare settings under an embedded basename", async () => {
+    // The embed rebases navigate() targets under the mount (basenamedRouting), so
+    // the replacement must land on /mount/settings/general, not the host root.
+    render(
+      <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+        <RoutingProvider value={basenamedRouting("/mount")}>
+          <MemoryRouter initialEntries={["/mount/settings"]}>
+            <App basename="/mount" />
+          </MemoryRouter>
+        </RoutingProvider>
+      </CapabilitiesProvider>,
+    );
+
+    expect(await screen.findByTestId("settings-location")).toHaveTextContent(
+      "/mount/settings/general",
     );
   });
 
