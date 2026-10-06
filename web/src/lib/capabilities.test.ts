@@ -9,6 +9,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // test starts from a fresh module cache; only the pure helpers are static.
 import { sandboxOptionLabel, sandboxProviderOptions } from "./capabilities";
 import type { ServerInfo } from "./capabilities";
+import { reportServerFeatures } from "./nativeBridge";
+
+vi.mock("./nativeBridge", () => ({ reportServerFeatures: vi.fn() }));
 
 /** A ServerInfo with only the sandbox fields a test cares about set. */
 function info(overrides: Partial<ServerInfo>): ServerInfo {
@@ -48,6 +51,7 @@ const fetchMock = vi.fn();
 
 beforeEach(() => {
   fetchMock.mockReset();
+  vi.mocked(reportServerFeatures).mockReset();
   vi.stubGlobal("fetch", fetchMock);
   vi.resetModules();
 });
@@ -149,6 +153,40 @@ describe("resolveServerInfo release features", () => {
     const parsed = await resolveServerInfo();
     expect(isFeatureEnabled(parsed, "usage_page")).toBe(false);
     expect(isFeatureEnabled(parsed, "harness_install")).toBe(false);
+  });
+});
+
+describe("resolveServerInfo desktop feature relay", () => {
+  it("reports an explicit true once per server info fetch", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ features: { desktop_arca_shutdown_warnings: true } }),
+    );
+    const { resolveServerInfo } = await import("./capabilities");
+    await Promise.all([resolveServerInfo(), resolveServerInfo()]);
+    await resolveServerInfo();
+    expect(reportServerFeatures).toHaveBeenCalledExactlyOnceWith({
+      desktop_arca_shutdown_warnings: true,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["missing", {}],
+    ["malformed", { features: { desktop_arca_shutdown_warnings: "yes" } }],
+  ])("reports false for a %s gate", async (_label, payload) => {
+    await probe(payload);
+    expect(reportServerFeatures).toHaveBeenCalledExactlyOnceWith({
+      desktop_arca_shutdown_warnings: false,
+    });
+  });
+
+  it("reports false when the info request fails", async () => {
+    fetchMock.mockRejectedValueOnce(new Error("offline"));
+    const { resolveServerInfo } = await import("./capabilities");
+    await resolveServerInfo();
+    expect(reportServerFeatures).toHaveBeenCalledExactlyOnceWith({
+      desktop_arca_shutdown_warnings: false,
+    });
   });
 });
 

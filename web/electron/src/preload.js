@@ -133,6 +133,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * process. Resolves a `{ ok, error?, authError? }` result.
    */
   connectArcaHost: () => ipcRenderer.invoke("omnigent:arca-connect"),
+  /** Report feature values resolved from this server's /v1/info. */
+  reportServerFeatures: (features) =>
+    ipcRenderer.invoke("omnigent:report-server-features", features),
 
   /**
    * Subscribe to host status-change pings. Fired only on real events (a host

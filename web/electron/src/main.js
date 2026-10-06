@@ -537,6 +537,32 @@ async function reportArcaExtendResult(result) {
 }
 
 let arcaResumeListenerRegistered = false;
+const arcaShutdownFeaturesByOrigin = new Map();
+const arcaOnlineOrigins = new Set();
+
+/** Allow warnings only for an online Arca origin whose server enabled them. */
+function arcaShutdownEnabled() {
+  return (
+    arcaAutoConnectFeatureEnabled() &&
+    loadSettings().arca_shutdown_prompts !== false &&
+    [...arcaOnlineOrigins].some((origin) => arcaShutdownFeaturesByOrigin.get(origin) === true)
+  );
+}
+
+/** Apply a gate change without reading Arca status when warnings are off. */
+function updateArcaShutdownWatchGate(wasEnabled) {
+  if (arcaShutdownEnabled()) {
+    if (wasEnabled) return;
+    if (!arcaResumeListenerRegistered) {
+      powerMonitor.on("resume", () => arcaShutdownWatch.onResume());
+      arcaResumeListenerRegistered = true;
+    }
+    if (arcaShutdownWatch.getState().started) arcaShutdownWatch.onResume();
+    else arcaShutdownWatch.start();
+  } else if (wasEnabled) {
+    arcaShutdownWatch.onResume();
+  }
+}
 
 /** Launch-time Arca auto-connect, behind the feature flag above. */
 const arcaAutoConnect = createArcaAutoConnect({
@@ -555,13 +581,11 @@ const arcaAutoConnect = createArcaAutoConnect({
       return null;
     }
   },
-  onStatus: (_origin, status) => {
-    if (status.state !== "online") return;
-    if (!arcaResumeListenerRegistered) {
-      powerMonitor.on("resume", () => arcaShutdownWatch.onResume());
-      arcaResumeListenerRegistered = true;
-    }
-    arcaShutdownWatch.start();
+  onStatus: (origin, status) => {
+    const wasEnabled = arcaShutdownEnabled();
+    if (status.state === "online") arcaOnlineOrigins.add(origin);
+    else arcaOnlineOrigins.delete(origin);
+    updateArcaShutdownWatchGate(wasEnabled);
   },
   log: (message) => console.log(`[omnigent] ${message}`),
 });
@@ -569,8 +593,7 @@ const arcaAutoConnect = createArcaAutoConnect({
 const arcaShutdownWatch = createArcaShutdownWatch({
   readStatus: () => arca.readArcaStatus({ resolveArcaPath: cachedArcaBinary }),
   extend: (mode) => arca.runArcaExtend(mode, { resolveArcaPath: cachedArcaBinary }),
-  isEnabled: () =>
-    arcaAutoConnectFeatureEnabled() && loadSettings().arca_shutdown_prompts !== false,
+  isEnabled: arcaShutdownEnabled,
   prompt: promptArcaShutdown,
   onExtendResult: reportArcaExtendResult,
   log: (message) => console.log(`[omnigent] ${message}`),
@@ -4715,6 +4738,22 @@ function registerIpc() {
       databricksInternalFeatures:
         databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(senderServerUrl(event)),
     };
+  });
+
+  // A pinned server page reports its release gate after /v1/info resolves.
+  ipcMain.handle("omnigent:report-server-features", (event, features) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("server features are only accepted from a connected server page");
+    }
+    if (!features || typeof features !== "object" || Array.isArray(features)) return null;
+    const enabled = features.desktop_arca_shutdown_warnings;
+    if (typeof enabled !== "boolean") return null;
+    const origin = pinnedOrigin(BrowserWindow.fromWebContents(event.sender));
+    if (!origin) return null;
+    const wasEnabled = arcaShutdownEnabled();
+    arcaShutdownFeaturesByOrigin.set(origin, enabled);
+    updateArcaShutdownWatchGate(wasEnabled);
+    return null;
   });
 
   // SPA → connect the user's Arca instance (Databricks-internal sandbox) to

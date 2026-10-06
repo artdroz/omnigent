@@ -200,6 +200,8 @@ interface ElectronDesktopApi extends NativeShellApi {
   getDesktopFeatures?: () => Promise<DesktopFeatures | null>;
   /** Connect the user's Arca instance to the window's server as a host. */
   connectArcaHost?: () => Promise<ArcaConnectResult>;
+  /** Relay server feature values to desktop shells that support them. */
+  reportServerFeatures?: (features: { desktop_arca_shutdown_warnings: boolean }) => Promise<void>;
 
   /** The local `omni` CLI status (installed, resolved path, version, source). */
   getCliStatus?: () => Promise<CliStatus | null>;
@@ -977,6 +979,19 @@ export async function getDesktopFeatures(): Promise<DesktopFeatures | null> {
   } catch (err) {
     console.warn("[nativeBridge] electron getDesktopFeatures failed:", err);
     return null;
+  }
+}
+
+/** Relay the server's Arca warning gate when this is a compatible desktop shell. */
+export async function reportServerFeatures(features: {
+  desktop_arca_shutdown_warnings: boolean;
+}): Promise<void> {
+  try {
+    const electron = electronApi();
+    if (typeof electron?.reportServerFeatures !== "function") return;
+    await electron.reportServerFeatures(features);
+  } catch (err) {
+    console.warn("[nativeBridge] electron reportServerFeatures failed:", err);
   }
 }
 

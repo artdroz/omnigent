@@ -19,6 +19,7 @@
  */
 
 import { hostFetch } from "./host";
+import { reportServerFeatures } from "./nativeBridge";
 
 /**
  * Server session-sharing policy (mirrors the backend ``SharingMode``):
@@ -57,7 +58,12 @@ export interface Branding {
 }
 
 /** Release features understood by this frontend build. */
-export type FeatureKey = "usage_page" | "harness_install" | "canvas" | "harness_settings_ui";
+export type FeatureKey =
+  | "usage_page"
+  | "harness_install"
+  | "canvas"
+  | "harness_settings_ui"
+  | "desktop_arca_shutdown_warnings";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -379,7 +385,12 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
     }
     cachedServerInfo = FALLBACK_SERVER_INFO;
     return cachedServerInfo;
-  })();
+  })().then((info) => {
+    void reportServerFeatures({
+      desktop_arca_shutdown_warnings: info.features.desktop_arca_shutdown_warnings === true,
+    });
+    return info;
+  });
   return pendingServerInfo;
 }
 

@@ -24,6 +24,7 @@ def test_features_default_off() -> None:
         "harness_install": False,
         "canvas": False,
         "harness_settings_ui": False,
+        "desktop_arca_shutdown_warnings": False,
     }
 
 
@@ -56,6 +57,13 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
     assert flags.enabled(Feature.CANVAS)
     assert flags.frontend_dict()["canvas"] is True
     assert flags.enabled_names() == ("canvas",)
+
+
+def test_desktop_arca_warnings_are_frontend_visible_and_opt_in() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "desktop_arca_shutdown_warnings"})
+
+    assert flags.enabled(Feature.DESKTOP_ARCA_SHUTDOWN_WARNINGS)
+    assert flags.frontend_dict()["desktop_arca_shutdown_warnings"] is True
 
 
 def test_unknown_feature_fails_with_known_names() -> None:

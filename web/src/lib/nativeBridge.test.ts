@@ -10,6 +10,7 @@ import {
   onNativeNotificationActivated,
   onNativeSidebarDrag,
   PRE_MANIFEST_BASELINE,
+  reportServerFeatures,
   type ServerManifest,
   serverManifestOf,
   setBadgeCount as bridgeSetBadge,
@@ -194,6 +195,35 @@ describe("isNativeShell / isElectronShell", () => {
     expect(isNativeShell()).toBe(false);
     delete (window as unknown as Record<string, unknown>).omnigentDesktop;
     delete (window as unknown as Record<string, unknown>).omnigentNative;
+  });
+});
+
+describe("reportServerFeatures", () => {
+  const features = { desktop_arca_shutdown_warnings: true };
+
+  it("does nothing in a browser or an older desktop shell", async () => {
+    await expect(reportServerFeatures(features)).resolves.toBeUndefined();
+    setElectron(true);
+    await expect(reportServerFeatures(features)).resolves.toBeUndefined();
+  });
+
+  it("relays the flag and absorbs a shell failure", async () => {
+    setElectron(true);
+    const desktop = (window as unknown as { omnigentDesktop: Record<string, unknown> })
+      .omnigentDesktop;
+    const relay = vi
+      .fn()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("closed"));
+    desktop.reportServerFeatures = relay;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await reportServerFeatures(features);
+    await expect(reportServerFeatures(features)).resolves.toBeUndefined();
+    expect(relay).toHaveBeenCalledTimes(2);
+    expect(relay).toHaveBeenCalledWith(features);
+    expect(warn).toHaveBeenCalledOnce();
+    warn.mockRestore();
   });
 });
 

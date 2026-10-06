@@ -1081,11 +1081,19 @@ describe("Arca shutdown warning wiring", () => {
   const mondayEvening = new Date(2026, 9, 5, 20).getTime();
   const settings = (h, values) => fs.writeFileSync(h.settingsPath, JSON.stringify(values));
   const connect = (h) => h.api.loadServerUrl(h.win, workspace);
+  const reportGate = (h, enabled) => {
+    h.api.registerIpc();
+    return h.ipc.get("omnigent:report-server-features")(
+      { sender: h.webContents, senderFrame: { url: workspace } },
+      { desktop_arca_shutdown_warnings: enabled },
+    );
+  };
   const soon = (now = mondayNoon) => now + 30 * 60 * 1000;
 
   it("does not read status with auto-connect disabled", async (t) => {
     const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
     t.after(h.cleanup);
+    await reportGate(h, true);
     await connect(h);
     assert.deepEqual(h.calls.arcaStatusReads, []);
     assert.deepEqual(h.calls.showMessageBox, []);
@@ -1093,14 +1101,67 @@ describe("Arca shutdown warning wiring", () => {
     assert.equal(h.calls.powerRegistrations, 0);
   });
 
+  it("keeps warnings off until an online server explicitly reports true", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
+    t.after(h.cleanup);
+    settings(h, { arca_auto_connect: true });
+    h.api.registerIpc();
+    await connect(h);
+    await until(() => h.calls.arcaConnects.length === 1, "Arca auto-connect");
+    assert.deepEqual(h.calls.arcaStatusReads, []);
+    await reportGate(h, false);
+    assert.deepEqual(h.calls.arcaStatusReads, []);
+    await reportGate(h, true);
+    await until(() => h.calls.arcaStatusReads.length === 1, "enabled Arca status read");
+    await reportGate(h, false);
+    h.powerEvents.get("resume")();
+    assert.equal(h.calls.arcaStatusReads.length, 1);
+  });
+
+  it("accepts a true report before Arca comes online", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
+    t.after(h.cleanup);
+    settings(h, { arca_auto_connect: true });
+    await reportGate(h, true);
+    assert.deepEqual(h.calls.arcaStatusReads, []);
+    await connect(h);
+    await until(() => h.calls.arcaStatusReads.length === 1, "enabled Arca status read");
+  });
+
+  it("rejects foreign pages and ignores unknown or non-boolean reports", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
+    t.after(h.cleanup);
+    settings(h, { arca_auto_connect: true });
+    h.api.registerIpc();
+    await connect(h);
+    await until(() => h.calls.arcaConnects.length === 1, "Arca auto-connect");
+    const report = h.ipc.get("omnigent:report-server-features");
+    assert.throws(
+      () =>
+        report(
+          { sender: h.webContents, senderFrame: { url: "https://untrusted.example/" } },
+          { desktop_arca_shutdown_warnings: true },
+        ),
+      /only accepted from a connected server page/,
+    );
+    const pinned = { sender: h.webContents, senderFrame: { url: workspace } };
+    await report(pinned, { unknown: true, desktop_arca_shutdown_warnings: "true" });
+    await report(pinned, { unknown: true });
+    assert.deepEqual(h.calls.arcaStatusReads, []);
+    await report(pinned, { unknown: true, desktop_arca_shutdown_warnings: true });
+    await until(() => h.calls.arcaStatusReads.length === 1, "enabled Arca status read");
+  });
+
   it("starts the watch when auto-connect comes online", async (t) => {
     const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
     t.after(h.cleanup);
     settings(h, { arca_auto_connect: true });
+    await reportGate(h, true);
     await connect(h);
     await until(() => h.calls.arcaStatusReads.length === 1, "Arca status read");
     assert.deepEqual(h.calls.arcaStatusReads, [arcaPath]);
     assert.equal(h.calls.powerRegistrations, 1);
+    await reportGate(h, true);
     await connect(h);
     assert.equal(h.calls.powerRegistrations, 1);
   });
@@ -1109,6 +1170,7 @@ describe("Arca shutdown warning wiring", () => {
     const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
     t.after(h.cleanup);
     settings(h, { arca_auto_connect: true, arca_shutdown_prompts: false });
+    await reportGate(h, true);
     await connect(h);
     assert.deepEqual(h.calls.arcaStatusReads, []);
     assert.deepEqual(h.calls.showMessageBox, []);
@@ -1132,6 +1194,7 @@ describe("Arca shutdown warning wiring", () => {
     });
     t.after(h.cleanup);
     settings(h, { arca_auto_connect: true });
+    await reportGate(h, true);
     await connect(h);
     await until(() => h.calls.showMessageBox.length === 1, "launch warning");
     const date = new Date(shutdownAt);
@@ -1174,6 +1237,7 @@ describe("Arca shutdown warning wiring", () => {
     });
     t.after(h.cleanup);
     settings(h, { arca_auto_connect: true });
+    await reportGate(h, true);
     await connect(h);
     await until(() => h.calls.arcaExtends.length === 1, "overnight extension");
     await until(() => h.calls.notifications.length === 1, "extension notification");
@@ -1221,6 +1285,7 @@ describe("Arca shutdown warning wiring", () => {
       });
       t.after(h.cleanup);
       settings(h, { arca_auto_connect: true });
+      await reportGate(h, true);
       await connect(h);
       await until(() => h.calls.showMessageBox.length === 1, `${day} warning`);
       const { options } = h.calls.showMessageBox[0];
@@ -1254,6 +1319,7 @@ describe("Arca shutdown warning wiring", () => {
     });
     t.after(h.cleanup);
     settings(h, { arca_auto_connect: true, server_url: workspace });
+    await reportGate(h, true);
     await connect(h);
     await until(
       () => JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).arca_shutdown_prompts === false,
@@ -1285,6 +1351,7 @@ describe("Arca shutdown warning wiring", () => {
     });
     t.after(h.cleanup);
     settings(h, { arca_auto_connect: true, server_url: workspace });
+    await reportGate(h, true);
     await connect(h);
     await until(
       () => JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).arca_shutdown_prompts === false,
@@ -1307,6 +1374,7 @@ describe("Arca shutdown warning wiring", () => {
     });
     t.after(h.cleanup);
     settings(h, { arca_auto_connect: true });
+    await reportGate(h, true);
     await connect(h);
     await until(() => h.calls.showMessageBox.length === 2, "extension error dialog");
     assert.equal(h.calls.showMessageBox[1].win, h.win);
@@ -1388,6 +1456,7 @@ describe("Arca shutdown warning wiring", () => {
     t.after(h.cleanup);
     settings(h, { arca_auto_connect: true });
     assert.equal(h.powerEvents.has("resume"), false);
+    await reportGate(h, true);
     await connect(h);
     await until(() => h.calls.arcaStatusReads.length === 1, "initial Arca status read");
     assert.equal(typeof h.powerEvents.get("resume"), "function");
