@@ -1,49 +1,19 @@
-// Keep the hover-preview clear of the header toggle’s click target.
+import { conversation as conv, conversationPage } from "@/test/sidebarMockHelpers";
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
+// The desktop peek card floats below the chat header so it never covers the
+// "Open sidebar" toggle whose hover armed it: once the card is visible, a click
+// on the toggle's spot must still reach the toggle, not the card's brand link.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import type { Conversation } from "@/hooks/useConversations";
-import { SidebarDataProvider } from "@/hooks/useSidebarData";
 
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
-  usePinnedConversations: () => ({
-    data: { conversations: [], filterHonored: true },
-    isSuccess: true,
-  }),
-  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => ({ mutate: vi.fn() }),
-  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
-  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: [] }),
-  useProjectSessions: () => ({
-    data: undefined,
-    isLoading: false,
-    hasNextPage: false,
-    isFetchingNextPage: false,
-    fetchNextPage: vi.fn(),
-  }),
-  useMoveToProject: () => ({ mutate: vi.fn() }),
-  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: undefined, isLoading: false }),
-  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: () => Promise.resolve([]),
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return conversationHooksMock();
+});
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
@@ -51,44 +21,6 @@ import { useConversations } from "@/hooks/useConversations";
 import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
-
-function conv(id: string): Conversation {
-  return {
-    id,
-    object: "conversation",
-    title: id,
-    created_at: 0,
-    updated_at: 0,
-    labels: {},
-    permission_level: null,
-    status: "idle",
-  };
-}
-
-function mockConversations(conversations: Conversation[]) {
-  useConvMock.mockImplementation(
-    () =>
-      ({
-        data: {
-          pages: [
-            {
-              data: conversations,
-              first_id: conversations[0]?.id ?? null,
-              last_id: conversations.at(-1)?.id ?? null,
-              has_more: false,
-            },
-          ],
-          pageParams: [undefined],
-        },
-        isLoading: false,
-        isError: false,
-        error: null,
-        fetchNextPage: vi.fn(),
-        hasNextPage: false,
-        isFetchingNextPage: false,
-      }) as unknown as ReturnType<typeof useConversations>,
-  );
-}
 
 function renderPeekingSidebar() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -106,7 +38,7 @@ function renderPeekingSidebar() {
 }
 
 beforeEach(() => {
-  mockConversations([conv("conv_a")]);
+  useConvMock.mockImplementation(() => conversationPage([conv("conv_a")]));
 });
 
 afterEach(() => {

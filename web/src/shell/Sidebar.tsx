@@ -953,7 +953,8 @@ function SidebarImpl({
           // floating-card positioning below (same `md:` layer, source order wins).
           !peek && "md:relative md:inset-auto",
           open || peek ? "md:m-0 md:w-[var(--sidebar-width)] " : "md:m-0 md:w-0 md:border-0",
-          // Float below the chat header so the peek card cannot intercept its toggle.
+          // Float below the chat header (md:top-12 matches its md:h-12) so the
+          // card never covers the "Open sidebar" toggle whose hover armed it.
           peek &&
             "is-peek md:absolute md:inset-x-2 md:top-12 md:bottom-2 p-0 md:max-w-[400px] ring-1 ring-border rounded-xl md:shadow-xl animate-in fade-in slide-in-from-left-4 duration-200 ease-out",
           // Click-through while fading in (see peekInteractive above): the
