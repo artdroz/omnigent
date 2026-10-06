@@ -3930,8 +3930,9 @@ def test_populate_codex_home_config_recovers_from_failed_fallback_copy(
 
     monkeypatch.setattr(Path, "read_bytes", _flaky_read_bytes)
 
-    with pytest.raises(OSError):
+    with pytest.raises(OSError) as excinfo:
         _populate_codex_home_config(target, source)
+    assert excinfo.value.errno == errno.EIO
 
     bridged = target / ".credentials.json"
     assert not bridged.exists()
@@ -4031,36 +4032,6 @@ def test_private_codex_home_config_source_resolves_home_with_missing_pointer_fil
     assert _resolve_codex_home_config_source(private, default_home) == source
 
 
-def test_populate_codex_home_config_discards_orphaned_bridge_after_source_removal(
-    tmp_path: Path,
-) -> None:
-    """A bridged hard link is dropped once its source store is removed.
-
-    After logging out of every remote MCP the source ``.credentials.json`` is
-    deleted, but a reused private home still holds the hard link to the orphaned
-    inode. Repopulating must remove it so the session cannot keep serving
-    credentials the user has signed out of.
-    """
-    from omnigent.inner.codex_executor import _populate_codex_home_config
-
-    source = tmp_path / "real_codex_home"
-    source.mkdir()
-    store = source / ".credentials.json"
-    store.write_text('{"linear|abc": {"access_token": "t"}}')
-    target = tmp_path / "persistent_codex_home"
-    target.mkdir()
-
-    _populate_codex_home_config(target, source)
-    bridged = target / ".credentials.json"
-    assert os.path.samefile(bridged, store)
-
-    store.unlink()
-    _populate_codex_home_config(target, source)
-
-    assert not bridged.exists()
-    assert not bridged.is_symlink()
-
-
 def test_populate_codex_home_config_propagates_non_cross_device_link_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4084,8 +4055,9 @@ def test_populate_codex_home_config_propagates_non_cross_device_link_failure(
     target = tmp_path / "temp_codex_home"
     target.mkdir()
 
-    with pytest.raises(OSError):
+    with pytest.raises(OSError) as excinfo:
         _populate_codex_home_config(target, source)
+    assert excinfo.value.errno == errno.EPERM
 
     assert not (target / ".credentials.json").exists()
     assert not (target / ".credentials.json.copy").exists()

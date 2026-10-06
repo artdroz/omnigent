@@ -1150,24 +1150,6 @@ def _relink_rotated_codex_credential_store(source_file: Path, dest_path: Path) -
     os.replace(staging, dest_path)
 
 
-def _discard_orphaned_bridge_credential_store(dest_path: Path, source_dir: Path) -> None:
-    """
-    Drop a bridged credential store whose source has been removed.
-
-    After a full remote-MCP logout the source ``.credentials.json`` is gone, but
-    a reused private home can still hold the bridge. A hard link on the source
-    filesystem is an orphaned pointer to signed-out tokens and is removed; a
-    cross-filesystem copy carries session-only tokens the source never had, so
-    it is preserved.
-
-    :param dest_path: The bridged store inside the private home.
-    :param source_dir: The source home whose store is now absent.
-    """
-    with suppress(OSError):
-        if dest_path.stat().st_dev == source_dir.stat().st_dev:
-            dest_path.unlink()
-
-
 def _populate_codex_home_config(
     target_dir: Path,
     source_dir: Path,
@@ -1292,7 +1274,6 @@ def _populate_codex_home_config(
                 dest_path.unlink()
             source_file = source_dir / filename
             if not source_file.is_file():
-                _discard_orphaned_bridge_credential_store(dest_path, source_dir)
                 continue
             if dest_path.exists():
                 _relink_rotated_codex_credential_store(source_file, dest_path)
