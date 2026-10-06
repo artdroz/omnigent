@@ -1,256 +1,110 @@
 """Gateway-backed Claude launches must withhold unsupported WebSearch.
 
-Run the real Claude CLI with the product terminal composition against a
-loopback mock gateway. The mock requests WebSearch when offered and rejects
-its nested server-side web_search tool with a region error. The visible
-turn must finish without that error. No live provider credentials are used."""
+Run the real Claude CLI with the product terminal composition against the shared
+mock model server standing in for a gateway: it calls WebSearch when offered and
+rejects Claude Code's nested server-side ``web_search`` request with a region
+error. The turn must finish on the scripted answer without that error, and no
+nested request may reach the gateway. No live provider credentials are used.
+"""
 
 from __future__ import annotations
 
-import http.server
 import json
 import os
 import shutil
 import subprocess
-import threading
 import uuid
 from pathlib import Path
-from typing import Any
 
+import httpx
 import pytest
 
 from omnigent.harnesses.claude_native.bridge import prepare_bridge_dir
 from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig, _claude_terminal_request
 from tests.e2e._harness_probes import cli_unavailable_reason
 
+_MODEL = "claude-sonnet-4-5"
+_PROMPT_TOKEN = "WEBSEARCH-GATEWAY-CLI-PROBE-7f3a"
+_PROMPT = f"Search the web for today's weather in Paris ({_PROMPT_TOKEN})"
+# The mock serves the longest matching token, so these selectors rank the
+# scripted turns: search offered > search deferred behind ToolSearch > no search.
+_SEARCH_OFFERED_MATCH = f"weather in Paris ({_PROMPT_TOKEN})"
+_SEARCH_DEFERRED_MATCH = f"Paris ({_PROMPT_TOKEN})"
+_FINAL_TEXT = "WEBSEARCH-CLI-TURN-FINISHED"
+_NO_SEARCH_TEXT = f"I can't search the web from this session. {_FINAL_TEXT}"
 RESTRICTION_MESSAGE = (
     "Web search is only available in the US: the web_search tool "
     "is not supported in this region (mock gateway US-only restriction)."
 )
 
 
-class _MockGateway(http.server.ThreadingHTTPServer):
-    """Mock a model requesting WebSearch and a gateway rejecting its nested server tool.
-
-    Expand deferred search through ToolSearch; answer normally when search
-    is absent and echo search outcomes when present."""
-
-    def __init__(self) -> None:
-        self.requests: list[dict[str, Any]] = []
-        super().__init__(("127.0.0.1", 0), _MockGatewayHandler)
-
-    @property
-    def host(self) -> str:
-        return f"http://127.0.0.1:{self.server_address[1]}"
+def _configure(mock_url: str, body: dict) -> None:
+    httpx.post(f"{mock_url}/mock/configure", json=body, timeout=10.0).raise_for_status()
 
 
-def _sse_event(event: str, data: dict[str, Any]) -> str:
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
-
-
-def _sse_message(blocks: list[dict[str, Any]], stop_reason: str) -> bytes:
-    """Minimal Anthropic Messages SSE stream carrying *blocks*."""
-    out = [
-        _sse_event(
-            "message_start",
-            {
-                "type": "message_start",
-                "message": {
-                    "id": "msg_mock",
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [],
-                    "model": "mock",
-                    "stop_reason": None,
-                    "stop_sequence": None,
-                    "usage": {"input_tokens": 10, "output_tokens": 1},
-                },
-            },
-        )
-    ]
-    for i, blk in enumerate(blocks):
-        if blk["type"] == "text":
-            out.append(
-                _sse_event(
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": i,
-                        "content_block": {"type": "text", "text": ""},
-                    },
-                )
-            )
-            out.append(
-                _sse_event(
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": i,
-                        "delta": {"type": "text_delta", "text": blk["text"]},
-                    },
-                )
-            )
-        else:  # tool_use
-            out.append(
-                _sse_event(
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": i,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": blk["id"],
-                            "name": blk["name"],
-                            "input": {},
-                        },
-                    },
-                )
-            )
-            out.append(
-                _sse_event(
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": i,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": json.dumps(blk["input"]),
-                        },
-                    },
-                )
-            )
-        out.append(_sse_event("content_block_stop", {"type": "content_block_stop", "index": i}))
-    out.append(
-        _sse_event(
-            "message_delta",
-            {
-                "type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": {"output_tokens": 5},
-            },
-        )
-    )
-    out.append(_sse_event("message_stop", {"type": "message_stop"}))
-    return "".join(out).encode()
-
-
-def _tool_uses(parsed: dict[str, Any]) -> set[str]:
-    """Names of client tools already called earlier in the conversation."""
-    names: set[str] = set()
-    for message in parsed.get("messages", []):
-        content = message.get("content")
-        if isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_use":
-                    name = block.get("name")
-                    if isinstance(name, str):
-                        names.add(name)
-    return names
-
-
-class _MockGatewayHandler(http.server.BaseHTTPRequestHandler):
-    server: _MockGateway
-
-    def _send(self, status: int, content_type: str, body: bytes) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_GET(self) -> None:
-        self._send(200, "application/json", b"{}")
-
-    def do_POST(self) -> None:
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        body = self.rfile.read(length)
-        try:
-            parsed: dict[str, Any] = json.loads(body)
-        except (ValueError, UnicodeDecodeError):
-            parsed = {}
-        self.server.requests.append({"path": self.path, "body": parsed})
-
-        if "/messages" not in self.path or "count_tokens" in self.path:
-            self._send(200, "application/json", json.dumps({"input_tokens": 10}).encode())
-            return
-
-        tools = parsed.get("tools") or []
-        # The nested request Claude Code issues to *execute* WebSearch carries
-        # the server-side web_search tool. The gateway leg rejects it: this is
-        # the US-only restriction users hit on gateway-backed launches.
-        if any("web_search" in json.dumps(t) for t in tools):
-            rejection = {
-                "type": "error",
-                "error": {"type": "invalid_request_error", "message": RESTRICTION_MESSAGE},
-            }
-            self._send(400, "application/json", json.dumps(rejection).encode())
-            return
-
-        tool_names = {t.get("name") for t in tools if isinstance(t, dict)}
-        already_ran = _tool_uses(parsed)
-        if "WebSearch" in already_ran and '"tool_result"' in json.dumps(parsed):
-            # Follow-up after WebSearch executed: echo the tool result so the
-            # outcome (search result or surfaced API error) is user-visible.
-            results: list[str] = []
-            for message in parsed.get("messages", []):
-                content = message.get("content")
-                if isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "tool_result":
-                            results.append(json.dumps(block.get("content"))[:600])
-            text = "FINAL: " + (" | ".join(results) or "(no tool result content)")
-            stream = _sse_message([{"type": "text", "text": text}], "end_turn")
-            self._send(200, "text/event-stream", stream)
-            return
-
-        # Call WebSearch as soon as it is offered. Under Omnigent's env,
-        # Claude Code defers client tools behind MCP Tool Search, so expand
-        # them with a single ToolSearch call first; otherwise answer in text.
-        if "WebSearch" in tool_names:
-            self._send(
-                200,
-                "text/event-stream",
-                _sse_message(
-                    [
+def _script_gateway(mock_url: str) -> None:
+    """Call WebSearch when offered, reject its nested server leg, answer without it otherwise."""
+    _configure(
+        mock_url,
+        {
+            "match": _SEARCH_OFFERED_MATCH,
+            "required_tools": ["WebSearch"],
+            "responses": [
+                {
+                    "tool_calls": [
                         {
-                            "type": "tool_use",
-                            "id": "toolu_ws_1",
+                            "call_id": "toolu_ws_1",
                             "name": "WebSearch",
-                            "input": {"query": "Paris weather today"},
+                            "arguments": json.dumps({"query": "Paris weather today"}),
                         }
-                    ],
-                    "tool_use",
-                ),
-            )
-            return
-        if "ToolSearch" in tool_names and "ToolSearch" not in already_ran:
-            self._send(
-                200,
-                "text/event-stream",
-                _sse_message(
-                    [
+                    ]
+                },
+                {"text": _FINAL_TEXT},
+                {"text": _FINAL_TEXT},
+            ],
+        },
+    )
+    _configure(
+        mock_url,
+        {
+            "match": _SEARCH_DEFERRED_MATCH,
+            "required_tools": ["ToolSearch"],
+            "responses": [
+                {
+                    "tool_calls": [
                         {
-                            "type": "tool_use",
-                            "id": "toolu_ts_1",
+                            "call_id": "toolu_ts_1",
                             "name": "ToolSearch",
-                            "input": {"query": "web search"},
+                            "arguments": json.dumps({"query": "WebSearch"}),
                         }
-                    ],
-                    "tool_use",
-                ),
-            )
-            return
-        self._send(
-            200,
-            "text/event-stream",
-            _sse_message(
-                [{"type": "text", "text": "ANSWER-WITHOUT-WEBSEARCH: no search available."}],
-                "end_turn",
-            ),
-        )
+                    ]
+                },
+                {"text": _NO_SEARCH_TEXT},
+                {"text": _NO_SEARCH_TEXT},
+            ],
+        },
+    )
+    # Guard on Bash: the main turn always advertises it, while Claude Code's
+    # tool-less background requests (title generation) must not consume the reply.
+    _configure(
+        mock_url,
+        {
+            "match": _PROMPT_TOKEN,
+            "required_tools": ["Bash"],
+            "responses": [{"text": _NO_SEARCH_TEXT}] * 3,
+        },
+    )
+    rejection = [{"error": RESTRICTION_MESSAGE, "status_code": 400}] * 6
+    _configure(mock_url, {"key": _MODEL, "required_tools": ["web_search"], "responses": rejection})
+    _configure(
+        mock_url, {"key": "default", "required_tools": ["web_search"], "responses": rejection}
+    )
 
-    def log_message(self, *args: object) -> None:  # keep pytest output clean
-        pass
+
+def _is_server_web_search_tool(tool: object) -> bool:
+    return isinstance(tool, dict) and (
+        tool.get("name") == "web_search" or str(tool.get("type", "")).startswith("web_search")
+    )
 
 
 @pytest.mark.posix_only
@@ -258,19 +112,20 @@ class _MockGatewayHandler(http.server.BaseHTTPRequestHandler):
 def test_websearch_under_gateway_launch_does_not_surface_us_only_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    isolated_mock_llm_server_url: str,
 ) -> None:
     """The real Claude launch must not expose the mock gateway's WebSearch region error."""
     reason = cli_unavailable_reason("claude")
     if reason is not None:
         pytest.skip(f"requires a runnable 'claude' CLI; {reason}")
 
-    gateway = _MockGateway()
-    threading.Thread(target=gateway.serve_forever, daemon=True).start()
+    mock_url = isolated_mock_llm_server_url
+    _script_gateway(mock_url)
     bridge_dir: Path | None = None
     try:
         # Gateway-backed launch composition: base URL override + apiKeyHelper.
         claude_config = ClaudeNativeUcodeConfig(
-            env={"ANTHROPIC_BASE_URL": gateway.host},
+            env={"ANTHROPIC_BASE_URL": mock_url},
             api_key_helper="echo test-key",
         )
 
@@ -284,11 +139,11 @@ def test_websearch_under_gateway_launch_does_not_surface_us_only_error(
         body = _claude_terminal_request(
             (
                 "-p",
-                "Search the web for today's weather in Paris.",
+                _PROMPT,
                 "--allowedTools",
                 "WebSearch",
                 "--model",
-                "claude-sonnet-4-5",
+                _MODEL,
                 "--output-format",
                 "text",
             ),
@@ -325,16 +180,16 @@ def test_websearch_under_gateway_launch_does_not_surface_us_only_error(
             timeout=240,
         )
     finally:
-        gateway.shutdown()
-        gateway.server_close()
         if bridge_dir is not None:
             shutil.rmtree(bridge_dir, ignore_errors=True)
 
     output = f"{proc.stdout}\n{proc.stderr}"
-    model_turns = [r for r in gateway.requests if "/messages" in r["path"]]
-    assert model_turns, f"the claude CLI never reached the gateway endpoint: {output[-2000:]}"
+    requests = httpx.get(f"{mock_url}/mock/requests", timeout=10.0).json()["requests"]
+    assert requests, f"the claude CLI never reached the gateway endpoint: {output[-2000:]}"
     assert proc.returncode == 0, f"claude CLI exited {proc.returncode}: {output[-2000:]}"
-    assert proc.stdout.strip(), f"claude CLI produced no answer: {output[-2000:]}"
+    assert _FINAL_TEXT in proc.stdout, (
+        f"claude CLI did not finish on the scripted answer: {output[-2000:]}"
+    )
 
     # The gateway's region rejection must not surface as the WebSearch outcome.
     assert "only available in the US" not in output and "API Error" not in output, (
@@ -342,13 +197,14 @@ def test_websearch_under_gateway_launch_does_not_surface_us_only_error(
         f"restriction to the user: {proc.stdout.strip()[-1500:]!r}"
     )
     # And the launch must never have sent the gateway a request carrying the
-    # server-side web_search tool — the nested leg the gateway cannot serve.
+    # server-side web_search tool, the nested leg the gateway cannot serve.
     nested_search_requests = [
-        r["path"]
-        for r in gateway.requests
-        if any("web_search" in json.dumps(t) for t in (r["body"].get("tools") or []))
+        r
+        for r in requests
+        if isinstance(r, dict)
+        and any(_is_server_web_search_tool(t) for t in (r.get("tools") or []))
     ]
     assert not nested_search_requests, (
         "the launch still routed a nested server-side web_search request to "
-        f"the gateway: {nested_search_requests}"
+        f"the gateway: {len(nested_search_requests)} request(s)"
     )

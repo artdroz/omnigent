@@ -101,7 +101,9 @@ def _script_gateway(mock_url: str) -> None:
                             "arguments": json.dumps({"query": "WebSearch"}),
                         }
                     ]
-                }
+                },
+                {"text": _NO_SEARCH_TEXT},
+                {"text": _NO_SEARCH_TEXT},
             ],
         },
     )
@@ -125,13 +127,19 @@ def _script_gateway(mock_url: str) -> None:
     )
 
 
+def _is_server_web_search_tool(tool: object) -> bool:
+    return isinstance(tool, dict) and (
+        tool.get("name") == "web_search" or str(tool.get("type", "")).startswith("web_search")
+    )
+
+
 def _nested_web_search_requests(mock_url: str) -> list[dict]:
     requests = httpx.get(f"{mock_url}/mock/requests", timeout=10.0).json()["requests"]
     return [
         r
         for r in requests
         if isinstance(r, dict)
-        and any("web_search" in json.dumps(t) for t in (r.get("tools") or []))
+        and any(_is_server_web_search_tool(t) for t in (r.get("tools") or []))
     ]
 
 
@@ -183,7 +191,7 @@ def _approve_pending_permission(page: Page) -> bool:
 
 
 def _wait_for_turn(page: Page) -> bool:
-    """Approve any WebSearch permission prompt until the turn settles; return whether one was approved."""
+    """Approve any WebSearch permission card until the turn settles; say whether one appeared."""
     deadline = time.monotonic() + _TURN_TIMEOUT_S
     approved = False
     while time.monotonic() < deadline:
@@ -247,7 +255,8 @@ def test_gateway_launch_does_not_surface_websearch_region_error(
     _select_view_mode(page, "Chat")
     expect(page.locator(_USER, has_text=_PROMPT_TOKEN).first).to_be_visible(timeout=60_000)
     approved = _wait_for_turn(page)
-    expect(page.locator(_ASSISTANT, has_text=_TURN_SETTLED).first).to_be_visible(timeout=10_000)
+    # Both scripted replies end with the marker; the mock's generic fallback does not.
+    expect(page.locator(_ASSISTANT, has_text=_FINAL_TEXT).first).to_be_visible(timeout=10_000)
     expect(page.locator(_WORKING)).to_have_count(0, timeout=30_000)
 
     transcript = _transcript(base_url, session_id)

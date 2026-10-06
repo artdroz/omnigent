@@ -466,28 +466,40 @@ _CLAUDE_CLOUD_PROVIDER_FLAG_ENVS: tuple[str, ...] = (
 )
 
 
-def _claude_launch_env_value(
-    claude_config: ClaudeNativeUcodeConfig | None, name: str
+def _managed_claude_env() -> dict[str, str]:
+    """The ``env`` block of the first readable Claude Code managed-settings file, else empty."""
+    for path in _managed_settings_paths():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw_env = payload.get("env")
+        if not isinstance(raw_env, dict):
+            return {}
+        return {
+            key: value.strip()
+            for key, value in raw_env.items()
+            if isinstance(value, str) and value.strip()
+        }
+    return {}
+
+
+def _effective_claude_env_value(
+    claude_config: ClaudeNativeUcodeConfig | None,
+    name: str,
+    managed_env: dict[str, str],
 ) -> str | None:
-    """The value Claude Code sees for *name*: the launch config's value, else the inherited env."""
+    """The value Claude Code sees for *name*.
+
+    Managed settings win, then the launch config, then the inherited process env.
+    """
+    if managed_env.get(name):
+        return managed_env[name]
     if claude_config is not None and claude_config.env.get(name):
         return claude_config.env[name]
     return os.environ.get(name) or None
-
-
-def effective_claude_base_url(claude_config: ClaudeNativeUcodeConfig | None) -> str | None:
-    """The ``ANTHROPIC_BASE_URL`` Claude Code will actually use at launch.
-
-    Managed settings win at Claude Code's launch; otherwise the launch config's
-    override applies, else the base URL the terminal inherits from this process
-    (for example a gateway forwarded into the runner env).
-
-    :param claude_config: The resolved launch config, or ``None`` for Claude
-        Code's own login.
-    :returns: The base URL, or ``None`` for the first-party default.
-    """
-    managed_base_url, _ = managed_claude_gateway_signal()
-    return managed_base_url or _claude_launch_env_value(claude_config, _UCODE_CLAUDE_BASE_URL_ENV)
 
 
 def endpoint_disallowed_claude_tools(
@@ -498,19 +510,20 @@ def endpoint_disallowed_claude_tools(
     Claude Code treats any ``ANTHROPIC_BASE_URL`` as first-party and runs WebSearch
     through a nested ``web_search`` request to it, so a gateway that cannot serve
     that tool hands the user its raw error as the search result. Bedrock, Vertex
-    and Foundry modes gate the tool themselves.
+    and Foundry modes gate the tool themselves. Signals resolve as Claude Code
+    does at launch: managed settings, then the launch config, then inherited env.
 
     :param claude_config: The resolved launch config, or ``None`` for Claude
         Code's own login.
-    :returns: Tool names to merge into ``--disallowedTools``: ``("WebSearch",)``
-        or ``()``.
+    :returns: ``("WebSearch",)`` to merge into ``--disallowedTools``, or ``()``.
     """
-    if _claude_launch_env_value(claude_config, _ANTHROPIC_BEDROCK_BASE_URL_ENV) or any(
-        env_truthy(_claude_launch_env_value(claude_config, name))
+    managed_env = _managed_claude_env()
+    if any(
+        env_truthy(_effective_claude_env_value(claude_config, name, managed_env))
         for name in _CLAUDE_CLOUD_PROVIDER_FLAG_ENVS
     ):
         return ()
-    base_url = effective_claude_base_url(claude_config)
+    base_url = _effective_claude_env_value(claude_config, _UCODE_CLAUDE_BASE_URL_ENV, managed_env)
     if not base_url or _anthropic_api_host(base_url):
         return ()
     return ("WebSearch",)

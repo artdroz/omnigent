@@ -444,6 +444,19 @@ def _claude_endpoint_environment(
         (None, {}, {"ANTHROPIC_BASE_URL": _GATEWAY_URL}, ("WebSearch",)),
         (_FIRST_PARTY_CONFIG, {}, {"ANTHROPIC_BASE_URL": _GATEWAY_URL}, ("WebSearch",)),
         (None, {}, {"CLAUDE_CODE_USE_GATEWAY": "1"}, ()),
+        # Only the mode flags put Claude Code in a cloud-provider mode; a stray
+        # Bedrock URL beside an inherited gateway still routes WebSearch there.
+        (
+            claude_native.ClaudeNativeUcodeConfig(
+                env={"ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock.example.com"}
+            ),
+            {"ANTHROPIC_BASE_URL": _GATEWAY_URL},
+            None,
+            ("WebSearch",),
+        ),
+        (None, {"CLAUDE_CODE_USE_VERTEX": "1", "ANTHROPIC_BASE_URL": _GATEWAY_URL}, None, ()),
+        (None, {"CLAUDE_CODE_USE_FOUNDRY": "true", "ANTHROPIC_BASE_URL": _GATEWAY_URL}, None, ()),
+        (_GATEWAY_CONFIG, {}, {"CLAUDE_CODE_USE_BEDROCK": "1"}, ()),
     ],
     ids=[
         "no-config",
@@ -457,6 +470,10 @@ def _claude_endpoint_environment(
         "managed-settings-gateway",
         "managed-settings-override-config",
         "managed-settings-without-base-url",
+        "bedrock-url-without-flag",
+        "vertex-flag",
+        "foundry-flag",
+        "managed-settings-bedrock-flag",
     ],
 )
 def test_endpoint_disallowed_claude_tools(
