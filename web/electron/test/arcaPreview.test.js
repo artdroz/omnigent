@@ -48,6 +48,7 @@ function child({ exitOnKill = true } = {}) {
 function successfulSpawner({
   hostId = "host_arca",
   serverUrl = "https://srv.example.com/",
+  hostStatus = "online",
   failForwardIndex = 0,
 } = {}) {
   const calls = [];
@@ -63,7 +64,12 @@ function successfulSpawner({
           "data",
           JSON.stringify({
             daemons: [
-              { host_id: hostId, server_url: serverUrl, process: "online", host_status: "online" },
+              {
+                host_id: hostId,
+                server_url: serverUrl,
+                process: "online",
+                ...(hostStatus === null ? {} : { host_status: hostStatus }),
+              },
             ],
           }),
         );
@@ -105,6 +111,7 @@ describe("Arca localhost preview URL", () => {
     });
     assert.equal(loopbackPreview("https://example.com"), null);
     assert.equal(loopbackPreview("http://10.0.0.2:5173"), null);
+    assert.equal(loopbackPreview("http://[::1]:5173"), null);
   });
 
   it("parses status JSON after Arca startup notices", () => {
@@ -243,6 +250,44 @@ describe("Arca preview manager", () => {
     await Promise.all([first.release(), second.release()]);
   });
 
+  it("routes a scoped status probe and requires an online exact host attestation", async () => {
+    const serverUrl = "https://srv.example.com/omnigent?o=123";
+    for (const hostStatus of ["offline", null]) {
+      const fake = successfulSpawner({ serverUrl: "https://srv.example.com/omnigent", hostStatus });
+      const manager = createArcaPreviewManager({
+        resolveArcaPathFn: () => "/arca",
+        spawnFn: fake.spawn,
+        socketReady: () => true,
+      });
+      // oxlint-disable-next-line no-await-in-loop -- each status owns isolated manager state.
+      await assert.rejects(
+        manager.prepare({
+          conversationId: `scoped-${String(hostStatus)}`,
+          url: "http://localhost:5173",
+          hostId: "host_arca",
+          serverUrl,
+        }),
+        /not running on this server's Arca host/,
+      );
+      const status = fake.calls.find((call) => call.args.includes("status"));
+      assert.equal(status.args[status.args.indexOf("--server") + 1], `'${serverUrl}'`);
+    }
+
+    const online = successfulSpawner({ serverUrl: "https://srv.example.com/omnigent" });
+    const manager = createArcaPreviewManager({
+      resolveArcaPathFn: () => "/arca",
+      spawnFn: online.spawn,
+      socketReady: () => true,
+    });
+    const owned = await manager.prepare({
+      conversationId: "scoped-online",
+      url: "http://localhost:5173",
+      hostId: "host_arca",
+      serverUrl,
+    });
+    await owned.release();
+  });
+
   it("bounds an unresponsive mux exit before killing the master and removing its socket", async () => {
     const fake = successfulSpawner();
     let exitChild;
@@ -313,6 +358,45 @@ describe("Arca preview manager", () => {
     const owned = await replacement;
     assert.equal(fake.calls.filter((call) => call.args.includes("status")).length, 2);
     await owned.release();
+  });
+
+  it("serializes same-port preparation behind another conversation's shutdown", async () => {
+    const fake = successfulSpawner();
+    let delayedExit;
+    const manager = createArcaPreviewManager({
+      resolveArcaPathFn: () => "/arca",
+      spawnFn: (file, args) => {
+        if (!delayedExit && args.includes("-O") && args.includes("exit")) {
+          delayedExit = child();
+          return delayedExit;
+        }
+        return fake.spawn(file, args);
+      },
+      socketReady: () => true,
+      terminationGraceMs: 5,
+    });
+    const first = await manager.prepare({
+      conversationId: "first",
+      url: "http://localhost:5173",
+      hostId: "host_arca",
+      serverUrl: "https://srv.example.com",
+    });
+    const releasing = first.release();
+    const secondPending = manager.prepare({
+      conversationId: "second",
+      url: "http://localhost:5173",
+      hostId: "host_arca",
+      serverUrl: "https://srv.example.com",
+    });
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    assert.equal(fake.calls.filter((call) => call.args.includes("status")).length, 1);
+    delayedExit.emit("exit", 0);
+    await releasing;
+    const second = await secondPending;
+    assert.equal(fake.calls.filter((call) => call.args.includes("status")).length, 2);
+    await second.release();
   });
 
   it("keeps released and pending work in shutdownAll until cleanup settles", async () => {
@@ -528,7 +612,38 @@ describe("Arca preview manager", () => {
     });
     fake.children[fake.calls.findIndex((call) => call.args.includes("-M"))].emit("exit", 1);
     assert.deepEqual(exits, ["live"]);
-    owned.release();
+    await owned.release();
+  });
+
+  it("contains cleanup and callback failures on unexpected master exit", async () => {
+    const fake = successfulSpawner();
+    const logged = [];
+    const manager = createArcaPreviewManager({
+      resolveArcaPathFn: () => "/arca",
+      spawnFn: fake.spawn,
+      socketReady: () => true,
+      socketPathFn: () => ({ socketPath: "/tmp/arca-review/s", socketDir: "/tmp/arca-review" }),
+      unlinkSocket: () => {
+        throw new Error("unlink denied");
+      },
+      removeSocketDir: () => {
+        throw new Error("remove denied");
+      },
+      onExit: () => {
+        throw new Error("close failed");
+      },
+      logError: (...args) => logged.push(args.join(" ")),
+    });
+    await manager.prepare({
+      conversationId: "exit-errors",
+      url: "http://localhost:5173",
+      hostId: "host_arca",
+      serverUrl: "https://srv.example.com",
+    });
+    const master = fake.children[fake.calls.findIndex((call) => call.args.includes("-M"))];
+    assert.doesNotThrow(() => master.emit("exit", 1));
+    assert.equal(manager.release("exit-errors"), null);
+    assert.ok(logged.some((message) => message.includes("close failed")));
   });
 
   it("settles a preparation deadline and terminates the owned status process", async (t) => {
@@ -549,6 +664,37 @@ describe("Arca preview manager", () => {
       /timed out preparing/,
     );
     assert.equal(proc.killed, true);
+  });
+
+  it("does not schedule a late deadline kill after synchronous cancellation", async () => {
+    let manager;
+    let replacement;
+    const proc = child({ exitOnKill: false });
+    const spawnFn = () => {
+      replacement = manager.prepare({
+        conversationId: "sync-cancel",
+        url: "https://example.com",
+      });
+      return proc;
+    };
+    manager = createArcaPreviewManager({
+      resolveArcaPathFn: () => "/arca",
+      spawnFn,
+      timeoutMs: 5,
+      terminationGraceMs: 5,
+    });
+    const attempt = manager.prepare({
+      conversationId: "sync-cancel",
+      url: "http://localhost:5173",
+      hostId: "host_arca",
+      serverUrl: "https://srv.example.com",
+    });
+    await assert.rejects(attempt, /cancelled|superseded/);
+    await replacement;
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20);
+    });
+    assert.deepEqual(proc.killSignals, ["SIGTERM"]);
   });
 
   it("bounds captured command output", async () => {
@@ -579,10 +725,14 @@ describe("Arca preview manager", () => {
 
   it("directly settles cancellation while waiting for the owned control socket", async () => {
     const fake = successfulSpawner();
+    let socketPolls = 0;
     const manager = createArcaPreviewManager({
       resolveArcaPathFn: () => "/arca",
       spawnFn: fake.spawn,
-      socketReady: () => false,
+      socketReady: () => {
+        socketPolls += 1;
+        return false;
+      },
     });
     const pending = manager.prepare({
       conversationId: "socket-wait",
@@ -593,8 +743,48 @@ describe("Arca preview manager", () => {
     await new Promise((resolve) => {
       setImmediate(resolve);
     });
-    manager.release("socket-wait");
+    const releasing = manager.release("socket-wait");
     await assert.rejects(pending, /cancelled/);
+    const pollsAfterCancellation = socketPolls;
+    await new Promise((resolve) => {
+      setTimeout(resolve, 50);
+    });
+    assert.equal(socketPolls, pollsAfterCancellation);
+    await releasing;
+  });
+
+  it("stops control-socket polling after the master exits", async () => {
+    const fake = successfulSpawner();
+    let master;
+    let socketPolls = 0;
+    const manager = createArcaPreviewManager({
+      resolveArcaPathFn: () => "/arca",
+      spawnFn: (file, args) => {
+        const proc = fake.spawn(file, args);
+        if (args.includes("-M")) master = proc;
+        return proc;
+      },
+      socketReady: () => {
+        socketPolls += 1;
+        return false;
+      },
+    });
+    const pending = manager.prepare({
+      conversationId: "master-exit-socket-wait",
+      url: "http://localhost:5173",
+      hostId: "host_arca",
+      serverUrl: "https://srv.example.com",
+    });
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    master.emit("exit", 9);
+    await assert.rejects(pending, /Arca preview exited \(9\)/);
+    const pollsAfterExit = socketPolls;
+    await new Promise((resolve) => {
+      setTimeout(resolve, 50);
+    });
+    assert.equal(socketPolls, pollsAfterExit);
   });
 
   it("fails immediately when the control master exits during a forward request", async () => {

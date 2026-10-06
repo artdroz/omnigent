@@ -3701,12 +3701,17 @@ async function prepareArcaPreviewNavigation(event, conversationId, url, opts, li
     serverUrl: arcaTarget,
     deadline: lifecycle.deadline,
   });
-  if (
-    browserRegistryForSender(event) !== registry ||
-    senderServerUrl(event) !== connectedServer ||
-    windowArcaServerUrl(win) !== arcaTarget ||
-    !lifecycle.onCancel(owned.release)
-  ) {
+  let current;
+  try {
+    current =
+      browserRegistryForSender(event) === registry &&
+      senderServerUrl(event) === connectedServer &&
+      windowArcaServerUrl(win) === arcaTarget &&
+      lifecycle.onCancel(owned.release);
+  } catch {
+    current = false;
+  }
+  if (!current) {
     owned.release();
     throw new Error("preview navigation was superseded");
   }

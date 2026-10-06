@@ -345,11 +345,13 @@ function registerBrowserIpc({
     let request = null;
     if (typeof previewRequestId === "string") {
       request = previewRequests.get(previewRequestId) ?? null;
-      previewRequests.delete(previewRequestId);
-      if (request) clearTimeout(request.timer);
-      if (request?.retentionTimer) clearTimeout(request.retentionTimer);
       const requestMatchesSender =
         request?.registry === g.registry && request?.conversationId === conversationId;
+      if (requestMatchesSender) {
+        previewRequests.delete(previewRequestId);
+        clearTimeout(request.timer);
+        if (request.retentionTimer) clearTimeout(request.retentionTimer);
+      }
       if (requestMatchesSender && (request.expired || request.deadline <= Date.now())) {
         return { ok: false, created: false, error: "localhost preview request expired" };
       }
@@ -370,17 +372,26 @@ function registerBrowserIpc({
     let preparedRelease = null;
     if (opts?.agent) {
       try {
-        opts = await prepareAgentNavigation(event, conversationId, url, opts, lifecycle);
+        const prepared = await prepareAgentNavigation(event, conversationId, url, opts, lifecycle);
+        if (!prepared || typeof prepared !== "object" || Array.isArray(prepared)) {
+          throw new Error("agent navigation preparation returned invalid options");
+        }
+        opts = { ...prepared, ...opts };
         preparedRelease = opts?.releaseOwnedOrigin || null;
       } catch (error) {
-        return { ok: false, created: false, error: error.message || String(error) };
+        return { ok: false, created: false, error: error?.message ?? String(error) };
       }
     }
-    if (
-      !g.registry.isNavigationCurrent(conversationId, intentToken) ||
-      !isPinnedOriginSender(event) ||
-      getRegistryForEvent(event) !== g.registry
-    ) {
+    let superseded;
+    try {
+      superseded =
+        !g.registry.isNavigationCurrent(conversationId, intentToken) ||
+        !isPinnedOriginSender(event) ||
+        getRegistryForEvent(event) !== g.registry;
+    } catch {
+      superseded = true;
+    }
+    if (superseded) {
       preparedRelease?.();
       return { ok: false, created: false, error: "navigation was superseded" };
     }
@@ -389,7 +400,7 @@ function registerBrowserIpc({
       r = g.registry.openOrNavigate(conversationId, url, bounds, { ...opts, intentToken });
     } catch (error) {
       preparedRelease?.();
-      return { ok: false, created: false, error: error.message || String(error) };
+      return { ok: false, created: false, error: error?.message ?? String(error) };
     }
     if (!r.ok) preparedRelease?.();
     // On first creation, wire nav listeners here (not in the registry factory,
@@ -523,8 +534,10 @@ function registerBrowserIpc({
     if (g.error) return { ok: false, error: g.error };
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
-    g.registry.beginNavigation(args.conversationId);
-    goBack(entry.view.webContents);
+    if (readNavState(entry.view.webContents).canGoBack) {
+      g.registry.beginNavigation(args.conversationId);
+      goBack(entry.view.webContents);
+    }
     return { ok: true, ...readNavState(entry.view.webContents) };
   });
 
@@ -533,8 +546,10 @@ function registerBrowserIpc({
     if (g.error) return { ok: false, error: g.error };
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
-    g.registry.beginNavigation(args.conversationId);
-    goForward(entry.view.webContents);
+    if (readNavState(entry.view.webContents).canGoForward) {
+      g.registry.beginNavigation(args.conversationId);
+      goForward(entry.view.webContents);
+    }
     return { ok: true, ...readNavState(entry.view.webContents) };
   });
 

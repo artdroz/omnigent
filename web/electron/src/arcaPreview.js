@@ -64,9 +64,9 @@ function sameServer(left, right) {
   const a = serverIdentity(left);
   const b = serverIdentity(right);
   if (!a || !b || a.base !== b.base) return false;
-  // The scoped status request is routed with the requested selector, but its
-  // daemon record normally omits `?o=` and does not attest that selector.
-  // Reject an explicit mismatch whenever the record does carry one.
+  // The CLI persists the requested selector and routes this exact status probe
+  // with its org header. The daemon record normally omits `?o=`, so its online
+  // host_id attests the routed workspace; reject any selector it does include.
   return !a.workspace || (!!b.workspace && a.workspace === b.workspace);
 }
 
@@ -180,18 +180,20 @@ function run(file, args, { spawnFn, deadline, onChild }) {
       reject(error);
       return;
     }
+    child.stdout?.on("data", (chunk) => (stdout = (stdout + String(chunk)).slice(-OUTPUT_LIMIT)));
+    child.stderr?.on("data", (chunk) => (stderr = (stderr + String(chunk)).slice(-OUTPUT_LIMIT)));
+    child.on("error", (error) => finish(error));
+    child.on("exit", (code) => finish(null, code));
+    if (settled) return;
     timer = setTimeout(
       () => {
+        if (settled) return;
         finish(new Error("timed out preparing the Arca localhost preview"));
         terminate(child);
       },
       Math.max(0, deadline - Date.now()),
     );
     timer.unref?.();
-    child.stdout?.on("data", (chunk) => (stdout = (stdout + String(chunk)).slice(-OUTPUT_LIMIT)));
-    child.stderr?.on("data", (chunk) => (stderr = (stderr + String(chunk)).slice(-OUTPUT_LIMIT)));
-    child.on("error", (error) => finish(error));
-    child.on("exit", (code) => finish(null, code));
   });
 }
 
@@ -228,9 +230,10 @@ async function verifyArcaHost({ arcaPath, serverUrl, hostId, spawnFn, deadline, 
   if (!daemon) throw new Error("the requesting session is not running on this server's Arca host");
 }
 
-function waitForSocket(socketPath, deadline, isSocketReady) {
+function waitForSocket(socketPath, deadline, isSocketReady, isCurrent) {
   return new Promise((resolve, reject) => {
     const poll = () => {
+      if (!isCurrent()) return reject(new Error("preview was cancelled"));
       if (isSocketReady(socketPath)) return resolve();
       if (Date.now() >= deadline) return reject(new Error("timed out starting Arca SSH"));
       const timer = setTimeout(poll, 20);
@@ -404,7 +407,15 @@ function createArcaPreviewManager({
         });
       });
       state.cancel = () => rejectMaster(new Error("preview was cancelled"));
-      await Promise.race([waitForSocket(socketPath, deadline, socketReady), masterExit]);
+      await Promise.race([
+        waitForSocket(
+          socketPath,
+          deadline,
+          socketReady,
+          () => owned.get(conversationId)?.token === token && !state.masterExited,
+        ),
+        masterExit,
+      ]);
       const bindHosts = preview.host === "localhost" ? ["127.0.0.1", "[::1]"] : [preview.host];
       for (const bindHost of bindHosts) {
         const spec = `${bindHost}:${preview.port}:${preview.host}:${preview.port}`;
@@ -442,9 +453,15 @@ function createArcaPreviewManager({
       master.on("exit", () => {
         if (owned.get(conversationId)?.token !== token) return;
         owned.delete(conversationId);
-        unlinkSocket(socketPath);
-        if (state.socketDir) removeSocketDir(state.socketDir);
-        onExit(conversationId);
+        cleanupSocket(state);
+        try {
+          onExit(conversationId);
+        } catch (error) {
+          logError(
+            "[arca preview] exit callback failed:",
+            safeCommandDetail(error?.message ?? error),
+          );
+        }
       });
       return {
         origin: preview.origin,

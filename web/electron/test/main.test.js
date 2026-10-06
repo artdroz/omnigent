@@ -3497,6 +3497,39 @@ describe("Arca preview owner reuse", () => {
       assert.equal(releases, 1, field);
     }
   });
+
+  it("releases preparation when the sender is destroyed after acquisition", async (t) => {
+    let resolvePrepare;
+    let releases = 0;
+    let senderDestroyed = false;
+    const ctx = previewHarness(t, {
+      prepare: () =>
+        new Promise((resolve) => {
+          resolvePrepare = resolve;
+        }),
+    });
+    const event = {
+      senderFrame: ctx.event.senderFrame,
+      get sender() {
+        if (senderDestroyed) throw new Error("Object has been destroyed");
+        return ctx.event.sender;
+      },
+    };
+    const pending = ctx.h.api.prepareArcaPreviewNavigation(
+      event,
+      "conversation-destroyed",
+      "http://localhost:5173",
+      { agent: true, hostId: "host_a" },
+      ctx.lifecycle,
+    );
+    senderDestroyed = true;
+    resolvePrepare({
+      origin: "http://localhost:5173",
+      release: () => (releases += 1),
+    });
+    await assert.rejects(pending, /superseded/);
+    assert.equal(releases, 1);
+  });
 });
 
 describe("onboarding runner IPC", () => {
