@@ -207,9 +207,8 @@ def test_chat_linkifies_workspace_paths_including_home_relative(
     # URL: openFile writes the opened path to ``?file=<path>``, so a ``file=README.md``
     # query proves the link target was resolved to the workspace-relative form
     # (README.md lives only at the workspace root) rather than the raw ``~/...``.
-    # We assert the URL (not FileViewer visibility) because the viewer mounts as
-    # two testid="file-viewer" asides (mobile + desktop rail) and its slide-in
-    # transition makes a ``.last`` + to_be_visible() check flaky in CI; the URL
+    # We assert the URL (not FileViewer visibility) because the viewer's
+    # slide-in transition makes a to_be_visible() check flaky in CI; the URL
     # is the deterministic signal of what this test actually verifies.
     tilde_link.click()
     page.wait_for_url(re.compile(r"[?&]file=README\.md(?:&|$)"), timeout=15_000)

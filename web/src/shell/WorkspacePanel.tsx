@@ -56,6 +56,7 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
 import { FilesPanel } from "./FilesPanel";
@@ -798,6 +799,9 @@ function WorkspacePanelImpl({
     browsers.selected !== null &&
     selectedFilePath === null &&
     selectedTerminalKey === null;
+  // Below the md breakpoint this rail is display:none and AppShell's push panel
+  // shows the file, so the rail must not mount a second viewer for it.
+  const mobileLayout = useIsMobileViewport();
   const addBrowser = () => {
     browsers.add();
     onRightRailTabChange("browser");
@@ -1388,7 +1392,7 @@ function WorkspacePanelImpl({
               readOnly={!isOwnerLevel(permissionLevel)}
               autoFocus={autoFocusSelectedTerminal}
             />
-          ) : selectedFilePath !== null ? (
+          ) : selectedFilePath !== null && !mobileLayout ? (
             <FileViewer
               viewport="desktop"
               frameless

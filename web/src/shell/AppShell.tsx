@@ -101,6 +101,7 @@ import {
   livenessRowFromSession,
   useSessionLiveness,
 } from "@/hooks/useSessionLiveness";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
@@ -354,6 +355,9 @@ export function AppShell() {
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).selectedFilePath ?? null) : null,
   );
+  // Mount the file viewer only for the active layout: a CSS-hidden twin would
+  // fetch and render the same file again.
+  const mobileLayout = useIsMobileViewport();
   // Explicit opens override the URL, including opens without a cited position.
   const [fileNavigation, setFileNavigation] = useState<{
     conversationId: string | undefined;
@@ -2576,7 +2580,7 @@ export function AppShell() {
                 </MobilePanelDrawer>
               )}
               {/* Mobile-only push panel — on desktop the viewer lives inside the inline aside. */}
-              {serverConversationId && selectedFilePath !== null && (
+              {mobileLayout && serverConversationId && selectedFilePath !== null && (
                 <div className="md:hidden">
                   <FileViewer
                     viewport="mobile"
