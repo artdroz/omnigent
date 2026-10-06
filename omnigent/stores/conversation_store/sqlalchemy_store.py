@@ -3627,7 +3627,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.id == conversation_id,
                 )
                 .where(SqlConversationMetadata.runner_id.is_(None))
-                .values(runner_id=runner_id)
+                .values(
+                    runner_id=runner_id,
+                    runner_last_seen=None,
+                    runner_last_connected=None,
+                )
             )
             result = cast(_RowCountResult, session.execute(stmt))
             return result.rowcount == 1
@@ -3834,8 +3838,18 @@ class SqlAlchemyConversationStore(ConversationStore):
                     f"conversation {conversation_id!r} does not exist",
                 )
             if expected_runner_id is None:
+                if meta.runner_id != runner_id:
+                    # A real rebind drops the previous runner's liveness stamps;
+                    # the durable connect stamp would otherwise read as live
+                    # elsewhere until the new runner's tunnel re-stamps the row.
+                    meta.runner_last_seen = None
+                    meta.runner_last_connected = None
                 meta.runner_id = runner_id
             else:
+                new_values: dict[str, str | None] = {"runner_id": runner_id}
+                if expected_runner_id != runner_id:
+                    new_values["runner_last_seen"] = None
+                    new_values["runner_last_connected"] = None
                 session.execute(
                     update(SqlConversationMetadata)
                     .where(
@@ -3843,7 +3857,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         SqlConversationMetadata.id == conversation_id,
                         SqlConversationMetadata.runner_id == expected_runner_id,
                     )
-                    .values(runner_id=runner_id)
+                    .values(**new_values)
                 )
                 session.refresh(meta)
             return meta
@@ -3876,6 +3890,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     f"conversation {conversation_id!r} does not exist",
                 )
             meta.runner_id = None
+            meta.runner_last_seen = None
+            meta.runner_last_connected = None
             return meta
 
         meta = run_write_transaction(self._session_immediate, "clear_runner_id", write)
@@ -3914,6 +3930,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta.workspace = None
             meta.git_branch = None
             meta.runner_id = None
+            meta.runner_last_seen = None
+            meta.runner_last_connected = None
             return meta
 
         meta = run_write_transaction(self._session_immediate, "clear_host_binding", write)

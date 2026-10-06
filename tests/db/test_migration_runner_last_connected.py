@@ -36,40 +36,42 @@ def test_add_runner_last_connected_preserves_existing_rows(tmp_path: Path) -> No
     db_path = tmp_path / "runner_last_connected.db"
     uri = f"sqlite:///{db_path}"
     engine = sa.create_engine(uri)
-
-    # Schema just before the additive column, with a bound runner whose only
-    # liveness stamp is runner_last_seen, as a previous-build replica writes.
-    _upgrade(uri, engine, "mm1a2b3c4d5e")
-    with engine.begin() as conn:
-        conn.execute(
-            sa.text(
-                "INSERT INTO omnigent_conversation_metadata"
-                " (workspace_id, id, kind, runner_id, runner_last_seen)"
-                " VALUES (0, 'conv_live', 1, 'runner_1', 1700000000)"
+    try:
+        # Schema just before the additive column, with a bound runner whose only
+        # liveness stamp is runner_last_seen, as a previous-build replica writes.
+        _upgrade(uri, engine, "mm1a2b3c4d5e")
+        with engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO omnigent_conversation_metadata"
+                    " (workspace_id, id, kind, runner_id, runner_last_seen)"
+                    " VALUES (0, 'conv_live', 1, 'runner_1', 1700000000)"
+                )
             )
-        )
 
-    _upgrade(uri, engine, "nn1a2b3c4d5e")
-    with engine.begin() as conn:
-        row = conn.execute(
-            sa.text(
-                "SELECT runner_last_seen, runner_last_connected"
-                " FROM omnigent_conversation_metadata WHERE id = 'conv_live'"
-            )
-        ).one()
-    assert row == (1700000000, None)
+        _upgrade(uri, engine, "nn1a2b3c4d5e")
+        with engine.begin() as conn:
+            row = conn.execute(
+                sa.text(
+                    "SELECT runner_last_seen, runner_last_connected"
+                    " FROM omnigent_conversation_metadata WHERE id = 'conv_live'"
+                )
+            ).one()
+        assert row == (1700000000, None)
 
-    _downgrade(uri, engine, "mm1a2b3c4d5e")
-    columns = {c["name"] for c in sa.inspect(engine).get_columns("omnigent_conversation_metadata")}
-    assert "runner_last_connected" not in columns
-    with engine.begin() as conn:
-        seen = conn.execute(
-            sa.text(
-                "SELECT runner_last_seen FROM omnigent_conversation_metadata"
-                " WHERE id = 'conv_live'"
-            )
-        ).scalar_one()
-    assert seen == 1700000000
-
-    engine.dispose()
-    clear_engine_cache()
+        _downgrade(uri, engine, "mm1a2b3c4d5e")
+        columns = {
+            c["name"] for c in sa.inspect(engine).get_columns("omnigent_conversation_metadata")
+        }
+        assert "runner_last_connected" not in columns
+        with engine.begin() as conn:
+            seen = conn.execute(
+                sa.text(
+                    "SELECT runner_last_seen FROM omnigent_conversation_metadata"
+                    " WHERE id = 'conv_live'"
+                )
+            ).scalar_one()
+        assert seen == 1700000000
+    finally:
+        engine.dispose()
+        clear_engine_cache()
