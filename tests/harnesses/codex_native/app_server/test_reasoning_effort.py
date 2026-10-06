@@ -349,6 +349,7 @@ async def test_resume_effort_update_times_out_and_closes_client(
         client.request.side_effect = stalled
     monkeypatch.setattr(app_server, "client_for_transport", lambda *args, **kwargs: client)
     monkeypatch.setattr(app_server, "_EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(app_server, "_EFFORT_CONNECT_TIMEOUT_SECONDS", 0.01)
 
     task = asyncio.create_task(
         app_server.apply_codex_thread_effort(

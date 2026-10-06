@@ -68,6 +68,7 @@ from omnigent.inner.native_attachments import (
     requires_filesystem,
     unresolved_attachment_marker,
 )
+from omnigent.process_logging import log_once
 from omnigent.util.reasoning_effort import (
     CODEX_NATIVE_EFFORTS,
     effort_for_model_switch,
@@ -189,8 +190,13 @@ async def _start_codex_turn(
         )
         if resolved_effort != effort:
             settings_overrides["effort"] = resolved_effort
-    elif isinstance(settings_overrides.get("effort"), str):
-        _logger.warning("Codex effort change without a known model skips capability validation")
+    elif isinstance(effort, str):
+        log_once(
+            _logger,
+            logging.INFO,
+            "Codex effort %s has no known model; skipping capability validation",
+            effort,
+        )
     if settings_overrides:
         await client.request(
             "thread/settings/update",

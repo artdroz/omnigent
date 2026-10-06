@@ -118,6 +118,7 @@ CodexRequestFn = Callable[[str, CodexParams], Awaitable[CodexMessage]]
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
 _EFFORT_CATALOG_TIMEOUT_SECONDS = 2.0
 _EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS = 2.0
+_EFFORT_CONNECT_TIMEOUT_SECONDS = 2.0
 # Model discovery is a best-effort side process whose callers fall back to a
 # cached or bundled catalog, so it keeps a short readiness budget.
 _CONNECT_TIMEOUT_SECONDS = 10.0
@@ -4439,7 +4440,7 @@ async def apply_codex_thread_effort(
     """
     client = client_for_transport(transport, client_name="omnigent-codex-native-effort")
     try:
-        await asyncio.wait_for(client.connect(), timeout=_EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS)
+        await asyncio.wait_for(client.connect(), timeout=_EFFORT_CONNECT_TIMEOUT_SECONDS)
         if model is None and bridge_dir is not None:
             model = read_codex_config_model(bridge_dir)
         applied_effort = await resolve_codex_effort_for_model(
