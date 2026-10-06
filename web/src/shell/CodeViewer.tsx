@@ -512,6 +512,10 @@ export function CodeViewer({
   // Non-markdown files render in Monaco (read-only or editable by permission);
   // markdown keeps TipTap (editor) / Shiki (source) and HTML keeps its preview.
   const showMonaco = lang !== "markdown" && viewMode !== "preview";
+  // HTML, markdown, and notebook previews render through their own surfaces and
+  // never read the Shiki tokens, so skipping them avoids a wasted full-file pass.
+  const isRenderedPreview =
+    viewMode === "preview" && (lang === "html" || lang === "markdown" || isNotebookPath(path));
   // Only the Shiki DOM path needs the per-line split; skip it in Monaco mode.
   const rawLines = useMemo(() => (showMonaco ? [] : content.split("\n")), [content, showMonaco]);
 
@@ -546,6 +550,7 @@ export function CodeViewer({
   useEffect(() => {
     if (showMonaco) return; // Monaco does its own highlighting.
     if (viewMode === "editor" && lang === "markdown") return;
+    if (isRenderedPreview) return; // Preview surfaces never read the Shiki tokens.
     let cancelled = false;
     setTokenLines(null);
     if (!content) return;
@@ -556,7 +561,7 @@ export function CodeViewer({
     return () => {
       cancelled = true;
     };
-  }, [content, lang, viewMode, showMonaco]);
+  }, [content, lang, viewMode, showMonaco, isRenderedPreview]);
 
   // Scroll to the line containing the active selection when it changes
   // (e.g. user clicked a comment in the panel).

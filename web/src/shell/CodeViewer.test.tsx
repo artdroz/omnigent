@@ -5,6 +5,7 @@ import type { Comment } from "@/hooks/useComments";
 import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
+import { highlightCode } from "@/components/ai-elements/code-block";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
@@ -373,10 +374,14 @@ describe("CodeViewer editor routing", () => {
   });
 
   it("keeps markdown source on the Shiki path (not Monaco)", () => {
+    vi.mocked(highlightCode).mockClear();
     renderViewer("# heading", true, "notes.md");
     // Markdown source must NOT route to Monaco — it stays on the Shiki render
     // (TipTap handles markdown editing; Monaco is for non-markdown files).
     expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+    // The preview-only highlight skip must not reach here: markdown source still
+    // tokenizes through Shiki.
+    expect(highlightCode).toHaveBeenCalled();
   });
 });
 
@@ -685,6 +690,22 @@ describe("CodeViewer HTML preview sandbox", () => {
     expect(sandbox).not.toContain("allow-same-origin");
     // #777: every link opens in a new tab via the injected base tag.
     expect(iframe!.getAttribute("srcdoc")).toContain('<base target="_blank">');
+  });
+});
+
+describe("CodeViewer HTML preview skips Shiki highlighting", () => {
+  // A large HTML file opened in preview froze the renderer: the highlight effect
+  // ran Shiki over the whole file even though the HTML preview is a sandboxed
+  // iframe that never consumes the tokens.
+  it("does not tokenize file content when rendering the HTML preview", () => {
+    const largeHtml =
+      "<!doctype html><html><body><table>" +
+      "<tr><td>cell</td></tr>\n".repeat(20_000) +
+      "</table></body></html>";
+    vi.mocked(highlightCode).mockClear();
+    const { container } = renderViewer(largeHtml, true, "report.html", { viewMode: "preview" });
+    expect(container.querySelector('iframe[title="HTML preview"]')).not.toBeNull();
+    expect(highlightCode).not.toHaveBeenCalled();
   });
 });
 
