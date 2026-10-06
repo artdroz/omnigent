@@ -503,7 +503,7 @@ describe("Arca shutdown watch", () => {
 
   it("retries a failed status read and preserves launch eligibility", async () => {
     const h = makeWatch({
-      statuses: [{ ok: false, errorKind: "network", error: "offline" }, running(2 * HOUR)],
+      statuses: [{ ok: false, errorKind: "unreachable", error: "offline" }, running(2 * HOUR)],
     });
     h.watch.start();
     await flush();
@@ -517,7 +517,7 @@ describe("Arca shutdown watch", () => {
 
   it("preserves launch eligibility when resume replaces a failed read's retry", async () => {
     const h = makeWatch({
-      statuses: [{ ok: false, errorKind: "network", error: "offline" }, running(2 * HOUR)],
+      statuses: [{ ok: false, errorKind: "unreachable", error: "offline" }, running(2 * HOUR)],
     });
     h.watch.start();
     await flush();
@@ -549,7 +549,7 @@ describe("Arca shutdown watch", () => {
   });
 
   it("uses a two-minute first retry, fifteen-minute later retries, and resets on success", async () => {
-    const failure = { ok: false, errorKind: "network", error: "offline" };
+    const failure = { ok: false, errorKind: "unreachable", error: "offline" };
     const h = makeWatch({
       statuses: [failure, failure, { ok: true, state: "stopped", shutdownAt: null }, failure],
     });
@@ -563,6 +563,52 @@ describe("Arca shutdown watch", () => {
     h.watch.onResume();
     await flush();
     assert.equal(h.watch.getState().nextCheckAt, 19 * MINUTE);
+  });
+
+  it("uses fast retries only for transient status failures", async () => {
+    await Promise.all(
+      ["timeout", "unreachable", "unknown"].map(async (errorKind) => {
+        const h = makeWatch({ statuses: [{ ok: false, errorKind, error: "retry" }] });
+        h.watch.start();
+        await flush();
+        assert.equal(h.watch.getState().nextCheckAt, 2 * MINUTE, errorKind);
+      }),
+    );
+    await Promise.all(
+      ["not-installed", "no-instance", "arca-auth", "runtime-limit"].map(async (errorKind) => {
+        const h = makeWatch({ statuses: [{ ok: false, errorKind, error: "wait" }] });
+        h.watch.start();
+        await flush();
+        assert.equal(h.watch.getState().nextCheckAt, 3 * HOUR, errorKind);
+      }),
+    );
+  });
+
+  it("resets the fast-retry count after a permanent status failure", async () => {
+    const h = makeWatch({
+      statuses: [
+        { ok: false, errorKind: "timeout", error: "slow" },
+        { ok: false, errorKind: "arca-auth", error: "sign in" },
+        { ok: false, errorKind: "unreachable", error: "offline" },
+      ],
+    });
+    h.watch.start();
+    await flush();
+    await h.clock.advance(2 * MINUTE);
+    assert.equal(h.watch.getState().nextCheckAt, 2 * MINUTE + 3 * HOUR);
+    h.watch.onResume();
+    await flush();
+    assert.equal(h.watch.getState().nextCheckAt, 4 * MINUTE);
+  });
+
+  it("prunes prompt keys before the current effective deadline", async () => {
+    const h = makeWatch({ statuses: [running(2 * HOUR), running(26 * HOUR)] });
+    h.watch.start();
+    await flush();
+    assert.deepEqual(h.watch.getState().prompted, [`launch:${2 * HOUR}`]);
+    h.watch.onResume();
+    await flush();
+    assert.deepEqual(h.watch.getState().prompted, []);
   });
 
   it("refreshes stopped instances and missing shutdown times every three hours", async () => {

@@ -15,6 +15,7 @@ const DEFAULT_OPTIONS = Object.freeze({
   refreshMs: 3 * 60 * 60e3,
   businessHours: Object.freeze({ start: 6, end: 18 }),
 });
+const TRANSIENT_STATUS_ERROR_KINDS = new Set(["timeout", "unreachable", "unknown"]);
 
 /**
  * Find the current warning window's effective deadline.
@@ -229,11 +230,16 @@ function createArcaShutdownWatch({
     }
     if (disposed) return false;
     if (!status?.ok) {
-      failedReads++;
       shutdownAt = null;
       effectiveAt = null;
       safeLog(`arca shutdown: status failed (${status?.errorKind ?? "unknown"}): ${status?.error}`);
-      if (!confirmExtend || enabled()) armRetry();
+      if (TRANSIENT_STATUS_ERROR_KINDS.has(status?.errorKind)) {
+        failedReads++;
+        if (!confirmExtend || enabled()) armRetry();
+      } else {
+        failedReads = 0;
+        if (!confirmExtend || enabled()) armRefresh();
+      }
       return false;
     }
     failedReads = 0;
@@ -287,6 +293,9 @@ function createArcaShutdownWatch({
       localDayOffset,
       businessHours: settings.businessHours,
     });
+    for (const key of prompted) {
+      if (Number(key.slice(key.indexOf(":") + 1)) < effectiveAt) prompted.delete(key);
+    }
     const plan = planPrompt({
       effectiveAt,
       now: now(),

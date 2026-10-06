@@ -19,7 +19,7 @@
  */
 
 import { hostFetch } from "./host";
-import { reportServerFeatures } from "./nativeBridge";
+import { reportServerFeatures, type ReportedServerFeatures } from "./nativeBridge";
 
 /**
  * Server session-sharing policy (mirrors the backend ``SharingMode``):
@@ -378,10 +378,11 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           agent_install: data.agent_install === true,
           branding: parseBranding(data.branding),
         };
-        void reportServerFeatures({
+        const reportedFeatures: ReportedServerFeatures = {
           desktop_arca_shutdown_warnings:
             cachedServerInfo.features.desktop_arca_shutdown_warnings === true,
-        });
+        };
+        void reportServerFeatures(reportedFeatures);
         return cachedServerInfo;
       }
     } catch {

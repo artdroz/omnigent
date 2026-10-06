@@ -27,6 +27,7 @@ const { execFile, execFileSync, spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { StringDecoder } = require("node:string_decoder");
 
 /**
  * Connecting may cold-start the EC2 instance, which takes minutes — give the
@@ -37,7 +38,7 @@ const STATUS_TIMEOUT_MS = 60_000;
 const EXTEND_TIMEOUT_MS = 120_000;
 const ARCA_EXTEND_MODES = Object.freeze(["default", "overnight", "workweek"]);
 const ARCA_AUTH_RE = /arca (auth )?login|certificate.*expired|permission denied \(publickey/i;
-const MAX_STATUS_STDOUT_BYTES = 256 * 1024;
+const MAX_CLI_STDOUT_BYTES = 256 * 1024;
 
 /**
  * The only characters allowed in the server URL that rides inside the ssh
@@ -291,8 +292,7 @@ function parseArcaStatus(stdout) {
     let depth = 0;
     let inString = false;
     let escaped = false;
-    let candidates = 0;
-    for (let i = 0; i < stdout.length && candidates < 20; i++) {
+    for (let i = 0; i < stdout.length; i++) {
       const char = stdout[i];
       if (depth === 0) {
         if (char === "{") {
@@ -310,7 +310,6 @@ function parseArcaStatus(stdout) {
       } else if (char === "{") {
         depth++;
       } else if (char === "}" && --depth === 0) {
-        candidates++;
         const candidate = parseObject(stdout.slice(start, i + 1));
         const hasInstance =
           candidate &&
@@ -332,7 +331,10 @@ function parseArcaStatus(stdout) {
     }
   }
   if (!status) return null;
-  const raw = status.instance == null ? status.shutdown_time : status.instance.shutdown_time;
+  const raw =
+    status.instance === null || status.instance === undefined
+      ? status.shutdown_time
+      : status.instance.shutdown_time;
   const rawShutdownTime = typeof raw === "string" ? raw : null;
   const shutdownAt =
     rawShutdownTime && /(?:Z|[+-]\d{2}:?\d{2})$/i.test(rawShutdownTime)
@@ -364,6 +366,8 @@ function runArca(arcaPath, args, options) {
     let stdout = "";
     let stdoutBytes = 0;
     let stderr = "";
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
     let settled = false;
     let exited = false;
     let exitCode = null;
@@ -372,17 +376,19 @@ function runArca(arcaPath, args, options) {
       if (stdoutBytes >= (options.maxStdoutBytes ?? Infinity)) return;
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
       const retained = bytes.subarray(0, (options.maxStdoutBytes ?? Infinity) - stdoutBytes);
-      stdout += retained.toString("utf8");
+      stdout += stdoutDecoder.write(retained);
       stdoutBytes += retained.length;
     };
     const onStderr = (chunk) => {
-      stderr += String(chunk);
+      stderr += stderrDecoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
     };
     const settle = (result, fromClose = false) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       clearTimeout(exitGraceTimer);
+      stdout += stdoutDecoder.end();
+      stderr += stderrDecoder.end();
       if (!fromClose) {
         for (const [stream, listener] of [
           [child.stdout, onStdout],
@@ -447,7 +453,10 @@ function describeArcaCliFailure(run, action) {
     return {
       ok: false,
       errorKind: "no-instance",
-      error: "Your Arca instance isn't running anymore, so there's nothing to extend.",
+      error:
+        action === "status"
+          ? "Your Arca instance isn't running. Start it with `arca start` and try again."
+          : "Your Arca instance isn't running anymore, so there's nothing to extend.",
     };
   }
   if (/runtime limit/i.test(output)) {
@@ -455,7 +464,9 @@ function describeArcaCliFailure(run, action) {
       ok: false,
       errorKind: "runtime-limit",
       error:
-        "Your Arca instance reached its one-week runtime limit, so it can't be extended. Restart it with `arca stop && arca start`.",
+        action === "status"
+          ? "Your Arca instance reached its one-week runtime limit. Restart it with `arca stop && arca start`, then check its status again."
+          : "Your Arca instance reached its one-week runtime limit, so it can't be extended. Restart it with `arca stop && arca start`.",
     };
   }
   if (ARCA_AUTH_RE.test(output) || /dbcert/i.test(output)) {
@@ -501,7 +512,7 @@ async function readArcaStatus(deps = {}) {
     const run = await runArca(arcaPath, ["status", "--json"], {
       spawn: deps.spawn,
       timeoutMs: deps.timeoutMs ?? STATUS_TIMEOUT_MS,
-      maxStdoutBytes: MAX_STATUS_STDOUT_BYTES,
+      maxStdoutBytes: MAX_CLI_STDOUT_BYTES,
     });
     if (run.spawnError)
       return {
@@ -544,6 +555,7 @@ async function runArcaExtend(mode, deps = {}) {
     const run = await runArca(arcaPath, ["extend", mode], {
       spawn: deps.spawn,
       timeoutMs: deps.timeoutMs ?? EXTEND_TIMEOUT_MS,
+      maxStdoutBytes: MAX_CLI_STDOUT_BYTES,
     });
     if (run.spawnError)
       return {

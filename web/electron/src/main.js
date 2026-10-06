@@ -422,26 +422,35 @@ function showArcaPromptNotification(options, onClick) {
   return notification;
 }
 
+/** Build the native warning text for the current shutdown window. */
+function arcaShutdownPromptCopy(kind, shutdownAt, now) {
+  const { time, isToday } = arcaShutdownTime(shutdownAt, now);
+  if (kind === "launch") {
+    return {
+      message: `Arca can shut down after ${time}`,
+      detail: `Your Arca instance can shut down when it's idle after ${time}${isToday ? " today" : ""}. Keep it running longer so your Omnigent sessions on Arca stay available?`,
+    };
+  }
+  const remaining = shutdownAt - now;
+  if (remaining <= 0) {
+    return {
+      message: "Arca can shut down any time now",
+      detail:
+        "It's past your Arca instance's scheduled shutdown time, so it will shut down once it's been idle for an hour. Keep it running?",
+    };
+  }
+  const detail = `Your Arca instance can shut down when it's idle after ${time}. Keep it running so your Omnigent sessions on Arca stay available?`;
+  if (remaining < 50 * 60 * 1000) {
+    return { message: `Arca may shut down in ${Math.ceil(remaining / 60_000)} minutes`, detail };
+  }
+  return { message: "Arca may shut down in about an hour", detail };
+}
+
 /** Ask whether to extend an Arca instance near its shutdown time. */
 async function promptArcaShutdown({ kind, shutdownAt, now, modes }) {
   let notification = null;
   try {
-    const { time, isToday } = arcaShutdownTime(shutdownAt, now);
-    const remaining = shutdownAt - now;
-    const message =
-      kind === "launch"
-        ? `Arca can shut down after ${time}`
-        : remaining <= 0
-          ? "Arca can shut down any time now"
-          : remaining < 50 * 60 * 1000
-            ? `Arca may shut down in ${Math.ceil(remaining / 60_000)} minutes`
-            : "Arca may shut down in about an hour";
-    const detail =
-      kind === "launch"
-        ? `Your Arca instance can shut down when it's idle after ${time}${isToday ? " today" : ""}. Keep it running longer so your Omnigent sessions on Arca stay available?`
-        : remaining <= 0
-          ? "It's past your Arca instance's scheduled shutdown time, so it will shut down once it's been idle for an hour. Keep it running?"
-          : `Your Arca instance can shut down when it's idle after ${time}. Keep it running so your Omnigent sessions on Arca stay available?`;
+    const { message, detail } = arcaShutdownPromptCopy(kind, shutdownAt, now);
     const labels = {
       overnight: "Keep running overnight",
       workweek: "Keep running until Friday",
@@ -513,7 +522,10 @@ async function promptArcaShutdown({ kind, shutdownAt, now, modes }) {
 async function reportArcaExtendResult(result) {
   try {
     if (result.ok) {
-      if (!Notification.isSupported()) return;
+      if (!Notification.isSupported()) {
+        console.log("[omnigent] arca shutdown: extended (notifications unsupported)");
+        return;
+      }
       const body =
         result.shutdownAt === null
           ? "Your Arca instance's shutdown time was extended."
@@ -542,16 +554,23 @@ async function reportArcaExtendResult(result) {
 
 let arcaResumeListenerRegistered = false;
 const arcaShutdownFeaturesByWindow = new Map();
+const arcaShutdownClosedReports = new Map();
+const arcaShutdownObservedContents = new WeakSet();
 const arcaOnlineOrigins = new Set();
 
-/** Require a true report from a window for an online Arca origin. */
+/** Require a true live report, or the last closed report when no window remains. */
 function arcaShutdownServerGateEnabled() {
-  return (
-    arcaAutoConnectFeatureEnabled() &&
-    [...arcaShutdownFeaturesByWindow.values()].some(
-      ({ origin, enabled }) => enabled && arcaOnlineOrigins.has(origin),
-    )
-  );
+  if (!arcaAutoConnectFeatureEnabled()) return false;
+  for (const origin of arcaOnlineOrigins) {
+    let hasLiveReport = false;
+    for (const report of arcaShutdownFeaturesByWindow.values()) {
+      if (report.origin !== origin) continue;
+      hasLiveReport = true;
+      if (report.enabled) return true;
+    }
+    if (!hasLiveReport && arcaShutdownClosedReports.get(origin) === true) return true;
+  }
+  return false;
 }
 
 /** Apply the user's prompt preference after the server gate. */
@@ -587,6 +606,17 @@ function clearArcaShutdownFeatureReport(win) {
   const wasEnabled = arcaShutdownEnabled();
   const wasServerEnabled = arcaShutdownServerGateEnabled();
   arcaShutdownFeaturesByWindow.delete(win.webContents.id);
+  updateArcaShutdownWatchGate(wasEnabled, wasServerEnabled, report.origin);
+}
+
+/** Keep one origin report when its last renderer or window goes away. */
+function retireArcaShutdownFeatureReport(webContentsId) {
+  const report = arcaShutdownFeaturesByWindow.get(webContentsId);
+  if (!report) return;
+  const wasEnabled = arcaShutdownEnabled();
+  const wasServerEnabled = arcaShutdownServerGateEnabled();
+  arcaShutdownFeaturesByWindow.delete(webContentsId);
+  arcaShutdownClosedReports.set(report.origin, report.enabled);
   updateArcaShutdownWatchGate(wasEnabled, wasServerEnabled, report.origin);
 }
 
@@ -2703,6 +2733,7 @@ function createWindow(targetUrl, opts = {}) {
   // connect. Connecting is an explicit action from the host menu.
 
   win.on("closed", () => {
+    retireArcaShutdownFeatureReport(win.webContents.id);
     abortConnectionAttempt(win);
     cancelReconnect(win);
     databricksAuth?.reset(win);
@@ -4780,8 +4811,14 @@ function registerIpc() {
     if (typeof enabled !== "boolean") return null;
     const origin = originOf(windowArcaServerUrl(BrowserWindow.fromWebContents(event.sender)));
     if (!origin) return null;
+    if (event.sender.isDestroyed?.()) return null;
     const wasEnabled = arcaShutdownEnabled();
     const wasServerEnabled = arcaShutdownServerGateEnabled();
+    if (!arcaShutdownObservedContents.has(event.sender)) {
+      event.sender.on("destroyed", () => retireArcaShutdownFeatureReport(event.sender.id));
+      arcaShutdownObservedContents.add(event.sender);
+    }
+    arcaShutdownClosedReports.delete(origin);
     arcaShutdownFeaturesByWindow.set(event.sender.id, { origin, enabled });
     updateArcaShutdownWatchGate(wasEnabled, wasServerEnabled, origin);
     return null;

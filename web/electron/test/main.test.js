@@ -190,6 +190,7 @@ function loadNavigationHarness({
     showMessageBox: [],
     notifications: [],
     closedNotifications: [],
+    logs: [],
     powerRegistrations: 0,
     restores: 0,
     focuses: 0,
@@ -246,8 +247,14 @@ function loadNavigationHarness({
   let currentUrl = serverUrl;
   const appEvents = new Map();
   const powerEvents = new Map();
+  let primaryWebContentsDestroyed = false;
   const webContents = {
     id: 1,
+    isDestroyed: () => primaryWebContentsDestroyed,
+    destroy() {
+      primaryWebContentsDestroyed = true;
+      this.emit("destroyed");
+    },
     send: (channel, data) => calls.progress.push({ channel, data }),
     stop() {},
     reload() {
@@ -639,7 +646,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, promptArcaShutdown, reportArcaExtendResult, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); arcaShutdownWatch.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
+    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, arcaShutdownFeaturesByWindow, arcaShutdownClosedReports, SETUP_PAGE, promptArcaShutdown, reportArcaExtendResult, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); arcaShutdownWatch.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -651,7 +658,9 @@ function loadNavigationHarness({
     URLSearchParams,
     clearInterval,
     clearTimeout,
-    console,
+    console: Object.assign(Object.create(console), {
+      log: (...args) => calls.logs.push(args.join(" ")),
+    }),
     module,
     process: {
       ...process,
@@ -691,7 +700,16 @@ function loadNavigationHarness({
     webRequest,
     webContents,
     addWindow: (url, arcaServerUrl = url) => {
-      const contents = { id: additionalWindows.size + 2, getURL: () => url };
+      let destroyed = false;
+      const contents = Object.assign(new EventEmitter(), {
+        id: additionalWindows.size + 2,
+        getURL: () => url,
+        isDestroyed: () => destroyed,
+        destroy() {
+          destroyed = true;
+          this.emit("destroyed");
+        },
+      });
       const other = { ...win, webContents: contents };
       additionalWindows.set(contents, other);
       api.windows.set(other, {
@@ -1098,7 +1116,7 @@ describe("Arca shutdown warning wiring", () => {
   const settings = (h, values) => fs.writeFileSync(h.settingsPath, JSON.stringify(values));
   const connect = (h) => h.api.loadServerUrl(h.win, workspace);
   const reportGate = (h, enabled, win = h.win) => {
-    h.api.registerIpc();
+    if (!h.ipc.has("omnigent:report-server-features")) h.api.registerIpc();
     return h.ipc.get("omnigent:report-server-features")(
       { sender: win.webContents, senderFrame: { url: win.webContents.getURL() } },
       { desktop_arca_shutdown_warnings: enabled },
@@ -1271,8 +1289,55 @@ describe("Arca shutdown warning wiring", () => {
     await until(() => h.calls.arcaStatusReads.length === 1, "first Arca status read");
     h.emitWindow("closed");
     assert.equal(h.api.windows.has(h.win), false);
+    assert.equal(h.api.arcaShutdownFeaturesByWindow.size, 0);
+    assert.equal(h.api.arcaShutdownClosedReports.get(new URL(picked).origin), true);
     h.powerEvents.get("resume")();
     await until(() => h.calls.arcaStatusReads.length === 2, "status read after close");
+  });
+
+  it("closes the gate when a new window reports the server kill switch off", async (t) => {
+    const picked = "https://accounts.cloud.databricks.com/omnigent?o=123";
+    const h = loadNavigationHarness({
+      serverUrl: picked,
+      databricksMode: "browser",
+      arcaPath,
+      arcaWatchNow: mondayNoon,
+      arcaStatus: { ok: true, state: "running", shutdownAt: mondayNoon + 16 * 60 * 60 * 1000 },
+    });
+    t.after(h.cleanup);
+    settings(h, { arca_auto_connect: true, server_url: picked });
+    h.api.createWindow(picked);
+    await until(() => h.calls.arcaConnects.length === 1, "Arca auto-connect");
+    await reportGate(h, true);
+    await until(() => h.calls.arcaStatusReads.length === 1, "first Arca status read");
+    h.emitWindow("closed");
+    assert.equal(h.api.arcaShutdownClosedReports.get(new URL(picked).origin), true);
+
+    const replacement = h.addWindow(picked);
+    await reportGate(h, false, replacement);
+    assert.equal(h.api.arcaShutdownClosedReports.size, 0);
+    h.powerEvents.get("resume")();
+    await wait(10);
+    assert.equal(h.calls.arcaStatusReads.length, 1);
+  });
+
+  it("retires destroyed webContents without growing per-window reports", async (t) => {
+    const picked = "https://accounts.cloud.databricks.com/omnigent?o=123";
+    const h = loadNavigationHarness({ serverUrl: picked, databricksMode: "browser", arcaPath });
+    t.after(h.cleanup);
+    settings(h, { arca_auto_connect: true });
+    await h.api.loadServerUrl(h.win, picked);
+    await until(() => h.calls.arcaConnects.length === 1, "Arca auto-connect");
+    for (let index = 0; index < 25; index++) {
+      const other = h.addWindow(picked);
+      // oxlint-disable-next-line no-await-in-loop -- Each window must close before the next opens.
+      await reportGate(h, true, other);
+      assert.equal(h.api.arcaShutdownFeaturesByWindow.size, 1);
+      other.webContents.destroy();
+      assert.equal(h.api.arcaShutdownFeaturesByWindow.size, 0);
+      assert.equal(h.api.arcaShutdownClosedReports.size, 1);
+      h.api.windows.delete(other);
+    }
   });
 
   it("rejects foreign pages and ignores unknown or non-boolean reports", async (t) => {
@@ -1587,6 +1652,16 @@ describe("Arca shutdown warning wiring", () => {
     t.after(rejected.cleanup);
     await assert.doesNotReject(
       rejected.api.reportArcaExtendResult({ ok: false, error: "Arca runtime limit" }),
+    );
+  });
+
+  it("logs a successful extension when notifications are unsupported", async (t) => {
+    const h = loadNavigationHarness({ notificationsSupported: false });
+    t.after(h.cleanup);
+    await h.api.reportArcaExtendResult({ ok: true, shutdownAt: null });
+    assert.deepEqual(h.calls.notifications, []);
+    assert.ok(
+      h.calls.logs.includes("[omnigent] arca shutdown: extended (notifications unsupported)"),
     );
   });
 

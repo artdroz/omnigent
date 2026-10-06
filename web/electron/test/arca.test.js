@@ -127,6 +127,12 @@ describe("arca status output", () => {
     assert.equal(parseArcaStatus(stdout).shutdownAt, Date.UTC(2026, 9, 5, 1));
   });
 
+  it("finds a status payload after more than twenty brace notices", () => {
+    const notices = Array.from({ length: 25 }, (_, index) => `Notice ${index}: {arca upgrade}`);
+    const stdout = `${notices.join("\n")}\n{"status":"running","instance":null}`;
+    assert.equal(parseArcaStatus(stdout).state, "running");
+  });
+
   it("handles brace-heavy malformed output promptly", () => {
     const malformed = "{not-json}".repeat(1_250);
     const started = performance.now();
@@ -241,6 +247,19 @@ describe("arca status command", () => {
     assert.match((await readArcaStatus(deps)).error, /unexpected arca status output/i);
   });
 
+  it("decodes UTF-8 split across stdout chunks", async () => {
+    const deps = fakeCliSpawn((child) =>
+      queueMicrotask(() => {
+        const output = Buffer.from('{"status":"runníng","instance":null}');
+        const split = output.indexOf(0xc3) + 1;
+        child.stdout.emit("data", output.subarray(0, split));
+        child.stdout.emit("data", output.subarray(split));
+        child.emit("close", 0);
+      }),
+    );
+    assert.equal((await readArcaStatus(deps)).state, "runníng");
+  });
+
   it("maps non-zero exit, timeout, spawn errors, and malformed success", async () => {
     const fail = fakeCliSpawn((child) =>
       queueMicrotask(() => {
@@ -352,6 +371,40 @@ describe("arca extend command", () => {
       (await runArcaExtend("default", { resolveArcaPath: () => null })).errorKind,
       "not-installed",
     );
+  });
+
+  it("caps extend output and decodes UTF-8 split across stderr chunks", async () => {
+    const capped = fakeCliSpawn((child) =>
+      queueMicrotask(() => {
+        child.stdout.emit("data", "n".repeat(300_000));
+        child.stdout.emit("data", "SUCCESS");
+        child.emit("close", 0);
+      }),
+    );
+    const result = await runArcaExtend("overnight", capped);
+    assert.equal(Buffer.byteLength(result.message), 256 * 1024);
+    assert.equal(result.message.includes("SUCCESS"), false);
+
+    const splitError = fakeCliSpawn((child) =>
+      queueMicrotask(() => {
+        const output = Buffer.from("défaillance");
+        child.stderr.emit("data", output.subarray(0, 2));
+        child.stderr.emit("data", output.subarray(2));
+        child.emit("close", 1);
+      }),
+    );
+    assert.match((await runArcaExtend("overnight", splitError)).error, /défaillance/);
+  });
+
+  it("uses action-specific no-instance and runtime-limit messages", () => {
+    for (const output of ["No running arca instance", "one-week runtime limit"]) {
+      const run = { code: 1, stdout: "", stderr: output };
+      const status = describeArcaCliFailure(run, "status");
+      const extend = describeArcaCliFailure(run, "extend");
+      assert.equal(status.errorKind, extend.errorKind);
+      assert.notEqual(status.error, extend.error);
+      assert.match(status.error, /start|restart/i);
+    }
   });
 
   it("uses timeout before text classification", () => {
