@@ -11,6 +11,7 @@ import httpx
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation
 from omnigent.harness_plugins import native_agents
+from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.stores.conversation_store import ConversationNotFoundError, ConversationStore
 from omnigent.util.session_lifecycle import is_session_closed
@@ -80,7 +81,7 @@ def _restorable(conv: Conversation) -> bool:
         conv.agent_id is not None
         and not conv.archived
         and not is_session_closed(conv.labels, conv.title)
-        and conv.id not in _intentional_stop_sessions
+        and (conv.runner_id is None or _intentional_stop_sessions.get(conv.id) != conv.runner_id)
         and conv.id not in _interrupt_fenced_sessions
     )
 
@@ -174,6 +175,7 @@ async def restore_active_children(
                 or child.runner_id != snapshot.runner_id
                 or child.parent_conversation_id != owner.id
                 or child.host_id is not None
+                or is_side_chat_child(child.labels)
                 or not _restorable(child)
                 or (snapshot.id in active and not _interrupted(child))
             ):
@@ -203,7 +205,7 @@ async def restore_active_children(
                         resume_interrupted_turn=_interrupted(child),
                     )
                     response.raise_for_status()
-                _ensure_runner_relay(child.id, parent.runner_id, client, store)
+                _ensure_runner_relay(child.id, parent.runner_id, client, store, conversation=child)
                 # Only execution status can clear the interruption. Initialization
                 # may return before a native continuation emits its first running edge.
                 restored.add(child.id)
