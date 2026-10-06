@@ -37,6 +37,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omnigent.db.db_models import SqlConversationMetadata
 from omnigent.runner.identity import token_bound_runner_id
 from tests._helpers.compat import apply_runner_env, apply_server_env
 from tests.e2e.conftest import (
@@ -64,8 +65,9 @@ _FAILURE_SIGNATURE = re.compile(
 _RELAY_DECISION = re.compile(r"Relay: runner transport lost for session=(\S+) \((\w+)\)")
 _HEALTH_TIMEOUT_S = 90.0
 # How long before the old replica's deadline the new replica's tunnel drops,
-# so the blip is already underway when that deadline fires.
-_NEW_REPLICA_BLIP_LEAD_S = 6.0
+# so the blip is already underway and the stamp is cleared well before that
+# deadline fires, leaving a comfortable margin for the clear to propagate.
+_NEW_REPLICA_BLIP_LEAD_S = 12.0
 
 # Only replica A uses this bootstrap; the file arms its backend outage after
 # the real runner has reconnected to B. The metadata database remains readable.
@@ -295,6 +297,11 @@ class _ReconnectStack:
         self._runner_proc: subprocess.Popen[bytes] | None = None
         self.proxy: _TunnelIngressProxy | None = None
         self.client = httpx.Client(base_url=self.base_url, timeout=30.0, trust_env=False)
+
+    @property
+    def metadata_db_path(self) -> str:
+        """Filesystem path of the main database holding conversation metadata."""
+        return self._database_uri.removeprefix("sqlite:///")
 
     def _server_env(self, process_log: Path | None = None) -> dict[str, str]:
         env = {
@@ -551,11 +558,10 @@ def _relay_decisions(log_text: str, session_id: str) -> list[str]:
 
 def _persisted_runner_liveness(stack: _ReconnectStack) -> tuple[int | None, int | None]:
     """Read the stack runner's stored ``(runner_last_seen, runner_last_connected)``."""
-    db_path = stack._database_uri.removeprefix("sqlite:///")
-    with contextlib.closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
+    with contextlib.closing(sqlite3.connect(stack.metadata_db_path, timeout=5.0)) as conn:
         row = conn.execute(
             "SELECT runner_last_seen, runner_last_connected "
-            "FROM omnigent_conversation_metadata WHERE runner_id = ?",
+            f"FROM {SqlConversationMetadata.__tablename__} WHERE runner_id = ?",
             (stack.runner_id,),
         ).fetchone()
     return (row[0], row[1]) if row else (None, None)
@@ -845,6 +851,10 @@ def test_new_replica_blip_at_old_deadline_does_not_fail_the_recovered_turn(
         # runner_last_seen and only the durable runner_last_connected survives.
         blip_start = dropped_at + RUNNER_DISCONNECT_GRACE_S - _NEW_REPLICA_BLIP_LEAD_S
         time.sleep(max(0.0, blip_start - time.monotonic()))
+        assert not _relay_decisions(stack.process_log.read_text(), session_id), (
+            "replica A resolved the disconnect before B's blip began; the test no "
+            "longer exercises the blip scenario"
+        )
         rejected_before = proxy.rejected_connections
         proxy.begin_blackout()
         blip_started = time.monotonic() - dropped_at
@@ -868,6 +878,10 @@ def test_new_replica_blip_at_old_deadline_does_not_fail_the_recovered_turn(
             assert seen is None and connected is not None, (
                 "the blip must leave only the durable connect stamp, but the row read "
                 f"runner_last_seen={seen!r}, runner_last_connected={connected!r}"
+            )
+            assert not _relay_decisions(stack.process_log.read_text(), session_id), (
+                "replica A decided before the blip cleared the shared stamp, so the "
+                "decision did not have to rely on the durable connect stamp"
             )
             decision_deadline = dropped_at + RUNNER_DISCONNECT_GRACE_S + 30.0
             _poll_until(
