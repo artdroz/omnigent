@@ -115,6 +115,35 @@ _LOOPBACK_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
 _DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443}
 
 
+def _loopback_port(scheme: str, hostname: str, port: int | None) -> int | None:
+    """Return the effective port when the URL parts name a loopback host, else ``None``."""
+    if hostname not in _LOOPBACK_HOSTNAMES:
+        return None
+    return port if port is not None else _DEFAULT_SCHEME_PORTS.get(scheme)
+
+
+def loopback_server_port(server_url: str) -> int | None:
+    """Return the effective port of a loopback *server_url*, or ``None`` otherwise.
+
+    Every loopback spelling of one port (``http://127.0.0.1:6767``,
+    ``http://localhost:6767``, ``http://[::1]:6767``) names the same listener,
+    so callers that ask whether a requested URL is the local server compare
+    these ports instead of the raw strings.
+
+    :param server_url: Requested or recorded server URL.
+    :returns: The port, or ``None`` for a non-loopback or unparsable URL.
+    """
+    try:
+        parsed = urlsplit(server_url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if not parsed.scheme or hostname is None:
+        return None
+    return _loopback_port(parsed.scheme.lower(), hostname.lower(), port)
+
+
 def _is_tracked_local_server(
     scheme: str,
     hostname: str,
@@ -135,9 +164,7 @@ def _is_tracked_local_server(
     :returns: ``True`` when the host is loopback and the effective port
         matches the tracked local server port.
     """
-    if hostname not in _LOOPBACK_HOSTNAMES:
-        return False
-    effective_port = port if port is not None else _DEFAULT_SCHEME_PORTS.get(scheme)
+    effective_port = _loopback_port(scheme, hostname, port)
     if effective_port is None:
         return False
     return effective_port == _tracked_local_server_port(base_dir=base_dir)

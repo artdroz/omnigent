@@ -46,6 +46,7 @@ from omnigent.cli import (
 from omnigent.cli import (
     cli as cli_group,
 )
+from omnigent.host import local_server
 from omnigent.host.local_server import LocalServerStartup
 
 
@@ -447,15 +448,17 @@ def test_ensure_host_daemon_keeps_other_target_daemons(
     assert killed == []
 
 
+@pytest.mark.parametrize("requested_url", ["http://127.0.0.1:8123", "http://localhost:8123"])
 def test_ensure_host_daemon_local_daemon_serves_requested_url_is_noop(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, requested_url: str
 ) -> None:
     """A live local daemon already serving the requested loopback URL is reused.
 
     This is the idempotency path that lets claude-native's own
     ``_ensure_host_daemon(base_url)`` (after ``_ensure_backend`` resolved
     local mode) be a no-op instead of tearing the local daemon down to
-    respawn an equivalent remote-mode one.
+    respawn an equivalent remote-mode one. Every loopback spelling of the
+    local server's port names that same daemon.
     """
     captured: dict[str, object] = {}
     _patch_daemon_spawn(monkeypatch, tmp_path, captured)
@@ -464,9 +467,29 @@ def test_ensure_host_daemon_local_daemon_serves_requested_url_is_noop(
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: "http://127.0.0.1:8123")
 
-    _ensure_host_daemon("http://127.0.0.1:8123")
+    _ensure_host_daemon(requested_url)
 
     assert "args" not in captured  # reused, not respawned
+
+
+def test_ensure_host_daemon_reuses_live_daemon_for_other_loopback_spelling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``localhost`` and ``127.0.0.1`` spellings of the local server share one daemon."""
+    captured: dict[str, object] = {}
+    _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_PID_PATH", tmp_path / "local_server.pid")
+    (tmp_path / "local_server.pid").write_text("4242\n8123\n")
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: "http://127.0.0.1:8123")
+
+    _ensure_host_daemon("http://127.0.0.1:8123")
+    _ensure_host_daemon("http://localhost:8123")
+
+    calls = captured["calls"]
+    assert isinstance(calls, list)
+    assert len(calls) == 1, "the localhost spelling spawned a second daemon for the same server"
 
 
 def test_ensure_host_daemon_reuses_healthy_background_daemon(

@@ -72,6 +72,9 @@ from omnigent.host.daemon_lifecycle import (
     daemon_registry_dir as _daemon_registry_dir_for,
 )
 from omnigent.host.daemon_lifecycle import (
+    loopback_server_port as _loopback_server_port,
+)
+from omnigent.host.daemon_lifecycle import (
     normalize_daemon_target as _normalize_daemon_target_impl,
 )
 from omnigent.host.daemon_lifecycle import (
@@ -3172,7 +3175,8 @@ def _local_daemon_serves_target(target: str, server_url: str | None) -> bool:
     :param target: Normalized daemon target, e.g.
         ``"http://127.0.0.1:8123"``.
     :param server_url: Requested server URL, or ``None`` for local mode.
-    :returns: ``True`` if the live local daemon already serves *target*.
+    :returns: ``True`` if the live local daemon already serves *target*,
+        under any loopback spelling of its port.
     """
     if not server_url:
         return False
@@ -3180,7 +3184,17 @@ def _local_daemon_serves_target(target: str, server_url: str | None) -> bool:
     if local_record is None or not _pid_alive(local_record.pid):
         return False
     local_url = local_server_url_if_healthy()
-    return local_url is not None and local_url.rstrip("/") == target
+    if local_url is None:
+        return False
+    return local_url.rstrip("/") == target or _same_local_server(local_url, server_url)
+
+
+def _same_local_server(local_url: str, requested_url: str) -> bool:
+    """Whether *requested_url* names the listener behind the local daemon's *local_url*."""
+    if local_url.rstrip("/") == requested_url.rstrip("/"):
+        return True
+    local_port = _loopback_server_port(local_url)
+    return local_port is not None and local_port == _loopback_server_port(requested_url)
 
 
 def _spawn_host_daemon_process(
@@ -3383,7 +3397,8 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
             local_record is not None
             and local_record.pid != record.pid
             and _daemon_owner_is_live(local_record)
-            and local_record.resolved_server_url == record.server_url.rstrip("/")
+            and local_record.resolved_server_url is not None
+            and _same_local_server(local_record.resolved_server_url, record.server_url)
         ):
             return local_record
         if (

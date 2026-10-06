@@ -16,6 +16,7 @@ from omnigent.host.daemon_lifecycle import (
     DaemonLifecycleLock,
     HostDaemonRecord,
     daemon_record_path,
+    loopback_server_port,
     normalize_daemon_target,
     record_flock_is_held,
 )
@@ -101,6 +102,25 @@ def test_normalize_tolerates_a_malformed_pidfile(tmp_path: Path) -> None:
         normalize_daemon_target("http://127.0.0.1:6767", base_dir=tmp_path)
         == "http://127.0.0.1:6767"
     )
+
+
+@pytest.mark.parametrize(
+    ("server_url", "expected"),
+    [
+        ("http://127.0.0.1:6767", 6767),
+        ("http://localhost:6767/", 6767),
+        ("HTTP://LocalHost:6767", 6767),
+        ("http://[::1]:6767", 6767),
+        ("http://localhost", 80),
+        ("https://localhost", 443),
+        ("https://x.example.com:6767", None),
+        ("local", None),
+        ("http://localhost:not-a-port", None),
+    ],
+)
+def test_loopback_server_port(server_url: str, expected: int | None) -> None:
+    """Loopback spellings resolve to their port; anything else resolves to ``None``."""
+    assert loopback_server_port(server_url) == expected
 
 
 def test_equivalent_server_urls_share_record_path(tmp_path: Path) -> None:
@@ -420,6 +440,43 @@ def test_live_daemon_conflict_probes_legacy_record_lock_path(
 
     assert conflict == existing
     assert probed_paths == [cli._daemon_record_path(legacy_target)]
+
+
+def test_live_daemon_conflict_matches_loopback_spelling_of_local_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A foreground ``--server`` naming the local daemon's port conflicts with it."""
+    from omnigent import cli
+
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    local = HostDaemonRecord(
+        pid=222,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path=None,
+        started_at=100,
+        resolved_server_url="http://127.0.0.1:8123",
+    )
+    cli._write_daemon_record(local)
+    lock = DaemonLifecycleLock.for_target("local", base_dir=tmp_path, pid=222)
+    assert lock.acquire() is True
+
+    def _claimer(server_url: str) -> HostDaemonRecord:
+        return HostDaemonRecord(
+            pid=111,
+            target=normalize_daemon_target(server_url, base_dir=tmp_path),
+            mode="server",
+            server_url=server_url,
+            log_path=None,
+            started_at=200,
+        )
+
+    try:
+        assert cli._live_daemon_conflict(_claimer("http://localhost:8123")) == local
+        assert cli._live_daemon_conflict(_claimer("http://localhost:9999")) is None
+    finally:
+        lock.release()
 
 
 def _host_with_lock(lock: DaemonLifecycleLock) -> HostProcess:
