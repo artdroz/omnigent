@@ -524,6 +524,27 @@ const livePreviewReply = (id: string): Bubble => ({
   error: null,
   items: [{ kind: "text", itemId: `live:${id}`, text: "Paris", final: true }],
 });
+// A single assistant bubble fusing a settled answer with the next reply's
+// trailing `live:` preview — the shape buildBubbles yields when a new turn
+// previews before its user item commits.
+const settledThenPreviewReply = (settledId: string, previewId: string): Bubble => ({
+  kind: "assistant",
+  responseId: previewId,
+  stableId: settledId,
+  lifecycle: "streaming",
+  error: null,
+  items: [
+    { kind: "text", itemId: settledId, text: "Earlier answer", final: true },
+    { kind: "text", itemId: `live:${previewId}`, text: "Next", final: true },
+  ],
+});
+// An optimistic prompt the user steered into an already-streaming reply.
+const steeredUserBubble = (id: string): Bubble => ({
+  kind: "user",
+  itemId: id,
+  content: [{ type: "input_text", text: id }],
+  sentWhileStreaming: true,
+});
 // A card with no turn to anchor to carries the `elicit_*` response id
 // blockStream stamps for exactly that case; pass `responseId` to model a
 // card that DOES belong to a turn (an inline approval, or a question card
@@ -669,10 +690,21 @@ describe("mergePendingBubbles", () => {
     expect(bubbleIds(merged)).toEqual(["u1", "a1", "pend_1"]);
   });
 
-  it("lifts above a trailing live preview but stays below a settled earlier turn", () => {
-    const committed = [userBubble("u1"), assistantText("a1"), livePreviewReply("a2")];
+  it("does NOT lift a prompt above a bubble fusing a settled answer with a preview", () => {
+    // buildBubbles groups a settled answer and the next reply's `live:` preview
+    // into one bubble; lifting the whole bubble would push the prompt above the
+    // prior settled answer, so it stays at the tail until input.consumed settles it.
+    const committed = [userBubble("u1"), settledThenPreviewReply("a1", "a2")];
     const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
-    expect(bubbleIds(merged)).toEqual(["u1", "a1", "pend_1", "a2"]);
+    expect(bubbleIds(merged)).toEqual(["u1", "a1", "pend_1"]);
+  });
+
+  it("does NOT lift a message steered into an in-flight reply above its preview", () => {
+    // A send into a streaming reply is steering; it belongs below that live
+    // preview, unlike an idle send that merely raced the forwarder ahead of it.
+    const committed = [livePreviewReply("a1")];
+    const merged = mergePendingBubbles(committed, [steeredUserBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["a1", "pend_1"]);
   });
 });
 

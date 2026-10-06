@@ -223,6 +223,7 @@ export function buildPendingBubbles(
       // Stamped once at send time; absent for snapshot-replayed entries,
       // which show no timestamp rather than a re-stamped render time.
       ...(p.createdAtS !== undefined ? { createdAtS: p.createdAtS } : {}),
+      ...(p.sentWhileStreaming ? { sentWhileStreaming: true } : {}),
     };
   });
 }
@@ -269,16 +270,19 @@ function liftAboveCreateRoutingChips(committed: Bubble[], end: number): number {
   return start === 0 ? start : end;
 }
 
-// A native reply streams in as a provisional `live:` preview (see
-// applyLiveDelta) that can commit into `blocks` before `session.input.consumed`
-// promotes the just-sent user message, so it must stay below that prompt.
+// A fully provisional native reply bubble: it holds a streaming `live:` preview
+// (see applyLiveDelta) and no settled answer text. `buildBubbles` can fuse a
+// prior settled answer with the next preview, so match only pure previews.
 function isNativeLivePreviewBubble(bubble: Bubble): boolean {
-  return (
-    bubble.kind === "assistant" &&
-    bubble.items.some(
-      (item) => item.kind === "text" && (item.itemId?.startsWith(LIVE_ITEM_PREFIX) ?? false),
-    )
-  );
+  if (bubble.kind !== "assistant") return false;
+  let hasPreview = false;
+  let hasSettledText = false;
+  for (const item of bubble.items) {
+    if (item.kind !== "text") continue;
+    if (item.itemId?.startsWith(LIVE_ITEM_PREFIX) ?? false) hasPreview = true;
+    else if (item.itemId != null) hasSettledText = true;
+  }
+  return hasPreview && !hasSettledText;
 }
 
 // Place optimistic pending user bubbles into the committed timeline, keeping
@@ -286,12 +290,15 @@ function isNativeLivePreviewBubble(bubble: Bubble): boolean {
 // preview, or a create-time routing chip.
 export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bubble[] {
   if (pending.length === 0) return committed;
+  // A message steered into an in-flight reply belongs below that preview; only
+  // lift above a trailing preview that raced ahead of a message sent idle.
+  const liftAboveReply = !pending.some(
+    (bubble) => bubble.kind === "user" && bubble.sentWhileStreaming,
+  );
+  const stepOverTrailing = (bubble: Bubble): boolean =>
+    isStandaloneElicitationBubble(bubble) || (liftAboveReply && isNativeLivePreviewBubble(bubble));
   let insertAt = committed.length;
-  while (
-    insertAt > 0 &&
-    (isStandaloneElicitationBubble(committed[insertAt - 1]!) ||
-      isNativeLivePreviewBubble(committed[insertAt - 1]!))
-  ) {
+  while (insertAt > 0 && stepOverTrailing(committed[insertAt - 1]!)) {
     insertAt -= 1;
   }
   insertAt = liftAboveCreateRoutingChips(committed, insertAt);

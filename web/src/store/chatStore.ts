@@ -536,6 +536,10 @@ export interface PendingUserMessage {
    * on snapshot-replayed entries (they're already server-owned).
    */
   posted?: boolean;
+  /** The send happened while a reply was already streaming (claude-native
+   *  steering/queued input), so this message stays below that in-flight
+   *  preview instead of being lifted above it. */
+  sentWhileStreaming?: boolean;
 }
 
 /**
@@ -2361,6 +2365,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 ...(initialDraft ? { initialDraft } : {}),
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+                ...(s.blocks.some(isLiveProvisionalBlock) ? { sentWhileStreaming: true } : {}),
               },
             ],
         // A new turn does NOT supersede the background-shell tally: shells
@@ -6644,13 +6649,15 @@ function committedUserBlock(
   };
 }
 
-// On claude-native the forwarder emits delta previews before transcript items,
-// so a trailing `live:` preview can already sit at the tail when the user
-// message is promoted; insert the user block above it rather than appending.
+// Claude-native forwards a reply's delta preview before the user item, so a
+// trailing `live:` preview can sit at the tail when the message is promoted.
+// Lift the user above it, unless the send steered into an in-flight reply.
 function blocksWithPromotedUserMessage(
   blocks: AnyBlock[],
   userBlock: UserMessageBlock,
+  liftAboveReply: boolean,
 ): AnyBlock[] {
+  if (!liftAboveReply) return [...blocks, userBlock];
   let at = blocks.length;
   while (at > 0 && isLiveProvisionalBlock(blocks[at - 1]!)) at -= 1;
   if (at === blocks.length) return [...blocks, userBlock];
@@ -7469,6 +7476,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                   event.createdBy ?? matched.author,
                   matched.createdAtS,
                 ),
+                !matched.sentWhileStreaming,
               ),
             };
           }
@@ -7504,6 +7512,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 event.createdBy ?? head.author,
                 head.createdAtS,
               ),
+              !head.sentWhileStreaming,
             ),
           };
         }
@@ -7515,6 +7524,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           blocks: blocksWithPromotedUserMessage(
             s.blocks,
             committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
+            false,
           ),
         };
       });
