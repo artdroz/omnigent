@@ -144,7 +144,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
-from omnigent.process_logging import log_info_once
+from omnigent.process_logging import env_truthy, log_info_once
 from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -457,30 +457,60 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
     return _anthropic_api_host(base_url)
 
 
+#: Env flags that put Claude Code in a cloud-provider mode where it gates
+#: WebSearch itself and ignores ``ANTHROPIC_BASE_URL``.
+_CLAUDE_CLOUD_PROVIDER_FLAG_ENVS: tuple[str, ...] = (
+    _CLAUDE_CODE_USE_BEDROCK_ENV,
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+)
+
+
+def _claude_launch_env_value(
+    claude_config: ClaudeNativeUcodeConfig | None, name: str
+) -> str | None:
+    """The value Claude Code sees for *name*: the launch config's value, else the inherited env."""
+    if claude_config is not None and claude_config.env.get(name):
+        return claude_config.env[name]
+    return os.environ.get(name) or None
+
+
+def effective_claude_base_url(claude_config: ClaudeNativeUcodeConfig | None) -> str | None:
+    """The ``ANTHROPIC_BASE_URL`` Claude Code will actually use at launch.
+
+    Managed settings win at Claude Code's launch; otherwise the launch config's
+    override applies, else the base URL the terminal inherits from this process
+    (for example a gateway forwarded into the runner env).
+
+    :param claude_config: The resolved launch config, or ``None`` for Claude
+        Code's own login.
+    :returns: The base URL, or ``None`` for the first-party default.
+    """
+    managed_base_url, _ = managed_claude_gateway_signal()
+    return managed_base_url or _claude_launch_env_value(claude_config, _UCODE_CLAUDE_BASE_URL_ENV)
+
+
 def endpoint_disallowed_claude_tools(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> tuple[str, ...]:
-    """Claude tools to withhold because the configured endpoint cannot serve them.
+    """Withhold WebSearch for non-Anthropic gateways; leave first-party and cloud launches alone.
 
-    A launch that pins ``ANTHROPIC_BASE_URL`` at a non-Anthropic gateway reads
-    as first-party to Claude Code, so it keeps WebSearch enabled — but the tool
-    executes through a nested ``/v1/messages`` request carrying the server-side
-    ``web_search`` tool, which follows the same base URL, and a gateway that
-    does not serve that tool rejects it with a region restriction that surfaces
-    to the user as the search outcome. Withholding the tool at launch lets the
-    model answer without it instead. Bedrock launches need no entry here:
-    Claude Code detects that provider path itself and disables WebSearch.
+    Claude Code treats any ``ANTHROPIC_BASE_URL`` as first-party and runs WebSearch
+    through a nested ``web_search`` request to it, so a gateway that cannot serve
+    that tool hands the user its raw error as the search result. Bedrock, Vertex
+    and Foundry modes gate the tool themselves.
 
-    :param claude_config: The resolved native launch config, or ``None`` for
-        Claude Code's own native auth (first-party, serves web search).
-    :returns: Tool names to merge into ``--disallowedTools``, e.g.
-        ``("WebSearch",)``, or ``()`` when the endpoint serves them all.
+    :param claude_config: The resolved launch config, or ``None`` for Claude
+        Code's own login.
+    :returns: Tool names to merge into ``--disallowedTools``: ``("WebSearch",)``
+        or ``()``.
     """
-    if claude_config is None:
+    if _claude_launch_env_value(claude_config, _ANTHROPIC_BEDROCK_BASE_URL_ENV) or any(
+        env_truthy(_claude_launch_env_value(claude_config, name))
+        for name in _CLAUDE_CLOUD_PROVIDER_FLAG_ENVS
+    ):
         return ()
-    if claude_config.env.get(_ANTHROPIC_BEDROCK_BASE_URL_ENV):
-        return ()
-    base_url = claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV)
+    base_url = effective_claude_base_url(claude_config)
     if not base_url or _anthropic_api_host(base_url):
         return ()
     return ("WebSearch",)

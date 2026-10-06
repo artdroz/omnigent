@@ -364,29 +364,53 @@ def test_claude_terminal_request_preserves_user_model_arg(tmp_path, monkeypatch)
     assert args.count("--model") == 1
 
 
+_GATEWAY_URL = "https://example.databricks.com/ai-gateway/anthropic"
+_GATEWAY_CONFIG = claude_native.ClaudeNativeUcodeConfig(env={"ANTHROPIC_BASE_URL": _GATEWAY_URL})
+_FIRST_PARTY_CONFIG = claude_native.ClaudeNativeUcodeConfig(
+    env={"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
+)
+_CLAUDE_ENDPOINT_ENV_VARS = (
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+)
+
+
+def _claude_endpoint_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    process_env: dict[str, str],
+    managed_env: dict[str, str] | None,
+) -> None:
+    """Pin the process env and managed settings Claude Code would inherit at launch."""
+    for name in _CLAUDE_ENDPOINT_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in process_env.items():
+        monkeypatch.setenv(name, value)
+    paths: tuple[Path, ...] = ()
+    if managed_env is not None:
+        managed = tmp_path / "managed-settings.json"
+        managed.write_text(
+            json.dumps({"apiKeyHelper": "printf token", "env": managed_env}), encoding="utf-8"
+        )
+        paths = (managed,)
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", paths)
+
+
 @pytest.mark.parametrize(
-    ("claude_config", "expected"),
+    ("claude_config", "process_env", "managed_env", "expected"),
     [
-        # No provider config: Claude Code's own native auth is first-party,
-        # which serves the web_search server tool.
-        (None, ()),
-        # No endpoint override: first-party API, serves web search.
-        (claude_native.ClaudeNativeUcodeConfig(env={}), ()),
-        # First-party base URL spelled explicitly: still serves web search.
-        (
-            claude_native.ClaudeNativeUcodeConfig(
-                env={"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
-            ),
-            (),
-        ),
+        # Claude Code's own login with nothing in the env: first-party.
+        (None, {}, None, ()),
+        (claude_native.ClaudeNativeUcodeConfig(env={}), {}, None, ()),
+        (_FIRST_PARTY_CONFIG, {}, None, ()),
         # A gateway base URL: WebSearch's nested server-tool request would
         # follow it and be rejected, so the tool must be withheld.
-        (
-            claude_native.ClaudeNativeUcodeConfig(
-                env={"ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic"}
-            ),
-            ("WebSearch",),
-        ),
+        (_GATEWAY_CONFIG, {}, None, ("WebSearch",)),
         # Bedrock: Claude Code detects this provider path itself and disables
         # WebSearch natively, so the launch adds nothing.
         (
@@ -396,60 +420,98 @@ def test_claude_terminal_request_preserves_user_model_arg(tmp_path, monkeypatch)
                     "CLAUDE_CODE_USE_BEDROCK": "1",
                 }
             ),
+            {},
+            None,
             (),
         ),
+        # No provider config, but the terminal inherits a gateway endpoint the
+        # host forwarded into the runner env (ANTHROPIC_AUTH_TOKEN + base URL).
+        (
+            None,
+            {"ANTHROPIC_BASE_URL": _GATEWAY_URL, "ANTHROPIC_AUTH_TOKEN": "token"},
+            None,
+            ("WebSearch",),
+        ),
+        (None, {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}, None, ()),
+        (
+            None,
+            {"CLAUDE_CODE_USE_BEDROCK": "1", "ANTHROPIC_BASE_URL": _GATEWAY_URL},
+            None,
+            (),
+        ),
+        # Managed settings pin the gateway for a plain Claude login, and they
+        # win over the launch config at Claude Code's launch.
+        (None, {}, {"ANTHROPIC_BASE_URL": _GATEWAY_URL}, ("WebSearch",)),
+        (_FIRST_PARTY_CONFIG, {}, {"ANTHROPIC_BASE_URL": _GATEWAY_URL}, ("WebSearch",)),
+        (None, {}, {"CLAUDE_CODE_USE_GATEWAY": "1"}, ()),
     ],
-    ids=["no-config", "no-endpoint-override", "first-party-url", "gateway-url", "bedrock"],
+    ids=[
+        "no-config",
+        "no-endpoint-override",
+        "first-party-url",
+        "gateway-url",
+        "bedrock",
+        "inherited-gateway-env",
+        "inherited-first-party-env",
+        "inherited-bedrock-flag",
+        "managed-settings-gateway",
+        "managed-settings-override-config",
+        "managed-settings-without-base-url",
+    ],
 )
 def test_endpoint_disallowed_claude_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     claude_config: claude_native.ClaudeNativeUcodeConfig | None,
+    process_env: dict[str, str],
+    managed_env: dict[str, str] | None,
     expected: tuple[str, ...],
 ) -> None:
-    """Withhold WebSearch for gateways; preserve first-party and Bedrock handling."""
+    """Withhold WebSearch for the gateway Claude Code will use; keep first-party and Bedrock."""
+    _claude_endpoint_environment(
+        tmp_path, monkeypatch, process_env=process_env, managed_env=managed_env
+    )
     assert claude_native.endpoint_disallowed_claude_tools(claude_config) == expected
 
 
-def test_claude_terminal_request_withholds_websearch_on_gateway(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("claude_config", "process_env", "withheld"),
+    [
+        (_GATEWAY_CONFIG, {}, True),
+        (None, {}, False),
+        (None, {"ANTHROPIC_BASE_URL": _GATEWAY_URL, "ANTHROPIC_AUTH_TOKEN": "token"}, True),
+    ],
+    ids=["gateway-config", "first-party-login", "inherited-gateway-env"],
+)
+def test_claude_terminal_request_websearch_follows_the_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claude_config: claude_native.ClaudeNativeUcodeConfig | None,
+    process_env: dict[str, str],
+    withheld: bool,
+) -> None:
     """
-    A gateway-backed terminal launch disallows the WebSearch tool.
+    Gateway launches disallow WebSearch; first-party launches keep it.
 
-    If this regresses, a user asking a gateway-backed native Claude session
-    to search the web gets ``API Error: 400 Web search is only available in
-    the US ...`` as the search outcome instead of an answer.
+    If the gateway cases regress, a user asking a gateway-backed native Claude
+    session to search the web gets ``API Error: 400 ...`` as the search outcome
+    instead of an answer; if the first-party case regresses, api.anthropic.com
+    users lose a tool their endpoint serves.
     """
-    config = claude_native.ClaudeNativeUcodeConfig(
-        env={"ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic"},
-        api_key_helper="printf token",
-    )
+    _claude_endpoint_environment(tmp_path, monkeypatch, process_env=process_env, managed_env=None)
 
     body = claude_native._claude_terminal_request(
         ("--print", "hi"),
         command="claude",
         bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
-        claude_config=config,
+        claude_config=claude_config,
     )
 
     args = body["spec"]["args"]
-    assert "--disallowedTools" in args
-    disallowed = args[args.index("--disallowedTools") + 1].split(",")
-    assert "WebSearch" in disallowed
-
-
-def test_claude_terminal_request_keeps_websearch_on_first_party(tmp_path, monkeypatch) -> None:
-    """
-    A first-party launch (no endpoint override) injects no tool disallow.
-
-    api.anthropic.com serves the web_search server tool, so withholding
-    WebSearch there would strip working functionality.
-    """
-    body = claude_native._claude_terminal_request(
-        ("--print", "hi"),
-        command="claude",
-        bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
-        claude_config=None,
-    )
-
-    assert "--disallowedTools" not in body["spec"]["args"]
+    if withheld:
+        assert "WebSearch" in args[args.index("--disallowedTools") + 1].split(",")
+    else:
+        assert "--disallowedTools" not in args
 
 
 def test_ucode_config_for_profile_reads_allowlisted_claude_state(

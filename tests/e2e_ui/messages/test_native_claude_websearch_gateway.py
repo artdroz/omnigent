@@ -183,7 +183,7 @@ def _approve_pending_permission(page: Page) -> bool:
 
 
 def _wait_for_turn(page: Page) -> bool:
-    """Approve any WebSearch permission prompt; return whether the model's final text landed."""
+    """Approve any WebSearch permission prompt until the turn settles; return whether one was approved."""
     deadline = time.monotonic() + _TURN_TIMEOUT_S
     approved = False
     while time.monotonic() < deadline:

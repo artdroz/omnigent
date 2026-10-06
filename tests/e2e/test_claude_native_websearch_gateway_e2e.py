@@ -205,8 +205,7 @@ class _MockGatewayHandler(http.server.BaseHTTPRequestHandler):
 
         # Call WebSearch as soon as it is offered. Under Omnigent's env,
         # Claude Code defers client tools behind MCP Tool Search, so expand
-        # them with a single ToolSearch call first; after that, answer in
-        # plain text when WebSearch was never offered (the fixed behavior).
+        # them with a single ToolSearch call first; otherwise answer in text.
         if "WebSearch" in tool_names:
             self._send(
                 200,
@@ -269,8 +268,7 @@ def test_websearch_under_gateway_launch_does_not_surface_us_only_error(
     threading.Thread(target=gateway.serve_forever, daemon=True).start()
     bridge_dir: Path | None = None
     try:
-        # The real product composition used to point the native Claude
-        # terminal at a gateway: base URL override + apiKeyHelper credential.
+        # Gateway-backed launch composition: base URL override + apiKeyHelper.
         claude_config = ClaudeNativeUcodeConfig(
             env={"ANTHROPIC_BASE_URL": gateway.host},
             api_key_helper="echo test-key",
@@ -338,8 +336,7 @@ def test_websearch_under_gateway_launch_does_not_surface_us_only_error(
     assert proc.returncode == 0, f"claude CLI exited {proc.returncode}: {output[-2000:]}"
     assert proc.stdout.strip(), f"claude CLI produced no answer: {output[-2000:]}"
 
-    # The bug: the gateway's region rejection of the nested web_search request
-    # is surfaced to the user as the WebSearch outcome.
+    # The gateway's region rejection must not surface as the WebSearch outcome.
     assert "only available in the US" not in output and "API Error" not in output, (
         "WebSearch under the gateway launch surfaced the US-only region "
         f"restriction to the user: {proc.stdout.strip()[-1500:]!r}"

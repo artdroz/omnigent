@@ -4194,6 +4194,26 @@ async def _run_auto_create_claude_terminal_for_routing_class(
     return captured["spec"]
 
 
+async def test_auto_create_claude_terminal_withholds_websearch_on_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host-spawned launch carries the gateway endpoint's WebSearch exclusion.
+
+    The ucode config above routes Claude Code through a non-Anthropic gateway,
+    which cannot serve the nested server-side ``web_search`` request; the
+    composed argv must withhold the tool so the model answers without it.
+    """
+    spec = await _run_auto_create_claude_terminal_for_routing_class(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        session_id="d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6",
+        routed=False,
+    )
+
+    args = list(spec.args)
+    assert "WebSearch" in args[args.index("--disallowedTools") + 1].split(",")
+
+
 def _claude_pretooluse_matchers(spec: Any) -> list[str | None]:
     settings = _load_claude_invocation_settings(spec.args)
     return [entry.get("matcher") for entry in settings["hooks"].get("PreToolUse", [])]
