@@ -431,7 +431,7 @@ describe("useAvailableAgents", () => {
           { id: "ag_kiro", name: "kiro-native-ui", harness: "kiro-native", builtin: true },
           // Seeded via OMNIGENT_BUILTIN_AGENT_DIRS: a built-in, but not the stock wrapper.
           { id: "ag_teamresearch", name: "teamresearch", harness: "claude-native", builtin: true },
-          // Registered with `omnigent server --agent`.
+          // Registered with `omnigent server --agent` (builtin: false).
           {
             id: "ag_autoresearch",
             name: "autoresearch",
@@ -459,7 +459,7 @@ describe("useAvailableAgents", () => {
     });
 
     // Only the stock wrappers carry the vendor label; a custom agent on the same
-    // harness is neither relabelled "Claude Code" / "Kiro" nor folded away.
+    // native harness keeps its own name and its own row, never folded away.
     expect((result.current.data ?? []).map((a) => [a.id, a.display_name])).toEqual([
       ["ag_native", "Claude Code"],
       ["ag_kiro", "Kiro"],
@@ -611,8 +611,8 @@ describe("useAvailableAgents", () => {
       [BUILTINS_URL]: mockResponse({
         object: "list",
         data: [
-          // Stale clone rows from older local state strip back to the stock
-          // wrapper name; they must not compete with the seeded rows.
+          // Stale/non-canonical native rows from older local state; they
+          // resolve by harness but must not compete with the seeded rows.
           { id: "ag_stale_codex", name: "codex-native-ui (fork ag_old)", harness: "codex-native" },
           { id: "ag_codex", name: "codex-native-ui", harness: "codex-native" },
           {
@@ -621,7 +621,7 @@ describe("useAvailableAgents", () => {
             harness: "claude-native",
           },
           { id: "ag_claude", name: "claude-native-ui", harness: "claude-native" },
-          { id: "ag_stale_kiro", name: "kiro-native-ui (fork ag_old)", harness: "kiro-native" },
+          { id: "ag_stale_kiro", name: "kiro-naitive", harness: "kiro-native" },
           { id: "ag_kiro", name: "kiro-native-ui", harness: "kiro-native" },
         ],
         has_more: false,
@@ -629,8 +629,10 @@ describe("useAvailableAgents", () => {
       [MINE_URL]: sessionResponse({
         object: "list",
         data: [
-          // Session-bound custom agent whose name is not a stock wrapper name:
-          // listed by its own name (harness is null until lazy enrichment).
+          // Session-bound id with a non-canonical kiro name (server typo).
+          // On initial load harness is null (lazy enrichment), so it appears
+          // in the list; prefetchAvailableAgentDetails removes it once enriched
+          // to harness: "kiro-native" and a kiro built-in already exists.
           { id: "ag_session_kiro", name: "kiro-naitive" },
           // Legacy failed Kiro attempts used a plain "kiro" agent name and
           // no harness; that row must not surface as a custom Kiro picker row.
@@ -646,7 +648,9 @@ describe("useAvailableAgents", () => {
       expect(result.current.isPlaceholderData).toBe(false);
     });
 
-    // ag_session_kiro is a distinct custom agent and stays listed;
+    // ag_session_kiro appears on initial load with harness: null because
+    // enrichment is deferred. prefetchAvailableAgentDetails (called on picker
+    // open) would later detect harness: "kiro-native" and remove the duplicate.
     // ag_legacy_kiro is filtered by kiroLegacyNames (name: "kiro").
     expect(result.current.data).toEqual([
       {
@@ -1014,15 +1018,17 @@ describe("prefetchAvailableAgentDetails", () => {
   });
 
   it("removes a session agent when enrichment reveals it is a native shadow", async () => {
-    // A session bound a clone of the kiro wrapper; its harness only arrives with
-    // enrichment, after which the clone folds into the seeded kiro built-in.
+    // A session bound a kiro agent with a non-canonical name ("kiro-naitive"
+    // typo). On initial load harness is null so it passes the kiro filter.
+    // prefetchAvailableAgentDetails detects harness: "kiro-native" after
+    // enrichment and removes the agent since a seeded kiro built-in exists.
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const kiroBuiltin = testAgent("ag_kiro", "kiro-native-ui", {
       display_name: "Kiro",
       harness: "kiro-native",
     });
-    const kiroShadow = testAgent("ag_session_kiro", "kiro-native-ui (fork ag_old)", {
-      display_name: "Kiro-native-ui (fork ag_old)",
+    const kiroShadow = testAgent("ag_session_kiro", "kiro-naitive", {
+      display_name: "Kiro-naitive",
       harness: null,
       sessionId: "conv_kiro",
     });
@@ -1032,7 +1038,7 @@ describe("prefetchAvailableAgentDetails", () => {
       mockResponse({
         id: "ag_session_kiro",
         object: "agent",
-        name: "kiro-native-ui (fork ag_old)",
+        name: "kiro-naitive",
         harness: "kiro-native",
         skills: [],
       }),

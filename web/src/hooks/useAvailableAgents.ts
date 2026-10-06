@@ -78,6 +78,23 @@ function stockNativeAgent(
   return spec !== undefined && agentRootName(agent.name) === spec.agentName ? spec : undefined;
 }
 
+/**
+ * The vendor wrapper a row collapses into for dedup and shadow removal: the
+ * canonical wrapper itself (or a clone of it, by name), plus legacy or session
+ * rows that resolve to a native vendor only by harness and carry no explicit
+ * `builtin` flag — a stale or mistyped local row must not compete with the
+ * seeded wrapper. A row the server explicitly flags (builtin true or false)
+ * under its own name is a distinct agent and keeps its own picker row.
+ */
+function nativeWrapperSlot(
+  agent: Pick<AvailableAgent, "name" | "harness" | "builtin">,
+): NativeCodingAgentSpec | undefined {
+  const stock = stockNativeAgent(agent);
+  if (stock !== undefined) return stock;
+  if (agent.builtin !== undefined) return undefined;
+  return nativeCodingAgentForAvailableAgent(agent);
+}
+
 function displayNameForAgent(name: string, harness?: string | null): string {
   return (
     stockNativeAgent({ name, harness: harness ?? null })?.displayName ??
@@ -91,7 +108,7 @@ function dedupeNativeAgents(agents: AvailableAgent[]): AvailableAgent[] {
   const result: AvailableAgent[] = [];
   const stockIndex = new Map<string, number>();
   for (const agent of agents) {
-    const stock = stockNativeAgent(agent);
+    const stock = nativeWrapperSlot(agent);
     if (stock === undefined) {
       result.push(agent);
       continue;
@@ -279,14 +296,13 @@ export async function prefetchAvailableAgentDetails(
               skills: json.skills ?? [],
             },
       );
-      // If enrichment reveals this agent is a clone of a stock native wrapper,
-      // remove it when that wrapper's seeded row already exists so it doesn't
-      // surface as a duplicate picker row.
+      // If enrichment folds this agent into a stock native wrapper and that
+      // wrapper's seeded row already exists, drop it so it isn't a duplicate row.
       const enrichedAgent = enriched.find((a) => a.id === agent.id);
-      const enrichedKey = enrichedAgent ? stockNativeAgent(enrichedAgent)?.key : undefined;
+      const enrichedKey = enrichedAgent ? nativeWrapperSlot(enrichedAgent)?.key : undefined;
       if (enrichedKey) {
         const builtinExists = enriched.some(
-          (a) => a.id !== agent.id && stockNativeAgent(a)?.key === enrichedKey,
+          (a) => a.id !== agent.id && nativeWrapperSlot(a)?.key === enrichedKey,
         );
         if (builtinExists) return enriched.filter((a) => a.id !== agent.id);
       }
@@ -416,7 +432,7 @@ function mergeAvailableAgents(
 
   const resolved = Array.from(byName.values())
     .map((c) => (c.template !== null ? c.template : sessionAgentFromDiscovery(c.discovered!)))
-    .filter((agent) => stockNativeAgent(agent)?.key !== "kiro" || !hasKiroBuiltin);
+    .filter((agent) => nativeWrapperSlot(agent)?.key !== "kiro" || !hasKiroBuiltin);
   // Seeded built-ins first; user templates / custom uploads follow, newest
   // first. NewChatDialog's display-order sort is stable, so unranked names
   // keep this relative order.
