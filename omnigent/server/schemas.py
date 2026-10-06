@@ -25,6 +25,7 @@ from pydantic import (
     model_validator,
 )
 
+from omnigent.db.enum_codecs import SessionLiveStatus
 from omnigent.entities import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     USER_SESSION_TITLE_MAX_CHARS,
@@ -836,7 +837,7 @@ class ChildSessionSummary(BaseModel):
     current_task_id: str | None = None
     current_task_status: str | None = None
     busy: bool = False
-    status: Literal["idle", "running", "waiting", "failed"] | None = None
+    status: SessionLiveStatus | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     last_task_error: dict[str, str] | None = None
     last_message_preview: str | None = None

@@ -212,10 +212,11 @@ def test_supervisor_sees_stopped_subagent_status_after_runner_restart(
 
     def saw_session_list() -> bool:
         nonlocal sub_agents
-        items = http_client.get(
+        response = http_client.get(
             f"/v1/sessions/{parent_id}/items", params={"limit": 1000, "order": "asc"}
-        ).json()["data"]
-        sub_agents = _latest_session_list_subagents(items)
+        )
+        response.raise_for_status()
+        sub_agents = _latest_session_list_subagents(response.json()["data"])
         return sub_agents is not None
 
     _wait(saw_session_list, timeout=120, what="the supervisor to call sys_session_list")

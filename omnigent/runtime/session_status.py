@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Literal, cast
+from typing import cast
 
-from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
+from omnigent.db.enum_codecs import SESSION_LIVE_STATUS, SessionLiveStatus
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 
 LAST_TASK_ERROR_CODE_LABEL_KEY = "omnigent.last_task_error_code"
 LAST_TASK_ERROR_MESSAGE_LABEL_KEY = "omnigent.last_task_error_message"
-
-ChildSessionLiveStatus = Literal["idle", "running", "waiting", "failed"]
 
 session_status_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
@@ -22,15 +20,17 @@ def resolve_child_session_status(
     labels: Mapping[str, str],
     *,
     cached_status: str | None = None,
-) -> ChildSessionLiveStatus | None:
-    """Prefer a durable failure, then the relay cache, then the stored row."""
+) -> SessionLiveStatus | None:
+    """Prefer a durable failure, then a known relay-cache value, then the stored row."""
     if labels.get(LAST_TASK_ERROR_CODE_LABEL_KEY) and labels.get(
         LAST_TASK_ERROR_MESSAGE_LABEL_KEY
     ):
         return "failed"
     if cached_status is None:
         cached_status = session_status_cache.get(session_id)
-    status = cached_status if cached_status is not None else durable_status
-    if status in SESSION_LIVE_STATUS:
-        return cast(ChildSessionLiveStatus, status)
+    # The runner status probe caches the raw payload, so an out-of-vocabulary
+    # cache entry must not hide a valid persisted status.
+    for status in (cached_status, durable_status):
+        if status in SESSION_LIVE_STATUS:
+            return cast(SessionLiveStatus, status)
     return None

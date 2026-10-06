@@ -37,12 +37,12 @@ def _child(
 
 @pytest.fixture(autouse=True)
 def _clean_status_cache() -> Iterator[None]:
-    """Isolate the module-global relay status cache around each test."""
-    saved = dict(_session_status_cache)
-    _session_status_cache.clear()
+    """Isolate the ``conv_child`` relay-cache entry around each test."""
+    saved = _session_status_cache.pop("conv_child", None)
     yield
-    _session_status_cache.clear()
-    _session_status_cache.update(saved)
+    _session_status_cache.pop("conv_child", None)
+    if saved is not None:
+        _session_status_cache["conv_child"] = saved
 
 
 def test_cache_miss_falls_back_to_durable_live_status() -> None:
@@ -84,6 +84,17 @@ def test_no_state_anywhere_is_none() -> None:
     assert summary.status is None
     assert summary.busy is False
     assert summary.current_task_status is None
+
+
+def test_unknown_cached_value_falls_back_to_the_row() -> None:
+    """A cache entry outside the status vocabulary does not hide the row's status."""
+    _session_status_cache["conv_child"] = "launching"
+    summary = _child_session_summary_from_conversation(
+        _child(live_status="idle"), "conv_parent", None
+    )
+    assert summary.status == "idle"
+    assert summary.busy is False
+    assert summary.current_task_status == "completed"
 
 
 def test_durable_task_error_forces_failed() -> None:
