@@ -473,6 +473,138 @@ function makeEventCapturingRegistry() {
   };
 }
 
+function previewOwnership(partition, overrides = {}) {
+  return {
+    agent: true,
+    ownedOrigin: "http://localhost:5173",
+    ownedHostId: "host_a",
+    ownedServerUrl: "https://workspace.cloud.databricks.com/omnigent",
+    ownedArcaTarget: "https://target.cloud.databricks.com/omnigent",
+    previewPartition: partition,
+    ...overrides,
+  };
+}
+
+describe("browserViewRegistry — preview partition ownership", () => {
+  it("reuses the same complete owner without recreating its view or partition", () => {
+    const { registry } = makeRegistry();
+    const partition = registry.newPreviewPartition();
+    const first = registry.openOrNavigate(
+      "conv_1",
+      "http://localhost:5173/app",
+      undefined,
+      previewOwnership(partition),
+    );
+    const second = registry.openOrNavigate(
+      "conv_1",
+      "http://localhost:5173/next",
+      undefined,
+      previewOwnership(partition),
+    );
+
+    assert.equal(second.ok, true);
+    assert.equal(second.created, false);
+    assert.equal(second.entry.view, first.entry.view);
+    assert.equal(second.entry.partition, partition);
+    assert.equal(second.entry.agentOwnedPartition, partition);
+  });
+
+  it("fails closed when an existing view or owner does not match the requested partition", () => {
+    const { registry } = makeRegistry();
+    const firstPartition = registry.newPreviewPartition();
+    const secondPartition = registry.newPreviewPartition();
+    const first = registry.openOrNavigate(
+      "conv_1",
+      "http://localhost:5173",
+      undefined,
+      previewOwnership(firstPartition),
+    );
+
+    const partitionMismatch = registry.openOrNavigate(
+      "conv_1",
+      "http://localhost:5173/next",
+      undefined,
+      previewOwnership(secondPartition),
+    );
+    assert.deepEqual(partitionMismatch, { ok: false, error: "preview partition mismatch" });
+    assert.equal(registry.get("conv_1"), first.entry);
+
+    first.entry.agentOwnedHostId = "host_b";
+    const ownerMismatch = registry.openOrNavigate(
+      "conv_1",
+      "http://localhost:5173/next",
+      undefined,
+      previewOwnership(firstPartition),
+    );
+    assert.deepEqual(ownerMismatch, { ok: false, error: "preview ownership mismatch" });
+    assert.equal(first.entry.agentOwnedHostId, "host_b");
+  });
+
+  it("does not treat a private partition name alone as verified ownership", () => {
+    const { registry } = makeRegistry();
+    const result = registry.openOrNavigate("conv_1", "https://example.com", undefined, {
+      agent: true,
+      previewPartition: registry.newPreviewPartition(),
+    });
+    assert.deepEqual(result, {
+      ok: false,
+      error: "preview partition requires verified ownership",
+    });
+    assert.equal(registry.has("conv_1"), false);
+  });
+
+  it("replaces generic and retired views while preserving the current intent", () => {
+    for (const retired of [false, true]) {
+      const { registry, fire } = makeEventCapturingRegistry();
+      const original = retired
+        ? registry.openOrNavigate(
+            "conv_1",
+            "http://localhost:5173",
+            undefined,
+            previewOwnership(registry.newPreviewPartition()),
+          )
+        : registry.openOrNavigate("conv_1", "https://example.com");
+      if (retired) fire("did-navigate", "https://example.com/away");
+      const retiredPartition = original.entry.partition;
+      const token = registry.beginNavigation("conv_1");
+      assert.equal(registry.discardForNavigation("conv_1", token), true);
+      assert.equal(registry.isNavigationCurrent("conv_1", token), true);
+
+      const partition = registry.newPreviewPartition();
+      const admitted = registry.openOrNavigate(
+        "conv_1",
+        "http://localhost:5173/new",
+        undefined,
+        previewOwnership(partition, { intentToken: token }),
+      );
+      assert.equal(admitted.ok, true);
+      assert.notEqual(admitted.entry.view, original.entry.view);
+      assert.notEqual(partition, retiredPartition);
+    }
+  });
+
+  it("never reuses a partition after close or ownership replacement", () => {
+    const { registry } = makeRegistry();
+    const firstPartition = registry.newPreviewPartition();
+    registry.openOrNavigate(
+      "conv_1",
+      "http://localhost:5173",
+      undefined,
+      previewOwnership(firstPartition),
+    );
+    registry.close("conv_1", "user");
+    const secondPartition = registry.newPreviewPartition();
+    registry.openOrNavigate(
+      "conv_1",
+      "http://localhost:5173",
+      undefined,
+      previewOwnership(secondPartition),
+    );
+    assert.notEqual(secondPartition, firstPartition);
+    assert.equal(registry.get("conv_1").partition, secondPartition);
+  });
+});
+
 describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every hop)", () => {
   it("admits the owned exact origin on every guard and releases it on navigation away", () => {
     const { registry, fire, windowOpen } = makeEventCapturingRegistry();

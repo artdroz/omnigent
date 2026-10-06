@@ -495,10 +495,13 @@ describe("browserIpc — url live-tracking", () => {
       prepareAgentNavigation: async () => ({
         agent: true,
         ownedOrigin: "http://localhost:5173",
+        ownedServerUrl: "https://workspace.cloud.databricks.com/omnigent",
+        ownedArcaTarget: "https://target.cloud.databricks.com/omnigent",
+        previewPartition: "omnigent-preview-test-1",
         releaseOwnedOrigin: () => (releases += 1),
       }),
     });
-    failed.registry.openOrNavigate = () => ({ ok: false, error: "browser view cap reached" });
+    failed.registry.openOrNavigate = () => ({ ok: false, error: "preview partition mismatch" });
     const rejected = await failed.ipcMain.invoke(
       "omnigent:browser-open-or-navigate",
       failed.event,
@@ -540,6 +543,9 @@ describe("browserIpc — url live-tracking", () => {
         agent: false,
         hostId: "host_arca",
         ownedOrigin: "http://169.254.169.254",
+        ownedServerUrl: "https://forged.example",
+        ownedArcaTarget: "https://forged-target.example",
+        previewPartition: "omnigent-preview-forged-1",
         releaseOwnedOrigin: () => {},
         intentToken: 999,
       },

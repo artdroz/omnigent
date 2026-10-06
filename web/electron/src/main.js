@@ -1296,11 +1296,28 @@ function setWindowServerUrl(win, serverUrl) {
   state.serverUrl = serverUrl;
 }
 
-function matchesAgentPreviewOwner(entry, preview, hostId, serverUrl) {
+/** Record the effective server target used to enroll and verify this window's Arca host. */
+function setWindowArcaServerUrl(win, arcaServerUrl) {
+  const state = windows.get(win);
+  if (!state) return;
+  const previous = state.arcaServerUrl ?? state.serverUrl ?? null;
+  const next = arcaServerUrl ?? state.serverUrl ?? null;
+  if (previous && previous !== next) {
+    state.browserRegistry?.closeAll("server-changed");
+  }
+  state.arcaServerUrl = arcaServerUrl;
+}
+
+function matchesAgentPreviewOwner(entry, preview, hostId, connectedServer, arcaTarget, partition) {
   return (
     entry?.agentOwnedOrigin === preview.origin &&
     entry.agentOwnedHostId === hostId &&
-    entry.agentOwnedServerUrl === serverUrl
+    entry.agentOwnedServerUrl === connectedServer &&
+    entry.agentOwnedArcaTarget === arcaTarget &&
+    typeof partition === "string" &&
+    partition.startsWith("omnigent-preview-") &&
+    entry.agentOwnedPartition === partition &&
+    entry.partition === partition
   );
 }
 
@@ -1997,10 +2014,12 @@ async function loadServerUrl(
       windowState.authKind = null;
       // An explicit connect targets what was typed; a restore or switch lands on
       // the workspace host and maps back to the URL picked for it.
-      windowState.arcaServerUrl =
+      setWindowArcaServerUrl(
+        win,
         (!interactive &&
           serverLabel(parseServerLabels(loadSettings().server_labels), requestedServerUrl)) ||
-        requestedServerUrl;
+          requestedServerUrl,
+      );
     }
     let target = loadUrl ?? (routePath ? resolveServerPath(serverUrl, routePath) : serverUrl);
     let manifest = null;
@@ -2328,6 +2347,9 @@ function createWindow(targetUrl, opts = {}) {
     // Clean server identity (no conversation path) for host/server CLI
     // commands; ``loadUrl`` (possibly /c/<id>) is what gets loaded below.
     serverUrl: destination ? serverUrl : null,
+    // Enrollment/verification target is distinct when a saved label maps the
+    // connected renderer host back to the server the user originally picked.
+    arcaServerUrl: destination ? serverUrl : null,
     ephemeral,
     badgeCount: 0,
     // Per-conversation embedded-browser view registry for this window.
@@ -3478,6 +3500,81 @@ function browserRegistryForSender(event) {
   return windows.get(win)?.browserRegistry ?? null;
 }
 
+async function prepareArcaPreviewNavigation(event, conversationId, url, opts, lifecycle) {
+  const registry = browserRegistryForSender(event);
+  const preview = loopbackPreview(url);
+  if (!registry) throw new Error("no browser registry for this window");
+  if (!preview) return opts;
+
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const connectedServer = senderServerUrl(event);
+  const arcaTarget = windowArcaServerUrl(win);
+  if (
+    !databricksInternalFeaturesEnabled() ||
+    !connectedServer ||
+    !arcaTarget ||
+    !isDatabricksManagedServerUrl(connectedServer) ||
+    !isDatabricksManagedServerUrl(arcaTarget)
+  ) {
+    throw new Error("Arca localhost previews require a managed Databricks server");
+  }
+
+  const existing = registry.get(conversationId);
+  const ownedPartition = existing?.agentOwnedPartition;
+  if (
+    matchesAgentPreviewOwner(
+      existing,
+      preview,
+      opts.hostId,
+      connectedServer,
+      arcaTarget,
+      ownedPartition,
+    )
+  ) {
+    return {
+      ...opts,
+      ownedOrigin: preview.origin,
+      ownedHostId: opts.hostId,
+      ownedServerUrl: connectedServer,
+      ownedArcaTarget: arcaTarget,
+      previewPartition: ownedPartition,
+    };
+  }
+
+  if (existing && !registry.discardForNavigation(conversationId, lifecycle.intentToken)) {
+    throw new Error("preview navigation was superseded");
+  }
+  const previewPartition = registry.newPreviewPartition();
+  if (!lifecycle.onCancel(() => registry.arcaPreview.release(conversationId))) {
+    throw new Error("preview navigation was superseded");
+  }
+  const owned = await registry.arcaPreview.prepare({
+    conversationId,
+    url,
+    hostId: opts.hostId,
+    serverUrl: arcaTarget,
+    deadline: lifecycle.deadline,
+  });
+  if (
+    browserRegistryForSender(event) !== registry ||
+    senderServerUrl(event) !== connectedServer ||
+    windowArcaServerUrl(win) !== arcaTarget ||
+    !lifecycle.onCancel(owned.release)
+  ) {
+    owned.release();
+    throw new Error("preview navigation was superseded");
+  }
+  return {
+    ...opts,
+    ownedOrigin: owned.origin,
+    ownedHostId: opts.hostId,
+    ownedServerUrl: connectedServer,
+    ownedArcaTarget: arcaTarget,
+    previewPartition,
+    releaseOwnedOrigin: owned.release,
+  };
+}
+
 const WORKSPACE_PICKER_PAGE = path.join(__dirname, "..", "workspace-picker", "index.html");
 
 /**
@@ -4426,60 +4523,7 @@ function registerIpc() {
     ipcMain,
     isPinnedOriginSender,
     getRegistryForEvent: browserRegistryForSender,
-    prepareAgentNavigation: async (event, conversationId, url, opts, lifecycle) => {
-      const registry = browserRegistryForSender(event);
-      const preview = loopbackPreview(url);
-      if (!registry) throw new Error("no browser registry for this window");
-      if (!preview) {
-        return opts;
-      }
-      const serverUrl = senderServerUrl(event);
-      if (
-        !databricksInternalFeaturesEnabled() ||
-        !serverUrl ||
-        !isDatabricksManagedServerUrl(serverUrl)
-      ) {
-        throw new Error("Arca localhost previews require a managed Databricks server");
-      }
-      const existing = registry.get(conversationId);
-      if (matchesAgentPreviewOwner(existing, preview, opts.hostId, serverUrl)) {
-        return {
-          ...opts,
-          ownedOrigin: preview.origin,
-          ownedHostId: opts.hostId,
-          ownedServerUrl: serverUrl,
-        };
-      }
-      lifecycle.onCancel(() => registry.arcaPreview.release(conversationId));
-      if (
-        existing?.agentOwnedOrigin &&
-        !registry.discardForNavigation(conversationId, lifecycle.intentToken)
-      ) {
-        throw new Error("preview navigation was superseded");
-      }
-      const owned = await registry.arcaPreview.prepare({
-        conversationId,
-        url,
-        hostId: opts.hostId,
-        serverUrl,
-        deadline: lifecycle.deadline,
-      });
-      if (
-        browserRegistryForSender(event) !== registry ||
-        senderServerUrl(event) !== serverUrl ||
-        !lifecycle.onCancel(owned.release)
-      ) {
-        owned.release();
-        throw new Error("preview navigation was superseded");
-      }
-      return {
-        ...opts,
-        ownedOrigin: owned.origin,
-        ownedHostId: opts.hostId,
-        ownedServerUrl: serverUrl,
-        releaseOwnedOrigin: owned.release,
-      };
-    },
+    prepareAgentNavigation: prepareArcaPreviewNavigation,
   });
 }
 

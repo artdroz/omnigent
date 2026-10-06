@@ -558,7 +558,7 @@ function loadNavigationHarness({
     "./omnigent_cli": {
       isExecutableFile: () => false,
       resolveCliPath: () => (cliPath ? { path: cliPath } : null),
-      cliCommandParts: require("../src/omnigent_cli").cliCommandParts,
+      cliCommandParts: () => ({ displayName: "omnigent" }),
       localHostId: () => "host_test",
       getCliStatus: () => ({ installed: false }),
     },
@@ -577,7 +577,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, matchesAgentPreviewOwner, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, trackPreviewShutdown, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
+    "\nmodule.exports.testApi = { createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, matchesAgentPreviewOwner, pickWorkspaceForBridge, prepareArcaPreviewNavigation, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, setWindowArcaServerUrl, trackPreviewShutdown, windowArcaServerUrl, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -612,6 +612,7 @@ function loadNavigationHarness({
   api.windows.set(win, {
     origin: new URL(serverUrl).origin,
     serverUrl,
+    arcaServerUrl: serverUrl,
     ephemeral: false,
     badgeCount: 0,
     browserRegistry: { closeAll: () => {} },
@@ -1304,6 +1305,7 @@ describe("Databricks auth mode wiring", () => {
 
     it("keeps the workspace URL for sign-in, and shows the pick", async (t) => {
       const h = await joinThroughAccount(t);
+      assert.equal(h.api.windowArcaServerUrl(h.win), picked);
       assert.equal(saved(h).server_url, workspace);
       assert.deepEqual(saved(h).recent_servers, [workspace]);
       assert.deepEqual(saved(h).server_labels, { [workspaceOrigin]: picked });
@@ -1580,6 +1582,17 @@ describe("browser permission wiring", () => {
       const a = registry.openOrNavigate("a", "https://login.example").entry.view.webContents;
       const b = registry.openOrNavigate("b", "https://login.example").entry.view.webContents;
       assert.notEqual(a.session, b.session);
+      const previewPartition = registry.newPreviewPartition();
+      const preview = registry.openOrNavigate("preview", "http://localhost:5173", undefined, {
+        agent: true,
+        ownedOrigin: "http://localhost:5173",
+        ownedHostId: "host_a",
+        ownedServerUrl: "https://workspace.cloud.databricks.com/omnigent",
+        ownedArcaTarget: "https://target.cloud.databricks.com/omnigent",
+        previewPartition,
+      }).entry.view.webContents;
+      assert.equal(preview.session, sessions.get(previewPartition));
+      assert.notEqual(preview.session, a.session);
       const check = (wc) =>
         wc.session.check(wc, "loopback-network", wc.getURL(), { isMainFrame: true });
       assert.equal(check(a), false, "detached panes cannot prompt");
@@ -2962,6 +2975,29 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     );
   });
 
+  it("closes previews when only the effective Arca enrollment target changes", () => {
+    const harness = loadNavigationHarness();
+    let closes = 0;
+    const state = harness.api.windows.get(harness.win);
+    state.browserRegistry = { closeAll: () => (closes += 1) };
+    state.serverUrl = "https://workspace.cloud.databricks.com/omnigent";
+    state.arcaServerUrl = "https://first.cloud.databricks.com/omnigent";
+
+    harness.api.setWindowArcaServerUrl(harness.win, "https://second.cloud.databricks.com/omnigent");
+    assert.equal(closes, 1);
+    assert.equal(
+      harness.api.windowArcaServerUrl(harness.win),
+      "https://second.cloud.databricks.com/omnigent",
+    );
+    harness.api.setWindowArcaServerUrl(harness.win, null);
+    assert.equal(closes, 2, "clearing the override compares against the connected-server fallback");
+    assert.equal(
+      harness.api.windowArcaServerUrl(harness.win),
+      "https://workspace.cloud.databricks.com/omnigent",
+    );
+    harness.cleanup();
+  });
+
   it("releases every registry before the forced app-exit fallback can run", () => {
     assert.match(
       liveCode,
@@ -3024,13 +3060,72 @@ describe("browser-view teardown on server change (src/main.js)", () => {
 });
 
 describe("Arca preview owner reuse", () => {
-  it("requires the same verified host and full connected server identity", () => {
+  const connectedServer = "https://workspace.cloud.databricks.com/omnigent?o=1";
+  const arcaTarget = "https://target.cloud.databricks.com/omnigent?o=1";
+  const previewPartition = "omnigent-preview-test-1";
+
+  function previewHarness(t, { existing = null, prepare } = {}) {
+    const h = loadNavigationHarness({
+      serverUrl: connectedServer,
+      internalFeatures: true,
+      registerFallbacks: false,
+    });
+    t.after(h.cleanup);
+    const calls = { discarded: [], prepared: [], released: [], partitions: [] };
+    let entry = existing;
+    let partitionSequence = 0;
+    const registry = {
+      get: () => entry,
+      discardForNavigation: (conversationId, token) => {
+        calls.discarded.push({ conversationId, token });
+        entry = null;
+        return true;
+      },
+      newPreviewPartition: () => {
+        const partition = `omnigent-preview-main-${++partitionSequence}`;
+        calls.partitions.push(partition);
+        return partition;
+      },
+      arcaPreview: {
+        release: (conversationId) => calls.released.push({ conversationId, pending: true }),
+        prepare: async (options) => {
+          calls.prepared.push(options);
+          return prepare
+            ? prepare(options)
+            : {
+                origin: "http://localhost:5173",
+                release: () => calls.released.push({ conversationId: options.conversationId }),
+              };
+        },
+      },
+    };
+    const state = h.api.windows.get(h.win);
+    state.serverUrl = connectedServer;
+    state.arcaServerUrl = arcaTarget;
+    state.browserRegistry = registry;
+    const cancellations = [];
+    const lifecycle = {
+      intentToken: 7,
+      deadline: Date.now() + 60_000,
+      onCancel: (cancel) => {
+        cancellations.push(cancel);
+        return true;
+      },
+    };
+    const event = { sender: h.webContents, senderFrame: { url: connectedServer } };
+    return { h, calls, cancellations, event, lifecycle, registry };
+  }
+
+  it("requires the same origin, host, both server identities, and actual partition", () => {
     const h = loadNavigationHarness();
     try {
       const entry = {
         agentOwnedOrigin: "http://localhost:5173",
         agentOwnedHostId: "host_a",
-        agentOwnedServerUrl: "https://workspace.example/omnigent?o=1",
+        agentOwnedServerUrl: connectedServer,
+        agentOwnedArcaTarget: arcaTarget,
+        agentOwnedPartition: previewPartition,
+        partition: previewPartition,
       };
       const preview = { origin: "http://localhost:5173" };
       assert.equal(
@@ -3038,21 +3133,126 @@ describe("Arca preview owner reuse", () => {
           entry,
           preview,
           "host_a",
-          "https://workspace.example/omnigent?o=1",
+          connectedServer,
+          arcaTarget,
+          previewPartition,
         ),
         true,
       );
+      for (const args of [
+        ["host_b", connectedServer, arcaTarget, previewPartition],
+        ["host_a", "https://other.cloud.databricks.com/omnigent", arcaTarget, previewPartition],
+        [
+          "host_a",
+          connectedServer,
+          "https://other.cloud.databricks.com/omnigent",
+          previewPartition,
+        ],
+        ["host_a", connectedServer, arcaTarget, "omnigent-preview-test-2"],
+      ]) {
+        assert.equal(h.api.matchesAgentPreviewOwner(entry, preview, ...args), false);
+      }
       assert.equal(
         h.api.matchesAgentPreviewOwner(
-          entry,
+          { ...entry, partition: "omnigent-preview-test-2" },
           preview,
-          "host_b",
-          "https://workspace.example/omnigent?o=1",
+          "host_a",
+          connectedServer,
+          arcaTarget,
+          previewPartition,
         ),
         false,
       );
     } finally {
       h.cleanup();
+    }
+  });
+
+  it("uses the enrollment target and discards any generic entry before new admission", async (t) => {
+    const ctx = previewHarness(t, {
+      existing: { partition: "omnigent-agent-window-conversation" },
+    });
+    const prepared = await ctx.h.api.prepareArcaPreviewNavigation(
+      ctx.event,
+      "conversation",
+      "http://localhost:5173/app",
+      { agent: true, hostId: "host_a" },
+      ctx.lifecycle,
+    );
+
+    assert.deepEqual(ctx.calls.discarded, [{ conversationId: "conversation", token: 7 }]);
+    assert.equal(ctx.calls.prepared[0].serverUrl, arcaTarget);
+    assert.equal(prepared.ownedServerUrl, connectedServer);
+    assert.equal(prepared.ownedArcaTarget, arcaTarget);
+    assert.equal(prepared.previewPartition, "omnigent-preview-main-1");
+    assert.equal(ctx.cancellations.length, 2);
+  });
+
+  it("reuses only the complete valid owner and its existing partition", async (t) => {
+    const entry = {
+      agentOwnedOrigin: "http://localhost:5173",
+      agentOwnedHostId: "host_a",
+      agentOwnedServerUrl: connectedServer,
+      agentOwnedArcaTarget: arcaTarget,
+      agentOwnedPartition: previewPartition,
+      partition: previewPartition,
+    };
+    const ctx = previewHarness(t, { existing: entry });
+    const prepared = await ctx.h.api.prepareArcaPreviewNavigation(
+      ctx.event,
+      "conversation",
+      "http://localhost:5173/next",
+      { agent: true, hostId: "host_a" },
+      ctx.lifecycle,
+    );
+
+    assert.equal(prepared.previewPartition, previewPartition);
+    assert.deepEqual(ctx.calls.discarded, []);
+    assert.deepEqual(ctx.calls.prepared, []);
+    assert.deepEqual(ctx.calls.partitions, []);
+  });
+
+  it("refuses either unmanaged identity before status verification", async (t) => {
+    const ctx = previewHarness(t);
+    ctx.h.api.windows.get(ctx.h.win).arcaServerUrl = "https://example.com/omnigent";
+    await assert.rejects(
+      ctx.h.api.prepareArcaPreviewNavigation(
+        ctx.event,
+        "conversation",
+        "http://localhost:5173",
+        { agent: true, hostId: "host_a" },
+        ctx.lifecycle,
+      ),
+      /managed Databricks server/,
+    );
+    assert.deepEqual(ctx.calls.prepared, []);
+  });
+
+  it("releases preparation when either server identity changes while status is pending", async (t) => {
+    for (const field of ["serverUrl", "arcaServerUrl"]) {
+      let resolvePrepare;
+      let releases = 0;
+      const ctx = previewHarness(t, {
+        prepare: () =>
+          new Promise((resolve) => {
+            resolvePrepare = resolve;
+          }),
+      });
+      const pending = ctx.h.api.prepareArcaPreviewNavigation(
+        ctx.event,
+        `conversation-${field}`,
+        "http://localhost:5173",
+        { agent: true, hostId: "host_a" },
+        ctx.lifecycle,
+      );
+      ctx.h.api.windows.get(ctx.h.win)[field] = "https://other.cloud.databricks.com/omnigent";
+      resolvePrepare({
+        origin: "http://localhost:5173",
+        release: () => (releases += 1),
+      });
+      // oxlint-disable-next-line no-await-in-loop -- each case owns mutable window state.
+      await assert.rejects(pending, /superseded/);
+      assert.equal(releases, 1, field);
     }
   });
 });

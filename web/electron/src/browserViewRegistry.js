@@ -59,6 +59,7 @@ function agentPartition(scope, viewId) {
 // default partition scope. In-memory partitions never outlive the process, so
 // no cross-run uniqueness is needed.
 let registrySeq = 0;
+let previewPartitionSeq = 0;
 
 function createBrowserViewRegistry({
   WebContentsViewCtor, // (opts) => new WebContentsView(opts) — injectable for tests
@@ -132,10 +133,11 @@ function createBrowserViewRegistry({
     return { ok: true };
   }
 
-  function makeEntry(conversationId, view) {
+  function makeEntry(conversationId, view, partition) {
     const entry = {
       conversationId,
       view,
+      partition,
       boundsController: createBoundsController({
         getZoomFactor: getHostZoomFactor,
         getDisplayScaleFactor: getHostDisplayScaleFactor,
@@ -164,6 +166,8 @@ function createBrowserViewRegistry({
       agentOwnedOrigin: null,
       agentOwnedHostId: null,
       agentOwnedServerUrl: null,
+      agentOwnedArcaTarget: null,
+      agentOwnedPartition: null,
       expiredAgentOrigins: new Set(),
       releaseAgentOrigin: null,
       // Design-mode listeners + webContents, set by browserIpc's enable handler
@@ -181,28 +185,36 @@ function createBrowserViewRegistry({
     return entries.get(conversationId) || null;
   }
 
-  function getOrCreate(conversationId) {
+  function getOrCreate(conversationId, { partition } = {}) {
     const existing = entries.get(conversationId);
     if (existing) return { ok: true, entry: existing, created: false };
     if (entries.size >= cap) {
       return { ok: false, error: "browser view cap reached — close one", cap };
     }
+    const storagePartition =
+      typeof partition === "string" && partition
+        ? partition
+        : agentPartition(partitionScope, conversationId);
     const view = WebContentsViewCtor({
       webPreferences: {
         // Per-conversation storage isolation — see agentPartition.
-        partition: agentPartition(partitionScope, conversationId),
+        partition: storagePartition,
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,
       },
     });
-    const entry = makeEntry(conversationId, view);
+    const entry = makeEntry(conversationId, view, storagePartition);
     entries.set(conversationId, entry);
     installWindowOpenPolicy(entry);
     attachViewContextMenu(entry);
     attachAgentNavGuard(conversationId, entry);
     attachRecentSessionInput(entry);
     return { ok: true, entry, created: true };
+  }
+
+  function newPreviewPartition() {
+    return `omnigent-preview-${partitionScope}-${++previewPartitionSeq}`;
   }
 
   // SECURITY: a visited page must not spawn windows from the desktop shell, so
@@ -436,7 +448,21 @@ function createBrowserViewRegistry({
         return { ok: false, error: verdict.error };
       }
     }
-    const result = getOrCreate(conversationId);
+    const previewPartition =
+      typeof opts?.previewPartition === "string" && opts.previewPartition
+        ? opts.previewPartition
+        : null;
+    if (opts?.previewPartition != null && !previewPartition) {
+      return { ok: false, error: "invalid preview partition" };
+    }
+    if (previewPartition && !opts?.ownedOrigin) {
+      return { ok: false, error: "preview partition requires verified ownership" };
+    }
+    const existing = entries.get(conversationId);
+    if (previewPartition && existing && existing.partition !== previewPartition) {
+      return { ok: false, error: "preview partition mismatch" };
+    }
+    const result = getOrCreate(conversationId, { partition: previewPartition });
     if (!result.ok) return result;
     const { entry, created } = result;
     // Latch who drives THIS navigation so the will-navigate/will-redirect guard
@@ -447,12 +473,20 @@ function createBrowserViewRegistry({
       const sameOwner =
         entry.agentOwnedOrigin === opts.ownedOrigin &&
         entry.agentOwnedHostId === opts.ownedHostId &&
-        entry.agentOwnedServerUrl === opts.ownedServerUrl;
+        entry.agentOwnedServerUrl === opts.ownedServerUrl &&
+        entry.agentOwnedArcaTarget === (opts.ownedArcaTarget || null) &&
+        entry.agentOwnedPartition === previewPartition &&
+        (!previewPartition || entry.partition === previewPartition);
+      if (previewPartition && !created && !sameOwner) {
+        return { ok: false, error: "preview ownership mismatch" };
+      }
       if (!sameOwner) {
         entry.releaseAgentOrigin?.();
         entry.agentOwnedOrigin = opts.ownedOrigin;
         entry.agentOwnedHostId = opts.ownedHostId || null;
         entry.agentOwnedServerUrl = opts.ownedServerUrl || null;
+        entry.agentOwnedArcaTarget = opts.ownedArcaTarget || null;
+        entry.agentOwnedPartition = previewPartition;
         entry.releaseAgentOrigin = opts.releaseOwnedOrigin || null;
       } else if (opts.releaseOwnedOrigin) {
         entry.releaseAgentOrigin = opts.releaseOwnedOrigin;
@@ -652,6 +686,8 @@ function createBrowserViewRegistry({
     entry.agentOwnedOrigin = null;
     entry.agentOwnedHostId = null;
     entry.agentOwnedServerUrl = null;
+    entry.agentOwnedArcaTarget = null;
+    entry.agentOwnedPartition = null;
     entry.releaseAgentOrigin?.();
     entry.releaseAgentOrigin = null;
   }
@@ -660,6 +696,7 @@ function createBrowserViewRegistry({
     // Lifecycle
     get,
     getOrCreate,
+    newPreviewPartition,
     openOrNavigate,
     setActive,
     setSuppressed,

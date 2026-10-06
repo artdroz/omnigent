@@ -395,6 +395,28 @@ describe("Arca preview manager", () => {
     );
   });
 
+  it("rejects a daemon that matches only the connected renderer server", async () => {
+    const connectedServer = "https://connected.cloud.databricks.com/omnigent";
+    const arcaTarget = "https://target.cloud.databricks.com/omnigent";
+    const fake = successfulSpawner({ serverUrl: connectedServer });
+    const manager = createArcaPreviewManager({
+      resolveArcaPathFn: () => "/arca",
+      spawnFn: fake.spawn,
+      socketReady: () => true,
+    });
+    await assert.rejects(
+      manager.prepare({
+        conversationId: "target-mismatch",
+        url: "http://localhost:5173",
+        hostId: "host_arca",
+        serverUrl: arcaTarget,
+      }),
+      /not running on this server's Arca host/,
+    );
+    const status = fake.calls.find((call) => call.args.includes("status"));
+    assert.equal(status.args[status.args.indexOf("--server") + 1], `'${arcaTarget}'`);
+  });
+
   it("fails an occupied desktop port without treating that listener as readiness", async () => {
     let master = null;
     const spawn = (_file, args) => {
