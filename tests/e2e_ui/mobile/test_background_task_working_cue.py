@@ -28,6 +28,8 @@ Harness notes:
   shell runs without an approval pause.
 - The phone is desktop Chromium at Playwright's "iPhone 13" profile (390x664),
   so a recorder run with ``--device "iPhone 13"`` films pixel-exact.
+- The held follow-up is released only once the CLI's model request is actually
+  waiting on the mock's gate; a release with nothing pending is a no-op.
 - Skips when the ``claude`` CLI is unavailable.
 """
 
@@ -37,6 +39,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -92,6 +95,10 @@ _FOLLOW_UP_REPLY = "follow-up answered while the sleep keeps running"
 _TERMINAL_READY_TIMEOUT_MS = 120_000
 # A mock turn: CLI round trip through the bridge + hook + forwarder.
 _TURN_TIMEOUT_MS = 120_000
+_MENU_OPEN_TIMEOUT_S = 30.0
+_SCROLL_SETTLE_TIMEOUT_S = 20.0
+# The CLI's model request reaches the mock seconds after the UI shows the turn.
+_GATE_PENDING_TIMEOUT_S = 90.0
 
 
 @pytest.fixture
@@ -147,7 +154,9 @@ def _select_view(page: Page, option: str) -> None:
     """Switch to the Chat or Terminal view.
 
     A phone header folds the switch into its single "…" menu; a desktop header
-    shows the segmented ``view-mode-toggle`` instead.
+    shows the segmented ``view-mode-toggle`` instead. A terminal that has just
+    connected grabs keyboard focus, which dismisses the phone's non-modal menu
+    if it lands right after the tap; a user simply taps the menu again.
     """
     kebab = page.get_by_test_id("header-conversation-actions").or_(
         page.get_by_test_id("session-actions-menu")
@@ -158,9 +167,16 @@ def _select_view(page: Page, option: str) -> None:
         expect(segment).to_be_enabled(timeout=30_000)
         segment.click()
         return
-    kebab.click()
     item = page.get_by_test_id(f"view-mode-menu-{option}")
-    expect(item).to_be_visible(timeout=10_000)
+    deadline = time.monotonic() + _MENU_OPEN_TIMEOUT_S
+    while True:
+        kebab.click()
+        try:
+            expect(item).to_be_visible(timeout=3_000)
+            break
+        except AssertionError:
+            if time.monotonic() >= deadline:
+                raise
     item.click()
 
 
@@ -224,6 +240,12 @@ def _hold_follow_up(mock_url: str) -> str:
 
 
 def _release_follow_up(mock_url: str) -> None:
+    """Let the held reply finish once the CLI's request is waiting on the gate."""
+    deadline = time.monotonic() + _GATE_PENDING_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if httpx.get(f"{mock_url}/gate/pending", timeout=5.0).json().get("pending"):
+            break
+        time.sleep(0.25)
     httpx.post(f"{mock_url}/gate/release", timeout=5.0)
 
 
@@ -252,14 +274,27 @@ _SCROLL_TO_TOP = """
 """
 
 
+_SCROLLER_TOP = "() => document.querySelector('[data-pw-scroller]').scrollTop"
+
+
 def _scroll_to_top(page: Page) -> None:
-    """Scroll the transcript back to its first message (re-reading earlier turns)."""
+    """Scroll the transcript back to its first message (re-reading earlier turns).
+
+    Right after a turn the transcript may still pin itself to the bottom (a
+    late-committed item, a settling row measurement), so keep scrolling up
+    until it rests at the top, the way a reader would.
+    """
     size = page.evaluate(_TAG_SCROLLER)
     assert size["scrollHeight"] > size["clientHeight"] + 50, (
         f"the thread does not overflow the phone viewport: {size}"
     )
-    page.evaluate(_SCROLL_TO_TOP)
-    page.wait_for_function("document.querySelector('[data-pw-scroller]').scrollTop <= 2")
+    deadline = time.monotonic() + _SCROLL_SETTLE_TIMEOUT_S
+    while True:
+        page.evaluate(_SCROLL_TO_TOP)
+        page.wait_for_timeout(250)
+        if page.evaluate(_SCROLLER_TOP) <= 2:
+            return
+        assert time.monotonic() < deadline, "the transcript kept leaving its top"
 
 
 def _in_viewport(locator: Locator) -> bool | None:
