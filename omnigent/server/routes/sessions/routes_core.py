@@ -2748,12 +2748,16 @@ def register_core_routes(
         combined_model_forward = False
         _model_forward = None
         if live_forward and (effort is not None or clear_effort):
-            # The flag tells the runner a refusal is rolled back here, not saved for later.
-            effort_event = {
+            effort_event: dict[str, object] = {
                 "type": "effort_change",
                 "effort": updated.reasoning_effort,
-                "rollback_on_refusal": True,
             }
+            if (
+                updated.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+                == _CODEX_NATIVE_WRAPPER_LABEL_VALUE
+            ):
+                # Codex refusals are rolled back below, so the runner must not save them.
+                effort_event["rollback_on_refusal"] = True
             combined_model_forward = bool(
                 live_model_change
                 and updated.model_override
