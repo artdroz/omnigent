@@ -85,7 +85,9 @@ def _env(environ: Mapping[str, str], name: str) -> str | None:
     return value
 
 
-def _bypassed_by_no_proxy(host: str, port: int | None, no_proxy: str, http_scheme: str) -> bool:
+def _bypassed_by_no_proxy(
+    host: str, port: int | None, no_proxy: str, http_scheme: str, proxy_from_all: bool
+) -> bool:
     """Whether ``no_proxy`` exempts the target from proxying, as httpx would.
 
     Mirrors the rules the host's own HTTP client applies so HTTP requests and
@@ -104,6 +106,9 @@ def _bypassed_by_no_proxy(host: str, port: int | None, no_proxy: str, http_schem
     :param no_proxy: Raw ``no_proxy`` value.
     :param http_scheme: ``"http"`` or ``"https"``, the HTTP scheme the tunnel
         scheme corresponds to.
+    :param proxy_from_all: Whether the proxy came from the ``all_proxy``
+        fallback; httpx then mounts it as ``all://``, which a scheme-specific
+        wildcard bypass outranks.
     :returns: True when the target must be dialed directly.
     """
     host = host.lower()
@@ -114,7 +119,7 @@ def _bypassed_by_no_proxy(host: str, port: int | None, no_proxy: str, http_schem
         if entry == "*":
             return True
         if "://" in entry:
-            if _matches_url_pattern(host, port, http_scheme, entry):
+            if _matches_url_pattern(host, port, http_scheme, entry, proxy_from_all):
                 return True
             continue
         entry_port: int | None = None
@@ -148,13 +153,16 @@ def _bypassed_by_no_proxy(host: str, port: int | None, no_proxy: str, http_schem
     return False
 
 
-def _matches_url_pattern(host: str, port: int | None, http_scheme: str, pattern: str) -> bool:
+def _matches_url_pattern(
+    host: str, port: int | None, http_scheme: str, pattern: str, proxy_from_all: bool
+) -> bool:
     """Match a URL-form ``no_proxy`` entry the way an httpx mount pattern would.
 
     :param host: Lowercased target hostname.
     :param port: Explicit non-default target port, else None.
     :param http_scheme: HTTP scheme corresponding to the tunnel scheme.
     :param pattern: Lowercased entry containing ``://``.
+    :param proxy_from_all: Whether the proxy came from ``all_proxy``.
     :returns: True when the entry covers the target.
     """
     try:
@@ -170,9 +178,10 @@ def _matches_url_pattern(host: str, port: int | None, http_scheme: str, pattern:
     if pattern_port is not None and pattern_port != port:
         return False
     if pattern_host == "*":
-        # In httpx only a port-qualified wildcard outranks the scheme-specific
-        # proxy mounts; a bare ``all://*`` or ``http://*`` bypasses nothing.
-        return pattern_port is not None
+        # A bare wildcard only outranks httpx's proxy mount when it is
+        # port-qualified, or when it names the scheme and the proxy itself is
+        # the scheme-less ``all://`` mount from all_proxy.
+        return pattern_port is not None or (proxy_from_all and parts.scheme != "all")
     if pattern_host.startswith("*."):
         return host.endswith(pattern_host[1:])
     if pattern_host.startswith("*"):
@@ -224,7 +233,8 @@ def ws_env_proxy_url(ws_url: str, environ: Mapping[str, str] | None = None) -> s
         return None
     proxy = _env(environ, proxy_env)
     if proxy is None:
-        # Remember which variable supplied the value so warnings name it.
+        # Remember which variable supplied the value so warnings name it and
+        # the bypass rules can account for httpx's scheme-less all:// mount.
         proxy_env = "all_proxy"
         proxy = _env(environ, proxy_env)
     if not proxy:
@@ -232,7 +242,11 @@ def ws_env_proxy_url(ws_url: str, environ: Mapping[str, str] | None = None) -> s
     no_proxy = _env(environ, "no_proxy")
     explicit_port = None if port == _DEFAULT_PORT_BY_WS_SCHEME[scheme] else port
     if no_proxy and _bypassed_by_no_proxy(
-        host, explicit_port, no_proxy, _HTTP_SCHEME_BY_WS_SCHEME[scheme]
+        host,
+        explicit_port,
+        no_proxy,
+        _HTTP_SCHEME_BY_WS_SCHEME[scheme],
+        proxy_from_all=proxy_env == "all_proxy",
     ):
         return None
     if "://" not in proxy:

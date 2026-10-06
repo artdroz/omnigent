@@ -80,6 +80,13 @@ _OK = b"HTTP/1.1 200 Connection Established\r\n\r\n"
             {"https_proxy": "http://p:1", "no_proxy": "http://example.com"},
             "http://p:1",
         ),
+        # A scheme wildcard outranks httpx's all:// mount from all_proxy, but
+        # not a scheme-specific proxy mount.
+        (_TUNNEL_URL, {"all_proxy": "http://p:1", "no_proxy": "http://*"}, None),
+        ("wss://example.com/t", {"all_proxy": "http://p:1", "no_proxy": "https://*"}, None),
+        (_TUNNEL_URL, {"all_proxy": "http://p:1", "no_proxy": "https://*"}, "http://p:1"),
+        (_TUNNEL_URL, {"http_proxy": "http://p:1", "no_proxy": "http://*"}, "http://p:1"),
+        (_TUNNEL_URL, {"all_proxy": "http://p:1", "no_proxy": "all://*"}, "http://p:1"),
         # Loopback never goes through a proxy, even without a no_proxy entry.
         ("ws://localhost:8000/t", {"http_proxy": "http://p:1"}, None),
         ("ws://127.0.0.1:8000/t", {"ALL_PROXY": "http://p:1"}, None),
