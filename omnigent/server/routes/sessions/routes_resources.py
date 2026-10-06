@@ -2696,10 +2696,9 @@ def register_resources_routes(
         absolute, relative_path = _resolve_browse_path(request, relative_path)
         conv, owner = await _authorize_browse_read_with_owner(session_id, request, relative_path)
 
-        # A workspace symlink may lead outside the workspace. The owner may
-        # browse that target by absolute path already, so the runner is told
-        # it may follow the link; collaborators keep the workspace boundary.
-        # The workspace root itself is never such a link.
+        # The owner may browse a workspace symlink's outside target by absolute
+        # path already, so the runner is told it may follow the link; everyone
+        # else keeps the workspace boundary. The root itself is never a link.
         reach = {"scope": "reach"} if owner and not absolute and relative_path else {}
         qs = urllib.parse.urlencode({**params, **reach})
         runner_rel = _runner_path_segment(relative_path, absolute=absolute)

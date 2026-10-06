@@ -1388,10 +1388,9 @@ def register_resource_routes(
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
         download: bool = False,
-        # ``reach`` lets a workspace symlink lead outside the workspace when
-        # the environment's reach covers its target. The server sends it only
-        # for a caller who may browse that target by absolute path; the
-        # runner cannot see who is asking.
+        # ``reach`` admits a workspace symlink whose target lies outside the
+        # workspace but within the environment's reach. Only the server sends
+        # it, for a caller who may browse that target by absolute path.
         scope: str = Query(default="workspace", pattern="^(workspace|reach)$"),
     ) -> Response:
         await _require_os_env(session_id)
