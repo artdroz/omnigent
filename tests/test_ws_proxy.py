@@ -66,6 +66,9 @@ _OK = b"HTTP/1.1 200 Connection Established\r\n\r\n"
         (_TUNNEL_URL, {"Http_Proxy": "http://p:1"}, "http://p:1"),
         (_TUNNEL_URL, {"http_proxy": "http://p:1", "No_Proxy": "server.sandbox.test"}, None),
         (_TUNNEL_URL, {"HTTP_PROXY": "http://p:2", "HTTP_proxy": ""}, None),
+        # urllib ignores HTTP_PROXY under CGI; the lowercase spelling survives.
+        (_TUNNEL_URL, {"HTTP_PROXY": "http://p:1", "REQUEST_METHOD": "GET"}, None),
+        (_TUNNEL_URL, {"http_proxy": "http://p:1", "REQUEST_METHOD": "GET"}, "http://p:1"),
         # Loopback never goes through a proxy, even without a no_proxy entry.
         ("ws://localhost:8000/t", {"http_proxy": "http://p:1"}, None),
         ("ws://127.0.0.1:8000/t", {"ALL_PROXY": "http://p:1"}, None),
@@ -99,6 +102,8 @@ def test_proxy_selection(url, env, expected):
         ("[fd00::1]:8000", "[fd00::1]:8000", True),
         ("[fd00:0:0:0:0:0:0:1]:8000", "fd00::1", False),
         ("evil.10.1.2.3:8000", "10.1.2.3", False),
+        # Deliberately stricter than httpx, which suffix-matches IP entries with a port.
+        ("evil.10.1.2.3:8000", "10.1.2.3:8000", False),
         ("server.sandbox.test:8000", "localhost,10.1.2.3,fd00::1", False),
     ],
 )
@@ -276,7 +281,7 @@ async def test_connect_timeout_race_closes_completed_dial(monkeypatch):
     patched_asyncio = types.SimpleNamespace(**vars(asyncio))
     patched_asyncio.wait_for = wait_for_after_completion
     monkeypatch.setattr(ws_proxy, "asyncio", patched_asyncio)
-    with pytest.raises(TimeoutError):
+    with pytest.raises(TimeoutError, match="within 5s"):
         await open_proxy_connect_socket("http://127.0.0.1:1", _TUNNEL_URL, timeout=5)
     await asyncio.sleep(0)
     assert sock.fileno() == -1

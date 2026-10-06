@@ -8166,10 +8166,12 @@ async def test_dispatch_fs_write_op_unknown_op_raises() -> None:
         HostProcess._dispatch_fs_write_op("/ws", "bogus", {})
 
 
+@pytest.mark.parametrize("failure", ["constructor", "enter"])
 @pytest.mark.parametrize("use_proxy", [False, True])
 async def test_connect_and_serve_proxy_socket(
-    monkeypatch: pytest.MonkeyPatch, use_proxy: bool
+    monkeypatch: pytest.MonkeyPatch, use_proxy: bool, failure: str
 ) -> None:
+    """The proxied socket is passed to connect() and closed when either connect step fails."""
     from omnigent.host import connect as connect_mod
 
     proxy_url = "http://127.0.0.1:3128"
@@ -8181,7 +8183,10 @@ async def test_connect_and_serve_proxy_socket(
     )
     monkeypatch.setattr(host, "_build_connect_headers", dict)
     connect = Mock(return_value=AsyncMock())
-    connect.return_value.__aenter__.side_effect = ConnectionError("test rejection")
+    if failure == "constructor":
+        connect.side_effect = ConnectionError("test rejection")
+    else:
+        connect.return_value.__aenter__.side_effect = ConnectionError("test rejection")
     monkeypatch.setattr(connect_mod.websockets.asyncio.client, "connect", connect)
 
     with socket.socket() as proxy_sock:
@@ -8225,32 +8230,6 @@ async def test_connect_and_serve_builds_ssl_context_before_dialing_proxy(
     with pytest.raises(ssl.SSLError, match="bad CA bundle"):
         await host._connect_and_serve()
     dial.assert_not_awaited()
-
-
-async def test_connect_and_serve_closes_proxy_socket_when_connect_constructor_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A connect() constructor failure must not leak the already dialed proxy socket."""
-    from omnigent.host import connect as connect_mod
-
-    monkeypatch.setenv("http_proxy", "http://127.0.0.1:3128")
-    host = HostProcess(
-        HostIdentity(host_id="host_test_connect", name="test-laptop"),
-        "http://server.sandbox.test:8000",
-    )
-    monkeypatch.setattr(host, "_build_connect_headers", dict)
-    monkeypatch.setattr(
-        connect_mod.websockets.asyncio.client,
-        "connect",
-        Mock(side_effect=ConnectionError("test rejection")),
-    )
-    with socket.socket() as proxy_sock:
-        monkeypatch.setattr(
-            connect_mod, "open_proxy_connect_socket", AsyncMock(return_value=proxy_sock)
-        )
-        with pytest.raises(ConnectionError, match="test rejection"):
-            await host._connect_and_serve()
-        assert proxy_sock.fileno() == -1
 
 
 @pytest.mark.parametrize("action", ["attach", "remove"])

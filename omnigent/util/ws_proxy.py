@@ -63,7 +63,9 @@ def _env(environ: Mapping[str, str], name: str) -> str | None:
 
     Any capitalisation of *name* counts; a spelling ending in lowercase
     ``_proxy`` takes precedence, and such a spelling that is present but empty
-    suppresses the others (``http_proxy=""`` disables ``HTTP_PROXY``).
+    suppresses the others (``http_proxy=""`` disables ``HTTP_PROXY``). Like
+    urllib, ``HTTP_PROXY`` is ignored when ``REQUEST_METHOD`` marks a CGI
+    environment, where it would carry the request's ``Proxy`` header.
 
     :param environ: Environment mapping to read.
     :param name: Lowercase variable name, e.g. ``"http_proxy"``.
@@ -73,6 +75,8 @@ def _env(environ: Mapping[str, str], name: str) -> str | None:
     for key, candidate in environ.items():
         if key.lower() == name and candidate:
             value = candidate
+    if name == "http_proxy" and "REQUEST_METHOD" in environ:
+        value = None
     for key, candidate in environ.items():
         if key.lower() == name and key.endswith("_proxy"):
             value = candidate or None
@@ -86,7 +90,9 @@ def _bypassed_by_no_proxy(host: str, port: int | None, no_proxy: str) -> bool:
     the tunnel never disagree about the proxy: ``*`` disables proxying; a
     plain name matches itself and its subdomains; a leading dot matches
     subdomains only; a ``*``-prefixed entry matches nothing; an IP literal or
-    ``localhost`` matches that exact text; ``host:port`` also requires the port.
+    ``localhost`` matches that exact text (also when the entry carries a port,
+    where httpx falls back to suffix matching); ``host:port`` also requires
+    the port.
 
     :param host: Target hostname (no brackets), lowercase or not.
     :param port: Target port when explicit and not the scheme default, else
@@ -291,8 +297,8 @@ async def open_proxy_connect_socket(
     except TimeoutError:
         # Registered first: the worker may finish just as the deadline fires.
         dial.add_done_callback(_close_dial_result)
-        if dial.done():
-            raise
+        if dial.done() and not dial.cancelled() and dial.exception() is not None:
+            raise  # the worker's own budget fired; keep its message
         raise TimeoutError(
             f"proxy did not complete CONNECT to {target_host}:{target_port} within {timeout:g}s"
         ) from None
