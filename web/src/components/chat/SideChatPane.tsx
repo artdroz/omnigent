@@ -24,7 +24,7 @@ import {
 } from "@/components/chat/chatBubbleParts";
 import { ChatComposer, ComposerSendButton } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
-import { ComposerMicButton } from "@/components/ComposerMicButton";
+import { ComposerMicButton, type ComposerMicButtonHandle } from "@/components/ComposerMicButton";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import { Button } from "@/components/ui/button";
@@ -371,6 +371,9 @@ function SideChatComposer({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const voiceSnapshotRef = useRef("");
+  // Lets a Send end a live voice take: a live side chat stays enabled while
+  // busy, so sending alone never disables the mic to auto-stop it.
+  const micRef = useRef<ComposerMicButtonHandle>(null);
   const dictation = useDictationInsert(text, setText, textareaRef);
   // This tab's seeded text: on a pending tab the "Ask in side chat" selection
   // to QUOTE, on a live tab the `/side` question to SEND.
@@ -428,6 +431,8 @@ function SideChatComposer({
     }
     if (busy || (trimmed.length === 0 && files.length === 0) || agentId === null) return;
     const outgoing = files;
+    // A sent message ends any live voice take so the mic stops recording.
+    micRef.current?.endTake();
     clearComposer(childId);
     void send(trimmed, agentId, outgoing.length > 0 ? outgoing : undefined, {
       pinnedConversationId: childId,
@@ -501,6 +506,7 @@ function SideChatComposer({
           trailing: (
             <>
               <ComposerMicButton
+                ref={micRef}
                 className="size-8 md:size-7"
                 disabled={!ready}
                 onVoiceStart={() => {

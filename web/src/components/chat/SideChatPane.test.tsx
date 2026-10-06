@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { createPortal } from "react-dom";
-import { StrictMode } from "react";
+import { forwardRef, StrictMode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { toast } from "sonner";
@@ -17,7 +17,11 @@ vi.mock("@/store/chatStore", async (importOriginal) => ({
 }));
 
 vi.mock("@/components/composer/ComposerAddMenu", () => ({ ComposerAddMenu: () => null }));
-vi.mock("@/components/ComposerMicButton", () => ({ ComposerMicButton: () => null }));
+vi.mock("@/components/ComposerMicButton", () => ({
+  // forwardRef so the pane's mic ref (used to end the take on send) attaches
+  // without React's "function components cannot be given refs" warning.
+  ComposerMicButton: forwardRef(() => null),
+}));
 const sessionLabels = vi.hoisted(() => ({ current: {} as Record<string, string> }));
 vi.mock("@/hooks/useSession", () => ({
   useSession: () => ({ session: { labels: sessionLabels.current }, isLoading: false, error: null }),

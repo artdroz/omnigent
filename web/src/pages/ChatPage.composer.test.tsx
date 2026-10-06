@@ -5914,3 +5914,65 @@ describe("saved sandbox inference policy", () => {
     },
   );
 });
+
+describe("Composer voice dictation", () => {
+  let handlers: Record<string, (event: unknown) => void>;
+  let stopSpy: ReturnType<typeof vi.fn>;
+  let originalMediaDevices: PropertyDescriptor | undefined;
+
+  beforeEach(() => {
+    handlers = {};
+    stopSpy = vi.fn();
+    class FakeRecognition {
+      continuous = false;
+      interimResults = false;
+      lang = "en-US";
+      start = vi.fn();
+      stop = stopSpy;
+      addEventListener(type: string, handler: (event: unknown) => void) {
+        handlers[type] = handler;
+      }
+      removeEventListener() {}
+    }
+    vi.stubGlobal("SpeechRecognition", FakeRecognition);
+    // The listening-state visualizer calls getUserMedia; reject so jsdom never
+    // constructs an AudioContext.
+    originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia: vi.fn().mockRejectedValue(new Error("no mic")) },
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    if (originalMediaDevices) {
+      Object.defineProperty(navigator, "mediaDevices", originalMediaDevices);
+    } else {
+      delete (navigator as { mediaDevices?: unknown }).mediaDevices;
+    }
+  });
+
+  it("ends the voice take when the dictated message is sent", () => {
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    const mic = screen.getByRole("button", { name: "Voice dictation" });
+    fireEvent.click(mic);
+    act(() => handlers.start?.({}));
+    expect(mic).toHaveAttribute("aria-pressed", "true");
+    act(() =>
+      handlers.result?.({
+        resultIndex: 0,
+        results: {
+          length: 1,
+          0: { length: 1, isFinal: true, 0: { transcript: "voice dictated message" } },
+        },
+      }),
+    );
+    expect(textarea().value).toBe("voice dictated message");
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(onSend).toHaveBeenCalledWith("voice dictated message", undefined);
+    expect(stopSpy).toHaveBeenCalledTimes(1);
+  });
+});

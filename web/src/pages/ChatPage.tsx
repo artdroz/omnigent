@@ -213,7 +213,7 @@ import {
   useWorkspaceDirectory,
   type WorkspaceFile,
 } from "@/hooks/useWorkspaceChangedFiles";
-import { ComposerMicButton } from "@/components/ComposerMicButton";
+import { ComposerMicButton, type ComposerMicButtonHandle } from "@/components/ComposerMicButton";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
 import {
@@ -2632,6 +2632,9 @@ function ComposerImpl(
   const dirtyRef = useRef(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
+  // Lets a Send end a live voice take: on touch devices Send is a button tap,
+  // which never reaches the mic's Enter-commit handler.
+  const micRef = useRef<ComposerMicButtonHandle>(null);
   // On mobile, programmatic focus immediately summons the software keyboard.
   // Keep desktop's fast-type affordance, but let mobile users explicitly tap
   // the composer when switching back from Terminal or changing sessions.
@@ -3438,6 +3441,8 @@ function ComposerImpl(
     } else {
       onSend(mentionPreamble + trimmed, sendFiles);
     }
+    // A sent message ends any live voice take so the mic stops recording.
+    micRef.current?.endTake();
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);
     clearAttachments();
@@ -3982,6 +3987,7 @@ function ComposerImpl(
                 />
               </div>
               <ComposerMicButton
+                ref={micRef}
                 className="size-8 md:size-7"
                 enableHotkey
                 disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}

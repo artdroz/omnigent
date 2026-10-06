@@ -8,7 +8,15 @@ import { DictationBusyError, DictationSession } from "@/lib/dictation";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { Loader2Icon, MicIcon, SquareIcon } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  type ForwardedRef,
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+} from "react";
 
 // Local-only types; speech-input.tsx already augments Window globally.
 interface SpeechRecognitionLike {
@@ -92,21 +100,32 @@ export interface ComposerMicButtonProps {
   onVoiceDiscard?: () => void;
 }
 
+export interface ComposerMicButtonHandle {
+  /** End an in-progress take, keeping whatever was already dictated but never
+   *  flushing a trailing server utterance. Parents call this when they commit
+   *  the draft (e.g. a Send tap, which on touch devices never reaches the
+   *  Enter-commit handler). No-op when idle. */
+  endTake: () => void;
+}
+
 /** getUserMedia permission failures, distinct from transport failures. */
 const isPermissionError = (error: unknown): boolean =>
   error instanceof DOMException &&
   (error.name === "NotAllowedError" || error.name === "SecurityError");
 
-export const ComposerMicButton = ({
-  onTranscript,
-  className,
-  onInterim,
-  disabled,
-  lang = getDefaultDictationLang(),
-  enableHotkey = false,
-  onVoiceStart,
-  onVoiceDiscard,
-}: ComposerMicButtonProps) => {
+function ComposerMicButtonImpl(
+  {
+    onTranscript,
+    className,
+    onInterim,
+    disabled,
+    lang = getDefaultDictationLang(),
+    enableHotkey = false,
+    onVoiceStart,
+    onVoiceDiscard,
+  }: ComposerMicButtonProps,
+  ref: ForwardedRef<ComposerMicButtonHandle>,
+) {
   // Web Speech is primary whenever the browser has the constructor
   // (Chrome/Safari, unchanged behavior); with no constructor at all
   // (Firefox) takes use server dictation when GET /v1/info advertises it.
@@ -464,6 +483,26 @@ export const ComposerMicButton = ({
     }
   }, [isListening, Ctor, serverAvailable, toggleServer]);
 
+  // Server takes are cancelled (no trailing flush into the cleared composer);
+  // Web Speech is stopped so its end event keeps whatever was already dictated.
+  const endTake = useCallback(() => {
+    const session = sessionRef.current;
+    if (session) {
+      sessionRef.current = null;
+      serverBusyRef.current = false;
+      session.cancel();
+      setIsListening(false);
+      return;
+    }
+    if (!isListening && !transitionRef.current) return;
+    try {
+      recognitionRef.current?.stop();
+    } catch {
+      // Already stopping — the end event will reconcile state.
+    }
+  }, [isListening]);
+  useImperativeHandle(ref, () => ({ endTake }), [endTake]);
+
   // ⌘⌥V toggles dictation from anywhere — same as clicking the button. Enabled
   // whenever dictation could run (Web Speech OR the server path) and the
   // composer isn't disabled, so the chord is inert when it can't do anything.
@@ -561,4 +600,7 @@ export const ComposerMicButton = ({
       )}
     </Button>
   );
-};
+}
+
+export const ComposerMicButton = forwardRef(ComposerMicButtonImpl);
+ComposerMicButton.displayName = "ComposerMicButton";
