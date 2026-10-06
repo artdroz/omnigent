@@ -2177,6 +2177,10 @@ async def _runner_confirmed_offline(session_id: str, runner_router: RunnerRouter
         runner_router.client_for_session_resources(session_id)
     except OmnigentError as exc:
         return exc.code != ErrorCode.WRONG_REPLICA
+    except (LookupError, httpx.HTTPError):
+        # A routing/transport failure is not proof the runner is gone; the
+        # reconcile is best-effort, so never fail an already-resolved answer.
+        return False
     return False
 
 

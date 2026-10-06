@@ -1,35 +1,13 @@
-"""Multiagent "Needs response" stuck after a runner death and a server restart.
+"""Answering a sub-agent prompt must clear "Needs response" after a restart.
 
-A sub-agent asks a question, the session sits
-at "Needs response", the harness message reader dies (``exit code 143`` / SIGTERM),
-the user restarts Omnigent, and the session stays "Needs response" while the answer
-never reaches the agent.
-
-This drives the deterministic, environment-independent core of that failure:
-
-1. A runner-bound session (modelling the sub-agent's session, which runs on its
-   own transient runner) parks a real ``permission-request`` elicitation via the
-   claude-native hook. The persisted ``pending_elicitation_count`` becomes 1, so
-   the sidebar renders the "Needs response" badge
-   (``SessionStateBadge`` reads ``pending_elicitations_count`` via
-   ``useSessionState``).
-2. The runner is killed with SIGTERM (the reported ``exit code 143`` message-reader
-   death) and is NOT restarted — a dispatched sub-agent's per-turn runner does not
-   come back on its own.
-3. Omnigent is restarted (the server process recycles against the same durable
-   store). The in-memory pending-elicitation index dies with the process; the
-   persisted count survives on the conversation row. ``_on_runner_connect``'s
-   reconcile is keyed per-runner and never fires for the dead sub-agent runner, so
-   the badge stays "Needs response".
-4. The user answers via the resolve endpoint. Because the in-memory index is empty
-   after the restart, ``pending_elicitations.resolve()`` early-returns without
-   firing the count-persist hook, so the persisted count is never decremented — the
-   badge stays stuck and the answer never registers.
-
-The test asserts the behaviour a *fixed* build must satisfy: after the user
-answers the restarted session, the pending-elicitation badge must clear
-(``pending_elicitations_count == 0``). On the buggy build the answer is a no-op
-and the count stays 1, so this assertion fails — the fail→pass target for the fix.
+A sub-agent's transient runner dies (SIGTERM / exit 143) and never reconnects,
+then the server restarts against the same durable store: the in-memory
+pending-elicitation index is gone but the persisted count survives, and the
+per-runner reconcile in ``_on_runner_connect`` never fires for the dead runner.
+This drives that scenario end-to-end over real server and runner processes and
+asserts the invariant a fixed build must hold — after the user answers the
+restarted session, ``pending_elicitations_count`` returns to 0 so the sidebar
+badge clears. On the buggy build the answer is a no-op and the count stays 1.
 """
 
 from __future__ import annotations

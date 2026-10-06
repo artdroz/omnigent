@@ -1,20 +1,11 @@
-"""Answering a parked prompt must clear a restart-orphaned pending count.
+"""Answering a parked prompt reconciles a restart-orphaned pending count.
 
-A sub-agent's transient runner can die (SIGTERM / exit 143) and never reconnect;
-a server restart then wipes the in-memory pending-elicitation index while the
-persisted ``pending_elicitation_count`` survives on the conversation row. The
-per-runner resync in ``_on_runner_connect`` only fires when that runner comes
-back, and the in-memory ``resolve`` early-returns on the empty index — so before
-the fix the user's answer never decremented the persisted count and the sidebar
-"Needs response" badge stayed lit forever.
-
-``_resolve_elicitation`` now reconciles the persisted count to the authoritative
-live count when the bound runner is confirmed offline, so an answer to an
-orphaned prompt finally clears the badge. A reachable runner is left untouched,
-and so is a runner that is merely live on another replica (``WRONG_REPLICA``):
-that replica owns the tunnel and the authoritative count, so reconciling off
-this replica's empty index would wrongly zero the badge without the answer ever
-reaching the runner.
+When a sub-agent's runner dies and a restart wipes the in-memory index, the
+persisted ``pending_elicitation_count`` is orphaned and the "Needs response"
+badge stays lit. ``_resolve_elicitation`` reconciles the persisted count to the
+live count only when the bound runner is confirmed offline: a reachable runner,
+and one merely live on another replica (``WRONG_REPLICA``), own the
+authoritative count and are left untouched.
 """
 
 from __future__ import annotations
@@ -30,9 +21,14 @@ from omnigent.server.routes import sessions as S
 @pytest.fixture
 def _clean_index():
     """Isolate the module-global pending-elicitation index per test."""
+    # reset_for_tests clears the index but not the count-persist hook; a hook
+    # leaked from another test would bypass the per-test persist_pending_count
+    # patch, so clear it too.
     pending_elicitations.reset_for_tests()
+    pending_elicitations.set_count_persist_hook(None)
     yield
     pending_elicitations.reset_for_tests()
+    pending_elicitations.set_count_persist_hook(None)
 
 
 def _request_event(elicitation_id: str) -> dict:
@@ -99,7 +95,7 @@ async def test_offline_runner_resolve_persists_remaining_live_count(_clean_index
 
     await S._resolve_elicitation(sid, {"elicitation_id": answered, "action": "accept"}, None)
 
-    assert persisted[-1] == (sid, 1), (
+    assert (sid, 1) in persisted and persisted[-1] == (sid, 1), (
         "reconcile must persist the authoritative live count (1, the still-live "
         f"sibling), not a blind zero; got {persisted}"
     )
@@ -206,4 +202,82 @@ async def test_offline_runner_via_router_resolve_reconciles(_clean_index, monkey
     assert (sid, 0) in persisted, (
         "a confirmed-offline runner (RUNNER_UNAVAILABLE) must reconcile the "
         f"persisted count to the live count (0) via the router path; got {persisted}"
+    )
+
+
+class _ExplodingRouter:
+    """Router whose resource lookup fails with a non-routing error."""
+
+    def client_for_session_resources(self, session_id: str):
+        raise LookupError("host record missing")
+
+
+@pytest.mark.asyncio
+async def test_router_lookup_error_resolve_stays_best_effort(_clean_index, monkeypatch):
+    """A non-routing lookup failure is not proof the runner is gone: the resolve
+    must neither raise (the answer already forwarded) nor reconcile blindly."""
+    sid = "conv_router_boom"
+    eid = "elicit_evaluate_66666666666666666666666666666666"
+
+    async def _no_local_client(session_id, runner_router, **kwargs):
+        return None
+
+    monkeypatch.setattr(S, "_get_runner_client", _no_local_client)
+
+    persisted: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        session_live_state,
+        "persist_pending_count",
+        lambda conv_id, count: persisted.append((conv_id, count)),
+    )
+
+    router = _ExplodingRouter()
+    # Must not raise even though the routing lookup blows up.
+    await S._resolve_elicitation(sid, {"elicitation_id": eid, "action": "accept"}, router)
+
+    assert persisted == [], (
+        "a non-routing lookup failure is inconclusive, so the reconcile must be "
+        f"skipped rather than clobber the count; got {persisted}"
+    )
+
+
+class _RoutedRouter:
+    """Router that successfully resolves a client for the session's runner."""
+
+    def client_for_session_resources(self, session_id: str):
+        return object()
+
+
+@pytest.mark.asyncio
+async def test_routed_runner_resolve_does_not_reconcile(_clean_index, monkeypatch):
+    """A router that resolves a client locally means the runner is reachable from
+    this replica, so the resolve must leave the authoritative count untouched."""
+    sid = "conv_routed_live"
+    eid = "elicit_evaluate_77777777777777777777777777777777"
+
+    class _FakeResponse:
+        status_code = 202
+
+    class _FakeClient:
+        async def post(self, *args, **kwargs):
+            return _FakeResponse()
+
+    async def _live_runner(session_id, runner_router, **kwargs):
+        return _FakeClient()
+
+    monkeypatch.setattr(S, "_get_runner_client", _live_runner)
+
+    persisted: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        session_live_state,
+        "persist_pending_count",
+        lambda conv_id, count: persisted.append((conv_id, count)),
+    )
+
+    router = _RoutedRouter()
+    await S._resolve_elicitation(sid, {"elicitation_id": eid, "action": "accept"}, router)
+
+    assert persisted == [], (
+        "a successfully routed (reachable) runner must not trigger the offline "
+        f"reconcile; the routed replica owns the count; got {persisted}"
     )
