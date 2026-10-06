@@ -1091,12 +1091,18 @@ def _bridge_codex_credential_store(source_file: Path, dest_path: Path) -> None:
     """
     try:
         os.link(source_file, dest_path)
+    except FileExistsError:
+        # A concurrent populate of a shared probe home can win the race to the
+        # same source inode between the caller's existence check and this link.
+        with suppress(OSError):
+            if os.path.samefile(source_file, dest_path):
+                return
+        raise
     except OSError as exc:
         if exc.errno != errno.EXDEV:
-            # Only a cross-filesystem link is truly impossible. Any other link
-            # failure must surface rather than silently degrade to a private
-            # copy: a same-filesystem copy is indistinguishable from an orphaned
-            # hard link and a later relink would clobber its refreshed tokens.
+            # Non-EXDEV failures must surface: a same-filesystem copy is
+            # indistinguishable from an orphaned hard link, so a later relink
+            # would clobber its refreshed tokens.
             raise
         logger.info(
             "could not hard-link %r into %s (%s); copying instead, so token "
@@ -1147,7 +1153,11 @@ def _relink_rotated_codex_credential_store(source_file: Path, dest_path: Path) -
         os.link(source_file, staging)
     except OSError:
         return
-    os.replace(staging, dest_path)
+    try:
+        os.replace(staging, dest_path)
+    except OSError:
+        staging.unlink(missing_ok=True)
+        raise
 
 
 def _populate_codex_home_config(

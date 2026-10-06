@@ -4063,6 +4063,86 @@ def test_populate_codex_home_config_propagates_non_cross_device_link_failure(
     assert not (target / ".credentials.json.copy").exists()
 
 
+def test_bridge_codex_credential_store_tolerates_concurrent_bridge_of_same_inode(
+    tmp_path: Path,
+) -> None:
+    """A concurrent populate that already bridged the same inode is a no-op.
+
+    Two populates of a shared probe home can both pass the caller's existence
+    check and race to hard-link the same source store. The loser's ``os.link``
+    raises ``FileExistsError``; because the winner produced the identical inode,
+    the bridge must treat it as done rather than fail population.
+    """
+    from omnigent.inner.codex_executor import _bridge_codex_credential_store
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    store = source / ".credentials.json"
+    store.write_text('{"linear|abc": {"access_token": "t"}}')
+    dest = tmp_path / "probe_codex_home" / ".credentials.json"
+    dest.parent.mkdir()
+    os.link(store, dest)
+
+    _bridge_codex_credential_store(store, dest)
+
+    assert os.path.samefile(store, dest)
+    assert dest.read_text() == '{"linear|abc": {"access_token": "t"}}'
+
+
+def test_bridge_codex_credential_store_rejects_conflicting_destination(
+    tmp_path: Path,
+) -> None:
+    """A destination that is not the source inode surfaces the link conflict.
+
+    A pre-existing file that does not share the source inode is not the benign
+    same-inode race, so the ``FileExistsError`` must propagate rather than be
+    masked and leave an unrelated file standing in for the store.
+    """
+    from omnigent.inner.codex_executor import _bridge_codex_credential_store
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    store = source / ".credentials.json"
+    store.write_text('{"linear|abc": {"access_token": "t"}}')
+    dest = tmp_path / "probe_codex_home" / ".credentials.json"
+    dest.parent.mkdir()
+    dest.write_text("{}")
+
+    with pytest.raises(FileExistsError):
+        _bridge_codex_credential_store(store, dest)
+    assert dest.read_text() == "{}"
+
+
+def test_relink_rotated_credential_store_cleans_staging_on_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed relink publish removes its staging link instead of leaking it.
+
+    The relink stages a fresh hard link and atomically renames it over the
+    orphaned store. If the rename fails, the ``.relink`` staging file must not
+    be left behind, and the error must surface.
+    """
+    from omnigent.inner.codex_executor import _relink_rotated_codex_credential_store
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    store = source / ".credentials.json"
+    store.write_text('{"linear|new": {"access_token": "t2"}}')
+    dest = tmp_path / "persistent_codex_home" / ".credentials.json"
+    dest.parent.mkdir()
+    dest.write_text('{"linear|old": {"access_token": "t1"}}')
+
+    def _blocked_replace(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.EACCES, "permission denied")
+
+    monkeypatch.setattr(os, "replace", _blocked_replace)
+
+    with pytest.raises(OSError) as excinfo:
+        _relink_rotated_codex_credential_store(store, dest)
+    assert excinfo.value.errno == errno.EACCES
+    assert not (dest.parent / ".credentials.json.relink").exists()
+
+
 def test_populate_codex_home_config_symlinks_memories(tmp_path: Path) -> None:
     """``memories_1.sqlite``, ``memories/``, and ``rules/`` are symlinked.
 
