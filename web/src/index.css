@@ -2271,6 +2271,11 @@ aside[aria-label="Workspace"][data-maximized] {
   .turn-fold-content[data-state="closed"] {
     animation: none;
   }
+  /* The global gate turns the hidden-geometry swap into a one-frame
+     transition, which would show the expanded trace scaled down for a frame. */
+  .turn-fold-content {
+    transition: none !important;
+  }
   /* No collapse animation, so hide the mounted trace at once; the fold's
      settled-closed inline geometry takes over from here. */
   .turn-fold-content[data-state="closed"] {

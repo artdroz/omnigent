@@ -184,9 +184,11 @@ def _seed_settled_markdown_turn(base_url: str, session_id: str) -> None:
     _publish_status(base_url, session_id, "idle", response_id=thread)
 
 
+@pytest.mark.parametrize("reduced_motion", [False, True], ids=["motion", "reduced-motion"])
 def test_expanding_settled_fold_does_not_rerender_markdown(
     request: pytest.FixtureRequest,
     seeded_session: tuple[str, str],
+    reduced_motion: bool,
 ) -> None:
     """Expanding a settled turn must not jolt or re-highlight its markdown."""
     base_url, session_id = seeded_session
@@ -194,6 +196,9 @@ def test_expanding_settled_fold_does_not_rerender_markdown(
 
     # Requested after seeding so a recording starts at the reported journey.
     page: Page = request.getfixturevalue("page")
+    if reduced_motion:
+        # No collapse animation: the hidden geometry alone must hold the trace.
+        page.emulate_media(reduced_motion="reduce")
     # Navigate after settlement so the history fold mounts closed.
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=20_000)
