@@ -2365,7 +2365,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 ...(initialDraft ? { initialDraft } : {}),
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
-                ...(s.blocks.some(isLiveProvisionalBlock) ? { sentWhileStreaming: true } : {}),
+                ...(alreadyStreaming ? { sentWhileStreaming: true } : {}),
               },
             ],
         // A new turn does NOT supersede the background-shell tally: shells
@@ -7518,7 +7518,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         }
 
         // 3. Nothing pending (or a marker that owns no bubble) — render the
-        //    event payload fresh.
+        //    event payload fresh. No local send timing (another client), so
+        //    append below any streaming preview instead of guessing a lift.
         if (eventContent === null) return {};
         return {
           blocks: blocksWithPromotedUserMessage(

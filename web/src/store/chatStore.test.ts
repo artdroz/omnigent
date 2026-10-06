@@ -1327,8 +1327,9 @@ describe("chatStore — switchTo", () => {
     sink.close();
   });
 
-  // Compose transcript bubbles exactly as Transcript.tsx does, then assert the
-  // user's own prompt renders above the assistant reply.
+  // Compose transcript bubbles like Transcript.tsx (buildBubbles + pending
+  // merge); the elicitation/routing-chip reorders it also runs do not affect
+  // these ordering scenarios. Then assert prompt-above-reply ordering.
   const composeNativeRoles = (): string[] => {
     const state = useChatStore.getState();
     const committed = buildBubbles(

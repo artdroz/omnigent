@@ -545,6 +545,19 @@ const steeredUserBubble = (id: string): Bubble => ({
   content: [{ type: "input_text", text: id }],
   sentWhileStreaming: true,
 });
+// A streaming reply bubble that already holds a settled non-text item (a
+// completed native tool call) plus the next reply's trailing `live:` preview.
+const toolThenPreviewReply = (toolId: string, previewId: string): Bubble => ({
+  kind: "assistant",
+  responseId: previewId,
+  stableId: toolId,
+  lifecycle: "streaming",
+  error: null,
+  items: [
+    { kind: "native_tool", itemId: toolId, toolType: "read", label: "Read", data: {} },
+    { kind: "text", itemId: `live:${previewId}`, text: "Next", final: true },
+  ],
+});
 // A card with no turn to anchor to carries the `elicit_*` response id
 // blockStream stamps for exactly that case; pass `responseId` to model a
 // card that DOES belong to a turn (an inline approval, or a question card
@@ -705,6 +718,27 @@ describe("mergePendingBubbles", () => {
     const committed = [livePreviewReply("a1")];
     const merged = mergePendingBubbles(committed, [steeredUserBubble("pend_1")]);
     expect(bubbleIds(merged)).toEqual(["a1", "pend_1"]);
+  });
+
+  it("lifts an idle send above a trailing preview but keeps a steered one below", () => {
+    // A mixed pending batch — an idle prompt whose reply is previewing plus a
+    // follow-up steered into it — splits around the preview: idle above it,
+    // steered below it, rather than collapsing to one placement for the batch.
+    const committed = [livePreviewReply("a1")];
+    const merged = mergePendingBubbles(committed, [
+      userBubble("idle_1"),
+      steeredUserBubble("steer_1"),
+    ]);
+    expect(bubbleIds(merged)).toEqual(["idle_1", "a1", "steer_1"]);
+  });
+
+  it("does NOT lift a prompt above a bubble whose settled content is a tool call", () => {
+    // A streaming bubble can fuse a committed tool call with the next reply's
+    // trailing preview; its settled non-text output keeps the prompt below it
+    // just like settled text would.
+    const committed = [userBubble("u1"), toolThenPreviewReply("t1", "a2")];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["u1", "t1", "pend_1"]);
   });
 });
 
