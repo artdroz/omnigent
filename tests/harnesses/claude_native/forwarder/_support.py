@@ -283,11 +283,12 @@ def _seed_subagent_on_disk(
     subagent_id: str,
     agent_type: str,
     description: str,
-    tool_use_id: str,
+    tool_use_id: str | None,
     transcript_records: list[dict[str, Any]] | None = None,
     spawn_transcript_path: Path | None = None,
     spawn_tool_name: str = "Agent",
     transcript_subdir: str | None = None,
+    parent_agent_id: str | None = None,
 ) -> Path:
     """
     Create the ``.meta.json`` + ``.jsonl`` pair Claude Code would
@@ -303,7 +304,9 @@ def _seed_subagent_on_disk(
     :param agent_type: ``agentType`` value for the meta file,
         e.g. ``"Explore"``.
     :param description: ``description`` value for the meta file.
-    :param tool_use_id: ``toolUseId`` value for the meta file.
+    :param tool_use_id: ``toolUseId`` value for the meta file. ``None`` omits
+        the key and writes no spawning tool call, as Claude does for the
+        agents a workflow run launches.
     :param transcript_records: Optional list of decoded transcript
         rows to seed into the sub-agent's ``.jsonl``. ``None`` /
         empty leaves the transcript empty (the common case when a
@@ -316,47 +319,46 @@ def _seed_subagent_on_disk(
         the agent files land in, mirroring the CLI's per-agent
         ``transcriptSubdir`` (``workflows/<runId>`` for workflow-run spawns).
         ``None`` writes the flat ``subagents/agent-<id>.*`` layout.
+    :param parent_agent_id: Optional ``parentAgentId`` for the meta file: the
+        Claude agent id that spawned this one, when it was not the session.
     :returns: Path to the sub-agent's ``.jsonl`` (handy for tests
         that append rows after the fact).
     """
     spawn_path = spawn_transcript_path or transcript_path
-    with spawn_path.open("a", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(
-                {
-                    "isSidechain": spawn_path != transcript_path,
-                    "type": "assistant",
-                    "uuid": f"spawn-{subagent_id}",
-                    "message": {
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "tool_use",
-                                "id": tool_use_id,
-                                "name": spawn_tool_name,
-                                "input": {"description": description},
-                            }
-                        ],
-                    },
-                }
+    if tool_use_id is not None:
+        with spawn_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "isSidechain": spawn_path != transcript_path,
+                        "type": "assistant",
+                        "uuid": f"spawn-{subagent_id}",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": tool_use_id,
+                                    "name": spawn_tool_name,
+                                    "input": {"description": description},
+                                }
+                            ],
+                        },
+                    }
+                )
+                + "\n"
             )
-            + "\n"
-        )
     subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
     if transcript_subdir is not None:
         subagents_dir = subagents_dir / transcript_subdir
     subagents_dir.mkdir(parents=True, exist_ok=True)
     meta_path = subagents_dir / f"agent-{subagent_id}.meta.json"
-    meta_path.write_text(
-        json.dumps(
-            {
-                "agentType": agent_type,
-                "description": description,
-                "toolUseId": tool_use_id,
-            }
-        ),
-        encoding="utf-8",
-    )
+    meta: dict[str, Any] = {"agentType": agent_type, "description": description}
+    if tool_use_id is not None:
+        meta["toolUseId"] = tool_use_id
+    if parent_agent_id is not None:
+        meta["parentAgentId"] = parent_agent_id
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
     jsonl_path = subagents_dir / f"agent-{subagent_id}.jsonl"
     if transcript_records:
         jsonl_path.write_text(

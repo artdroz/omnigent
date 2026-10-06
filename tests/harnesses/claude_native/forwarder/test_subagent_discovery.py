@@ -739,8 +739,18 @@ async def test_subagent_watcher_registers_workflow_nested_spawn(
         tool_use_id="toolu_nested",
         transcript_subdir="workflows/wf_run_abc123",
     )
+    # Claude's workflow runner launches agents without a tool call: no toolUseId.
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="workflow-worker",
+        agent_type="general-purpose",
+        description="phase one",
+        tool_use_id=None,
+        transcript_subdir="workflows/wf_run_abc123",
+    )
 
     start_paths: dict[str, str] = {}
+    tool_use_ids: dict[str, str] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
@@ -748,6 +758,7 @@ async def test_subagent_watcher_registers_workflow_nested_spawn(
             return httpx.Response(202, json={})
         subagent_id = body["data"]["subagent_id"]
         start_paths[subagent_id] = request.url.path
+        tool_use_ids[subagent_id] = body["data"]["tool_use_id"]
         return httpx.Response(
             202,
             json={"queued": False, "child_session_id": f"conv_{subagent_id}"},
@@ -772,15 +783,24 @@ async def test_subagent_watcher_registers_workflow_nested_spawn(
     assert start_paths == {
         "flat-worker": "/v1/sessions/conv_root/events",
         "nested-worker": "/v1/sessions/conv_root/events",
+        "workflow-worker": "/v1/sessions/conv_root/events",
     }
+    assert tool_use_ids["nested-worker"] == "toolu_nested"
+    # The server requires a tool-use id, so a tool-less spawn gets a stable stand-in.
+    assert tool_use_ids["workflow-worker"] == "workflow:wf_run_abc123:workflow-worker"
     assert "nested-worker" in state.subagents
     assert state.subagents["nested-worker"].child_conversation_id == "conv_nested-worker"
+    assert state.subagents["workflow-worker"].transcript_subdir == "workflows/wf_run_abc123"
 
 
 def test_subagent_state_reader_keeps_transcript_subdir_inside_subagents(
     tmp_path: Path,
 ) -> None:
-    """A persisted ``transcript_subdir`` can only point inside ``subagents/``."""
+    """Persisted ids and subdirs can only point inside ``subagents/``.
+
+    Ids with separators, ``..`` or glob metacharacters are dropped; bad subdirs
+    fall back to the flat layout.
+    """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     rows = {
@@ -792,6 +812,8 @@ def test_subagent_state_reader_keeps_transcript_subdir_inside_subagents(
         "absolute": {"child_conversation_id": "conv_abs", "transcript_subdir": "/etc"},
         "escaping": {"child_conversation_id": "conv_esc", "transcript_subdir": "../../outside"},
         "malformed": {"child_conversation_id": "conv_bad", "transcript_subdir": 5},
+        "../../etc/cron.d/job": {"child_conversation_id": "conv_traversal"},
+        "wild*card": {"child_conversation_id": "conv_glob"},
     }
     (bridge_dir / "subagent_forwarder.json").write_text(
         json.dumps({"subagents": rows}), encoding="utf-8"
@@ -799,12 +821,14 @@ def test_subagent_state_reader_keeps_transcript_subdir_inside_subagents(
 
     state = forwarder._read_subagent_forward_state(bridge_dir)
 
+    # Rows without a usable value are left unrecorded (``None``) so the tail can
+    # relocate the transcript; an explicit ``""`` means a flat layout was seen.
     assert {sid: entry.transcript_subdir for sid, entry in state.subagents.items()} == {
         "nested": "workflows/wf_run_abc123",
-        "flat": "",
-        "absolute": "",
-        "escaping": "",
-        "malformed": "",
+        "flat": None,
+        "absolute": None,
+        "escaping": None,
+        "malformed": None,
     }
     subagents_dir = tmp_path / "session" / "subagents"
     assert forwarder._subagent_transcript_path(subagents_dir, state.subagents["nested"]) == (
@@ -867,3 +891,62 @@ async def test_subagent_watcher_keeps_first_meta_for_a_duplicated_id(
         if "duplicate claude-native sub-agent" in record.message
     ]
     assert len(warnings) == 1 and "workflows/wf_run_abc123" in warnings[0].message
+
+
+async def test_subagent_watcher_registers_workflow_child_under_its_parent_agent(
+    tmp_path: Path,
+) -> None:
+    """A tool-less workflow agent whose meta names ``parentAgentId`` joins that parent."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="lead",
+        agent_type="general-purpose",
+        description="workflow lead",
+        tool_use_id="toolu_lead",
+    )
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="phase-worker",
+        agent_type="general-purpose",
+        description="phase two",
+        tool_use_id=None,
+        transcript_subdir="workflows/wf_run_abc123",
+        parent_agent_id="lead",
+    )
+    start_paths: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("type") != "external_subagent_start":
+            return httpx.Response(202, json={})
+        subagent_id = body["data"]["subagent_id"]
+        start_paths[subagent_id] = request.url.path
+        return httpx.Response(
+            202,
+            json={"queued": False, "child_session_id": f"conv_{subagent_id}"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert start_paths == {
+        "lead": "/v1/sessions/conv_root/events",
+        "phase-worker": "/v1/sessions/conv_lead/events",
+    }
+    assert state.subagents["phase-worker"].parent_subagent_id == "lead"

@@ -106,6 +106,9 @@ _MAX_SEEN_DELTA_KEYS = 5000
 # Seconds without transcript activity before reporting an idle observation.
 # This heuristic does not establish that the sub-agent has completed.
 _SUBAGENT_IDLE_THRESHOLD_S = 5.0
+# Backoff between ``subagents/`` scans for a tracked transcript that is missing.
+_SUBAGENT_RELOCATE_BASE_DELAY_S = 1.0
+_SUBAGENT_RELOCATE_MAX_DELAY_S = 60.0
 
 # Sub-agent file globs under ``<session>/subagents/``, matched recursively: each
 # ``agent-<id>.meta.json`` sits beside its ``agent-<id>.jsonl``, flat for a Task spawn
@@ -591,7 +594,8 @@ class SubagentEntry:
         incomplete. After inactivity it reports ``failed`` instead of idle.
     :param transcript_subdir: Directory holding this sub-agent's files,
         relative to ``subagents/``: ``""`` for a flat Task spawn,
-        ``"workflows/<runId>"`` for a workflow-run spawn.
+        ``"workflows/<runId>"`` for a workflow-run spawn, ``None`` when the
+        state predates the field (the tail relocates the transcript).
     """
 
     subagent_id: str
@@ -602,7 +606,7 @@ class SubagentEntry:
     last_activity_ts: float | None = None
     last_status: str | None = None
     delivery_error: str | None = None
-    transcript_subdir: str = ""
+    transcript_subdir: str | None = None
 
 
 @dataclass(frozen=True)
@@ -638,6 +642,34 @@ class _SessionEventBatchCapability:
     """Cache whether this server accepts arrays at the session-events route."""
 
     supported: bool | None = None
+
+
+@dataclass
+class _SubagentRelocationBackoff:
+    """Space out ``subagents/`` scans for tracked entries whose transcript is missing."""
+
+    next_attempt_at: dict[str, float] = field(default_factory=dict)
+    attempts: dict[str, int] = field(default_factory=dict)
+
+    def due(self, subagent_id: str) -> bool:
+        """Return whether a relocation scan may run for ``subagent_id`` now."""
+        return time.monotonic() >= self.next_attempt_at.get(subagent_id, 0.0)
+
+    def record_miss(self, subagent_id: str) -> int:
+        """Schedule the next scan with exponential backoff and return the attempt count."""
+        attempts = self.attempts.get(subagent_id, 0) + 1
+        self.attempts[subagent_id] = attempts
+        delay_s = min(
+            _SUBAGENT_RELOCATE_BASE_DELAY_S * 2 ** (attempts - 1),
+            _SUBAGENT_RELOCATE_MAX_DELAY_S,
+        )
+        self.next_attempt_at[subagent_id] = time.monotonic() + delay_s
+        return attempts
+
+    def clear(self, subagent_id: str) -> None:
+        """Forget an entry whose transcript was found."""
+        self.next_attempt_at.pop(subagent_id, None)
+        self.attempts.pop(subagent_id, None)
 
 
 @dataclass
@@ -1221,6 +1253,7 @@ async def forward_claude_transcript_to_session(
     session_event_batch_capability = _SessionEventBatchCapability()
     delta_batch_capability = _SessionEventBatchCapability()
     subagent_status_capability = _SubagentStatusCapability()
+    subagent_relocation_backoff = _SubagentRelocationBackoff()
     # Dedupe: Claude rewrites the same usage block every poll until
     # the next assistant entry; only POST on real change. Mutated in
     # place by ``_forward_available_items`` and carried across polls.
@@ -1501,6 +1534,7 @@ async def forward_claude_transcript_to_session(
                                         status_retry_tracker=subagent_status_retries,
                                         batch_capability=session_event_batch_capability,
                                         status_capability=subagent_status_capability,
+                                        relocation_backoff=subagent_relocation_backoff,
                                     ),
                                     timeout=_FORWARD_LOOP_STALL_DEADLINE_S,
                                 ),
@@ -1594,6 +1628,16 @@ def _subagent_transcript_subdir(subagents_dir: Path, agent_file: Path) -> str:
     return "" if relative == Path() else relative.as_posix()
 
 
+def _is_workflow_subdir(transcript_subdir: str) -> bool:
+    """``workflows/<runId>`` holds the agents a Claude workflow run launched."""
+    return transcript_subdir.startswith("workflows/")
+
+
+def _workflow_tool_use_id(transcript_subdir: str, subagent_id: str) -> str:
+    """Stable stand-in for the ``tool_use_id`` the server requires of a registration."""
+    return f"workflow:{transcript_subdir.removeprefix('workflows/')}:{subagent_id}"
+
+
 def _subagent_transcript_path(subagents_dir: Path, entry: SubagentEntry) -> Path:
     """Locate a tracked sub-agent's ``agent-<id>.jsonl`` under ``subagents/``."""
     base = subagents_dir / entry.transcript_subdir if entry.transcript_subdir else subagents_dir
@@ -1633,6 +1677,12 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
     for subagent_id, row in subagents_raw.items():
         if not isinstance(subagent_id, str) or not isinstance(row, dict):
             continue
+        # The id is spliced into paths and a glob; a separator, ``..`` segment, or
+        # glob metacharacter would likewise escape ``subagents/``.
+        if len(Path(f"agent-{subagent_id}.jsonl").parts) != 1 or any(
+            ch in subagent_id for ch in "*?["
+        ):
+            continue
         child_id = row.get("child_conversation_id")
         parent_subagent_id = row.get("parent_subagent_id")
         byte_offset = row.get("byte_offset", 0)
@@ -1658,13 +1708,14 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             last_activity_ts = None
         if last_status is not None and not isinstance(last_status, str):
             last_status = None
-        # A hand-edited state file must not point the tail outside ``subagents/``.
+        # A hand-edited state file must not point the tail outside ``subagents/``;
+        # an absent or unusable value is relocated on the next tail.
         if (
             not isinstance(transcript_subdir, str)
             or Path(transcript_subdir).is_absolute()
             or ".." in Path(transcript_subdir).parts
         ):
-            transcript_subdir = ""
+            transcript_subdir = None
         entries[subagent_id] = SubagentEntry(
             subagent_id=subagent_id,
             child_conversation_id=child_id,
@@ -1812,7 +1863,9 @@ async def _post_external_subagent_start(
     return child_session_id
 
 
-def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
+def _read_subagent_meta(
+    meta_path: Path, *, allow_missing_tool_use_id: bool = False
+) -> dict[str, str] | None:
     """
     Read a Claude sub-agent's ``.meta.json`` file, validating the
     fields the forwarder needs.
@@ -1822,9 +1875,14 @@ def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
     on the next tick.
 
     :param meta_path: Path to ``agent-<id>.meta.json``.
+    :param allow_missing_tool_use_id: Accept a meta without ``toolUseId``.
+        Claude's workflow runner launches agents without a tool call, so
+        their metas carry none; ``parentAgentId`` then names the spawning
+        agent when it was not the session itself.
     :returns: A dict with string-typed ``agentType``, ``description``,
-        and ``toolUseId``; or ``None`` when the file is missing /
-        malformed / missing any required key.
+        ``toolUseId`` (``""`` when absent and allowed) and ``parentAgentId``
+        (``""`` when absent); or ``None`` when the file is missing /
+        malformed / missing a required key.
     """
     try:
         raw = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -1835,16 +1893,22 @@ def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
     agent_type = raw.get("agentType")
     description = raw.get("description")
     tool_use_id = raw.get("toolUseId")
+    parent_agent_id = raw.get("parentAgentId")
     if not isinstance(agent_type, str) or not agent_type:
         return None
     if not isinstance(description, str):
         return None
-    if not isinstance(tool_use_id, str) or not tool_use_id:
+    if tool_use_id is None and allow_missing_tool_use_id:
+        tool_use_id = ""
+    if not isinstance(tool_use_id, str) or (not tool_use_id and not allow_missing_tool_use_id):
         return None
+    if not isinstance(parent_agent_id, str):
+        parent_agent_id = ""
     return {
         "agentType": agent_type,
         "description": description,
         "toolUseId": tool_use_id,
+        "parentAgentId": parent_agent_id,
     }
 
 
@@ -2127,6 +2191,7 @@ async def _forward_one_subagent(
     status_retry_tracker: _PostRetryTracker,
     batch_capability: _SessionEventBatchCapability,
     status_capability: _SubagentStatusCapability,
+    relocation_backoff: _SubagentRelocationBackoff | None = None,
 ) -> None:
     """Drain one child's transcript in ordered, byte-capped batches."""
     retry_prefixes = (
@@ -2139,7 +2204,9 @@ async def _forward_one_subagent(
         return
     jsonl_path = _subagent_transcript_path(subagents_dir, entry)
     if not jsonl_path.exists():
-        if entry.transcript_subdir:
+        if relocation_backoff is None:
+            relocation_backoff = _SubagentRelocationBackoff()
+        if entry.transcript_subdir is not None or not relocation_backoff.due(entry.subagent_id):
             return
         # An older runner may have checkpointed this entry without its subdir;
         # relocate a nested transcript instead of waiting for a flat one forever.
@@ -2147,7 +2214,16 @@ async def _forward_one_subagent(
             _recover_subagent_transcript_subdir, subagents_dir, entry
         )
         if not recovered:
+            if relocation_backoff.record_miss(entry.subagent_id) == 1:
+                _logger.warning(
+                    "Tracked claude-native sub-agent has no transcript; "
+                    "parent_session=%s subagent_id=%s expected=%s",
+                    parent_session_id,
+                    entry.subagent_id,
+                    jsonl_path,
+                )
             return
+        relocation_backoff.clear(entry.subagent_id)
         entry = replace(entry, transcript_subdir=recovered)
         await checkpoint.put(entry)
         jsonl_path = _subagent_transcript_path(subagents_dir, entry)
@@ -2519,6 +2595,7 @@ async def _forward_available_subagents(
     status_retry_tracker: _PostRetryTracker,
     batch_capability: _SessionEventBatchCapability | None = None,
     status_capability: _SubagentStatusCapability | None = None,
+    relocation_backoff: _SubagentRelocationBackoff | None = None,
 ) -> SubagentForwardState:
     """
     Discover new Claude Task-tool sub-agents on disk, mint Omnigent child
@@ -2551,6 +2628,8 @@ async def _forward_available_subagents(
         event arrays. A new cache is created for direct callers that omit it.
     :param status_capability: Process-local cache of whether the server accepts
         idle observations. A new cache is created for direct callers that omit it.
+    :param relocation_backoff: Process-local backoff for re-scanning ``subagents/``
+        when a tracked transcript is missing. Created for direct callers that omit it.
     :returns: Updated state with new sub-agents registered and
         existing sub-agents' cursors advanced.
     """
@@ -2561,6 +2640,8 @@ async def _forward_available_subagents(
         batch_capability = _SessionEventBatchCapability()
     if status_capability is None:
         status_capability = _SubagentStatusCapability()
+    if relocation_backoff is None:
+        relocation_backoff = _SubagentRelocationBackoff()
 
     # ── Register newly-appeared sub-agents ──────────────
     # ``rglob`` is sync; offload to a thread so we don't stat the
@@ -2600,10 +2681,22 @@ async def _forward_available_subagents(
     )
     pending: list[tuple[Path, dict[str, str], str | None]] = []
     for meta_path in candidate_meta_paths:
-        meta = await asyncio.to_thread(_read_subagent_meta, meta_path)
+        transcript_subdir = _subagent_transcript_subdir(subagents_dir, meta_path)
+        meta = await asyncio.to_thread(
+            _read_subagent_meta,
+            meta_path,
+            allow_missing_tool_use_id=_is_workflow_subdir(transcript_subdir),
+        )
         if meta is None:
             continue
         tool_use_id = meta["toolUseId"]
+        if not tool_use_id:
+            # A workflow run launches its agents without a tool call; the meta
+            # names the spawning agent when there is one, else the session owns it.
+            subagent_id = _subagent_id_from_meta_path(meta_path)
+            meta["toolUseId"] = _workflow_tool_use_id(transcript_subdir, subagent_id)
+            pending.append((meta_path, meta, meta["parentAgentId"] or None))
+            continue
         if tool_use_id not in parents_by_tool_use:
             # No transcript owns this spawn yet: the record is still mid-write, or
             # it resolved to two owners and was dropped as ambiguous. Either way we
@@ -2780,6 +2873,7 @@ async def _forward_available_subagents(
                 status_retry_tracker=status_retry_tracker,
                 batch_capability=batch_capability,
                 status_capability=status_capability,
+                relocation_backoff=relocation_backoff,
             )
 
     entries = list(updated.subagents.values())

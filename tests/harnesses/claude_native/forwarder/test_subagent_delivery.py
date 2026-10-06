@@ -1473,8 +1473,10 @@ async def test_timed_out_batch_is_split_not_dropped(
     assert updated.seen_source_ids == tuple(item.source_id for item in items)
 
 
+@pytest.mark.parametrize("delivered_before", [0, 1], ids=["fresh", "advanced-cursor"])
 async def test_subagent_watcher_relocates_nested_transcript_when_state_lost_its_subdir(
     tmp_path: Path,
+    delivered_before: int,
 ) -> None:
     """
     A tracked nested child whose persisted entry lacks ``transcript_subdir`` (an
@@ -1510,16 +1512,24 @@ async def test_subagent_watcher_relocates_nested_transcript_when_state_lost_its_
             },
         ],
     )
+    # The row an older runner checkpoints: no transcript_subdir; the cursor may
+    # already sit past records delivered before the downgrade.
+    lines = nested_jsonl.read_bytes().splitlines(keepends=True)
     (bridge_dir / "subagent_forwarder.json").write_text(
         json.dumps(
             {
                 "subagents": {
-                    "nested-worker": {"child_conversation_id": "conv_nested", "byte_offset": 0}
+                    "nested-worker": {
+                        "child_conversation_id": "conv_nested",
+                        "byte_offset": sum(len(line) for line in lines[:delivered_before]),
+                        "seen_source_ids": ["nested-user-1:0:message"][:delivered_before],
+                    }
                 }
             }
         ),
         encoding="utf-8",
     )
+    expected = ["user:go", "assistant:phase one"][delivered_before:]
     posted: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1554,7 +1564,7 @@ async def test_subagent_watcher_relocates_nested_transcript_when_state_lost_its_
             )
 
         first = await forward()
-        assert posted == ["user:go", "assistant:phase one"]
+        assert posted == expected
         entry = first.subagents["nested-worker"]
         assert entry.transcript_subdir == "workflows/wf_run_abc123"
         assert entry.byte_offset == nested_jsonl.stat().st_size
@@ -1576,5 +1586,58 @@ async def test_subagent_watcher_relocates_nested_transcript_when_state_lost_its_
             )
         second = await forward()
 
-    assert posted == ["user:go", "assistant:phase one", "assistant:phase two"]
+    assert posted == [*expected, "assistant:phase two"]
     assert second.subagents["nested-worker"].byte_offset == nested_jsonl.stat().st_size
+
+
+async def test_subagent_watcher_backs_off_relocating_a_missing_transcript(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A tracked entry with no transcript anywhere is scanned for once per backoff window."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    forwarder._subagents_dir_for_transcript(transcript_path).mkdir(parents=True)
+    scans: list[str] = []
+    real_recover = forwarder._recover_subagent_transcript_subdir
+
+    def counting_recover(subagents_dir: Path, entry: forwarder.SubagentEntry) -> str | None:
+        scans.append(entry.subagent_id)
+        return real_recover(subagents_dir, entry)
+
+    monkeypatch.setattr(forwarder, "_recover_subagent_transcript_subdir", counting_recover)
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "ghost": forwarder.SubagentEntry(
+                subagent_id="ghost", child_conversation_id="conv_ghost"
+            )
+        }
+    )
+    backoff = forwarder._SubagentRelocationBackoff()
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(202, json={})),
+        base_url="http://ap",
+    ) as client:
+        with caplog.at_level(logging.WARNING, logger=forwarder._logger.name):
+            for _ in range(3):
+                state = await forwarder._forward_available_subagents(
+                    client=client,
+                    parent_session_id="conv_parent",
+                    bridge_dir=bridge_dir,
+                    transcript_path=transcript_path,
+                    state=state,
+                    agent_name="claude-native-ui",
+                    start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                    item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                    status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                    relocation_backoff=backoff,
+                )
+
+    assert scans == ["ghost"]
+    warnings = [record for record in caplog.records if "has no transcript" in record.message]
+    assert len(warnings) == 1 and "ghost" in warnings[0].message
+    assert state.subagents["ghost"].transcript_subdir is None
