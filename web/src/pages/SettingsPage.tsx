@@ -206,6 +206,10 @@ import {
 } from "@/lib/composerSendShortcutPreferences";
 import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
+  readDeleteWorktreesOnArchive,
+  writeDeleteWorktreesOnArchive,
+} from "@/lib/archiveWorktreePreferences";
+import {
   archivedAtSeconds,
   readRetentionDays,
   writeRetentionDays,
@@ -246,16 +250,19 @@ import {
   getCliStatus,
   isElectronShell,
   resetCliPath,
+  supportsBrowser,
   type UpdateConfig,
   type UpdateMode,
   updateBridge,
 } from "@/lib/nativeBridge";
+import { readOpenLinksInApp, writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { cn } from "@/lib/utils";
 import {
   readBackgroundSessionTitlesEnabled,
   writeBackgroundSessionTitlesEnabled,
 } from "@/lib/backgroundSessionTitlesPreferences";
-import { SettingsCustomizeSection } from "./settings/SettingsCustomizeSection";
+import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
+import { ReviewImportsPanel } from "@/components/onboarding/HostImportReview";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -282,11 +289,21 @@ export function SettingsPage() {
   // A login session exists (accounts OR OIDC) when the server advertises a
   // login_url; gates the Account section so SSO users get it too.
   const hasAuthSession = info !== "loading" && info.login_url !== null;
-  const { section, subSection } = useSettingsRoute();
+  const { section } = useSettingsRoute();
   // Per-section page view: `settings.appearance`, `settings.account`, etc. The
   // hook re-keys on pathname, so switching sections re-fires under the new id.
   // `section` is a closed SettingsSectionId union (no PII / unbounded values).
   useOmnigentPageView(`settings.${section}`);
+
+  const pageWrapperSettings = useMemo(() => {
+    if (section === "harnesses") {
+      return {
+        maxWidthClassName: "max-w-4xl",
+        contentClassName: "px-8",
+      };
+    }
+    return undefined;
+  }, [section]);
 
   // Members / Policies are admin-only management surfaces that own their full
   // layout (their own PageScroll + admin gating), so they render directly —
@@ -309,17 +326,11 @@ export function SettingsPage() {
     );
   }
 
-  // Nested sections own their own layout. useSettingsRoute only sets
-  // subSection for a valid, feature-enabled customize route, so no extra
-  // flag check is needed here.
-  if (section === "customize" && subSection) {
-    return <SettingsCustomizeSection subSection={subSection} />;
-  }
-
   return (
-    <PageScroll contentClassName="px-8" extraBottom="2.5rem">
+    <PageScroll contentClassName="px-8" extraBottom="2.5rem" {...pageWrapperSettings}>
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
+      {section === "harnesses" && <SettingsHarnessesSection />}
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}
       {section === "shortcuts" && <ShortcutsSection />}
@@ -1008,13 +1019,10 @@ function AppearanceSection() {
             </DialogHeader>
             <DialogFooter>
               <DialogClose asChild>
-                <Button variant="outline" size="sm">
-                  Cancel
-                </Button>
+                <Button variant="outline">Cancel</Button>
               </DialogClose>
               <Button
                 variant="default"
-                size="sm"
                 onClick={confirmResetAppearance}
                 data-testid="reset-appearance-confirm"
                 componentId="settings.appearance.reset"
@@ -1057,13 +1065,10 @@ function AppearanceSection() {
           )}
           <DialogFooter>
             <DialogClose asChild>
-              <Button variant="outline" size="sm">
-                Cancel
-              </Button>
+              <Button variant="outline">Cancel</Button>
             </DialogClose>
             <Button
               variant="default"
-              size="sm"
               data-testid="import-settings-choose-file"
               onClick={() => fileInputRef.current?.click()}
             >
@@ -1078,6 +1083,8 @@ function AppearanceSection() {
 
 /** Git behavior settings. */
 function GitSection() {
+  const info = useServerInfo();
+  const archiveWorktreeCleanup = info !== "loading" && info.archive_worktree_cleanup === true;
   return (
     <Section title="Git" description="Configure how Omnigent works with Git.">
       <div className="flex flex-col gap-3">
@@ -1087,6 +1094,11 @@ function GitSection() {
           <div className="mt-4 border-t border-border pt-4">
             <DefaultBaseBranchControl />
           </div>
+          {archiveWorktreeCleanup && (
+            <div className="mt-4 border-t border-border pt-4">
+              <DeleteWorktreesOnArchiveControl />
+            </div>
+          )}
         </div>
       </div>
     </Section>
@@ -1297,6 +1309,40 @@ function AlwaysUseWorktreeControl() {
 }
 
 /**
+ * Remove a session's git worktree when it's archived. Off until chosen; while
+ * unset, the first archive of a worktree session asks instead.
+ */
+function DeleteWorktreesOnArchiveControl() {
+  const [value, setValue] = useState(() => readDeleteWorktreesOnArchive() === true);
+  const labelId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setValue(next);
+    writeDeleteWorktreesOnArchive(next);
+  }, []);
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Delete worktrees for archived sessions
+        </span>
+        <span className="text-ui text-muted-foreground">
+          Remove a session's git worktree directory, including uncommitted changes, when you archive
+          it. The branch is kept.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        checked={value}
+        onCheckedChange={toggle}
+        data-testid="settings-delete-worktrees-on-archive-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.git.delete_worktrees_on_archive"
+      />
+    </div>
+  );
+}
+
+/**
  * Connect / disconnect a Databricks workspace. Once connected, a managed
  * sandbox launched by this user reaches the Databricks AI Gateway (MCP + model
  * serving) as them, using their per-user OAuth token. Databricks is
@@ -1487,6 +1533,45 @@ function ComposerSendShortcutControl() {
   );
 }
 
+/**
+ * Where a plain click on a web link in chat content opens — desktop shells
+ * with the embedded browser only. Off keeps the current behavior (the
+ * default external browser); on routes the link into the conversation's
+ * in-app Browser tab. Modified clicks always stay external.
+ */
+function OpenLinksInAppControl() {
+  const [enabled, setEnabled] = useState(readOpenLinksInApp);
+  const labelId = useId();
+  const descriptionId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setEnabled(next);
+    writeOpenLinksInApp(next);
+  }, []);
+
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Open links in the in-app browser
+        </span>
+        <span id={descriptionId} className="text-ui text-muted-foreground">
+          Open web links from chat in this conversation&apos;s Browser tab instead of your default
+          browser. {MOD_KEY}+click always opens the external browser.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        aria-describedby={descriptionId}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="open-links-in-app-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.open_links_in_app"
+      />
+    </div>
+  );
+}
+
 function BackgroundSessionTitlesControl() {
   const [enabled, setEnabled] = useState(readBackgroundSessionTitlesEnabled);
   const labelId = useId();
@@ -1610,6 +1695,14 @@ function GeneralSection() {
         <div className="rounded-xl border border-border bg-card p-4">
           <TerminalClipboardControl />
         </div>
+        {supportsBrowser() && (
+          <>
+            <h2 className="mt-3 text-ui font-medium">Links</h2>
+            <div className="rounded-xl border border-border bg-card p-4">
+              <OpenLinksInAppControl />
+            </div>
+          </>
+        )}
       </div>
     </Section>
   );
@@ -2592,6 +2685,15 @@ function ImportSection() {
         <h2 className="text-ui font-medium">Import from a machine</h2>
         <div className="rounded-xl border border-border bg-card p-4">
           <ImportSessionsPanel />
+        </div>
+      </div>
+      <div className="mt-8 flex flex-col gap-3">
+        <h2 className="text-ui font-medium">Harness imports</h2>
+        <p className="-mt-2 text-ui text-muted-foreground">
+          See the logins, MCP servers, skills, and plugins each machine's harnesses carry over.
+        </p>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <ReviewImportsPanel />
         </div>
       </div>
     </Section>
