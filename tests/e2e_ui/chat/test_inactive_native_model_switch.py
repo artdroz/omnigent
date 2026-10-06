@@ -191,10 +191,9 @@ def test_inactive_native_model_switch_recovers_terminal_first(
         f"but recovery was triggered on open: {recorded['recoveries']}"
     )
 
-    # Selecting applies the model only after recovery, so wait for the
-    # recovery-gated PATCH to settle: once its response arrives the retry_session
-    # recovery has already posted and any config error is rendered, so the checks
-    # below are not racing an in-flight request.
+    # Wait for the recovery-gated PATCH to settle: once it responds, the
+    # retry_session recovery has already posted and any config error is
+    # rendered, so the checks below are not racing an in-flight request.
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"

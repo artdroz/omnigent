@@ -2539,9 +2539,8 @@ function ComposerImpl(
   // Per-session lock guarding duplicate config changes, kept in a ref (not
   // useMemo, which React may discard mid-request) and looked up by id so an
   // in-flight request survives navigating away and back without affecting others.
-  const configBusyLocksRef = useRef<Map<string | null, { current: boolean }>>();
-  if (!configBusyLocksRef.current) configBusyLocksRef.current = new Map();
-  const configBusyLocks = configBusyLocksRef.current;
+  const configBusyLocksRef = useRef<Map<string | null, { current: boolean }> | null>(null);
+  const configBusyLocks = (configBusyLocksRef.current ??= new Map());
   if (!configBusyLocks.has(conversationId)) {
     configBusyLocks.set(conversationId, { current: false });
   }
@@ -3991,7 +3990,7 @@ function ComposerImpl(
                   modelLabelOptions={modelLabelOptions}
                   modelLabelHostId={composerSession?.hostId}
                   costRoutingEligible={costRoutingEligible}
-                  // Selecting a configuration wakes a missing native terminal,
+                  // Model and effort selections wake a missing native terminal,
                   // so the picker stays usable on reachable, asleep sessions.
                   disabled={isReadOnly || unreachable}
                   openNonce={pickerOpenNonce}
@@ -4643,7 +4642,6 @@ function SessionHarnessPicker({
   const [configOpen, setConfigOpen] = useState(false);
   const error = useChatStore((state) => state.sessionConfigError);
   const appliedOpenNonce = useRef(openNonce);
-  const conversationId = useChatStore((state) => state.conversationId);
   const sessionHarness = useChatStore((state) => state.sessionHarness);
   const subAgentName = useChatStore((state) => state.subAgentName);
   const pendingModelChange = useChatStore((state) => state.pendingModelChange);
@@ -4718,10 +4716,6 @@ function SessionHarnessPicker({
       setConfigOpen(true);
     }
   }, [openNonce, openMenu]);
-  useEffect(() => {
-    setMenuOpen(false);
-    setConfigOpen(false);
-  }, [conversationId]);
   const apply = (change: (sessionId: string | null) => Promise<unknown>) => {
     if (disabled || busy || busyRef.current || pendingModelChange !== null) return;
     return useChatStore.getState().applySessionConfig(change, { startTerminal: needsTerminal });

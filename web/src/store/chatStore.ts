@@ -874,6 +874,8 @@ export interface ConversationState {
   pendingModelChange: string | null;
   /** Configuration work survives Chat/Terminal view changes and session navigation. */
   sessionConfigPhase: "starting" | "applying" | null;
+  /** When the active `sessionConfigPhase` began, keying its hung-request grace timer. */
+  sessionConfigStartedAt: number | null;
   sessionConfigError: string | null;
   /**
    * Effective brain harness for the active session (override-aware),
@@ -1679,6 +1681,11 @@ const STREAM_RECONNECT_BASE_MS = 250;
 const STREAM_RECONNECT_MAX_MS = 5_000;
 export const ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS = 60_000;
 export const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS = 15_000;
+// A session-config request has no fetch timeout. If it never settles, the
+// `finally` that clears `sessionConfigPhase` never runs, so expire a stranded
+// phase after this grace instead — long enough to outlast terminal recovery and
+// a held-open PATCH, matching the launch spinner's own grace window.
+export const SESSION_CONFIG_GRACE_MS = 45_000;
 // After the stream reconnects, `reconcileActiveSessionStatus` runs once
 // immediately — but a server that just restarted may not have reprocessed the
 // in-flight turn's completion yet, so that read can see a stale "running" and
@@ -1895,6 +1902,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   llmModel: null,
   pendingModelChange: null,
   sessionConfigPhase: null,
+  sessionConfigStartedAt: null,
   sessionConfigError: null,
   sessionHarness: null,
   awaitingSideChatFor: null,
@@ -2905,6 +2913,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (retainedState) {
         configOnRebind = {
           sessionConfigPhase: retainedState.sessionConfigPhase,
+          sessionConfigStartedAt: retainedState.sessionConfigStartedAt,
           sessionConfigError: retainedState.sessionConfigError,
           pendingModelChange: retainedState.pendingModelChange,
         };
@@ -3091,10 +3100,23 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         : (patch) => setterFor(conversationId)(patch);
     const startTerminal =
       opts?.startTerminal === true && conversationId !== null && !isTempConvId(conversationId);
+    const startedAt = Date.now();
     patchSet({
       sessionConfigPhase: startTerminal ? "starting" : "applying",
+      sessionConfigStartedAt: startedAt,
       sessionConfigError: null,
     });
+    // The config request has no fetch timeout, so a hung PATCH would leave the
+    // `finally` below unreached and the phase (hence the launch spinner) stuck.
+    // Expire a stranded phase after the grace; keyed on startedAt so a newer
+    // change's phase survives. Mirrors the pendingModelChange hygiene timer.
+    setTimeout(() => {
+      patchSet((s) =>
+        s.sessionConfigStartedAt === startedAt
+          ? { sessionConfigPhase: null, sessionConfigStartedAt: null }
+          : {},
+      );
+    }, SESSION_CONFIG_GRACE_MS);
     try {
       if (startTerminal) {
         const result = await retrySession(conversationId);
@@ -3110,12 +3132,20 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
       await change(conversationId);
     } catch (error) {
-      patchSet({
-        sessionConfigError:
-          error instanceof Error ? error.message : "Unable to update session configuration",
-      });
+      patchSet((s) =>
+        s.sessionConfigStartedAt === startedAt
+          ? {
+              sessionConfigError:
+                error instanceof Error ? error.message : "Unable to update session configuration",
+            }
+          : {},
+      );
     } finally {
-      patchSet({ sessionConfigPhase: null });
+      patchSet((s) =>
+        s.sessionConfigStartedAt === startedAt
+          ? { sessionConfigPhase: null, sessionConfigStartedAt: null }
+          : {},
+      );
     }
   },
 

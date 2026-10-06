@@ -7,6 +7,7 @@ import {
   bindConversationForTest,
   handleSessionEvent,
   initChatStore,
+  SESSION_CONFIG_GRACE_MS,
   useChatStore,
 } from "./chatStore";
 import { conversationRegistry } from "./conversationRegistry";
@@ -115,6 +116,25 @@ describe("session-scoped configuration operations", () => {
     patch.resolve();
     await operation;
     expect(useChatStore.getState().sessionConfigPhase).toBeNull();
+  });
+
+  it("expires a stranded config phase after the grace when the request never settles", async () => {
+    vi.useFakeTimers();
+    try {
+      // A change whose PATCH never settles: the finally never runs, so only the
+      // grace timer can release the phase that gates the launch spinner.
+      const change = vi.fn().mockReturnValue(deferred<void>().promise);
+      void useChatStore.getState().applySessionConfig(change);
+      expect(change).toHaveBeenCalledExactlyOnceWith(SOURCE);
+      expect(useChatStore.getState().sessionConfigPhase).toBe("applying");
+      expect(useChatStore.getState().sessionConfigStartedAt).not.toBeNull();
+
+      await vi.advanceTimersByTimeAsync(SESSION_CONFIG_GRACE_MS);
+      expect(useChatStore.getState().sessionConfigPhase).toBeNull();
+      expect(useChatStore.getState().sessionConfigStartedAt).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it.each([null, "temp:creating"])("does not recover non-persisted session %s", async (id) => {
