@@ -5,7 +5,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type * as UnseenConversationsModule from "@/hooks/useUnseenConversations";
+import type * as UseFileContentModule from "@/hooks/useFileContent";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
@@ -24,6 +28,9 @@ const mocks = vi.hoisted(() => ({
   deleteConversation: vi.fn(),
   markUnread: vi.fn(),
   fork: vi.fn(),
+  exportTranscript: vi.fn(),
+  triggerDownload: vi.fn(),
+  toastError: vi.fn(),
 }));
 
 vi.mock("@/hooks/useIsMobileViewport", () => ({
@@ -51,6 +58,21 @@ vi.mock("@/hooks/useUnseenConversations", async (importOriginal) => {
   return { ...actual, markConversationUnread: mocks.markUnread };
 });
 
+vi.mock("@/lib/sessionsApi", async (importOriginal) => {
+  const actual = await importOriginal<typeof SessionsApiModule>();
+  return { ...actual, exportSessionTranscript: mocks.exportTranscript };
+});
+
+vi.mock("@/hooks/useFileContent", async (importOriginal) => {
+  const actual = await importOriginal<typeof UseFileContentModule>();
+  return { ...actual, triggerBrowserDownload: mocks.triggerDownload };
+});
+
+// `toast` is callable too: archiving shows the Undo pill via `toast(...)`.
+vi.mock("sonner", () => ({
+  toast: Object.assign(vi.fn(), { error: mocks.toastError, custom: vi.fn(), dismiss: vi.fn() }),
+}));
+
 const CONVERSATION: Conversation = {
   id: "conv-1",
   object: "conversation",
@@ -76,17 +98,19 @@ function menuTree(overrides: Partial<Parameters<typeof HeaderConversationMenu>[0
   const queryClient = new QueryClient();
   return (
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={[`/c/${overrides.conversation?.id ?? CONVERSATION.id}`]}>
-        <HeaderConversationMenu
-          conversation={CONVERSATION}
-          currentProject={null}
-          canShare
-          canFork
-          onShare={() => {}}
-          onFork={mocks.fork}
-          {...overrides}
-        />
-      </MemoryRouter>
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, archive_worktree_cleanup: true }}>
+        <MemoryRouter initialEntries={[`/c/${overrides.conversation?.id ?? CONVERSATION.id}`]}>
+          <HeaderConversationMenu
+            conversation={CONVERSATION}
+            currentProject={null}
+            canShare
+            canFork
+            onShare={() => {}}
+            onFork={mocks.fork}
+            {...overrides}
+          />
+        </MemoryRouter>
+      </CapabilitiesProvider>
     </QueryClientProvider>
   );
 }
@@ -128,6 +152,7 @@ describe("HeaderConversationMenu", () => {
       "Pin",
       "Share",
       "Fork",
+      "Export",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -159,6 +184,33 @@ describe("HeaderConversationMenu", () => {
     expect(mocks.markUnread).toHaveBeenCalledWith("conv-1", 1_700_000_100);
   });
 
+  it("downloads the transcript as <session-id>.jsonl from Export", async () => {
+    const jsonl = '{"record_type":"session_meta","id":"conv-1"}\n';
+    mocks.exportTranscript.mockResolvedValueOnce(jsonl);
+    renderMenu();
+    openMenu();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "Export" }));
+
+    await waitFor(() => expect(mocks.triggerDownload).toHaveBeenCalledTimes(1));
+    expect(mocks.exportTranscript).toHaveBeenCalledWith("conv-1");
+    const [blob, filename] = mocks.triggerDownload.mock.calls[0]! as [Blob, string];
+    expect(filename).toBe("conv-1.jsonl");
+    expect(await blob.text()).toBe(jsonl);
+    expect(mocks.toastError).not.toHaveBeenCalled();
+  });
+
+  it("surfaces an export failure as a toast and downloads nothing", async () => {
+    mocks.exportTranscript.mockRejectedValueOnce(new Error("boom"));
+    renderMenu();
+    openMenu();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "Export" }));
+
+    await waitFor(() => expect(mocks.toastError).toHaveBeenCalledWith("Export failed"));
+    expect(mocks.triggerDownload).not.toHaveBeenCalled();
+  });
+
   it("opens a full-history fork from the session menu", () => {
     renderMenu();
 
@@ -188,10 +240,17 @@ describe("HeaderConversationMenu", () => {
 
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
-    // Just the flag: the optimistic overlay lives in the hook, and the Undo
-    // toast fires synchronously (navigating away unmounts this menu, so a
-    // mutate onSuccess callback wouldn't fire).
-    expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: true });
+    // A worktree session asks whether to delete the worktree first.
+    expect(mocks.archive).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Yes, delete worktree" }));
+    // The optimistic overlay lives in the hook, and the Undo toast fires
+    // synchronously (navigating away unmounts this menu, so a mutate onSuccess
+    // callback wouldn't fire).
+    expect(mocks.archive).toHaveBeenCalledWith({
+      id: "conv-1",
+      archived: true,
+      deleteWorktree: true,
+    });
 
     view.unmount();
     renderMenu();
@@ -388,7 +447,7 @@ describe("HeaderConversationMenu", () => {
     renderMenu();
     openMenu();
     const label = screen.getByText("Quarterly planning");
-    expect(label).toHaveAttribute("data-slot", "dropdown-menu-label");
+    expect(label.closest('[data-slot="dropdown-menu-label"]')).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("header-move-to-project"));
     expect(screen.queryByText("Quarterly planning")).toBeNull();
@@ -430,6 +489,7 @@ describe("HeaderConversationMenu", () => {
       "Pin",
       "Share",
       "Fork",
+      "Export",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -451,6 +511,7 @@ describe("HeaderConversationMenu", () => {
       "Pin",
       "Share",
       "Fork",
+      "Export",
       "Rename",
       "Mark as unread",
       "Add to project",

@@ -30,7 +30,6 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   conversationLoadError: true,
   sessionModelOverride: true,
   sessionReasoningEffort: true,
-  sessionEffortSeeded: true,
   sessionModelSeeded: true,
   sessionHostId: true,
   costControlModeOverride: true,
@@ -51,9 +50,6 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   sessionUsageByModel: true,
   gitBranch: true,
   todos: true,
-  skills: true,
-  skillsStatus: true,
-  skillsEventVersion: true,
   codexModelOptions: true,
   terminalPending: true,
   viewers: true,
@@ -65,8 +61,10 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   runnerLaunchedAt: true,
   failedSendDraft: true,
   pendingRetryStableId: true,
+  restoredSendDraft: true,
   sendLatchedAt: true,
   historyGeneration: true,
+  awaitingSideChatFor: true,
 };
 
 const CONVERSATION_STATE_KEYS = new Set<string>(Object.keys(CONVERSATION_STATE_KEY_MAP));
@@ -99,7 +97,6 @@ export function createInitialConversationState(): ConversationState {
     conversationLoadError: null,
     sessionModelOverride: null,
     sessionReasoningEffort: null,
-    sessionEffortSeeded: false,
     sessionModelSeeded: false,
     sessionHostId: null,
     costControlModeOverride: null,
@@ -120,9 +117,6 @@ export function createInitialConversationState(): ConversationState {
     sessionUsageByModel: null,
     gitBranch: null,
     todos: [],
-    skills: [],
-    skillsStatus: null,
-    skillsEventVersion: 0,
     codexModelOptions: [],
     terminalPending: false,
     viewers: [],
@@ -134,7 +128,9 @@ export function createInitialConversationState(): ConversationState {
     runnerLaunchedAt: null,
     failedSendDraft: null,
     pendingRetryStableId: null,
+    restoredSendDraft: null,
     sendLatchedAt: null,
     historyGeneration: 0,
+    awaitingSideChatFor: null,
   };
 }

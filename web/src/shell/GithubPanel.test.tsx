@@ -3,6 +3,7 @@
 // in jsdom) is stubbed to fire immediately so lazy sections mount.
 
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GithubChangedFile, GithubInfo } from "@/hooks/useGithub";
@@ -22,7 +23,12 @@ const state = vi.hoisted(() => ({
   } | null,
   // Per-file diffs the stubbed parsePatchFiles yields (name + optional
   // rename fields), so tests can exercise renamed/pure-rename rendering.
-  parsedFiles: [] as { name: string; prevName?: string; type?: string }[],
+  parsedFiles: [] as {
+    name: string;
+    prevName?: string;
+    type?: string;
+    unifiedLineCount?: number;
+  }[],
 }));
 
 vi.mock("@/hooks/useGithub", () => ({
@@ -73,7 +79,7 @@ vi.mock("@/components/ai-elements/message", () => ({
 
 import { useGithubInfo, useGithubChangedFiles } from "@/hooks/useGithub";
 
-import { GithubPanel, deriveGithubPanelState } from "./GithubPanel";
+import { GithubPanel, deriveGithubPanelState, LARGE_DIFF_THRESHOLD } from "./GithubPanel";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 
 function file(
@@ -193,6 +199,9 @@ afterEach(() => {
 describe("GithubPanel", () => {
   it("shows the PR title in the header and CI check pills on the Summary tab", async () => {
     renderPanel();
+    const heading = screen.getByRole("heading", { name: "GitHub" });
+    expect(heading).toHaveClass("pl-1", "font-medium", "text-ui");
+    expect(heading.parentElement).toHaveClass("h-11");
     // Title + number live in the shared header (both tabs).
     expect(await screen.findByText("chore: dummy PR")).toBeInTheDocument();
     expect(screen.getByText("#6000")).toBeInTheDocument();
@@ -207,7 +216,7 @@ describe("GithubPanel", () => {
   it.each([
     ["OPEN", "Open", "text-green-700"],
     ["CLOSED", "Closed", "text-red-700"],
-    ["MERGED", "Merged", "text-brand-accent"],
+    ["MERGED", "Merged", "text-purple-700"],
   ])("shows a %s status pill beside the PR title", (stateName, label, tone) => {
     state.info!.data!.pr!.state = stateName;
     renderPanel();
@@ -483,6 +492,52 @@ describe("GithubPanel", () => {
     });
     expect(screen.queryByRole("textbox", { name: "Pull request URL" })).toBeNull();
   });
+
+  it("shows the diff immediately when unifiedLineCount is at the threshold", async () => {
+    state.parsedFiles = [{ name: "hello.py", unifiedLineCount: LARGE_DIFF_THRESHOLD }];
+    state.changes = {
+      data: { available: true, data: [file("hello.py", "modified")] },
+      isLoading: false,
+      error: null,
+      isFetching: false,
+    };
+    renderChanges();
+    // Exactly at the threshold: diff renders, no affordance.
+    expect(await screen.findByTestId("diff")).toBeInTheDocument();
+    expect(screen.queryByText(/Large diff/)).toBeNull();
+  });
+
+  it("replaces a file's diff with a large-diff affordance when unifiedLineCount exceeds the threshold", async () => {
+    state.parsedFiles = [
+      { name: "hello.py", unifiedLineCount: LARGE_DIFF_THRESHOLD + 1 },
+      { name: "src/app.ts" },
+    ];
+    renderChanges();
+    // The oversized file shows the affordance; the normal file renders its diff.
+    expect(await screen.findByText(/Large diff/)).toBeInTheDocument();
+    expect(
+      screen.getByText(new RegExp(`${(LARGE_DIFF_THRESHOLD + 1).toLocaleString()}\\s*lines`)),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Show diff" })).toBeInTheDocument();
+    const diffs = screen.getAllByTestId("diff");
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0].getAttribute("data-path")).toBe("src/app.ts");
+  });
+
+  it("reveals the diff after clicking Show diff", async () => {
+    state.parsedFiles = [{ name: "hello.py", unifiedLineCount: LARGE_DIFF_THRESHOLD + 1 }];
+    state.changes = {
+      data: { available: true, data: [file("hello.py", "modified")] },
+      isLoading: false,
+      error: null,
+      isFetching: false,
+    };
+    renderChanges();
+    await screen.findByText(/Large diff/);
+    fireEvent.click(screen.getByRole("button", { name: "Show diff" }));
+    expect(await screen.findByTestId("diff")).toHaveAttribute("data-path", "hello.py");
+    expect(screen.queryByText(/Large diff/)).toBeNull();
+  });
 });
 
 describe("deriveGithubPanelState", () => {
@@ -558,6 +613,7 @@ describe("deriveGithubPanelState", () => {
 
 describe("session PR selection", () => {
   it("keeps the selector and repository identity while PR details load or fail", async () => {
+    const user = userEvent.setup();
     const one = "https://github.com/example/one/pull/42";
     const two = "https://github.com/example/two/pull/42";
     state.info = {
@@ -579,6 +635,7 @@ describe("session PR selection", () => {
             host: "github.com",
             repository: "example/one",
             number: 42,
+            title: "First repository",
             relationship: "created",
           },
           {
@@ -586,6 +643,7 @@ describe("session PR selection", () => {
             host: "github.com",
             repository: "example/two",
             number: 42,
+            title: "Second repository",
             relationship: "created",
           },
         ],
@@ -593,24 +651,44 @@ describe("session PR selection", () => {
     };
     const { rerender } = renderPanel();
     const picker = screen.getByRole("combobox", { name: "Session pull request" });
-    expect(picker).toHaveTextContent("example/one #42");
-    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
-    fireEvent.click(picker);
-    await waitFor(() =>
-      expect(screen.getByRole("option", { name: "example/one #42" })).toHaveAttribute(
-        "aria-selected",
-        "true",
-      ),
+    expect(picker).toHaveTextContent("example/one #42 — First repository");
+    expect(picker).not.toHaveAttribute("title");
+    await user.hover(picker);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      "example/one #42 — First repository",
     );
-    fireEvent.click(screen.getByRole("option", { name: "example/two #42" }));
-    expect(picker).toHaveTextContent("example/two #42");
+    await user.unhover(picker);
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    await user.click(picker);
+    await waitFor(() =>
+      expect(
+        screen.getByRole("option", { name: "example/one #42 — First repository" }),
+      ).toHaveAttribute("aria-selected", "true"),
+    );
+    const secondOption = screen.getByRole("option", {
+      name: "example/two #42 — Second repository",
+    });
+    expect(secondOption).toBeVisible();
+    expect(secondOption).not.toHaveAttribute("title");
+    await user.hover(secondOption);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      "example/two #42 — Second repository",
+    );
+    await user.click(secondOption);
+    expect(picker).toHaveTextContent("example/two #42 — Second repository");
+    expect(picker).not.toHaveAttribute("title");
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
     expect(useGithubInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: two });
+    await user.hover(picker);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      "example/two #42 — Second repository",
+    );
+    await user.unhover(picker);
 
     state.info = { isLoading: true, error: null, isFetching: true };
     rerender(<GithubPanel conversationId="conv_1" />);
     expect(screen.getByRole("combobox", { name: "Session pull request" })).toBe(picker);
-    expect(picker).toHaveTextContent("example/two #42");
+    expect(picker).toHaveTextContent("example/two #42 — Second repository");
     expect(screen.getByText("Loading GitHub…")).toBeInTheDocument();
     expect(screen.queryByText("First repository")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Link a PR" })).toBeEnabled();
@@ -620,17 +698,70 @@ describe("session PR selection", () => {
     state.info = { isLoading: false, error: new Error("Metadata unavailable"), isFetching: false };
     rerender(<GithubPanel conversationId="conv_1" />);
     expect(screen.getByRole("combobox", { name: "Session pull request" })).toBe(picker);
+    expect(picker).toHaveTextContent("example/two #42 — Second repository");
     const errorMessage = screen.getByText(/Metadata unavailable/);
     const fallback = screen.getByRole("link", { name: "Open the PR on GitHub" });
     expect(errorMessage.parentElement).toContainElement(fallback);
     expect(fallback).toHaveAttribute("href", two);
-    fireEvent.click(picker);
-    fireEvent.click(screen.getByRole("option", { name: "example/one #42" }));
+    await user.click(picker);
+    await user.click(screen.getByRole("option", { name: "example/one #42 — First repository" }));
     expect(useGithubInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: one });
 
     state.info = { isLoading: true, error: null, isFetching: true };
     rerender(<GithubPanel conversationId="conv_other" />);
     expect(screen.queryByRole("combobox", { name: "Session pull request" })).toBeNull();
+  });
+
+  it.each([undefined, null, "", "   "])(
+    "falls back to the PR identity when its title is %j",
+    (title) => {
+      const url = "https://github.com/example/one/pull/42";
+      Object.assign(state.info!.data!, {
+        tracking_available: true,
+        selected_pr_url: url,
+        prs: [
+          {
+            url,
+            host: "github.com",
+            repository: "example/one",
+            number: 42,
+            title,
+            relationship: "created",
+          },
+        ],
+      });
+      renderPanel();
+      const picker = screen.getByRole("combobox", { name: "Session pull request" });
+      expect(picker).toHaveTextContent(/^example\/one #42$/);
+      expect(picker).not.toHaveAttribute("title");
+      fireEvent.click(picker);
+      expect(screen.getByRole("option", { name: "example/one #42" })).toBeVisible();
+    },
+  );
+
+  it("keeps the host and inferred marker alongside a trimmed PR title", () => {
+    const url = "https://github.example.com/example/one/pull/42";
+    Object.assign(state.info!.data!, {
+      tracking_available: true,
+      selected_pr_url: url,
+      prs: [
+        {
+          url,
+          host: "github.example.com",
+          repository: "example/one",
+          number: 42,
+          title: "  Fix session selection  ",
+          relationship: "inferred",
+        },
+      ],
+    });
+    renderPanel();
+    const picker = screen.getByRole("combobox", { name: "Session pull request" });
+    const label = "github.example.com/example/one #42 (from branch) — Fix session selection";
+    expect(picker).toHaveTextContent(label);
+    expect(picker).not.toHaveAttribute("title");
+    fireEvent.click(picker);
+    expect(screen.getByRole("option", { name: label })).toBeVisible();
   });
 
   it("passes the selected PR and revisions into file queries", () => {

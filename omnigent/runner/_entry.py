@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import gc
 import json
 import logging
@@ -26,7 +27,7 @@ import httpx
 from fastapi import FastAPI
 
 from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.inner import _proc
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
 from omnigent.util.threaded_auth import ThreadedAuth
@@ -35,6 +36,7 @@ from omnigent.version import VERSION
 if TYPE_CHECKING:
     from types import TracebackType
 
+    from omnigent.inner.databricks_executor import _ReusedDatabricksTokenSource
     from omnigent.runner.native import ResolvedSpec
     from omnigent.runner.transports.ws_tunnel.serve import _ASGIApp
     from omnigent.spec.types import AgentSpec
@@ -654,12 +656,6 @@ def _make_auth_token_factory(
         )
         return _InitialAuthTokenFactory(initial_token, resolved_server_url)
 
-    from omnigent.inner.databricks_executor import (
-        DatabricksAuthError,
-        _DatabricksBearerAuth,
-        _resolve_databricks_auth,
-    )
-
     # Prefer the host-launched runner's owner-bound capability so user
     # credentials stay out of the runner and credential discovery is skipped.
     delegated_auth = os.environ.get(RUNNER_DELEGATED_AUTH_ENV_VAR, "").strip() == "1"
@@ -671,57 +667,7 @@ def _make_auth_token_factory(
         if delegated_factory is not None:
             return delegated_factory
 
-    # Reused Databricks SDK auth, resolved once on first use and cached
-    # here for the life of the factory. Reusing one Config is the whole
-    # point: the SDK serves the minted OAuth token from its in-memory
-    # cache and only re-runs the Databricks CLI (~0.5s) when the token
-    # nears expiry. The previous implementation built a fresh Config on
-    # every call (via _read_databrickscfg), shelling out to the CLI on
-    # EVERY runner->AP request — ~6.5s across the ~13 requests of session
-    # establish alone, plus the same tax on every later turn.
-    # ``sdk_auth_resolved`` is the "have we tried resolving yet" flag;
-    # ``sdk_auth`` is the (possibly ``None``) reused auth once resolved.
-    sdk_auth: _DatabricksBearerAuth | None = None
-    sdk_auth_resolved = False
-
-    def _sdk_token() -> str | None:
-        """
-        Return a bearer token from the reused SDK auth, or ``None``.
-
-        Resolves the SDK auth on first call and reuses it thereafter, so
-        repeat fetches hit the SDK's in-memory token cache instead of
-        rebuilding ``Config`` / re-shelling to the Databricks CLI.
-
-        :returns: Bearer token string, or ``None`` when no Databricks
-            credentials resolve.
-        """
-        nonlocal sdk_auth, sdk_auth_resolved
-        if not sdk_auth_resolved:
-            # A stored Databricks Apps pointer record (from
-            # ``omnigent login <apps-url>``) names the exact workspace
-            # the Apps edge accepts tokens from, so it beats ambient
-            # profile resolution.
-            from omnigent.cli_auth import load_databricks_workspace_host
-
-            workspace_host = (
-                load_databricks_workspace_host(resolved_server_url)
-                if resolved_server_url
-                else None
-            )
-            try:
-                if workspace_host is not None:
-                    sdk_auth, _host = _resolve_databricks_auth(host=workspace_host)
-                else:
-                    sdk_auth, _host = _resolve_databricks_auth()
-            except (DatabricksAuthError, ImportError, ValueError):
-                sdk_auth = None
-            sdk_auth_resolved = True
-        if sdk_auth is None:
-            return None
-        try:
-            return sdk_auth.current_token()
-        except DatabricksAuthError:
-            return None
+    sdk_token_source: _ReusedDatabricksTokenSource | None = None
 
     def _factory() -> str | None:
         """Return a fresh auth token.
@@ -732,6 +678,7 @@ def _make_auth_token_factory(
         :returns: Bearer token string, or ``None`` if no credentials
             are configured.
         """
+        nonlocal sdk_token_source
         # Check stored OIDC token first.
         if resolved_server_url:
             from omnigent.cli_auth import (
@@ -762,7 +709,13 @@ def _make_auth_token_factory(
             still_valid = load_token(resolved_server_url)
             if still_valid:
                 return still_valid
-        return _sdk_token()
+        if sdk_token_source is None:
+            # Optional SDK imports must not prevent delegated/OIDC recovery or
+            # bypass the managed-mint fallback when the executor cannot load.
+            from omnigent.inner.databricks_executor import _ReusedDatabricksTokenSource
+
+            sdk_token_source = _ReusedDatabricksTokenSource(resolved_server_url)
+        return sdk_token_source.current_token()
 
     # Probe once to check if a user credential is available.
     try:
@@ -1128,6 +1081,13 @@ def _runner_parent_pid_from_env() -> int | None:
     if parent_pid <= 0:
         raise RuntimeError(f"{RUNNER_PARENT_PID_ENV_VAR} must be a positive integer")
     return parent_pid
+
+
+def _runner_host_owns_global_cleanup_from_env() -> bool:
+    """Return whether the host daemon owns machine-global cleanup."""
+    from omnigent.runner.identity import RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR
+
+    return os.environ.get(RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR) == "1"
 
 
 def _parent_process_is_alive(parent_pid: int) -> bool:
@@ -1496,41 +1456,33 @@ def create_app(
             session_id=session_id,
         )
 
+    host_owns_global_cleanup = _runner_host_owns_global_cleanup_from_env()
+
     # Out-of-process runner owns its own TerminalRegistry.
     from omnigent.inner.terminal import reap_orphaned_terminals
     from omnigent.terminals import TerminalRegistry
 
     _terminal_registry = TerminalRegistry(conversation_link_base_url=server_url)
-    # Reap terminal tmux servers leaked by a previous runner that died
-    # without graceful shutdown (SIGKILL / harness teardown). Detached
-    # tmux outlives its supervisor, and runner-bound SDK sessions now
-    # auto-create the embedded REPL terminal — without this sweep every
-    # ungraceful exit leaks one tmux server per session (enough to
-    # starve CI hosts running many short-lived runners).
-    _reaped_terminals = reap_orphaned_terminals()
-    if _reaped_terminals:
-        _logger.info(
-            "Reaped %d orphaned terminal tmux server(s) from prior runs",
-            _reaped_terminals,
-            extra={"session_id": runner_primary_session_id()},
-        )
-
-    # Reap per-session native-harness bridge dirs (bridge.json token, MCP/
-    # policy config, permission_hook.json) leaked by a prior runner that died
-    # without running the explicit delete path. Dynamic across all native
-    # harnesses — see native_bridge_common.reap_orphaned_native_bridge_dirs.
-    # Best-effort: a sweep failure must never crash runner startup.
-    try:
-        from omnigent.native.native_bridge_common import reap_orphaned_native_bridge_dirs
-
-        _reaped_bridge_dirs = reap_orphaned_native_bridge_dirs()
-        if _reaped_bridge_dirs:
+    if not host_owns_global_cleanup:
+        _reaped_terminals = reap_orphaned_terminals()
+        if _reaped_terminals:
             _logger.info(
-                "Reaped %d orphaned native bridge dir(s) from prior runs",
-                _reaped_bridge_dirs,
+                "Reaped %d orphaned terminal tmux server(s) from prior runs",
+                _reaped_terminals,
+                extra={"session_id": runner_primary_session_id()},
             )
-    except Exception:  # noqa: BLE001 — housekeeping must never block startup
-        _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
+
+        try:
+            from omnigent.native.native_bridge_common import reap_orphaned_native_bridge_dirs
+
+            _reaped_bridge_dirs = reap_orphaned_native_bridge_dirs()
+            if _reaped_bridge_dirs:
+                _logger.info(
+                    "Reaped %d orphaned native bridge dir(s) from prior runs",
+                    _reaped_bridge_dirs,
+                )
+        except Exception:  # noqa: BLE001 — housekeeping must never block startup
+            _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
 
     # Reuse the tunnel binding token for runner-side request auth.
     # The same secret is already shared between the
@@ -1551,7 +1503,7 @@ def create_app(
 
     async def _start_pm() -> None:
         """Start harness process manager; register MCP prewarm metadata if requested."""
-        await pm.start()
+        await pm.start(sweep_orphans=not host_owns_global_cleanup)
         prewarm_path = os.environ.get(_RUNNER_PREWARM_SPEC_PATH_ENV_VAR)
         if prewarm_path and mcp_manager is not None:
             try:
@@ -1579,28 +1531,24 @@ def create_app(
         _pane_reaper = getattr(app.state, "native_pane_reaper", None)
         if _pane_reaper is not None:
             await _pane_reaper.start()
-        # Backstop for a hard host/runner death (SIGKILL / OOM / crash) that
-        # ran no graceful teardown: a codex app-server spawned in its own
-        # session outlives its runner. Reconciling the crash-safe registry at
-        # boot reaps any such orphan whose owner lock is no longer held (its
-        # runner is gone), so a fresh runner on the host cleans up what a dead
-        # predecessor left. Held owner locks (live sibling runners) are skipped.
-        from omnigent.harnesses.codex_native.process_registry import (
-            reconcile_codex_native_process_registry,
-        )
+        if not host_owns_global_cleanup:
+            from omnigent.harnesses.codex_native.process_registry import (
+                reconcile_codex_native_process_registry,
+            )
 
-        with contextlib.suppress(Exception):
-            await asyncio.to_thread(reconcile_codex_native_process_registry)
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(reconcile_codex_native_process_registry)
         # Liveness backstop for sub-agent dispatches wedged in ``launching``:
         # a child that never emits any edge would otherwise hold the parent's
         # work handle open forever with no error surfaced. The app's
         # wake-scheduling seam is passed so a reaped failure also wakes the
         # idle parent — the inbox insert alone would never be read.
-        from omnigent.runner.app import run_subagent_launch_reaper
+        from omnigent.runner.subagent_work import run_subagent_launch_reaper
 
         app.state.subagent_launch_reaper = asyncio.create_task(
             run_subagent_launch_reaper(
                 mark_terminal=app.state.mark_subagent_terminal_and_wake,
+                reconcile_pending=app.state.reconcile_pending_subagent_results,
             ),
             name="runner-subagent-launch-reaper",
         )
@@ -1618,14 +1566,16 @@ def create_app(
         _pane_reaper = getattr(app.state, "native_pane_reaper", None)
         if _pane_reaper is not None:
             await _pane_reaper.shutdown()
-        # Close host-spawned codex-native app-servers before the process exits.
-        # Each is spawned in its own session (survives the runner's death), and a
-        # host-initiated stop tears the runner down without a per-session DELETE,
-        # so without this they orphan as lingering ``codex`` processes.
-        from omnigent.runner.native import teardown_all_codex_native_app_servers
+        # Host shutdown skips per-session deletion, so close native servers here.
+        from omnigent.runner.native import (
+            teardown_all_codex_native_app_servers,
+            teardown_all_opencode_native_servers,
+        )
 
         with contextlib.suppress(Exception):
             await teardown_all_codex_native_app_servers()
+        with contextlib.suppress(Exception):
+            await teardown_all_opencode_native_servers()
         await pm.shutdown()
         await _terminal_registry.shutdown()
         if mcp_manager is not None:
@@ -1649,6 +1599,42 @@ def create_app(
 
     app.router.lifespan_context = _lifespan
     return app
+
+
+def _handle_loop_exception(
+    loop: asyncio.AbstractEventLoop,  # noqa: ARG001 — asyncio handler signature
+    context: dict[str, object],
+) -> None:
+    """Attribute asynchronous failures without serializing callback arguments."""
+    from websockets.exceptions import ConnectionClosedOK
+
+    exc = context.get("exception")
+    future = context.get("task") or context.get("future")
+    handle = context.get("handle")
+    callback = getattr(handle, "_callback", None)
+    while isinstance(callback, functools.partial):
+        callback = callback.func
+    coroutine = future.get_coro() if isinstance(future, asyncio.Task) else None
+    extra = debug_event(
+        "runner_async_failure",
+        session_id=runner_primary_session_id(),
+        exception_type=type(exc).__name__ if isinstance(exc, BaseException) else None,
+        callback_name=getattr(callback, "__qualname__", None),
+        coroutine_name=getattr(coroutine, "__qualname__", None),
+        future_done=future.done() if isinstance(future, asyncio.Future) else None,
+        future_cancelled=future.cancelled() if isinstance(future, asyncio.Future) else None,
+        context_kind="callback"
+        if handle is not None
+        else "task"
+        if isinstance(future, asyncio.Task)
+        else "other",
+    )
+    if isinstance(exc, asyncio.CancelledError | ConnectionClosedOK):
+        _logger.debug("asyncio teardown completed", exc_info=exc, extra=extra)
+    elif isinstance(exc, BaseException):
+        _logger.error("asyncio callback or task failed", exc_info=exc, extra=extra)
+    else:
+        _logger.error("asyncio reported an unhandled failure", extra=extra)
 
 
 async def _run_tunnel_from_env() -> None:
@@ -1704,6 +1690,10 @@ async def _run_tunnel_from_env() -> None:
     # Reuse the tunnel's token factory for the app's httpx client so the
     # runner resolves Databricks auth once at boot, not twice.
     app = create_app(auth_token_factory=auth_token_factory)
+    from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
+
+    event_dispatcher = RunnerEventDispatcher()
+    app.state.runner_event_dispatcher = event_dispatcher
     idle_timeout_s = _load_runner_idle_timeout_s_from_config()
     # starlette 1.x removed Router.startup/shutdown; drive the lifespan manually.
     _lifespan_cm = app.router.lifespan_context(app)
@@ -1714,28 +1704,6 @@ async def _run_tunnel_from_env() -> None:
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     last_activity_at = loop.time()
-
-    # asyncio funnels unretrieved task exceptions and callback errors through
-    # the loop's exception handler. Those are not our own _logger callsites
-    # (e.g. a discarded ``ws.recv()`` task on a normal tunnel close), so this is
-    # the one place we can attribute them to the runner's session and keep them
-    # out of asyncio's default, untagged "Task exception was never retrieved".
-    from websockets.exceptions import ConnectionClosedOK
-
-    def _handle_loop_exception(
-        loop: asyncio.AbstractEventLoop,  # noqa: ARG001 — signature mandated by asyncio
-        context: dict[str, object],
-    ) -> None:
-        exc = context.get("exception")
-        message = context.get("message") or "unhandled asyncio exception"
-        extra = {"session_id": runner_primary_session_id()}
-        if isinstance(exc, asyncio.CancelledError | ConnectionClosedOK):
-            # Benign teardown — keep it quiet but still attributed.
-            _logger.debug("asyncio: %s", message, exc_info=exc, extra=extra)
-        elif isinstance(exc, BaseException):
-            _logger.error("asyncio: %s", message, exc_info=exc, extra=extra)
-        else:
-            _logger.error("asyncio: %s (context=%r)", message, context, extra=extra)
 
     loop.set_exception_handler(_handle_loop_exception)
 
@@ -1763,9 +1731,7 @@ async def _run_tunnel_from_env() -> None:
         :returns: ``True`` while at least one agent turn is active.
         """
         callback = getattr(app.state, "has_active_work", None)
-        if not callable(callback):
-            return False
-        return bool(callback())
+        return event_dispatcher.has_pending or (callable(callback) and bool(callback()))
 
     # Human-readable reason for why the runner is shutting down, recorded
     # by whichever path wins the shutdown race and logged on the way out so
@@ -1785,10 +1751,14 @@ async def _run_tunnel_from_env() -> None:
     # Set when the launcher adopts this runner (tmux detach); makes the
     # parent-death killer stand down so the runner outlives the CLI.
     adopted_event = threading.Event()
+    _shutting_down_state = getattr(app.state, "shutting_down", None)
     _install_signal_handlers(
         stop_event,
         adopted_event=adopted_event,
         record_reason=_record_exit_reason,
+        mark_shutting_down=(
+            _shutting_down_state.set if _shutting_down_state is not None else None
+        ),
     )
     # Set (instead of stop_event) on an idle-reaper shutdown so the tunnel
     # drains its session streams and closes cleanly — the server then sees an
@@ -1836,6 +1806,7 @@ async def _run_tunnel_from_env() -> None:
             auth_token=auth_token,
             tunnel_token=binding_token,
             auth_token_factory=auth_token_factory,
+            event_dispatcher=event_dispatcher,
             on_reconnect=getattr(app.state, "catch_up_scan", None),
             on_activity=_mark_activity,
             shutdown_event=tunnel_shutdown_event,
@@ -1952,6 +1923,7 @@ def _install_signal_handlers(
     stop_event: asyncio.Event,
     adopted_event: threading.Event | None = None,
     record_reason: Callable[[str], None] | None = None,
+    mark_shutting_down: Callable[[], None] | None = None,
 ) -> None:
     """Install process signal handlers that request graceful shutdown.
 
@@ -1963,6 +1935,10 @@ def _install_signal_handlers(
     :param record_reason: Optional callback given the signal name when a
         shutdown signal arrives, so the exit log line can attribute the
         cause. ``None`` skips attribution.
+    :param mark_shutting_down: Optional callback invoked (no args) when a
+        shutdown signal arrives, before any teardown runs — lets app.py tell
+        an intentional stop from a real crash when a terminal watcher races
+        the shutdown. ``None`` skips it.
     :returns: None.
     """
     loop = asyncio.get_running_loop()
@@ -1975,6 +1951,8 @@ def _install_signal_handlers(
         """
         if record_reason is not None:
             record_reason(f"received {signal.Signals(sig).name}")
+        if mark_shutting_down is not None:
+            mark_shutting_down()
         stop_event.set()
 
     degraded = False
