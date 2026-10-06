@@ -9,7 +9,6 @@ against the live server, and the browser must show the original characters.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import sqlite3
 import threading
@@ -130,7 +129,7 @@ def test_cursor_question_card_keeps_non_ascii_text(
         form = card.locator(_FORM)
         expect(form).to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)
         card.scroll_into_view_if_needed()
-        page.wait_for_timeout(3000)
+        page.wait_for_timeout(3000)  # hold on the rendered form (recording)
 
         rendered = form.inner_text()
         assert _PROMPT in rendered, f"question card shows {rendered!r}"
@@ -145,8 +144,11 @@ def test_cursor_question_card_keeps_non_ascii_text(
         expect(responded).to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)
     finally:
         thread.join(timeout=10)
+        fallback_note = ""
         if thread.is_alive():
-            with contextlib.suppress(httpx.HTTPError):
+            # No verdict reached the mirror (an assertion above failed first):
+            # decline the parked elicitation so the thread can exit.
+            try:
                 httpx.post(
                     f"{base_url}/v1/sessions/{session_id}/events",
                     json={
@@ -155,10 +157,16 @@ def test_cursor_question_card_keeps_non_ascii_text(
                     },
                     timeout=10.0,
                 ).raise_for_status()
+            except httpx.HTTPError as exc:
+                fallback_note = f" (decline fallback failed: {exc!r})"
             thread.join(timeout=30)
+        if "error" in mirror_result:
+            # Raised here so an early mirror failure is reported as the cause rather
+            # than hidden behind the card-visibility timeout it provokes.
+            raise AssertionError(
+                f"cursor question mirror failed: {mirror_result['error']}"
+            ) from mirror_result["error"]  # type: ignore[misc]
 
-    assert not thread.is_alive(), "cursor question mirror never received a web verdict"
-    if "error" in mirror_result:
-        raise AssertionError(
-            f"cursor question mirror failed: {mirror_result['error']}"
-        ) from mirror_result["error"]  # type: ignore[misc]
+    assert not thread.is_alive(), (
+        f"cursor question mirror never received a web verdict{fallback_note}"
+    )
