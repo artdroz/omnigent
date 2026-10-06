@@ -105,7 +105,9 @@ async def test_restore_active_descendants_and_idle_ancestor(recovery_tree: Any) 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("exclusion", ["closed", "archived", "stopped", "hosted", "live_runner"])
+@pytest.mark.parametrize(
+    "exclusion", ["closed", "archived", "stopped", "hosted", "side_chat", "live_runner"]
+)
 async def test_do_not_restore_excluded_children(
     recovery_tree: Any, monkeypatch: pytest.MonkeyPatch, exclusion: str
 ) -> None:
@@ -118,9 +120,11 @@ async def test_do_not_restore_excluded_children(
     elif exclusion == "archived":
         store.update_conversation(row.id, archived=True)
     elif exclusion == "stopped":
-        _intentional_stop_sessions.add(row.id)
+        _intentional_stop_sessions[row.id] = "old"
     elif exclusion == "hosted":
         store.set_host_id(row.id, "a" * 32, workspace="/tmp")
+    elif exclusion == "side_chat":
+        store.set_labels(row.id, {"omnigent.codex_native.agent_nickname": "Side chat"})
     else:
         monkeypatch.setattr(
             "omnigent.runtime.get_runner_router", lambda: Mock(runner_is_online=lambda _: True)
@@ -133,7 +137,26 @@ async def test_do_not_restore_excluded_children(
         assert store.get_conversation(row.id).runner_id == "old"
         relay.assert_not_called()
     finally:
-        _intentional_stop_sessions.discard(row.id)
+        _intentional_stop_sessions.pop(row.id, None)
+
+
+@pytest.mark.asyncio
+async def test_child_stop_for_an_older_runner_does_not_block_recovery(recovery_tree: Any) -> None:
+    from omnigent.server.routes._sessions.common import _intentional_stop_sessions
+
+    store, parent, child, relay, _, initializer = recovery_tree
+    row = child()
+    _intentional_stop_sessions[row.id] = "previously-stopped"
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _: httpx.Response(201)),
+            base_url="http://runner",
+        ) as client:
+            await restore_active_children(parent, client, store, initializer)
+        assert store.get_conversation(row.id).runner_id == "new"
+        relay.assert_called_once()
+    finally:
+        _intentional_stop_sessions.pop(row.id, None)
 
 
 @pytest.mark.asyncio
@@ -349,7 +372,7 @@ async def test_message_handshake_does_not_wait_for_child_initialization(
     row = child()
     entered, release, restored = asyncio.Event(), asyncio.Event(), asyncio.Event()
     requests = []
-    relay.side_effect = lambda *_args: restored.set()
+    relay.side_effect = lambda *_args, **_kwargs: restored.set()
 
     async def respond(request: httpx.Request) -> httpx.Response:
         session_id = json.loads(request.content)["session_id"]
@@ -455,7 +478,9 @@ async def test_parent_recovery_published_before_descendant_store_failure(
 
     def fail_lookup(*_args: Any) -> None:
         recovered.assert_awaited_once_with(parent.id, store)
-        ready.assert_awaited_once_with(parent.id, parent.runner_id, client, store)
+        ready.assert_awaited_once_with(
+            parent.id, parent.runner_id, client, store, conversation=parent
+        )
         raise failure
 
     monkeypatch.setattr(store, "list_child_conversation_ids_by_parent", fail_lookup)
