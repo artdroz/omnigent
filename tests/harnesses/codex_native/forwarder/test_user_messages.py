@@ -62,6 +62,7 @@ class _BlockingEventClient(_ScriptedEventClient):
         if len(self.posts) == 1:
             self._entered.set()
             await self._pending
+        self.accepted_posts.append(json)
         return httpx.Response(202, request=httpx.Request("POST", url), json={})
 
 
@@ -275,6 +276,7 @@ async def test_cancelled_user_post_releases_claim_for_retry() -> None:
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+    pending.cancel()
 
     assert state.pending_item_claims == set()
     assert state.synced_item_keys == set()
@@ -399,6 +401,7 @@ async def test_cancelled_recovery_user_post_releases_claim() -> None:
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+    pending.cancel()
 
     assert state.pending_item_claims == set()
     assert state.synced_item_keys == set()
