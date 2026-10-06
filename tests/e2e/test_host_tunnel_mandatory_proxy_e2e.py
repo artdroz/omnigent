@@ -41,6 +41,8 @@ socket.getaddrinfo = _getaddrinfo
 @contextlib.contextmanager
 def _mandatory_proxy(server_port: int) -> Iterator[tuple[str, list[tuple[str, str]]]]:
     """Forward HTTP and CONNECT only for the otherwise unresolvable server."""
+    # Appended from handler threads and read by the test thread; CPython's
+    # list.append is atomic, so no lock is needed here.
     requests: list[tuple[str, str]] = []
     stopped = threading.Event()
 

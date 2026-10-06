@@ -69,19 +69,20 @@ def _env(environ: Mapping[str, str], name: str) -> str | None:
 
 
 def _bypassed_by_no_proxy(host: str, port: int, no_proxy: str) -> bool:
-    """Whether ``no_proxy`` exempts *host*:*port* from proxying.
+    """Whether ``no_proxy`` exempts *host*:*port* from proxying, as httpx would.
 
-    Standard comma-separated entries: ``*`` disables proxying entirely; a
-    plain name matches itself and its subdomains (a leading dot is
-    equivalent); an IP literal matches that address exactly, as in httpx;
-    a ``host:port`` entry additionally requires the port.
+    Mirrors the rules the host's own HTTP client applies, so HTTP requests and
+    the tunnel never disagree about the proxy: ``*`` disables proxying; a
+    plain name matches itself and its subdomains; a leading dot matches
+    subdomains only; a ``*``-prefixed entry matches nothing; an IP literal or
+    ``localhost`` matches that exact text; ``host:port`` also requires the port.
 
     :param host: Target hostname (no brackets), lowercase or not.
     :param port: Target port.
     :param no_proxy: Raw ``no_proxy`` value.
     :returns: True when the target must be dialed directly.
     """
-    host = host.lower().rstrip(".")
+    host = host.lower()
     for raw_entry in no_proxy.split(","):
         entry = raw_entry.strip().lower()
         if not entry:
@@ -101,16 +102,17 @@ def _bypassed_by_no_proxy(host: str, port: int, no_proxy: str) -> bool:
         else:
             # Plain hostname or a bare IPv6 literal like ``::1``.
             entry_host = entry
-        # "*.example.com", ".example.com", and "example.com" all mean the
-        # domain and its subdomains.
-        entry_host = entry_host.lstrip("*").lstrip(".").rstrip(".")
-        if not entry_host:
+        if not entry_host or (entry_port is not None and entry_port != port):
             continue
-        if entry_port is not None and entry_port != port:
+        if entry_host.startswith("*"):
+            # httpx mounts "*example.com" as a pattern no real host matches.
             continue
-        entry_ip = _ip_literal(entry_host)
-        if entry_ip is not None:
-            if entry_ip == _ip_literal(host):
+        if entry_host.startswith("."):
+            if host.endswith(entry_host):
+                return True
+            continue
+        if _ip_literal(entry_host) is not None or entry_host == "localhost":
+            if host == entry_host:
                 return True
             continue
         if host == entry_host or host.endswith("." + entry_host):
@@ -262,9 +264,10 @@ async def open_proxy_connect_socket(
         dial.add_done_callback(_close_dial_result)
         raise
     except TimeoutError:
+        # Registered first: the worker may finish just as the deadline fires.
+        dial.add_done_callback(_close_dial_result)
         if dial.done():
             raise
-        dial.add_done_callback(_close_dial_result)
         raise TimeoutError(
             f"proxy did not complete CONNECT to {target_host}:{target_port} within {timeout:g}s"
         ) from None
@@ -339,7 +342,8 @@ def _connect_sync(
             raise OSError(
                 f"proxy sent a non-HTTP response to CONNECT {authority}: {status_line!r}"
             )
-        status_code = int(status_parts[1]) if status_parts[1].isdigit() else 0
+        status_text = status_parts[1]
+        status_code = int(status_text) if status_text.isascii() and status_text.isdigit() else 0
         if not 200 <= status_code < 300:
             raise OSError(f"proxy refused CONNECT to {authority}: {status_line!r}")
         if residue:

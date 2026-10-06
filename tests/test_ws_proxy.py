@@ -71,18 +71,23 @@ def test_proxy_selection(url, env, expected):
 @pytest.mark.parametrize(
     ("host", "no_proxy", "bypass"),
     [
+        # Expectations mirror httpx 0.28, the host's own HTTP client.
         ("example.com", "example.com", True),
         ("sub.example.com", "example.com", True),
         ("notexample.com", "example.com", False),
-        ("sub.example.com", "*.example.com", True),
+        ("example.com", ".example.com", False),
         ("sub.example.com", ".example.com", True),
+        ("deep.sub.example.com", ".example.com", True),
+        ("example.com", "*.example.com", False),
+        ("sub.example.com", "*.example.com", False),
         ("anything.test", "*", True),
         ("example.com:8443", "example.com:8443", True),
+        ("sub.example.com:8443", "example.com:8443", True),
         ("example.com:8000", "example.com:8443", False),
         ("10.1.2.3:8000", "localhost,10.1.2.3,fd00::1", True),
         ("[fd00::1]:8000", "localhost,10.1.2.3,fd00::1", True),
         ("[fd00::1]:8000", "[fd00::1]:8000", True),
-        ("[fd00:0:0:0:0:0:0:1]:8000", "fd00::1", True),
+        ("[fd00:0:0:0:0:0:0:1]:8000", "fd00::1", False),
         ("evil.10.1.2.3:8000", "10.1.2.3", False),
         ("server.sandbox.test:8000", "localhost,10.1.2.3,fd00::1", False),
     ],
@@ -163,11 +168,12 @@ async def test_connect_tunnel(userinfo):
     [
         (b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n", "refused CONNECT"),
         (b"GARBAGE 200 OK\r\n\r\n", "non-HTTP response"),
+        (b"HTTP/1.1 \xb200 OK\r\n\r\n", "refused CONNECT"),
         (b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 65607 + b"\r\n\r\n", "oversized"),
         (_OK + b"GARBAGE", "unexpected bytes"),
         (b"", "closed the connection"),
     ],
-    ids=["refused", "non-http", "oversized", "trailing-bytes", "eof"],
+    ids=["refused", "non-http", "non-decimal-status", "oversized", "trailing-bytes", "eof"],
 )
 async def test_connect_error(reply, error):
     async with _connect_proxy(reply) as (port, _requests):
@@ -236,6 +242,24 @@ async def test_connect_timeout_bounds_a_slow_dial(monkeypatch):
         if sock.fileno() == -1:
             break
         await asyncio.sleep(0.02)
+    assert sock.fileno() == -1
+
+
+async def test_connect_timeout_race_closes_completed_dial(monkeypatch):
+    """A deadline that fires as the dial completes still closes the returned socket."""
+    from omnigent.util import ws_proxy
+
+    sock = socket.socket()
+    monkeypatch.setattr(ws_proxy, "_connect_sync", lambda *_args: sock)
+
+    async def wait_for_after_completion(awaitable, _timeout):
+        await awaitable
+        raise TimeoutError
+
+    monkeypatch.setattr(ws_proxy.asyncio, "wait_for", wait_for_after_completion)
+    with pytest.raises(TimeoutError):
+        await open_proxy_connect_socket("http://127.0.0.1:1", _TUNNEL_URL, timeout=5)
+    await asyncio.sleep(0)
     assert sock.fileno() == -1
 
 

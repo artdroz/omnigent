@@ -4295,6 +4295,9 @@ class HostProcess:
             _logger.info("Connecting to %s", url)
         else:
             _logger.info("Connecting to %s via CONNECT proxy %s", url, redact_proxy_url(proxy_url))
+            # The CONNECT phase and the upgrade each get a full open_timeout on
+            # purpose: deducting dial time would starve TLS + upgrade behind a
+            # slow proxy and turn one slow attempt into a guaranteed retry.
             proxy_sock = await open_proxy_connect_socket(proxy_url, url, timeout=open_timeout)
         try:
             ws_cm = websockets.asyncio.client.connect(
