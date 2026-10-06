@@ -536,10 +536,11 @@ export interface PendingUserMessage {
    * on snapshot-replayed entries (they're already server-owned).
    */
   posted?: boolean;
-  /** The send happened while a reply was already streaming (claude-native
-   *  steering/queued input), so this message stays below that in-flight
-   *  preview instead of being lifted above it. */
-  sentWhileStreaming?: boolean;
+  /** The send happened locally while the agent was idle, so a native reply
+   *  that previews before input.consumed can be lifted below this message.
+   *  Absent on sends that steered into an in-flight reply and on
+   *  snapshot-replayed entries (unknown provenance), which stay at the tail. */
+  sentWhileIdle?: boolean;
 }
 
 /**
@@ -2365,7 +2366,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 ...(initialDraft ? { initialDraft } : {}),
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
-                ...(alreadyStreaming ? { sentWhileStreaming: true } : {}),
+                ...(alreadyStreaming ? {} : { sentWhileIdle: true }),
               },
             ],
         // A new turn does NOT supersede the background-shell tally: shells
@@ -2678,6 +2679,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           content: [{ type: "input_text" as const, text: commandText }],
           createdAtS: Math.floor(Date.now() / 1000),
           ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+          ...(alreadyStreaming ? {} : { sentWhileIdle: true }),
         },
       ],
     }));
@@ -6651,7 +6653,7 @@ function committedUserBlock(
 
 // Claude-native forwards a reply's delta preview before the user item, so a
 // trailing `live:` preview can sit at the tail when the message is promoted.
-// Lift the user above it, unless the send steered into an in-flight reply.
+// Lift the user above it only for a known local idle send.
 function blocksWithPromotedUserMessage(
   blocks: AnyBlock[],
   userBlock: UserMessageBlock,
@@ -7476,7 +7478,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                   event.createdBy ?? matched.author,
                   matched.createdAtS,
                 ),
-                !matched.sentWhileStreaming,
+                matched.sentWhileIdle === true,
               ),
             };
           }
@@ -7512,7 +7514,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 event.createdBy ?? head.author,
                 head.createdAtS,
               ),
-              !head.sentWhileStreaming,
+              head.sentWhileIdle === true,
             ),
           };
         }

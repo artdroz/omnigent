@@ -538,12 +538,13 @@ const settledThenPreviewReply = (settledId: string, previewId: string): Bubble =
     { kind: "text", itemId: `live:${previewId}`, text: "Next", final: true },
   ],
 });
-// An optimistic prompt the user steered into an already-streaming reply.
-const steeredUserBubble = (id: string): Bubble => ({
+// An optimistic prompt from a local send while the agent was idle -- the only
+// provenance the renderer lifts above a trailing native live preview.
+const idleUserBubble = (id: string): Bubble => ({
   kind: "user",
   itemId: id,
   content: [{ type: "input_text", text: id }],
-  sentWhileStreaming: true,
+  sentWhileIdle: true,
 });
 // A streaming reply bubble that already holds a settled non-text item (a
 // completed native tool call) plus the next reply's trailing `live:` preview.
@@ -686,21 +687,13 @@ describe("mergePendingBubbles", () => {
     ]);
   });
 
-  it("splices the pending prompt ABOVE a trailing native live-preview reply", () => {
+  it("lifts an idle local send above a trailing native live-preview reply", () => {
     // A native reply previews as a `live:` block before input.consumed promotes
-    // the just-sent user message, so appending after it would show the reply above
+    // the just-sent idle message, so appending after it would show the reply above
     // the user's own input.
     const committed = [livePreviewReply("a1")];
-    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    const merged = mergePendingBubbles(committed, [idleUserBubble("pend_1")]);
     expect(bubbleIds(merged)).toEqual(["pend_1", "a1"]);
-  });
-
-  it("does NOT lift a new prompt above a settled assistant reply", () => {
-    // Only a still-streaming preview belongs below the optimistic prompt; a
-    // settled prior turn stays above the next message being typed.
-    const committed = [userBubble("u1"), assistantText("a1")];
-    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
-    expect(bubbleIds(merged)).toEqual(["u1", "a1", "pend_1"]);
   });
 
   it("does NOT lift a prompt above a bubble fusing a settled answer with a preview", () => {
@@ -712,24 +705,35 @@ describe("mergePendingBubbles", () => {
     expect(bubbleIds(merged)).toEqual(["u1", "a1", "pend_1"]);
   });
 
-  it("does NOT lift a message steered into an in-flight reply above its preview", () => {
-    // A send into a streaming reply is steering; it belongs below that live
-    // preview, unlike an idle send that merely raced the forwarder ahead of it.
+  it("does NOT lift a send of unknown or steered provenance above a trailing preview", () => {
+    // Only a known idle send lifts; a steered send and a snapshot-replayed entry
+    // carry no idle flag, so they stay below the live preview.
     const committed = [livePreviewReply("a1")];
-    const merged = mergePendingBubbles(committed, [steeredUserBubble("pend_1")]);
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
     expect(bubbleIds(merged)).toEqual(["a1", "pend_1"]);
   });
 
-  it("lifts an idle send above a trailing preview but keeps a steered one below", () => {
-    // A mixed pending batch — an idle prompt whose reply is previewing plus a
-    // follow-up steered into it — splits around the preview: idle above it,
-    // steered below it, rather than collapsing to one placement for the batch.
+  it("lifts the idle prefix of a mixed batch but keeps a trailing steered send below", () => {
+    // A mixed pending batch -- an idle prompt whose reply is previewing followed
+    // by a steered one -- lifts only the leading idle prefix above the preview and
+    // keeps the rest below it in order.
     const committed = [livePreviewReply("a1")];
     const merged = mergePendingBubbles(committed, [
-      userBubble("idle_1"),
-      steeredUserBubble("steer_1"),
+      idleUserBubble("idle_1"),
+      userBubble("steer_1"),
     ]);
     expect(bubbleIds(merged)).toEqual(["idle_1", "a1", "steer_1"]);
+  });
+
+  it("keeps FIFO order when a steered send precedes an idle one in the batch", () => {
+    // The FIFO prefix is lifted, not every idle send: a steered send at the head
+    // pins the whole batch below the preview so the original order is preserved.
+    const committed = [livePreviewReply("a1")];
+    const merged = mergePendingBubbles(committed, [
+      userBubble("steer_1"),
+      idleUserBubble("idle_1"),
+    ]);
+    expect(bubbleIds(merged)).toEqual(["a1", "steer_1", "idle_1"]);
   });
 
   it("does NOT lift a prompt above a bubble whose settled content is a tool call", () => {

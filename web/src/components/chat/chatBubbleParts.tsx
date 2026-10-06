@@ -223,7 +223,7 @@ export function buildPendingBubbles(
       // Stamped once at send time; absent for snapshot-replayed entries,
       // which show no timestamp rather than a re-stamped render time.
       ...(p.createdAtS !== undefined ? { createdAtS: p.createdAtS } : {}),
-      ...(p.sentWhileStreaming ? { sentWhileStreaming: true } : {}),
+      ...(p.sentWhileIdle ? { sentWhileIdle: true } : {}),
     };
   });
 }
@@ -298,19 +298,21 @@ export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bub
     insertAt -= 1;
   }
   insertAt = liftAboveCreateRoutingChips(committed, insertAt);
-  // An idle send that merely raced a streaming preview lifts above it; a send
-  // steered into that in-flight reply stays below it. Split a mixed batch so
-  // each prompt lands on the correct side of the trailing preview.
+  // A known local idle send that merely raced a streaming preview lifts above
+  // it; a steered send and a snapshot-replayed entry (unknown provenance) stay
+  // below. Lift only the FIFO prefix of idle sends so a mixed batch keeps its
+  // original order on each side of the trailing preview.
   const trailingPreview = committed.slice(insertAt).some(isNativeLivePreviewBubble);
   if (!trailingPreview) {
     if (insertAt === committed.length) return [...committed, ...pending];
     return [...committed.slice(0, insertAt), ...pending, ...committed.slice(insertAt)];
   }
-  const steersIntoReply = (bubble: Bubble): boolean =>
-    bubble.kind === "user" && (bubble.sentWhileStreaming ?? false);
-  const lifted = pending.filter((bubble) => !steersIntoReply(bubble));
-  const steered = pending.filter(steersIntoReply);
-  return [...committed.slice(0, insertAt), ...lifted, ...committed.slice(insertAt), ...steered];
+  const isIdleLocalSend = (bubble: Bubble): boolean =>
+    bubble.kind === "user" && (bubble.sentWhileIdle ?? false);
+  const firstKept = pending.findIndex((bubble) => !isIdleLocalSend(bubble));
+  const lifted = firstKept === -1 ? pending : pending.slice(0, firstKept);
+  const kept = firstKept === -1 ? [] : pending.slice(firstKept);
+  return [...committed.slice(0, insertAt), ...lifted, ...committed.slice(insertAt), ...kept];
 }
 
 type ElicitationItem = Extract<RenderItem, { kind: "elicitation" }>;

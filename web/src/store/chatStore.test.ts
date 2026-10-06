@@ -1468,10 +1468,10 @@ describe("chatStore — switchTo", () => {
     sink.close();
   });
 
-  it("marks a send that steers into an already-streaming native reply", async () => {
-    // send() records whether a reply was already previewing at submit time, so
-    // the renderer keeps that reply above a steering follow-up instead of
-    // lifting the follow-up above it like an idle send that raced the forwarder.
+  it("flags a local idle send but not one steered into an already-streaming native reply", async () => {
+    // send() records whether the agent was idle at submit time, so the renderer
+    // lifts an idle send that merely raced the forwarder above the preview while
+    // keeping a steered follow-up below the in-flight reply it steers into.
     const sink = pushableStream();
     seedSession("conv_5555_steer", []);
     sessionLabels.set("conv_5555_steer", { "omnigent.wrapper": "claude-code-native-ui" });
@@ -1507,8 +1507,10 @@ describe("chatStore — switchTo", () => {
       m.content.map((c) => (c.type === "input_text" ? c.text : "")).join("");
     const idle = pending.find((m) => textOf(m) === "first question");
     const steered = pending.find((m) => textOf(m) === "actually, use metric units");
-    expect(idle?.sentWhileStreaming ?? false).toBe(false);
-    expect(steered?.sentWhileStreaming).toBe(true);
+    expect(idle, "idle send present").toBeDefined();
+    expect(steered, "steered send present").toBeDefined();
+    expect(idle?.sentWhileIdle).toBe(true);
+    expect(steered?.sentWhileIdle ?? false).toBe(false);
 
     sink.close();
   });
@@ -1571,6 +1573,68 @@ describe("chatStore — switchTo", () => {
     // The settled prior answer renders above the promoted prompt, which in turn
     // renders above its own streaming reply.
     expect(composeNativeRoles()).toEqual(["user", "assistant", "user", "assistant"]);
+
+    sink.close();
+  });
+
+  it("keeps a reloaded reply above a hydrated pending message through input.consumed", async () => {
+    // Reload mid-reply: the server replays the queued message in pending_inputs
+    // (no local send provenance) while the native stream re-previews the reply as
+    // a `live:` block. The hydrated message has unknown provenance, so it stays
+    // BELOW that preview before AND after input.consumed names its id -- never
+    // flipping above the reply the way a known idle send would.
+    const sink = pushableStream();
+    seedSession("conv_5555_reload", []);
+    seedPendingInputs("conv_5555_reload", [
+      { pending_id: "pending_steer", content: [{ type: "input_text", text: "use metric units" }] },
+    ]);
+    sessionLabels.set("conv_5555_reload", { "omnigent.wrapper": "claude-code-native-ui" });
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_5555_reload/stream")
+        return mockResponse(null, { bodyStream: sink.stream });
+      return base(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_5555_reload");
+    // Hydrated from pending_inputs: no local send timing, so no idle flag.
+    const hydrated = useChatStore.getState().pendingUserMessages;
+    expect(hydrated).toHaveLength(1);
+    expect(hydrated[0]!.sentWhileIdle ?? false).toBe(false);
+
+    // The reply re-previews before input.consumed re-acks the queued message.
+    sink.push(sse("response.created", { id: "resp_reload", status: "in_progress", output: [] }));
+    sink.push(
+      sse("response.output_text.delta", {
+        delta: "Converting to metric.",
+        message_id: "msg_reload",
+        index: 0,
+      }),
+    );
+    await tick();
+    await tick();
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toContain("live:msg_reload");
+    // Unknown provenance never lifts: the reply stays above the hydrated message.
+    expect(composeNativeRoles()).toEqual(["assistant", "user"]);
+
+    // input.consumed names the hydrated entry by its pending id (branch 1).
+    sink.push(
+      sse("session.input.consumed", {
+        data: {
+          item_id: "item_reload_user",
+          type: "message",
+          cleared_pending_id: "pending_steer",
+          data: { role: "user", content: [{ type: "input_text", text: "use metric units" }] },
+        },
+      }),
+    );
+    await tick();
+    await tick();
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(0);
+    const order = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
+    expect(order.indexOf("live:msg_reload")).toBeLessThan(order.indexOf("item_reload_user"));
+    expect(composeNativeRoles()).toEqual(["assistant", "user"]);
 
     sink.close();
   });
