@@ -1740,6 +1740,17 @@ describe("splitSlashCommand", () => {
     });
   });
 
+  it("treats a known skill name with spaces as one token", () => {
+    const name = "/Simplified Technical English (ASD-STE100)";
+    expect(splitSlashCommand(`${name} rewrite this`, ["/compact", name])).toEqual({
+      before: "",
+      token: name,
+      after: " rewrite this",
+    });
+    // Without a catalog match only the first word reads as the command.
+    expect(splitSlashCommand(`${name} rewrite this`, ["/compact"])?.token).toBe("/Simplified");
+  });
+
   it("returns null when the text isn't a command", () => {
     expect(splitSlashCommand("just prose")).toBeNull();
   });

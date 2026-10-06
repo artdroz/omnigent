@@ -1114,6 +1114,30 @@ describe("Composer slash-command submit routing", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
+  it("routes a skill whose name contains spaces, with and without args", () => {
+    // SKILL.md frontmatter names may carry spaces and parentheses; the
+    // catalog's full name must match, not just the first token.
+    const name = "Simplified Technical English (ASD-STE100)";
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name, description: "Rewrite per ASD-STE100." }],
+    });
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    const ta = textarea();
+    // Menu completion leaves "/<name> " in the composer; Enter must submit it.
+    fireEvent.change(ta, { target: { value: `/${name} ` } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSendSlashCommand).toHaveBeenCalledExactlyOnceWith(name, "");
+
+    fireEvent.change(ta, { target: { value: `/${name} rewrite this paragraph` } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSendSlashCommand).toHaveBeenLastCalledWith(name, "rewrite this paragraph");
+    expect(onSendSlashCommand).toHaveBeenCalledTimes(2);
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
   it("routes a known skill whose args carry slashes (paths, URLs)", () => {
     const onSend = vi.fn();
     const onSendSlashCommand = vi.fn();
@@ -3295,6 +3319,18 @@ describe("Composer slash-command highlight overlay", () => {
     expect(overlayText()).toBe(COMMAND_PROMPT);
     expect(textarea()).toHaveClass("text-ui");
     expect(screen.getByTestId("composer-highlight-overlay")).toHaveClass("text-ui");
+  });
+
+  it("tints the full name of a skill with spaces, leaving args default", () => {
+    const name = "Simplified Technical English (ASD-STE100)";
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name, description: "Rewrite per ASD-STE100." }],
+    });
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: `/${name} rewrite this` } });
+    expect(tintedText()).toBe(`/${name}`);
+    expect(overlayText()).toBe(`/${name} rewrite this`);
   });
 
   it("renders no overlay for plain prose", () => {

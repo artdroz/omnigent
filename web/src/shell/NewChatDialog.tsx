@@ -120,7 +120,11 @@ import {
 export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
 import { isFeatureEnabled, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { useHeading, usePoweredBy } from "@/lib/branding";
-import { isSlashCommandText, SlashCommandMenu } from "@/components/SlashCommandMenu";
+import {
+  isSlashCommandText,
+  matchSlashCommandInvocation,
+  SlashCommandMenu,
+} from "@/components/SlashCommandMenu";
 import {
   beginLocalConversation,
   hasPendingLocalMessage,
@@ -1193,8 +1197,9 @@ function SandboxRepoBranchSelect({
  * (:func:`isSlashCommandText`): the first token must read as ``/name``
  * (file paths like ``/etc/hosts`` never match), while the args after it
  * may carry anything — including paths and URLs, e.g.
- * ``"/review-pr https://github.com/..."``. The command name must
- * exactly match an available skill. Unknown commands are sent as plain text.
+ * ``"/review-pr https://github.com/..."``. The command must exactly match
+ * an available skill's full name, which may contain spaces. Unknown commands
+ * are sent as plain text.
  *
  * @param text The sanitized first message, e.g. ``"/review-pr 123"``.
  * @param skills The chosen agent's bundled skills and the selected host's catalog.
@@ -1207,10 +1212,11 @@ export function matchSkillInvocation(
 ): { name: string; args: string } | null {
   const trimmed = text.trim();
   if (!isSlashCommandText(trimmed)) return null;
-  const command = trimmed.split(/\s+/)[0]!;
-  const name = command.slice(1);
-  if (!skills.some((s) => s.name === name)) return null;
-  return { name, args: trimmed.slice(command.length).trim() };
+  const match = matchSlashCommandInvocation(
+    trimmed,
+    skills.map((s) => `/${s.name}`),
+  );
+  return match && { name: match.command.slice(1), args: match.args };
 }
 
 /**

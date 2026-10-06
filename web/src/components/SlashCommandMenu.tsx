@@ -46,6 +46,27 @@ export function isSlashCommandText(text: string): boolean {
 }
 
 /**
+ * The known command or skill `text` invokes, split from its arguments, or null.
+ * Skill names may contain spaces, so the longest key in `commands` (prefix and
+ * exact case included) that prefixes the text at a word boundary wins.
+ */
+export function matchSlashCommandInvocation(
+  text: string,
+  commands: Iterable<string>,
+): { command: string; args: string } | null {
+  const trimmed = text.trim();
+  let command: string | null = null;
+  for (const candidate of commands) {
+    if (command !== null && candidate.length <= command.length) continue;
+    if (!trimmed.startsWith(candidate)) continue;
+    const rest = trimmed.slice(candidate.length);
+    if (rest === "" || /^\s/.test(rest)) command = candidate;
+  }
+  if (command === null) return null;
+  return { command, args: trimmed.slice(command.length).trim() };
+}
+
+/**
  * True when `query` is a case-insensitive substring of the command name
  * (sans the leading `/`). Matches on the name only — not the description —
  * because the web menu never shows descriptions inline, so a

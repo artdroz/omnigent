@@ -203,6 +203,7 @@ import { HostBadge } from "@/components/HostBadge";
 import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
+  matchSlashCommandInvocation,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
@@ -334,14 +335,18 @@ const SLASH_COMMAND_SPLIT_RE = /^(\s*)([/$][A-Za-z0-9][\w:-]*)(?=\s|$)/;
 
 /**
  * Split a command or skill draft for the composer highlight overlay.
- * Returns null for prose and file paths such as `/etc/hosts`.
+ * Returns null for prose and file paths such as `/etc/hosts`. When the draft
+ * invokes one of `commands`, that whole name is the token, so a skill name
+ * with spaces tints as one command rather than just its first word.
  */
 export function splitSlashCommand(
   value: string,
+  commands: Iterable<string> = [],
 ): { before: string; token: string; after: string } | null {
   const m = SLASH_COMMAND_SPLIT_RE.exec(value);
   if (!m) return null;
-  const [, before, token] = m;
+  const [, before] = m;
+  const token = matchSlashCommandInvocation(value, commands)?.command ?? m[2];
   return { before, token, after: value.slice(before.length + token.length) };
 }
 
@@ -2790,6 +2795,7 @@ function ComposerImpl(
       supportsModelReset,
     ],
   );
+  const slashCommandNames = useMemo(() => Object.keys(slashCommands), [slashCommands]);
   // Skills always need an optional argument fill-in so the user can
   // type extra context after the name; built-in commands keep their
   // existing fill/execute split.
@@ -3397,14 +3403,17 @@ function ComposerImpl(
       // Known skill on an in-process session: send a `slash_command` event
       // (the REPL's wire shape) so the server resolves the skill and
       // injects its instructions, instead of the agent seeing the literal
-      // "/name" text. `parts[0]` keeps the original case for the server's
-      // exact-name lookup. `onSendSlashCommand` is undefined for
+      // "/name" text. Skill names may contain spaces, so match the catalog's
+      // full name (original case, for the server's exact-name lookup) rather
+      // than the first token. `onSendSlashCommand` is undefined for
       // native-terminal sessions, so those fall through to the plaintext
       // path below and the vendor TUI loads the skill itself.
-      if (onSendSlashCommand && parts[0] in slashCommands) {
-        const skillArgs = trimmed.slice(parts[0].length).trim();
+      const skill = onSendSlashCommand
+        ? matchSlashCommandInvocation(trimmed, slashCommandNames)
+        : null;
+      if (onSendSlashCommand && skill !== null) {
         appendEntry(trimmed);
-        onSendSlashCommand(parts[0].slice(1), skillArgs);
+        onSendSlashCommand(skill.command.slice(1), skill.args);
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
@@ -3848,7 +3857,7 @@ function ComposerImpl(
               className="composer-input-text pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-3 pt-3 pb-1 text-ui text-foreground"
             >
               {(() => {
-                const split = splitSlashCommand(value);
+                const split = splitSlashCommand(value, slashCommandNames);
                 if (!split) return value;
                 return (
                   <>
