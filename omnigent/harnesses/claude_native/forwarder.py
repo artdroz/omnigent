@@ -667,7 +667,7 @@ class _SubagentScanMemo:
         attempts = self.attempts.get(subagent_id, 0) + 1
         self.attempts[subagent_id] = attempts
         delay_s = min(
-            _SUBAGENT_RELOCATE_BASE_DELAY_S * 2 ** (attempts - 1),
+            _SUBAGENT_RELOCATE_BASE_DELAY_S * 2 ** min(attempts - 1, 16),
             _SUBAGENT_RELOCATE_MAX_DELAY_S,
         )
         self.next_attempt_at[subagent_id] = self.clock() + delay_s
@@ -1652,10 +1652,11 @@ def _subagent_transcript_path(subagents_dir: Path, entry: SubagentEntry) -> Path
 
 
 def _recover_subagent_transcript_subdir(subagents_dir: Path, entry: SubagentEntry) -> str | None:
-    """Relocate the unique ``agent-<id>.jsonl`` of an entry whose subdir was not persisted."""
+    """Relocate the ``agent-<id>.jsonl`` of an entry whose subdir was not persisted."""
     matches = sorted(subagents_dir.rglob(f"agent-{entry.subagent_id}.jsonl"))
-    if len(matches) != 1:
+    if not matches:
         return None
+    # A duplicated id keeps the sorted-first path, like discovery does.
     return _subagent_transcript_subdir(subagents_dir, matches[0])
 
 

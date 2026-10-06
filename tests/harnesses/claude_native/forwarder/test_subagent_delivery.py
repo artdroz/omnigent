@@ -1670,3 +1670,69 @@ async def test_subagent_watcher_backs_off_relocating_a_missing_transcript(
     warnings = [record for record in caplog.records if "has no transcript" in record.message]
     assert len(warnings) == 1 and "ghost" in warnings[0].message
     assert state.subagents["ghost"].transcript_subdir is None
+
+
+async def test_subagent_watcher_relocates_a_duplicated_id_to_the_first_transcript(
+    tmp_path: Path,
+) -> None:
+    """A legacy entry whose id has two nested transcripts takes the sorted-first one."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    for run_id in ("wf_run_b", "wf_run_a"):
+        _seed_subagent_on_disk(
+            transcript_path=transcript_path,
+            subagent_id="twin",
+            agent_type="general-purpose",
+            description="duplicated id",
+            tool_use_id="toolu_twin",
+            transcript_subdir=f"workflows/{run_id}",
+            transcript_records=[
+                {
+                    "isSidechain": True,
+                    "type": "assistant",
+                    "uuid": f"twin-{run_id}",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": f"copy from {run_id}"}],
+                    },
+                }
+            ],
+        )
+    (bridge_dir / "subagent_forwarder.json").write_text(
+        json.dumps({"subagents": {"twin": {"child_conversation_id": "conv_twin"}}}),
+        encoding="utf-8",
+    )
+    posted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if not isinstance(body, list):
+            return httpx.Response(202, json={})
+        for event in body:
+            item_data = event["data"]["item_data"]
+            posted.append(item_data["content"][0]["text"])
+        return httpx.Response(
+            202,
+            json=[{"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)],
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder._read_subagent_forward_state(bridge_dir),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert posted == ["copy from wf_run_a"]
+    assert state.subagents["twin"].transcript_subdir == "workflows/wf_run_a"

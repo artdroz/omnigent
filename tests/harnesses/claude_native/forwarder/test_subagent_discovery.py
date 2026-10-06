@@ -722,7 +722,7 @@ async def test_subagent_watcher_registers_workflow_nested_spawn(
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
 
-    # Flat spawn (control) — the layout that already registers today.
+    # Flat spawn (control).
     _seed_subagent_on_disk(
         transcript_path=transcript_path,
         subagent_id="flat-worker",
