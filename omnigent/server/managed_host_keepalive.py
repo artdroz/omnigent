@@ -117,8 +117,8 @@ def configure(
     """Wire the stores and provider set the keepalive needs.
 
     Called once at app construction. A ``None`` *sandbox_config* (no
-    ``sandbox:`` section) leaves :func:`touch` a no-op, so a server with no
-    managed sandboxes pays nothing.
+    ``sandbox:`` section) leaves :func:`touch` a no-op and releases any pool a
+    previous call built, so a server with no managed sandboxes pays nothing.
 
     :param conversation_store: Store used to resolve a runner to its session's host.
     :param host_store: Store used to read the host's recorded sandbox; ``None``
@@ -130,12 +130,19 @@ def configure(
     _conversation_store = conversation_store
     _host_store = host_store
     _sandbox_config = sandbox_config
+    stale: ThreadPoolExecutor | None = None
     with _state_lock:
-        if sandbox_config is not None and host_store is not None and _executor is None:
+        enabled = sandbox_config is not None and host_store is not None
+        if enabled and _executor is None:
             _executor = ThreadPoolExecutor(
                 max_workers=_KEEPALIVE_MAX_WORKERS,
                 thread_name_prefix="managed-keepalive",
             )
+        elif not enabled and _executor is not None:
+            stale, _executor = _executor, None
+    if stale is not None:
+        # Outside the lock: cancelling queued futures runs _finalize_job, which locks.
+        stale.shutdown(wait=False, cancel_futures=True)
 
 
 def _interval_for(runner_id: str) -> float:
@@ -143,7 +150,9 @@ def _interval_for(runner_id: str) -> float:
     the fast agent_sandbox cadence so a short-window sandbox is never under-refreshed."""
     with _state_lock:
         interval = _runner_interval_s.get(runner_id)
-    return interval or resolve_managed_keepalive_interval_s("agent_sandbox")
+    if interval is None:
+        return resolve_managed_keepalive_interval_s("agent_sandbox")
+    return interval
 
 
 def keepalive_interval_s(runner_id: str) -> float:
@@ -229,17 +238,19 @@ def _release_reservation(runner_id: str) -> None:
     with _state_lock:
         _inflight.discard(runner_id)
         _last_kept.pop(runner_id, None)
+        _runner_interval_s.pop(runner_id, None)
 
 
 def _finalize_job(future: Future[None], runner_id: str) -> None:
-    """Release a reservation whose job was cancelled or crashed before its own cleanup ran."""
+    """Release a cancelled job's reservation; only record a crash (the job released its own)."""
     if future.cancelled():
         _release_reservation(runner_id)
         _emit_outcome(runner_id, _KeepAliveOutcome.CANCELLED, queue_delay_s=0.0)
         return
     exc = future.exception()
     if exc is not None:
-        _release_reservation(runner_id)
+        # Releasing here could clobber a newer reservation made after the
+        # crashed job's own cleanup; _run_keepalive_job always runs that cleanup.
         _emit_outcome(
             runner_id,
             _KeepAliveOutcome.RESOLUTION_ERROR,
@@ -250,11 +261,13 @@ def _finalize_job(future: Future[None], runner_id: str) -> None:
 
 def _run_keepalive_job(runner_id: str, queued_at: float) -> None:
     """Resolve the runner's sandbox on a worker, reporting how long the job queued."""
-    token = _queue_delay_s.set(max(0.0, time.monotonic() - queued_at))
     try:
-        _keep_alive_for_runner(runner_id)
+        token = _queue_delay_s.set(max(0.0, time.monotonic() - queued_at))
+        try:
+            _keep_alive_for_runner(runner_id)
+        finally:
+            _queue_delay_s.reset(token)
     finally:
-        _queue_delay_s.reset(token)
         with _state_lock:
             _inflight.discard(runner_id)
 

@@ -42,6 +42,15 @@ def _record_submission(submitted: list[str], *args: object) -> Future[None]:
     return Future()
 
 
+def _outcomes(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The managed_keepalive outcomes logged so far, in order."""
+    return [
+        record.attributes["outcome"]
+        for record in caplog.records
+        if isinstance(getattr(record, "attributes", None), dict) and "outcome" in record.attributes
+    ]
+
+
 class _FakeClock:
     """time module stand-in: a settable monotonic clock, everything else real."""
 
@@ -59,15 +68,22 @@ class _DeferredExecutor:
     """Holds submitted jobs so a test can run them inline at a chosen clock time."""
 
     def __init__(self) -> None:
-        self.jobs: list[tuple[Callable[..., None], tuple[object, ...]]] = []
+        self.jobs: list[tuple[Callable[..., None], tuple[object, ...], Future[None]]] = []
 
     def submit(self, fn: Callable[..., None], *args: object) -> Future[None]:
-        self.jobs.append((fn, args))
-        return Future()
+        future: Future[None] = Future()
+        self.jobs.append((fn, args, future))
+        return future
 
     def run_next(self) -> None:
-        fn, args = self.jobs.pop(0)
-        fn(*args)
+        """Run the oldest job the way a worker would, then complete its future."""
+        fn, args, future = self.jobs.pop(0)
+        try:
+            fn(*args)
+        except Exception as exc:
+            future.set_exception(exc)
+        else:
+            future.set_result(None)
 
 
 def _wire(
@@ -101,7 +117,9 @@ def test_extends_the_hosts_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
     assert launcher.calls == ["sbx1"]
 
 
-def test_provider_without_keep_alive_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_provider_without_keep_alive_is_skipped(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     # kubernetes today: the base class raises, and that must not propagate.
     launcher = _Launcher(raises=SandboxCapabilityError("nope"))
     _wire(
@@ -109,8 +127,10 @@ def test_provider_without_keep_alive_is_skipped(monkeypatch: pytest.MonkeyPatch)
         launcher=launcher,
         host=SimpleNamespace(sandbox_id="sbx1", sandbox_provider="kubernetes"),
     )
-    managed_host_keepalive._keep_alive_for_runner("r1")
+    with caplog.at_level(logging.DEBUG, logger="omnigent.server.managed_host_keepalive"):
+        managed_host_keepalive._keep_alive_for_runner("r1")
     assert launcher.calls == ["sbx1"]  # attempted, error swallowed
+    assert _outcomes(caplog) == ["unsupported"]
 
 
 def test_store_failure_never_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -131,15 +151,30 @@ def test_store_failure_never_propagates(monkeypatch: pytest.MonkeyPatch) -> None
     managed_host_keepalive._keep_alive_for_runner("r1")  # must not raise
 
 
-def test_cli_host_without_a_sandbox_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cli_host_without_a_sandbox_is_skipped(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     launcher = _Launcher()
     _wire(
         monkeypatch,
         launcher=launcher,
         host=SimpleNamespace(sandbox_id=None, sandbox_provider=None),
     )
-    managed_host_keepalive._keep_alive_for_runner("r1")
+    with caplog.at_level(logging.DEBUG, logger="omnigent.server.managed_host_keepalive"):
+        managed_host_keepalive._keep_alive_for_runner("r1")
     assert launcher.calls == []
+    assert _outcomes(caplog) == ["no_sandbox"]
+
+
+def test_a_host_row_that_no_longer_exists_is_skipped(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    launcher = _Launcher()
+    _wire(monkeypatch, launcher=launcher, host=None)
+    with caplog.at_level(logging.DEBUG, logger="omnigent.server.managed_host_keepalive"):
+        managed_host_keepalive._keep_alive_for_runner("r1")
+    assert launcher.calls == []
+    assert _outcomes(caplog) == ["no_host"]
 
 
 def test_touch_is_rate_limited_per_runner(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -209,7 +244,7 @@ def test_worker_runs_inside_the_callers_workspace_scope(
 
 
 def test_a_host_on_an_unoffered_provider_is_skipped(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """
     Never extend through another provider's launcher. `recorded()` would fall
@@ -230,8 +265,10 @@ def test_a_host_on_an_unoffered_provider_is_skipped(
     monkeypatch.setattr(managed_host_keepalive, "_host_store", hosts)
     monkeypatch.setattr(managed_host_keepalive, "_sandbox_config", deployment)
 
-    managed_host_keepalive._keep_alive_for_runner("r1")
+    with caplog.at_level(logging.DEBUG, logger="omnigent.server.managed_host_keepalive"):
+        managed_host_keepalive._keep_alive_for_runner("r1")
     assert launcher.calls == []
+    assert _outcomes(caplog) == ["provider_unavailable"]
 
 
 @pytest.mark.parametrize(
@@ -360,16 +397,25 @@ def test_helper_cannot_release_a_new_reservation_at_worker_handoff(
 def test_configure_builds_the_bounded_worker_pool(monkeypatch: pytest.MonkeyPatch) -> None:
     """configure() builds the production pool at the fixed bound, not a single worker."""
     pool_sizes: list[int] = []
+    shutdowns: list[bool] = []
 
     class _RecordingPool:
         def __init__(self, *, max_workers: int, thread_name_prefix: str) -> None:
             pool_sizes.append(max_workers)
+
+        def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+            shutdowns.append(cancel_futures)
 
     monkeypatch.setattr(managed_host_keepalive, "ThreadPoolExecutor", _RecordingPool)
     for name in ("_conversation_store", "_host_store", "_sandbox_config", "_executor"):
         monkeypatch.setattr(managed_host_keepalive, name, None)
     managed_host_keepalive.configure(object(), object(), object())
     assert pool_sizes == [managed_host_keepalive._KEEPALIVE_MAX_WORKERS] == [8]
+
+    # Switching managed sandboxes off releases the pool instead of leaving idle workers.
+    managed_host_keepalive.configure(object(), object(), None)
+    assert managed_host_keepalive._executor is None
+    assert shutdowns == [True]
 
 
 def test_a_tick_one_interval_after_touch_is_not_throttled(
@@ -469,6 +515,7 @@ def test_cancelled_job_releases_the_runner_reservation(
 ) -> None:
     """Cancelling an accepted but unstarted job frees the runner for the next tick."""
     futures = _accept_jobs(monkeypatch)
+    managed_host_keepalive._runner_interval_s["r1"] = 600.0
 
     managed_host_keepalive.touch("r1")
     assert "r1" in managed_host_keepalive._inflight
@@ -476,6 +523,7 @@ def test_cancelled_job_releases_the_runner_reservation(
         assert futures[0].cancel()
     assert "r1" not in managed_host_keepalive._inflight
     assert "r1" not in managed_host_keepalive._last_kept
+    assert "r1" not in managed_host_keepalive._runner_interval_s  # no orphaned cadence entry
     assert any(
         getattr(record, "attributes", {}).get("outcome") == "cancelled"
         for record in caplog.records
@@ -485,17 +533,36 @@ def test_cancelled_job_releases_the_runner_reservation(
     assert len(futures) == 2
 
 
-def test_crashed_job_releases_the_runner_reservation(
+def test_a_crashed_job_releases_once_and_keeps_a_newer_reservation(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A job that dies outside the worker's own cleanup must not wedge the runner."""
-    futures = _accept_jobs(monkeypatch)
+    """A crashed job releases its own reservation; its late callback leaves a newer one alone."""
+    executor = _DeferredExecutor()
+    monkeypatch.setattr(managed_host_keepalive, "_executor", executor)
+    monkeypatch.setattr(managed_host_keepalive, "_sandbox_config", object())
+    monkeypatch.setattr(managed_host_keepalive, "_host_store", object())
+    monkeypatch.setattr(managed_host_keepalive, "_last_kept", {})
+    monkeypatch.setattr(managed_host_keepalive, "_runner_interval_s", {})
+    monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
 
+    def _crash(_rid: str) -> None:
+        raise RuntimeError("worker crashed")
+
+    monkeypatch.setattr(managed_host_keepalive, "_keep_alive_for_runner", _crash)
     managed_host_keepalive.touch("r1")
+    fn, args, stale_future = executor.jobs.pop(0)
+    with pytest.raises(RuntimeError):
+        fn(*args)
+    assert "r1" not in managed_host_keepalive._inflight  # the job's own cleanup ran
+
+    managed_host_keepalive._last_kept.clear()  # the next tick is due and reserves again
+    managed_host_keepalive.touch("r1")
+    assert "r1" in managed_host_keepalive._inflight
     with caplog.at_level(logging.WARNING, logger="omnigent.server.managed_host_keepalive"):
-        futures[0].set_exception(RuntimeError("worker crashed"))
-    assert "r1" not in managed_host_keepalive._inflight
-    assert "r1" not in managed_host_keepalive._last_kept
+        stale_future.set_exception(RuntimeError("worker crashed"))
+    assert "r1" in managed_host_keepalive._inflight, (
+        "a stale callback released a newer reservation"
+    )
     event = next(
         r
         for r in caplog.records
@@ -503,9 +570,6 @@ def test_crashed_job_releases_the_runner_reservation(
     )
     assert event.attributes["error_type"] == "RuntimeError"
     assert event.exc_info is not None
-
-    managed_host_keepalive.touch("r1")
-    assert len(futures) == 2
 
 
 def test_worker_releases_reservation_when_the_provider_raises(
