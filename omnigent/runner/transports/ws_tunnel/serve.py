@@ -971,10 +971,9 @@ async def _serve_tunnel_once(
                     # Pre-connected through the mandatory egress proxy (None dials
                     # direct); TLS for wss:// is layered on top by connect().
                     sock=proxy_sock,
-                    # Protocol keepalive aligned to the server's 90 s app-level budget
-                    # (not the 20 s library default that drops a busy-but-healthy tunnel,
-                    # issue #1116). Also the runner's only liveness probe for a
-                    # silently-dead server.
+                    # Keepalive aligned to the server's 90 s app-level budget (the 20 s
+                    # library default drops a busy-but-healthy tunnel); also the runner's
+                    # only liveness probe for a silently-dead server.
                     ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
                     ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
                 )

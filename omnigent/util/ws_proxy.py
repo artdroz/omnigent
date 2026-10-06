@@ -232,15 +232,34 @@ async def open_proxy_connect_socket(
     if proxy.username is not None:
         credentials = f"{unquote(proxy.username)}:{unquote(proxy.password or '')}"
         auth_header = "Basic " + base64.b64encode(credentials.encode("utf-8")).decode("ascii")
-    return await asyncio.to_thread(
-        _connect_sync,
-        proxy.hostname,
-        proxy_port,
-        target.hostname,
-        target_port,
-        auth_header,
-        timeout,
+    dial = asyncio.ensure_future(
+        asyncio.to_thread(
+            _connect_sync,
+            proxy.hostname,
+            proxy_port,
+            target.hostname,
+            target_port,
+            auth_header,
+            timeout,
+        )
     )
+    try:
+        return await asyncio.shield(dial)
+    except asyncio.CancelledError:
+        # The worker thread cannot be interrupted; close any socket it still
+        # hands back after this cancellation instead of orphaning it.
+        dial.add_done_callback(_close_dial_result)
+        raise
+
+
+def _close_dial_result(dial: asyncio.Future[socket.socket]) -> None:
+    """Close the socket a cancelled CONNECT dial still produced.
+
+    :param dial: The finished dial future.
+    """
+    if not dial.cancelled() and dial.exception() is None:
+        with contextlib.suppress(OSError):
+            dial.result().close()
 
 
 def _connect_sync(
@@ -258,7 +277,8 @@ def _connect_sync(
     :param target_host: Origin hostname the proxy must reach.
     :param target_port: Origin port.
     :param auth_header: Optional ``Proxy-Authorization`` value.
-    :param timeout: Overall budget, in seconds, for the dial and handshake.
+    :param timeout: Overall budget, in seconds, for the dial and handshake
+        (the dial applies it per resolved proxy address).
     :returns: The connected socket with its timeout cleared.
     :raises OSError: On dial failure, a refused/garbled CONNECT, or an
         exhausted budget.
@@ -266,22 +286,27 @@ def _connect_sync(
     authority = f"[{target_host}]" if ":" in target_host else target_host
     authority = f"{authority}:{target_port}"
     deadline = time.monotonic() + timeout
+
+    def remaining_budget() -> float:
+        # One budget for the whole handshake, so a slow dial or a proxy that
+        # drips bytes cannot stretch it across many per-operation timeouts.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"proxy did not complete CONNECT to {authority} within {timeout:g}s"
+            )
+        return remaining
+
     sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
     try:
         request_lines = [f"CONNECT {authority} HTTP/1.1", f"Host: {authority}"]
         if auth_header is not None:
             request_lines.append(f"Proxy-Authorization: {auth_header}")
+        sock.settimeout(remaining_budget())
         sock.sendall(("\r\n".join(request_lines) + "\r\n\r\n").encode("latin-1"))
         response = b""
         while b"\r\n\r\n" not in response:
-            # One budget for the whole handshake, so a proxy that drips bytes
-            # cannot stretch it across many per-read timeouts.
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"proxy did not complete CONNECT to {authority} within {timeout:g}s"
-                )
-            sock.settimeout(remaining)
+            sock.settimeout(remaining_budget())
             chunk = sock.recv(4096)
             if not chunk:
                 raise OSError(f"proxy closed the connection during CONNECT to {authority}")

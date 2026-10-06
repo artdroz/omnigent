@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextlib
 import datetime
+import socket
 import ssl
 import time
 from contextlib import asynccontextmanager
@@ -161,6 +162,31 @@ async def test_connect_error(reply, error):
 async def test_connect_rejects_malformed_proxy_port():
     with pytest.raises(OSError, match="invalid port"):
         await open_proxy_connect_socket("http://127.0.0.1:bad", _TUNNEL_URL, timeout=5)
+
+
+async def test_connect_closes_socket_when_awaiter_is_cancelled(monkeypatch):
+    """A socket the worker thread hands back after cancellation is closed, not orphaned."""
+    from omnigent.util import ws_proxy
+
+    sock = socket.socket()
+
+    def slow_connect(*_args):
+        time.sleep(0.2)
+        return sock
+
+    monkeypatch.setattr(ws_proxy, "_connect_sync", slow_connect)
+    dial = asyncio.ensure_future(
+        open_proxy_connect_socket("http://127.0.0.1:1", _TUNNEL_URL, timeout=5)
+    )
+    await asyncio.sleep(0.05)
+    dial.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await dial
+    for _ in range(100):
+        if sock.fileno() == -1:
+            break
+        await asyncio.sleep(0.02)
+    assert sock.fileno() == -1
 
 
 async def test_connect_timeout_bounds_the_whole_handshake():
