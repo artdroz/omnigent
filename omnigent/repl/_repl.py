@@ -8535,7 +8535,9 @@ def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
             return _skill_handler
 
         handler = _make_handler(skill)
-        COMMANDS[cmd_name] = (skill.description, handler)
+        # Label the command with its display name, matching the web menu.
+        description = " — ".join(filter(None, (skill.display_name, skill.description)))
+        COMMANDS[cmd_name] = (description, handler)
         registered.append(cmd_name)
         _log.debug("Registered skill slash command: %s", cmd_name)
 

@@ -120,7 +120,11 @@ import {
 export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
 import { isFeatureEnabled, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { useHeading, usePoweredBy } from "@/lib/branding";
-import { isSlashCommandText, SlashCommandMenu } from "@/components/SlashCommandMenu";
+import {
+  isSlashCommandText,
+  skillMenuDescription,
+  SlashCommandMenu,
+} from "@/components/SlashCommandMenu";
 import {
   beginLocalConversation,
   hasPendingLocalMessage,
@@ -4613,7 +4617,10 @@ export function NewChatLandingScreen() {
   const skillCommands = useMemo(
     () =>
       Object.fromEntries(
-        availableSkills.map((skill) => [`${skillPrefix}${skill.name}`, skill.description]),
+        availableSkills.map((skill) => [
+          `${skillPrefix}${skill.name}`,
+          skillMenuDescription(skill),
+        ]),
       ),
     [availableSkills, skillPrefix],
   );

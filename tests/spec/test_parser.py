@@ -780,6 +780,24 @@ def test_parse_skill(agent_dir: Path) -> None:
     assert skill.skill_dir == skill_dir
     # Absent ``user-invocable`` frontmatter defaults to invocable.
     assert skill.user_invocable is True
+    # A frontmatter name equal to the directory carries no separate label.
+    assert skill.display_name is None
+
+
+def test_parse_skill_name_comes_from_directory(agent_dir: Path) -> None:
+    """The directory is the invocation name; the frontmatter name is a free-form label."""
+    skill_dir = agent_dir / "skills" / "asd-ste100"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: Simplified Technical English (ASD-STE100)\n"
+        "description: Write in Simplified Technical English.\n"
+        "---\n"
+        "Body."
+    )
+    skill = parse(agent_dir).skills[0]
+    assert skill.name == "asd-ste100"
+    assert skill.display_name == "Simplified Technical English (ASD-STE100)"
 
 
 def test_parse_skill_user_invocable_false(agent_dir: Path) -> None:

@@ -176,6 +176,30 @@ def test_claude_provider_excludes_agents_skills_dirs(
     assert [s.name for s in out] == ["claude-tier-skill"]
 
 
+def test_claude_provider_invokes_skills_by_directory_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude Code types a skill as ``/<dir>``; the frontmatter name is only its label.
+
+    A spaced frontmatter name used as the command would fail the slash-command
+    shape check and drop the skill from the menu entirely.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    skill = home / ".claude" / "skills" / "asd-ste100"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: Simplified Technical English (ASD-STE100)\ndescription: STE\n---\nbody\n"
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    out = resolve_harness_skills(_ctx(workspace, home), "claude-native")
+    assert [(s.name, s.display_name) for s in out] == [
+        ("asd-ste100", "Simplified Technical English (ASD-STE100)")
+    ]
+
+
 def test_claude_provider_sources_user_skills_from_config_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

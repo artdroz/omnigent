@@ -2563,6 +2563,9 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
 
     The file must begin with YAML frontmatter delimited by ``---``
     lines, containing at least ``name`` and ``description`` keys.
+    The skill's directory name becomes :attr:`SkillSpec.name` (the
+    invocation identifier); a frontmatter ``name`` that differs from it
+    becomes :attr:`SkillSpec.display_name`.
 
     :param skill_md: Path to the ``SKILL.md`` file, e.g.
         ``skills/code-review/SKILL.md``.
@@ -2623,12 +2626,14 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
     # ``user-invocable: false`` marks an internal orchestration skill that
     # the user should not invoke directly; absent/true ⇒ invocable.
     user_invocable = not _falsey_flag(frontmatter.get("user-invocable", True))
+    label = str(name)
     return SkillSpec(
-        name=str(name),
+        name=skill_md.parent.name,
         description=str(description),
         content=content.strip(),
         skill_dir=skill_md.parent,
         user_invocable=user_invocable,
+        display_name=label if label != skill_md.parent.name else None,
     )
 
 

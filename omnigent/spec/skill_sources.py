@@ -676,10 +676,12 @@ def antigravity_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
                 spec = _parse_skill(child / "SKILL.md")
             except (OmnigentError, OSError):  # best-effort discovery
                 continue
-            name = spec.name if namespace is None else f"{namespace}:{spec.name}"
+            # agy is not confirmed to invoke by directory, so keep its frontmatter-name keying.
+            base = spec.display_name or spec.name
+            name = base if namespace is None else f"{namespace}:{base}"
             if filter_names is not None and name not in filter_names:
                 continue
-            out.append(spec if namespace is None else replace(spec, name=name))
+            out.append(replace(spec, name=name, display_name=None))
     return out
 
 

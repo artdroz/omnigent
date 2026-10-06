@@ -57,6 +57,22 @@ export function slashCommandMatches(name: string, query: string): boolean {
 }
 
 /**
+ * Inline menu text for a skill: its frontmatter display name, when that
+ * differs from the typed command, ahead of the description. A skill in
+ * `asd-ste100/` named "Simplified Technical English (ASD-STE100)" is typed
+ * as `/asd-ste100` but labelled with its display name.
+ */
+export function skillMenuDescription(skill: {
+  name: string;
+  description: string;
+  display_name?: string | null;
+}): string {
+  const label = skill.display_name?.trim();
+  if (!label || label === skill.name) return skill.description;
+  return skill.description ? `${label} — ${skill.description}` : label;
+}
+
+/**
  * Filter `commands` to those matching `query`, then rank them for display:
  * built-in commands before skills (so the "Commands" section stays above
  * "Skills" and the flat keyboard index walks the same order that's
