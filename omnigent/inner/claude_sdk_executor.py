@@ -919,7 +919,9 @@ def _build_mcp_tools(
                         response["is_error"] = image_result.is_error
                         return response
                     response = {
-                        "content": [{"type": "text", "text": json.dumps(result)}],
+                        "content": [
+                            {"type": "text", "text": json.dumps(result, ensure_ascii=False)}
+                        ],
                     }
                     if result.get("blocked") is True or (
                         "error" in result and result.get("error")
