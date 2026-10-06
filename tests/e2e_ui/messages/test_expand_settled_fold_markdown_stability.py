@@ -13,8 +13,6 @@ _FOLD = '[data-testid="turn-worked-fold"]'
 # Maximum drift after the first open frame; the regression shifted about 250px.
 _MAX_POST_EXPAND_SHIFT_PX = 24
 
-_MARKER = "MARKER_BELOW_DIAGRAM"
-
 _NARRATION = """Let me sketch the flow first.
 
 ```mermaid
