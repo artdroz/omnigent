@@ -173,18 +173,24 @@ def test_model_id_with_1m_marker_opts_long_context_families_into_1m() -> None:
     )
     # A canonical id (a direct-spec pin) is marked on the spelling it is given.
     assert model_id_with_1m_marker("claude-opus-4-8") == "claude-opus-4-8[1m]"
-    # Capability is per-model: Sonnet opts in at 3.7 and Opus at 4.6, and every
+    # Capability is per-model: Sonnet opts in at 4.0 and Opus at 4.6, and every
     # later version of each family keeps it.
-    assert (
-        model_id_with_1m_marker("databricks-claude-sonnet-3-7")
-        == "databricks-claude-sonnet-3-7[1m]"
-    )
     assert (
         model_id_with_1m_marker("databricks-claude-opus-4-6") == "databricks-claude-opus-4-6[1m]"
     )
     assert (
         model_id_with_1m_marker("databricks-claude-sonnet-4") == "databricks-claude-sonnet-4[1m]"
     )
+    # A trailing date stamp on a 1M-capable Bedrock id is ignored, not read as a
+    # minor version that would demote the model.
+    assert (
+        model_id_with_1m_marker("us.anthropic.claude-opus-4-6-20251101-v1:0")
+        == "us.anthropic.claude-opus-4-6-20251101-v1:0[1m]"
+    )
+    # Surrounding whitespace is trimmed before the marker so it sits flush
+    # against the id; otherwise Claude Code would strip [1m] and leave the
+    # gateway a trailing-space model name it cannot route.
+    assert model_id_with_1m_marker("  system.ai.claude-opus-5  ") == "system.ai.claude-opus-5[1m]"
 
 
 def test_model_id_with_1m_marker_leaves_other_models_bare() -> None:
@@ -199,10 +205,32 @@ def test_model_id_with_1m_marker_leaves_other_models_bare() -> None:
     assert model_id_with_1m_marker("claude-3-opus") == "claude-3-opus"
     assert model_id_with_1m_marker("databricks-claude-opus-4-1") == "databricks-claude-opus-4-1"
     assert model_id_with_1m_marker("databricks-claude-opus-4-5") == "databricks-claude-opus-4-5"
+    # Sonnet opts in only at 4.0: 3.7 and earlier cap at 200K, in either naming
+    # order, so Claude Code must not be told they are 1M-capable.
+    assert (
+        model_id_with_1m_marker("databricks-claude-sonnet-3-7") == "databricks-claude-sonnet-3-7"
+    )
+    assert (
+        model_id_with_1m_marker("databricks-claude-3-7-sonnet") == "databricks-claude-3-7-sonnet"
+    )
     # The managed-sandbox Bedrock spelling of Opus 4.5 stays 200K-only too.
     assert (
         model_id_with_1m_marker("us.anthropic.claude-opus-4-5-20251101-v1:0")
         == "us.anthropic.claude-opus-4-5-20251101-v1:0"
+    )
+    # A trailing date stamp must not be read as a minor version: a dated Sonnet
+    # 3.x or Opus 4.0 is still 200K-only, not 1M.
+    assert (
+        model_id_with_1m_marker("anthropic.claude-3-sonnet-20240229-v1:0")
+        == "anthropic.claude-3-sonnet-20240229-v1:0"
+    )
+    assert (
+        model_id_with_1m_marker("anthropic.claude-3-7-sonnet-20250219-v1:0")
+        == "anthropic.claude-3-7-sonnet-20250219-v1:0"
+    )
+    assert (
+        model_id_with_1m_marker("us.anthropic.claude-opus-4-20250514-v1:0")
+        == "us.anthropic.claude-opus-4-20250514-v1:0"
     )
     # Non-Claude models the same gateway may serve.
     assert model_id_with_1m_marker("databricks-gpt-5-6") == "databricks-gpt-5-6"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import json
 import os
@@ -22,6 +23,7 @@ import pyte
 import pytest
 import yaml
 from playwright.sync_api import Page, expect
+from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect as ws_connect
 
 from tests._helpers.native_session import create_native_session
@@ -64,6 +66,7 @@ _AMBIENT_ENV_KEYS = frozenset(
 
 # Proxy-blind client: CI forces an egress proxy that must not intercept loopback.
 _client = httpx.Client(trust_env=False)
+atexit.register(_client.close)
 
 
 @dataclass
@@ -273,12 +276,19 @@ def create_pinned_claude_session(rig: Gateway1mRig) -> str:
         _client, rig.base_url, harness="claude", metadata={"workspace": str(_REPO_ROOT)}
     )
     session_id = str(created["session_id"])
-    bind = _client.patch(
-        f"{rig.base_url}/v1/sessions/{session_id}",
-        json={"runner_id": rig.runner_id},
-        timeout=10.0,
-    )
-    bind.raise_for_status()
+    try:
+        bind = _client.patch(
+            f"{rig.base_url}/v1/sessions/{session_id}",
+            json={"runner_id": rig.runner_id},
+            timeout=10.0,
+        )
+        bind.raise_for_status()
+    except httpx.HTTPError:
+        # The session (and its auto-launched terminal) exists before the bind
+        # returns, so clean it up before propagating a bind failure.
+        with contextlib.suppress(httpx.HTTPError):
+            _client.delete(f"{rig.base_url}/v1/sessions/{session_id}", timeout=10.0)
+        raise
     return session_id
 
 
@@ -304,14 +314,17 @@ def pane_text(base_url: str, session_id: str, *, seconds: float = 2.0) -> str:
     )
     raw = bytearray()
     deadline = time.monotonic() + seconds
-    with ws_connect(url, open_timeout=15, max_size=None) as ws:
-        while time.monotonic() < deadline:
-            try:
-                frame = ws.recv(timeout=max(0.1, deadline - time.monotonic()))
-            except TimeoutError:
-                break
-            if isinstance(frame, bytes):
-                raw.extend(frame)
+    # The terminal can drop the attach while Claude Code is still launching; a
+    # transient close just renders what arrived so wait_pane retries its poll.
+    with contextlib.suppress(ConnectionClosed, OSError):
+        with ws_connect(url, open_timeout=15, max_size=None) as ws:
+            while time.monotonic() < deadline:
+                try:
+                    frame = ws.recv(timeout=max(0.1, deadline - time.monotonic()))
+                except TimeoutError:
+                    break
+                if isinstance(frame, bytes):
+                    raw.extend(frame)
     screen = pyte.Screen(220, 200)
     pyte.ByteStream(screen).feed(bytes(raw))
     return "\n".join(line.rstrip() for line in screen.display)
@@ -376,7 +389,13 @@ def send_turn(page: Page) -> None:
 def snapshot_context_window(base_url: str, session_id: str) -> int | None:
     deadline = time.monotonic() + _SNAPSHOT_WINDOW_TIMEOUT_S
     while time.monotonic() < deadline:
-        snapshot = _client.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
+        response = _client.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+        if response.status_code != 200:
+            # A transient 5xx may carry a non-JSON body; retry rather than fail
+            # the poll with an opaque decode error.
+            time.sleep(2.0)
+            continue
+        snapshot = response.json()
         window = snapshot.get("context_window")
         if isinstance(window, int) and snapshot.get("last_total_tokens"):
             return window
