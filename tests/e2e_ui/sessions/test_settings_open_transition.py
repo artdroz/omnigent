@@ -70,7 +70,9 @@ def _wait_for_settings_settled(page: Page) -> None:
 
 
 def _collect_transition(page: Page) -> list[dict[str, Any]]:
-    return page.evaluate("window.__settingsTransitionProbe.stop()")
+    samples = page.evaluate("window.__settingsTransitionProbe.stop()")
+    assert samples, "the per-frame probe captured no frames"
+    return samples
 
 
 def _describe(samples: list[dict[str, Any]]) -> str:
@@ -119,7 +121,8 @@ def test_settings_open_from_collapsed_sidebar_pins_sidebar_before_first_paint(
     page.evaluate(_PROBE_INSTALL)
     page.wait_for_timeout(300)
     # The in-sidebar gear is clipped while collapsed; the hotkey is the Settings path here.
-    page.keyboard.press("Control+Alt+,")
+    # ControlOrMeta maps to the platform modifier (Cmd on macOS, Ctrl elsewhere).
+    page.keyboard.press("ControlOrMeta+Alt+,")
     _wait_for_settings_settled(page)
     samples = _collect_transition(page)
 
