@@ -9,6 +9,7 @@ import ssl
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, TypedDict
+from unittest.mock import AsyncMock
 
 import pytest
 from typing_extensions import Unpack
@@ -774,7 +775,6 @@ async def test_serve_tunnel_once_sends_bearer_header(
         "max_size": serve_module.RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
         "ping_interval": serve_module.TUNNEL_KEEPALIVE_PING_INTERVAL_S,
         "ping_timeout": serve_module.TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
-        # No proxy env in tests (see conftest) — the tunnel dials direct.
         "sock": None,
     }
     assert isinstance(captured["sent"], str)
@@ -1867,69 +1867,31 @@ async def test_serve_tunnel_no_ssl_context_for_ws(
 
 
 @pytest.mark.asyncio
-async def test_serve_tunnel_dials_through_mandatory_env_proxy(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "use_proxy,no_proxy", [(False, ""), (True, ""), (True, "server.sandbox.test")]
+)
+async def test_serve_tunnel_proxy_socket(
+    monkeypatch: pytest.MonkeyPatch, use_proxy: bool, no_proxy: str
 ) -> None:
-    """With proxy-mandated egress, connect() gets the CONNECT-tunneled socket.
-
-    In a sandbox whose only network path is the env-configured CONNECT proxy,
-    the tunnel must ride it like every other client — dialing direct fails
-    name resolution forever and the runner never comes online.
-    """
+    proxy_url = "http://127.0.0.1:3128"
     tunnel_url = "ws://server.sandbox.test:8000/v1/runners/runner_test/tunnel"
-    monkeypatch.setenv("http_proxy", "http://127.0.0.1:3128")
-    monkeypatch.setenv("no_proxy", "localhost,127.0.0.1,::1")
-    dialed: dict[str, object] = {}
-    proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if use_proxy:
+        monkeypatch.setenv("http_proxy", proxy_url)
+    monkeypatch.setenv("no_proxy", no_proxy)
 
-    async def _fake_dial(proxy_url: str, ws_url: str, *, timeout: float) -> socket.socket:
-        del timeout
-        dialed["proxy_url"] = proxy_url
-        dialed["ws_url"] = ws_url
-        return proxy_sock
-
-    monkeypatch.setattr(serve_module, "open_proxy_connect_socket", _fake_dial)
-    try:
+    with socket.socket() as proxy_sock:
+        dial = AsyncMock(return_value=proxy_sock)
+        monkeypatch.setattr(serve_module, "open_proxy_connect_socket", dial)
         captured = await _capture_connect_kwargs(monkeypatch, tunnel_url)
-    finally:
-        proxy_sock.close()
-
-    assert dialed == {"proxy_url": "http://127.0.0.1:3128", "ws_url": tunnel_url}
-    assert captured["kwargs"]["sock"] is proxy_sock
-
-
-@pytest.mark.asyncio
-async def test_serve_tunnel_dials_direct_without_proxy_env(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Without proxy env (the default), no CONNECT dial happens at all."""
-
-    async def _must_not_dial(*_args: object, **_kwargs: object) -> socket.socket:
-        raise AssertionError("the CONNECT dialer must not run without proxy env")
-
-    monkeypatch.setattr(serve_module, "open_proxy_connect_socket", _must_not_dial)
-    captured = await _capture_connect_kwargs(
-        monkeypatch, "ws://127.0.0.1:6767/v1/runners/runner_test/tunnel"
-    )
-    assert captured["kwargs"]["sock"] is None
-
-
-@pytest.mark.asyncio
-async def test_serve_tunnel_no_proxy_exempts_the_tunnel_target(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A no_proxy entry covering the server keeps the direct dial."""
-    monkeypatch.setenv("http_proxy", "http://127.0.0.1:3128")
-    monkeypatch.setenv("no_proxy", "server.sandbox.test")
-
-    async def _must_not_dial(*_args: object, **_kwargs: object) -> socket.socket:
-        raise AssertionError("the CONNECT dialer must not run for a no_proxy host")
-
-    monkeypatch.setattr(serve_module, "open_proxy_connect_socket", _must_not_dial)
-    captured = await _capture_connect_kwargs(
-        monkeypatch, "ws://server.sandbox.test:8000/v1/runners/runner_test/tunnel"
-    )
-    assert captured["kwargs"]["sock"] is None
+        proxied = use_proxy and not no_proxy
+        assert captured["url"] == tunnel_url
+        assert captured["kwargs"]["sock"] is (proxy_sock if proxied else None)
+        if proxied:
+            dial.assert_awaited_once_with(
+                proxy_url, tunnel_url, timeout=serve_module._PROXY_CONNECT_TIMEOUT_S
+            )
+        else:
+            dial.assert_not_awaited()
 
 
 @pytest.mark.asyncio
