@@ -33,9 +33,10 @@ def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
         except BaseException as exc:
             captured["error"] = exc
 
-    thread = threading.Thread(target=_worker)
+    thread = threading.Thread(target=_worker, daemon=True)
     thread.start()
-    thread.join()
+    thread.join(timeout=120)
+    assert not thread.is_alive(), "browser journey did not finish within 120s"
     if "error" in captured:
         raise captured["error"]
 

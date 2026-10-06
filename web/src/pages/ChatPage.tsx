@@ -602,12 +602,9 @@ export function ChatPage() {
     ) {
       setSessionDraft(urlConvId, { text: "", files: [] });
     }
-    // An interrupted POST may have landed before reload. The hydrated
-    // transcript is authoritative, so skip replay when it contains the prompt.
-    // `blocks` is the ACTIVE projection; only trust it once the store projects
-    // this conversation, or a mid-switch stale mirror could drop the prompt on
-    // another session's transcript. A redundant replay then dedupes via the
-    // reused submission id.
+    // Skip replay when the hydrated transcript already contains the prompt; only
+    // trust `blocks` once the store projects this conversation (a stale mirror
+    // misdetects). The recovered plain message dedupes via its stable id.
     const store = useChatStore.getState();
     if (
       store.conversationId === urlConvId &&
@@ -4241,6 +4238,9 @@ export function isInitialPromptDelivered(
           block.content.some((c) => c.type === "input_text" && c.text === echo)),
     );
   }
+  // An empty plain prompt (image-only draft) has no text block to match, and an
+  // empty-string compare would trivially match every user message.
+  if (prompt.text === "") return false;
   return blocks.some(
     (block) =>
       block.type === "user_message" &&

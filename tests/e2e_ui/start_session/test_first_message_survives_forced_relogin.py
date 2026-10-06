@@ -131,13 +131,14 @@ def _spawn_user_runner(
         "RUNNER_SERVER_URL": server.base_url,
         "OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN": jwt,
     }
-    log_handle = open(log_path, "w")  # noqa: SIM115 — lives for the Popen
+    log_handle = open(log_path, "w")  # noqa: SIM115 — fd dup'd into child; closed below
     proc = subprocess.Popen(
         [sys.executable, "-m", "omnigent.runner._entry"],
         env=env,
         stdout=log_handle,
         stderr=subprocess.STDOUT,
     )
+    log_handle.close()  # the child holds its own dup of the fd
     auth = {"Authorization": f"Bearer {jwt}"}
     deadline = time.monotonic() + 45
     online = False
@@ -152,11 +153,10 @@ def _spawn_user_runner(
             time.sleep(0.5)
         raise RuntimeError("runner never came online")
     finally:
-        # Only the success path hands proc/log_handle to the fixture teardown; a
-        # failed readiness check must not leak the runner subprocess.
+        # Only the success path hands proc to the fixture teardown; a failed
+        # readiness check must not leak the runner subprocess.
         if not online:
             proc.kill()
-            log_handle.close()
 
 
 def _seed_routing_decision(db_path: Path, session_id: str) -> None:
@@ -320,8 +320,10 @@ def test_first_message_survives_forced_relogin(
         timeout_s=15.0,
         what="first-message POST before the re-login",
     )
-    # The laptop sleeps with the send interrupted; wake finds the session lapsed.
-    page.wait_for_timeout(2_000)
+    # The laptop sleeps with the send interrupted; wake finds the session
+    # lapsed. The _wait_until above already proved the POST reached the server,
+    # so the interrupted send is fully simulated by the route hold plus the
+    # cookie clear below — no fixed sleep is needed.
     log.woke = True
     page.context.clear_cookies()
     page.reload()
@@ -333,7 +335,9 @@ def test_first_message_survives_forced_relogin(
 
     bubble = page.get_by_test_id("message-bubble").filter(has_text=_PROMPT).first
     deadline = time.monotonic() + _OBSERVATION_WINDOW_S
-    while time.monotonic() < deadline and not bubble.is_visible():
+    while time.monotonic() < deadline and not (
+        bubble.is_visible() and log.carried(log.after, journey.session_id)
+    ):
         page.wait_for_timeout(250)
     observed = {
         "transcript_has_message": bubble.is_visible(),

@@ -456,16 +456,15 @@ export function hydrateLocalConversation(
   }
 
   const store = useChatStore.getState();
-  // Preserve an interrupted first send across a hard reload, but do not
-  // replay its storage copy in this heap while the send below is in flight.
-  // A blank-text (image-only) draft has no recoverable storage copy, so skip it.
-  // A plain message reuses one submission id so a landed-but-reloaded POST
-  // dedupes server-side on replay; the slash path carries no dedup key.
-  const initialSubmissionId = skill === null && text ? newInitialSubmissionId() : undefined;
-  if (text)
+  // Preserve an interrupted first send across a hard reload, but do not replay
+  // its storage copy in this heap while the send below is in flight. Only a
+  // plain text message with no attachments recovers, reusing one submission id
+  // so a landed-but-reloaded POST dedupes server-side.
+  const recoverable = skill === null && !!text && !files?.length;
+  const initialSubmissionId = recoverable ? newInitialSubmissionId() : undefined;
+  if (recoverable)
     persistInitialPrompt(realId, {
       text,
-      skill,
       ...(initialSubmissionId ? { stableId: initialSubmissionId } : {}),
     });
   dispatchedInitialPrompts.add(realId);
@@ -1821,9 +1820,9 @@ export interface PendingInitialPrompt {
 // module-level singleton, so it works identically standalone and embedded.
 const pendingInitialPrompts = new Map<string, PendingInitialPrompt>();
 
-// Forced re-login after sleep clears the in-memory handoff. Persist text and
-// skill until server settlement so an interrupted first send can recover;
-// File attachments cannot survive the reload.
+// Forced re-login after sleep clears the in-memory handoff. Persist a plain
+// first message until server settlement so an interrupted first send can
+// recover. Skills and file attachments are never persisted.
 const PENDING_INITIAL_PROMPTS_KEY = "omnigent.pendingInitialPrompts";
 
 // A prompt dispatched in this heap must not replay from storage. The fallback
@@ -1832,14 +1831,12 @@ const dispatchedInitialPrompts = new Set<string>();
 
 interface PersistedInitialPrompt {
   text: string;
-  skill: { name: string; args: string } | null;
   stableId?: string;
 }
 
-// A plain first message reuses one submission id across its recovery dispatch;
-// the server then dedupes a landed-but-reloaded POST under that id (see
-// tests/server/integration/test_sessions_web_send_stable_id.py) rather than
-// double-delivering. Matches the hex shape `send` posts for ordinary turns.
+// A plain first message reuses one submission id across its recovery dispatch so
+// the server dedupes a landed-but-reloaded POST instead of double-delivering (see
+// tests/server/integration/test_sessions_web_send_stable_id.py). Hex, as `send` posts.
 function newInitialSubmissionId(): string {
   return randomUUID().replace(/-/g, "");
 }
@@ -1860,17 +1857,10 @@ function loadPersistedInitialPrompts(): Record<string, PersistedInitialPrompt> {
         stableId?: unknown;
       };
       if (typeof text !== "string" || text === "") continue;
-      const candidate = skill as { name?: unknown; args?: unknown } | null | undefined;
-      const validSkill =
-        candidate != null &&
-        typeof candidate === "object" &&
-        typeof candidate.name === "string" &&
-        typeof candidate.args === "string"
-          ? { name: candidate.name, args: candidate.args }
-          : null;
+      // A legacy entry that stored a skill must not replay as a plain message.
+      if (skill != null) continue;
       entries[id] = {
         text,
-        skill: validSkill,
         ...(typeof stableId === "string" && stableId !== "" ? { stableId } : {}),
       };
     }
@@ -1893,11 +1883,10 @@ function savePersistedInitialPrompts(entries: Record<string, PersistedInitialPro
   }
 }
 
-function persistInitialPrompt(conversationId: string, prompt: PendingInitialPrompt): void {
+function persistInitialPrompt(conversationId: string, prompt: PersistedInitialPrompt): void {
   const entries = loadPersistedInitialPrompts();
   entries[conversationId] = {
     text: prompt.text,
-    skill: prompt.skill,
     ...(prompt.stableId !== undefined ? { stableId: prompt.stableId } : {}),
   };
   savePersistedInitialPrompts(entries);
@@ -1915,19 +1904,12 @@ export function clearPersistedInitialPrompt(conversationId: string): void {
   );
 }
 
-// Match the settled payload so another send cannot erase an unsettled first prompt.
-function clearSettledInitialPrompt(conversationId: string, settledText: string): void {
-  const persisted = loadPersistedInitialPrompts()[conversationId];
-  if (persisted === undefined || persisted.skill !== null) return;
-  if (persisted.text !== settledText) return;
-  clearPersistedInitialPrompt(conversationId);
-}
-
-function clearSettledInitialSkill(conversationId: string, name: string, args: string): void {
-  const persisted = loadPersistedInitialPrompts()[conversationId];
-  if (persisted?.skill == null) return;
-  if (persisted.skill.name !== name || persisted.skill.args !== args) return;
-  clearPersistedInitialPrompt(conversationId);
+/** Drop every stored first prompt, e.g. on sign-out so a different account
+ *  never inherits the previous user's unsent first message. */
+export function clearAllPersistedInitialPrompts(): void {
+  pendingInitialPrompts.clear();
+  dispatchedInitialPrompts.clear();
+  savePersistedInitialPrompts({});
 }
 
 /**
@@ -1951,17 +1933,16 @@ export function setPendingInitialPrompt(
   prompt: PendingInitialPrompt,
 ): void {
   if (!prompt.text && !prompt.files?.length) return;
-  // Stamp a reusable submission id on a recoverable plain message so its replay
-  // after a hard reload dedupes server-side. Image-only drafts aren't
-  // recoverable, and the slash path has no dedup key, so leave both unset.
+  // Only a plain text message with no attachments can be recovered, exactly
+  // once, via a reused submission id. A skill or an attachment keeps the message
+  // in memory only, so a hard reload simply drops it (pre-recovery behavior).
+  const recoverable = prompt.skill === null && !!prompt.text && !prompt.files?.length;
   const stamped =
-    prompt.skill === null && prompt.text && prompt.stableId === undefined
+    recoverable && prompt.stableId === undefined
       ? { ...prompt, stableId: newInitialSubmissionId() }
       : prompt;
   pendingInitialPrompts.set(conversationId, stamped);
-  // Blank-text drafts can't be recovered from storage (load drops empty text),
-  // so only the in-memory handoff carries an image-only first message.
-  if (stamped.text) persistInitialPrompt(conversationId, stamped);
+  if (recoverable) persistInitialPrompt(conversationId, stamped);
 }
 
 /**
@@ -1981,9 +1962,10 @@ export function consumePendingInitialPrompt(conversationId: string): PendingInit
   const persisted = loadPersistedInitialPrompts()[conversationId];
   if (persisted === undefined) return null;
   dispatchedInitialPrompts.add(conversationId);
+  // Storage only ever holds a plain message, so recovery is always skill-less.
   return {
     text: persisted.text,
-    skill: persisted.skill,
+    skill: null,
     ...(persisted.stableId !== undefined ? { stableId: persisted.stableId } : {}),
   };
 }
@@ -2662,8 +2644,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ),
         }));
       }
-      // A settled send no longer needs its recovery copy.
-      clearSettledInitialPrompt(sessionId, text);
+      // A settled send spends the first-prompt insurance: clear it even if the
+      // user edited the text after a failed first attempt, since any message
+      // settling in this conversation means a reload must not replay the first.
+      clearPersistedInitialPrompt(sessionId);
       // Note: native-terminal messages return a `pending_id`, but the
       // optimistic bubble deliberately keeps its client temp id as its
       // stable React key — swapping it to the server id mid-send forces
@@ -2731,6 +2715,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         else if (verdict === "refused") serverRefused = true;
         else if (verdict === "delivered") deliveredDespiteFailure = true;
         else unsettled = true;
+      }
+      // A definitively settled first send — refused or proven delivered — must
+      // drop its recovery copy so a later reload can't resurrect it. An unknown
+      // transport outcome keeps the copy for a possible recovery retry.
+      if (draftSessionId !== null && (serverRefused || deliveredDespiteFailure)) {
+        clearPersistedInitialPrompt(draftSessionId);
       }
       if (
         !callerHandlesError &&
@@ -2898,7 +2888,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ),
         }));
       }
-      clearSettledInitialSkill(sessionId, name, args);
+      // A settled command spends the first-prompt insurance for this session.
+      clearPersistedInitialPrompt(sessionId);
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
