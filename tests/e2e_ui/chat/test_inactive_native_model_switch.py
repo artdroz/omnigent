@@ -108,7 +108,8 @@ def _install_inactive_native_session(page: Page, session_id: str) -> dict[str, l
             headers = {**response.headers, "content-type": "application/json"}
         elif request.method == "PATCH":
             request_body = json.loads(request.post_data or "{}")
-            payload = dict(latest_payload[0] or {})
+            assert latest_payload[0] is not None, "PATCH arrived before any session GET"
+            payload = {**latest_payload[0], **request_body}
             headers = {"content-type": "application/json"}
             if "model_override" in request_body:
                 recorded["model_patches"].append(request_body)
@@ -126,7 +127,6 @@ def _install_inactive_native_session(page: Page, session_id: str) -> dict[str, l
                         ),
                     )
                     return
-                payload["model_override"] = request_body["model_override"]
         else:
             route.continue_()
             return
@@ -163,8 +163,7 @@ def _remove_runner_terminals(base_url: str, session_id: str) -> None:
         params={"order": "asc", "limit": 1000},
         timeout=10.0,
     )
-    if listing.status_code != 200:
-        return
+    listing.raise_for_status()
     for row in listing.json().get("data", []):
         httpx.delete(
             f"{base_url}/v1/sessions/{session_id}/resources/terminals/{row['id']}",

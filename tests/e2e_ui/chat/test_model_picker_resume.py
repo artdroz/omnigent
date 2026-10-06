@@ -34,6 +34,7 @@ class _NativeSession:
 
     def finish_resume(self) -> None:
         """Complete the server's terminal-readiness acknowledgement."""
+        assert self.pending_retries, "no pending retry_session to acknowledge"
         self.running = True
         if not self.delay_terminal_discovery:
             self.terminal_available = True
@@ -43,6 +44,7 @@ class _NativeSession:
 
     def finish_change(self) -> None:
         """Acknowledge a configuration PATCH after the harness applies it."""
+        assert self.pending_patches, "no pending configuration PATCH to acknowledge"
         route, payload = self.pending_patches.pop()
         route.fulfill(json={**payload, "llm_model": self.reported_model})
 
@@ -127,7 +129,7 @@ def _mock_native_session(
                 }
             )
         elif path == f"/v1/sessions/{session_id}/events" and method == "POST":
-            body = route.request.post_data_json
+            body = route.request.post_data_json or {}
             state.mutations.append(("event", body))
             if body.get("type") == "retry_session":
                 state.pending_retries.append(route)
@@ -364,14 +366,21 @@ def test_model_change_survives_switching_to_terminal_during_startup(
     expect(composer).to_have_count(0)
     assert state.mutations == [("event", {"type": "retry_session", "data": {}})]
 
-    # No resource-created event: recovery must refresh the terminal inventory.
+    # No resource-created event: recovery must refresh the terminal inventory,
+    # so wait for that listing GET before asserting on the recorded snapshot.
     with page.expect_request(
         lambda request: (
-            request.method == "PATCH"
-            and urlparse(request.url).path == f"/v1/sessions/{session_id}"
+            request.method == "GET"
+            and urlparse(request.url).path == f"/v1/sessions/{session_id}/resources/terminals"
         )
     ):
-        state.finish_resume()
+        with page.expect_request(
+            lambda request: (
+                request.method == "PATCH"
+                and urlparse(request.url).path == f"/v1/sessions/{session_id}"
+            )
+        ):
+            state.finish_resume()
 
     # A first empty post-recovery inventory must keep the startup UI and poll.
     expect(terminal.get_by_test_id("terminal-starting-up")).to_contain_text("Starting up…")

@@ -493,7 +493,11 @@ def test_claude_native_picker_saves_model_while_host_asleep(
     retry_bodies: list[dict] = []
 
     def _resume(route: Route) -> None:
-        retry_bodies.append(route.request.post_data_json)
+        body = route.request.post_data_json or {}
+        retry_bodies.append(body)
+        if body.get("type") != "retry_session":
+            route.fulfill(status=400, json={"error": "Unexpected session input"})
+            return
         route.fulfill(
             json={"queued": False, "recovered": True, "recovery": "runner_relaunched"},
         )
