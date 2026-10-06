@@ -24,7 +24,7 @@
 //    with no trailing answer (interrupted / failed / tool-only step
 //    bubbles) keeps its trace expanded.
 
-import type { AnimationEvent, ReactNode } from "react";
+import type { AnimationEvent, CSSProperties, ReactNode } from "react";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ChevronRightIcon } from "lucide-react";
 import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
@@ -74,6 +74,18 @@ const FOLD_EXPAND_ANCHOR_HOLD_MS = 400;
 // Backstop when a collapse animation's `animationend` never arrives.
 // The `forwards` fill keeps content collapsed during the extra 200ms.
 const FOLD_COLLAPSE_HIDE_FALLBACK_MS = 400;
+
+// Hidden-trace geometry: Streamdown renders a diagram only once its block
+// intersects the viewport, so the folded trace stays laid out (zero height,
+// unclipped, invisible, inert) and scaled down so it adds no scroll space.
+const FOLD_PRERENDER_STYLE: CSSProperties = {
+  height: 0,
+  overflow: "visible",
+  visibility: "hidden",
+  pointerEvents: "none",
+  transform: "scale(0.01)",
+  transformOrigin: "top left",
+};
 
 interface BlockRendererProps {
   items: RenderItem[];
@@ -572,7 +584,8 @@ function TurnWorkedFold({
   }, [animateCollapse, defaultOpen]);
 
   // Keep the settled trace mounted so expansion reuses rendered markdown.
-  // Hide it after collapse so it cannot receive focus or affect layout.
+  // Once a collapse settles, the hidden geometry (FOLD_PRERENDER_STYLE)
+  // takes over so lazily rendered blocks finish while the fold is closed.
   const [closedSettled, setClosedSettled] = useState(!animateCollapse);
   useEffect(() => {
     if (open || closedSettled) return undefined;
@@ -664,7 +677,7 @@ function TurnWorkedFold({
       <CollapsibleContent
         className={cn("turn-fold-content", userOpened && "turn-fold-content-instant")}
         forceMount
-        hidden={!open && closedSettled}
+        style={!open && closedSettled ? FOLD_PRERENDER_STYLE : undefined}
         onAnimationEnd={handleContentAnimationEnd}
       >
         <div className="relative flex flex-col gap-1 pt-2 pl-4">

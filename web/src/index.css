@@ -2271,9 +2271,11 @@ aside[aria-label="Workspace"][data-maximized] {
   .turn-fold-content[data-state="closed"] {
     animation: none;
   }
-  /* With no animationend, hide the mounted trace immediately. */
+  /* No collapse animation, so hide the mounted trace at once; the fold's
+     settled-closed inline geometry takes over from here. */
   .turn-fold-content[data-state="closed"] {
-    display: none;
+    height: 0;
+    visibility: hidden;
   }
 }
 /* The summary row grows in over the same beat as the trace shrinks.

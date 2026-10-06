@@ -617,9 +617,17 @@ describe("BlockRenderer dispatch", () => {
       );
       const narration = screen.getByText("Planning the run.");
       expect(narration).not.toBeVisible();
+      // Hidden by geometry rather than display:none, so blocks that render
+      // lazily on viewport intersection still finish while folded.
+      const content = narration.closest('[data-slot="collapsible-content"]') as HTMLElement;
+      expect(content).not.toHaveAttribute("hidden");
+      expect(content.style.visibility).toBe("hidden");
+      expect(content.style.height).toBe("0px");
+      expect(content.style.overflow).toBe("visible");
 
       fireEvent.click(screen.getByText("Worked"));
       const revealed = screen.getByText("Planning the run.");
+      expect(content.style.visibility).toBe("");
       expect(revealed).toBe(narration);
       expect(revealed).toBeVisible();
     });

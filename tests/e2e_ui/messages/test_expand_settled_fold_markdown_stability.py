@@ -1,10 +1,11 @@
-"""Verify that expanding settled rich markdown does not shift its layout."""
+"""Verify that expanding settled rich markdown neither shifts its layout nor re-highlights."""
 
 from __future__ import annotations
 
 import json
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 _FOLD = '[data-testid="turn-worked-fold"]'
@@ -51,6 +52,7 @@ _INSTALL_SAMPLER = """
     const trigger = fold ? fold.querySelector('[data-slot="collapsible-trigger"]') : null;
     let markerRelY = null;
     let diagramH = -1;
+    let codeTokens = -1;
     if (content && trigger) {
       const triggerTop = trigger.getBoundingClientRect().top;
       for (const p of content.querySelectorAll('p')) {
@@ -63,12 +65,15 @@ _INSTALL_SAMPLER = """
         const h = svg.getBoundingClientRect().height;
         if (h > diagramH) diagramH = h;
       }
+      const code = content.querySelector('[data-streamdown="code-block"] code');
+      if (code) codeTokens = code.querySelectorAll('span[style*="color"]').length;
     }
     window.__probe.frames.push({
       t: performance.now(),
       state: content ? content.getAttribute('data-state') : 'none',
       markerRelY,
       diagramH,
+      codeTokens,
     });
     // Done once a real diagram (not an inline icon) has been on screen and
     // the layout has been stable for ~1s of frames.
@@ -182,13 +187,15 @@ def _seed_settled_markdown_turn(base_url: str, session_id: str) -> None:
 
 
 def test_expanding_settled_fold_does_not_rerender_markdown(
-    page: Page,
+    request: pytest.FixtureRequest,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Expanding a settled turn must not jolt its markdown."""
+    """Expanding a settled turn must not jolt or re-highlight its markdown."""
     base_url, session_id = seeded_session
     _seed_settled_markdown_turn(base_url, session_id)
 
+    # Requested after seeding so a recording starts at the reported journey.
+    page: Page = request.getfixturevalue("page")
     # Navigate after settlement so the history fold mounts closed.
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=20_000)
@@ -226,3 +233,13 @@ def test_expanding_settled_fold_does_not_rerender_markdown(
         f"at t={worst['t']:.0f}ms) — the expand must not visibly re-render "
         f"already-settled markdown"
     )
+
+    # A code block that opens unhighlighted and then gets its tokens is the
+    # reported flash; one that never highlights here is a renderer timing
+    # difference, not a re-render.
+    highlighted_at = next((f for f in open_frames if f["codeTokens"] > 0), None)
+    if open_frames[0]["codeTokens"] == 0 and highlighted_at is not None:
+        pytest.fail(
+            "the code block opened unhighlighted and was highlighted at "
+            f"+{highlighted_at['t'] - open_frames[0]['t']:.0f}ms"
+        )
