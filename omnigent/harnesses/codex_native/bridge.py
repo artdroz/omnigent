@@ -501,14 +501,23 @@ def bridge_dir_for_codex_home(codex_home: Path) -> Path:
     return codex_home.parent
 
 
-def write_unmirrored_codex_settings(bridge_dir: Path, settings: Mapping[str, str]) -> None:
-    """Record applied settings that ``config.toml`` lacks, against its current revision.
+def write_unmirrored_codex_settings(
+    bridge_dir: Path,
+    settings: Mapping[str, str],
+    *,
+    revision: tuple[int, int] | None = None,
+) -> None:
+    """Record applied settings that ``config.toml`` lacks, against a config revision.
 
     An empty mapping clears the record. Readers trust it only until another writer,
     such as an in-terminal ``/model``, replaces the config.
+
+    :param revision: The revision the caller's own writes left, or ``None`` for the
+        current one.
     """
     path = bridge_dir / _UNMIRRORED_SETTINGS_FILE
-    revision = codex_config_revision(bridge_dir)
+    if revision is None:
+        revision = codex_config_revision(bridge_dir)
     # Without a readable config there is no revision a later rewrite could change.
     if not settings or revision is None:
         with contextlib.suppress(OSError):
@@ -878,14 +887,18 @@ def mirror_applied_codex_settings(bridge_dir: Path, applied: Mapping[str, str]) 
     # The runner, hook, and executor run in separate processes; one must not stamp
     # another's superseded record against the config revision it just wrote.
     with _bridge_state_lock(bridge_dir, _UNMIRRORED_SETTINGS_LOCK_FILE):
+        expected = codex_config_revision(bridge_dir)
         pending = read_unmirrored_codex_settings(bridge_dir)
         for key, write in writers.items():
             if key in applied:
                 pending.pop(key, None)
-                if not write(bridge_dir, applied[key]):
+                if write(bridge_dir, applied[key]):
+                    expected = codex_config_revision(bridge_dir)
+                else:
                     failed[key] = applied[key]
-        # Stamp after these writes, so only a later rewrite supersedes the record.
-        write_unmirrored_codex_settings(bridge_dir, {**pending, **failed})
+        # Codex rewrites config.toml without this lock, so stamp the revision our own
+        # writes left; any rewrite after them then supersedes the record.
+        write_unmirrored_codex_settings(bridge_dir, {**pending, **failed}, revision=expected)
     return failed
 
 

@@ -6,6 +6,7 @@ import json
 import os
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1089,3 +1090,33 @@ def test_unmirrored_codex_settings_need_a_readable_config(bridge_dir: Path) -> N
 
     assert codex_native_bridge.read_unmirrored_codex_settings(bridge_dir) == {}
     assert not (bridge_dir / "unmirrored_settings.json").exists()
+
+
+def test_mirror_applied_codex_settings_ignores_values_codex_rewrote_after_them(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unlocked Codex rewrite between our writes and the stamp supersedes the record."""
+    home = codex_home_for_bridge_dir(bridge_dir)
+    home.mkdir(parents=True, exist_ok=True)
+    config = home / "config.toml"
+    config.write_text('model = "gpt-5.4"\nmodel_reasoning_effort = "low"\n')
+    monkeypatch.setattr(codex_native_bridge, "write_codex_config_model", lambda *_: False)
+    record = codex_native_bridge.write_unmirrored_codex_settings
+
+    def terminal_switch_then_record(*args: Any, **kwargs: Any) -> None:
+        # An in-terminal /model replaces the config before the record is stamped.
+        replacement = config.with_name("config.toml.terminal")
+        replacement.write_text('model = "gpt-5.5"\n')
+        os.replace(replacement, config)
+        record(*args, **kwargs)
+
+    monkeypatch.setattr(
+        codex_native_bridge, "write_unmirrored_codex_settings", terminal_switch_then_record
+    )
+
+    failed = codex_native_bridge.mirror_applied_codex_settings(
+        bridge_dir, {"model": "gpt-6-sol", "effort": "high"}
+    )
+
+    assert failed == {"model": "gpt-6-sol"}
+    assert codex_native_bridge.read_unmirrored_codex_settings(bridge_dir) == {}

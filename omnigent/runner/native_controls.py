@@ -301,7 +301,8 @@ def build_native_controls(
         # Any later rewrite, such as a terminal switch, makes the config current.
         pending = read_unmirrored_codex_settings(bridge_dir)
         if pending:
-            mirror_applied_codex_settings(bridge_dir, pending)
+            for key in mirror_applied_codex_settings(bridge_dir, pending):
+                _logger.warning("Could not mirror pending Codex %s in %s", key, bridge_dir)
         return pending
 
     async def _apply_codex_native_settings_update(
@@ -343,7 +344,8 @@ def build_native_controls(
         unmirrored: dict[str, str] = {}
         if "model" in settings or "effort" in settings:
             # A failed config write must not make the stale value the next update's base.
-            unmirrored = _unmirrored_codex_settings(bridge_dir)
+            # The record takes a cross-process file lock, so keep it off the event loop.
+            unmirrored = await asyncio.to_thread(_unmirrored_codex_settings, bridge_dir)
             model = (
                 settings.get("model")
                 or unmirrored.get("model")
@@ -452,7 +454,8 @@ def build_native_controls(
             _session_reasoning_effort[conv_id] = effort
             applied["effort"] = effort
         if applied:
-            for key in mirror_applied_codex_settings(bridge_dir, applied):
+            failed = await asyncio.to_thread(mirror_applied_codex_settings, bridge_dir, applied)
+            for key in failed:
                 _logger.warning("Could not mirror Codex %s for session=%s", key, conv_id)
         if isinstance(effort, str) and effort:
             # Codex emits no settings notification when normalization leaves

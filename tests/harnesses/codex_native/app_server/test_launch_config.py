@@ -428,8 +428,10 @@ async def test_start_clamps_effort_to_catalog(
         (None, False),
         (None, True),
         ("rejected", False),
+        ("rejected", True),
         ("disconnected", False),
         ("timeout", False),
+        ("unwritable", False),
     ],
 )
 async def test_start_without_catalog_snapshot_checks_the_live_models(
@@ -439,7 +441,7 @@ async def test_start_without_catalog_snapshot_checks_the_live_models(
     write_failure: str | None,
     symlink_config: bool,
 ) -> None:
-    """Startup isolates config repairs from the source and survives failed writes."""
+    """Startup repairs the private config without touching the source, locally if the RPC fails."""
     from unittest.mock import AsyncMock, call
 
     from omnigent.harnesses.codex_native import app_server
@@ -469,7 +471,7 @@ async def test_start_without_catalog_snapshot_checks_the_live_models(
                 }
             }
         assert method == "config/batchWrite"
-        if write_failure == "rejected":
+        if write_failure in ("rejected", "unwritable"):
             raise app_server.CodexAppServerResponseError(
                 {"code": -32601, "message": "unavailable"}
             )
@@ -505,6 +507,17 @@ async def test_start_without_catalog_snapshot_checks_the_live_models(
     monkeypatch.setattr(app_server, "_effort_catalog_cache", stale_catalog)
     monkeypatch.setattr(app_server, "_effort_catalog_misses", stale_misses)
 
+    if write_failure == "unwritable":
+        # With both repair writes failing, startup stops before any TUI thread exists.
+        def unwritable(*args: object) -> None:
+            raise PermissionError("private config is read-only")
+
+        monkeypatch.setattr(app_server, "_pin_codex_config_effort", unwritable)
+        with pytest.raises(PermissionError):
+            await server.start()
+        assert (source_home / "config.toml").read_text() == original
+        return
+
     try:
         await server.start()
         assert client.request.await_args_list == [
@@ -525,11 +538,11 @@ async def test_start_without_catalog_snapshot_checks_the_live_models(
         ]
         assert (source_home / "config.toml").read_text() == original
         assert not (private_home / "config.toml").is_symlink()
-        if write_failure is None:
-            assert (
-                tomllib.loads((private_home / "config.toml").read_text())["model_reasoning_effort"]
-                == "xhigh"
-            )
+        # A failed RPC repair falls back to the local write, so the TUI's thread starts supported.
+        assert (
+            tomllib.loads((private_home / "config.toml").read_text())["model_reasoning_effort"]
+            == "xhigh"
+        )
         trust.assert_awaited_once_with(client=client)
         client.close.assert_awaited_once()
         if write_failure:

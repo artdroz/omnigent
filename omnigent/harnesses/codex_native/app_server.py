@@ -40,6 +40,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_model,
     read_codex_home_config_effort,
     read_codex_home_config_model,
+    read_unmirrored_codex_settings,
     write_policy_hook_config,
 )
 from omnigent.harnesses.codex_native.launch_args import (
@@ -2185,6 +2186,7 @@ class CodexNativeAppServer:
                     and effective_effort
                     and _codex_model_catalog_entry(catalog, effective_model) is None
                 ):
+                    resolved_effort = effective_effort
                     try:
                         resolved_effort = await resolve_codex_effort_for_model(
                             startup_client,
@@ -2209,11 +2211,17 @@ class CodexNativeAppServer:
                                 ),
                                 timeout=_EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS,
                             )
-                    except Exception:  # noqa: BLE001 - optional repair must not block startup
+                    except Exception:  # noqa: BLE001 - the local write below still repairs it
                         _logger.warning(
                             "Could not persist supported Codex reasoning effort at startup",
                             exc_info=True,
                         )
+                        if resolved_effort != effective_effort:
+                            # The app-server and TUI read this file when the thread is created.
+                            # If it cannot be written either, stop rather than launch the pair.
+                            _pin_codex_config_effort(
+                                self.codex_home, resolved_effort, effective_model
+                            )
                 if self.policy_hook_disabled_reason is None:
                     try:
                         await self._trust_policy_hooks(client=startup_client)
@@ -4463,7 +4471,9 @@ async def apply_codex_thread_effort(
     try:
         await asyncio.wait_for(client.connect(), timeout=_EFFORT_CONNECT_TIMEOUT_SECONDS)
         if model is None and bridge_dir is not None:
-            model = read_codex_config_model(bridge_dir)
+            model = read_unmirrored_codex_settings(bridge_dir).get(
+                "model"
+            ) or read_codex_config_model(bridge_dir)
         applied_effort = await resolve_codex_effort_for_model(
             client, effort, model, transport=transport
         )
@@ -4474,8 +4484,9 @@ async def apply_codex_thread_effort(
             ),
             timeout=_EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS,
         )
-        if bridge_dir is not None and mirror_applied_codex_settings(
-            bridge_dir, {"effort": applied_effort}
+        # The mirror takes a cross-process file lock, so keep it off the event loop.
+        if bridge_dir is not None and await asyncio.to_thread(
+            mirror_applied_codex_settings, bridge_dir, {"effort": applied_effort}
         ):
             _logger.warning(
                 "Failed to mirror resumed Codex reasoning effort %s into config.toml "

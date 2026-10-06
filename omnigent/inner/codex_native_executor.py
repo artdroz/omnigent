@@ -223,7 +223,8 @@ async def _start_codex_turn(
             for key in ("model", "effort")
             if isinstance(value := settings_overrides.get(key), str) and value
         }
-        for key, value in mirror_applied_codex_settings(bridge_dir, switched).items():
+        failed = await asyncio.to_thread(mirror_applied_codex_settings, bridge_dir, switched)
+        for key, value in failed.items():
             _logger.warning("Failed to mirror codex %s switch into config.toml: %s", key, value)
     response = await client.request(
         "turn/start",
