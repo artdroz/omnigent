@@ -38,14 +38,14 @@ class _NativeSession:
         self.running = True
         if not self.delay_terminal_discovery:
             self.terminal_available = True
-        self.pending_retries.pop().fulfill(
+        self.pending_retries.pop(0).fulfill(
             json={"queued": False, "recovered": True, "recovery": "runner_relaunched"},
         )
 
     def finish_change(self) -> None:
         """Acknowledge a configuration PATCH after the harness applies it."""
         assert self.pending_patches, "no pending configuration PATCH to acknowledge"
-        route, payload = self.pending_patches.pop()
+        route, payload = self.pending_patches.pop(0)
         route.fulfill(json={**payload, "llm_model": self.reported_model})
 
 

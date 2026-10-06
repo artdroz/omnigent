@@ -1,9 +1,9 @@
 """Model switching on an *inactive* native session (one that has stopped and has
 no running terminal) must first recover — start — the missing terminal via the
-session-recovery API, then apply the selection. On the buggy build the composer
-calls the model update directly, so the PATCH forwards a ``model_change`` to a
-runner with no live pane, the server rejects it, and the picker surfaces a
-"Couldn't update configuration" error while the model stays unchanged.
+session-recovery API, then apply the selection. Applying the model change
+directly against a runner with no live pane forwards a ``model_change`` the
+server rejects, surfacing a "Couldn't update configuration" error while the
+model stays unchanged; this test guards the recover-first ordering.
 
 Browsing the switcher must stay usable without launching a terminal: merely
 opening the picker must NOT trigger recovery (recovering on open would
@@ -177,11 +177,6 @@ def test_inactive_native_model_switch_recovers_terminal_first(
 ) -> None:
     """Selecting a model on an inactive native session recovers, then applies.
 
-    On the buggy build the composer PATCHes the model change without first
-    recovering the terminal, so it fails on a terminal-less session and the
-    picker shows the config error. The fix recovers the terminal via the
-    session-recovery API on selection, then applies the change.
-
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
         session, whose browser view is patched to a terminal-less claude-native
@@ -208,12 +203,19 @@ def test_inactive_native_model_switch_recovers_terminal_first(
         f"but recovery was triggered on open: {recorded['recoveries']}"
     )
 
-    # Select a different model.
-    page.locator('[role="menuitemcheckbox"][data-model-id="opus"]').click()
+    # Select a different model and wait for the recovery-gated PATCH to settle,
+    # so a late config error would already be on screen before asserting its
+    # absence rather than racing the in-flight response.
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and urlparse(response.url).path == f"/v1/sessions/{session_id}"
+        )
+    ):
+        page.locator('[role="menuitemcheckbox"][data-model-id="opus"]').click()
 
-    # Settle on a definitive outcome before asserting: the fix recovers the
-    # terminal (recovery posted) and applies cleanly; the buggy build skips
-    # recovery and the picker shows the config error.
+    # Recovery must post before the model applies; skipping it surfaces the
+    # config error instead, so settle on whichever signal appears first.
     error_btn = page.get_by_test_id("composer-config-error")
     for _ in range(40):
         if recorded["recoveries"] or error_btn.count() > 0:
