@@ -1,14 +1,12 @@
 """Narrow-window layout of the macOS shell's title-bar strip.
 
 The macOS Electron shell hides the native title bar and the SPA pins a
-Search/Settings/toggle cluster beside the traffic lights (the
-``[data-electron-mac]`` rules in ``web/src/index.css``). Electron lets the
-window shrink to 720px, below the SPA's ``md`` breakpoint (768px), so the
-phone layout and the mac title-bar layout can be active at the same time.
-These tests emulate the shell in Chromium the way
-``tests/e2e_ui/sessions/test_session_search.py`` does and check that the
-sidebar header, the settings drawer's Back row and the command palette stay out
-of the strip the CSS reserves for the window controls.
+Search/Settings/toggle cluster beside the traffic lights (the ``[data-electron-mac]``
+rules in ``web/src/index.css``). Electron lets the window shrink to 720px, below
+the SPA's ``md`` breakpoint (768px), where the phone layout takes over. These tests
+emulate the shell in Chromium like ``tests/e2e_ui/sessions/test_session_search.py``
+and check that the sidebar header, the settings Back row and the command palette
+stay out of the strip the CSS reserves for the window controls.
 """
 
 from __future__ import annotations

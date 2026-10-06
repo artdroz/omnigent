@@ -834,10 +834,9 @@ aside[aria-label="Workspace"][data-maximized] {
     display: none;
   }
 }
-/* The settings sidebar swaps the header row for a "Back" row, which would sit
- * under the traffic lights at any width (below md the drawer is full-bleed from
- * the top edge). Push it below them — it has no cluster to align beside the
- * lights, so it clears them vertically instead. */
+/* The settings sidebar's "Back" row would sit under the traffic lights at any
+ * width (below md the drawer is full-bleed from the top edge). It has no cluster
+ * to align beside the lights, so it clears them vertically instead. */
 [data-electron-mac] .settings-sidebar-header {
   padding-top: 2.75rem;
 }
@@ -899,10 +898,9 @@ aside[aria-label="Workspace"][data-maximized] {
   padding-left: 10.5rem;
 }
 /* Below md the phone layout already carries these controls (drawer Search,
- * floating Settings, chat-header toggle), so the title-bar cluster would only
- * double the Search button beside the lights: hide it, and let the chat header
- * and the full-bleed drawer's header row clear just the lights. The row keeps
- * its phone height so its Search bubble stays level with the chat header's. */
+ * floating Settings, chat-header toggle): hide the title-bar cluster and let the
+ * chat header and the full-bleed drawer's header row clear just the lights. The
+ * row keeps its phone height so its Search bubble stays level with the header's. */
 @media (width < 48rem) {
   [data-electron-mac] .electron-sidebar-header-actions {
     display: none;

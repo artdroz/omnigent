@@ -294,9 +294,8 @@ export function CommandPalette({
                 height: "var(--omnigent-viewport-height, 100dvh)",
                 maxHeight: "var(--omnigent-viewport-height, 100dvh)",
                 // Pad both insets: safe-top clears the notch (or the macOS shell's
-                // traffic lights at the top-left corner), safe-bottom keeps the last
-                // row above the home indicator when the keyboard is closed (the
-                // visible-viewport height then spans the home bar).
+                // traffic lights), safe-bottom keeps the last row above the home
+                // indicator when the keyboard is closed and the viewport spans it.
                 paddingTop: isMacElectronShell()
                   ? MAC_TITLE_BAR_STRIP
                   : "var(--omnigent-safe-top, 0px)",
