@@ -1,10 +1,16 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
 import { isChunkLoadError } from "@/lib/chunkLoadRecovery";
 
+interface PdfPreviewBoundaryProps {
+  children: ReactNode;
+  // Identity of the file content; a failed preview retries once it changes.
+  resetKey?: unknown;
+}
+
 // Keep rejected PDF imports and rendering errors inside the file preview.
 // Stale-chunk failures are rethrown from render so ChunkLoadErrorBoundary can refresh the page.
 export class PdfPreviewBoundary extends Component<
-  { children: ReactNode },
+  PdfPreviewBoundaryProps,
   { failed: boolean; error: unknown }
 > {
   override state: { failed: boolean; error: unknown } = { failed: false, error: null };
@@ -16,6 +22,12 @@ export class PdfPreviewBoundary extends Component<
   override componentDidCatch(error: Error, info: ErrorInfo) {
     if (isChunkLoadError(error)) return;
     console.error("PDF preview failed", error, info.componentStack);
+  }
+
+  override componentDidUpdate(prevProps: PdfPreviewBoundaryProps) {
+    if (this.state.failed && prevProps.resetKey !== this.props.resetKey) {
+      this.setState({ failed: false, error: null });
+    }
   }
 
   override render() {

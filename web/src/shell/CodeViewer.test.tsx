@@ -878,15 +878,8 @@ describe("CodeViewer image rendering", () => {
 });
 
 describe("CodeViewer PDF routing", () => {
-  it("contains a PDF render failure and allows another file to open", async () => {
-    const error = new Error("PDF renderer failed");
-    pdfRendering.error = error;
-    const log = vi.spyOn(console, "error").mockImplementation(() => {});
-    const suppressExpectedError = (event: ErrorEvent) => {
-      if (event.error === error) event.preventDefault();
-    };
-    window.addEventListener("error", suppressExpectedError);
-    const props: CodeViewerProps = {
+  function brokenPdfProps(): CodeViewerProps {
+    return {
       conversationId: "conv_1",
       path: "broken.pdf",
       fileQuery: makePdfQuery(),
@@ -899,17 +892,57 @@ describe("CodeViewer PDF routing", () => {
       searchInputRef: noopRef,
       viewMode: "source",
     };
-    try {
-      const { rerender } = render(<CodeViewer {...props} />);
-      expect(await screen.findByRole("alert")).toHaveTextContent("Unable to render PDF.");
-      pdfRendering.error = null;
-      rerender(<CodeViewer {...props} path="healthy.pdf" />);
-      expect(await screen.findByTestId("pdf-viewer-stub")).toBeInTheDocument();
-      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-    } finally {
+  }
+
+  // Renders a PDF whose viewer throws, waits for the in-pane alert, then stops
+  // the stub from throwing so the caller can check how the failure clears.
+  async function renderFailedPdf(props: CodeViewerProps) {
+    const error = new Error("PDF renderer failed");
+    pdfRendering.error = error;
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const suppressExpectedError = (event: ErrorEvent) => {
+      if (event.error === error) event.preventDefault();
+    };
+    window.addEventListener("error", suppressExpectedError);
+    const view = render(<CodeViewer {...props} />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Unable to render PDF.");
+    pdfRendering.error = null;
+    const cleanup = () => {
       pdfRendering.error = null;
       window.removeEventListener("error", suppressExpectedError);
       log.mockRestore();
+    };
+    return { ...view, cleanup };
+  }
+
+  it.each<[string, (props: CodeViewerProps) => CodeViewerProps]>([
+    ["another file opens", (props) => ({ ...props, path: "healthy.pdf" })],
+    [
+      "another conversation shows the same path",
+      (props) => ({ ...props, conversationId: "conv_2" }),
+    ],
+    ["new content arrives for the same file", (props) => ({ ...props, fileQuery: makePdfQuery() })],
+  ])("recovers from a PDF render failure when %s", async (_case, next) => {
+    const props = brokenPdfProps();
+    const { rerender, cleanup } = await renderFailedPdf(props);
+    try {
+      rerender(<CodeViewer {...next(props)} />);
+      expect(await screen.findByTestId("pdf-viewer-stub")).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("keeps a PDF render failure when the same file re-renders unchanged", async () => {
+    const props = brokenPdfProps();
+    const { rerender, cleanup } = await renderFailedPdf(props);
+    try {
+      rerender(<CodeViewer {...props} />);
+      expect(screen.getByRole("alert")).toHaveTextContent("Unable to render PDF.");
+      expect(screen.queryByTestId("pdf-viewer-stub")).not.toBeInTheDocument();
+    } finally {
+      cleanup();
     }
   });
 

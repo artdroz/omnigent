@@ -45,6 +45,47 @@ it("contains a rejected PDF import while the surrounding conversation remains in
   }
 });
 
+it("retries a failed preview only once new content arrives", async () => {
+  const error = new Error("PDF renderer failed");
+  let shouldThrow = true;
+  function Pdf() {
+    if (shouldThrow) throw error;
+    return <p>PDF rendered</p>;
+  }
+  const suppressExpectedError = (event: ErrorEvent) => {
+    if (event.error === error) event.preventDefault();
+  };
+  window.addEventListener("error", suppressExpectedError);
+  vi.spyOn(console, "error").mockImplementation(() => {});
+
+  try {
+    const { rerender } = render(
+      <PdfPreviewBoundary resetKey="v1">
+        <Pdf />
+      </PdfPreviewBoundary>,
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent("Unable to render PDF.");
+
+    shouldThrow = false;
+    rerender(
+      <PdfPreviewBoundary resetKey="v1">
+        <Pdf />
+      </PdfPreviewBoundary>,
+    );
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+
+    rerender(
+      <PdfPreviewBoundary resetKey="v2">
+        <Pdf />
+      </PdfPreviewBoundary>,
+    );
+    expect(await screen.findByText("PDF rendered")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  } finally {
+    window.removeEventListener("error", suppressExpectedError);
+  }
+});
+
 it("lets a stale-chunk import failure reach the app-level refresh boundary", async () => {
   const chunkError = new TypeError(
     "Failed to fetch dynamically imported module: /assets/PdfViewer-old.js",

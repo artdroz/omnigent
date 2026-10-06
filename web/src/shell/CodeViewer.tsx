@@ -795,7 +795,7 @@ export function CodeViewer({
   }
   if (fileQuery.data && isPdfFile(path, fileQuery.data.content_type)) {
     return (
-      <PdfPreviewBoundary key={JSON.stringify([conversationId, path])}>
+      <PdfPreviewBoundary key={JSON.stringify([conversationId, path])} resetKey={fileQuery.data}>
         <Suspense
           fallback={
             <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
