@@ -63,8 +63,11 @@ _INSTALL_SAMPLER = """
         const h = svg.getBoundingClientRect().height;
         if (h > diagramH) diagramH = h;
       }
+      // Streamdown paints Shiki tokens through the --sdm-c custom property.
       const code = content.querySelector('[data-streamdown="code-block"] code');
-      if (code) codeTokens = code.querySelectorAll('span[style*="color"]').length;
+      if (code) {
+        codeTokens = code.querySelectorAll('span[style*="--sdm-c"], span[style*="color"]').length;
+      }
     }
     window.__probe.frames.push({
       t: performance.now(),
@@ -226,23 +229,34 @@ def test_expanding_settled_fold_does_not_rerender_markdown(
         "the journey did not reach the state under test"
     )
 
-    baseline = open_frames[0]["markerRelY"]
-    worst = max(open_frames, key=lambda f: abs(f["markerRelY"] - baseline))
-    shift = abs(worst["markerRelY"] - baseline)
-    assert shift <= _MAX_POST_EXPAND_SHIFT_PX, (
-        f"expanding the settled fold re-rendered its markdown: content below "
-        f"the diagram shifted {shift:.0f}px after the first open frame "
-        f"(baseline relY={baseline:.0f}, worst relY={worst['markerRelY']:.0f} "
-        f"at t={worst['t']:.0f}ms) — the expand must not visibly re-render "
-        f"already-settled markdown"
+    # Prevent a detector that no longer matches the token markup from passing vacuously.
+    assert any(f["codeTokens"] > 0 for f in open_frames), (
+        "the code block never showed highlighted tokens inside the expanded fold; "
+        "the journey did not reach the state under test"
     )
 
-    # A code block that opens unhighlighted and then gets its tokens is the
-    # reported flash; one that never highlights here is a renderer timing
-    # difference, not a re-render.
-    highlighted_at = next((f for f in open_frames if f["codeTokens"] > 0), None)
-    if open_frames[0]["codeTokens"] == 0 and highlighted_at is not None:
-        pytest.fail(
-            "the code block opened unhighlighted and was highlighted at "
-            f"+{highlighted_at['t'] - open_frames[0]['t']:.0f}ms"
+    first = open_frames[0]
+    problems: list[str] = []
+
+    worst = max(open_frames, key=lambda f: abs(f["markerRelY"] - first["markerRelY"]))
+    shift = abs(worst["markerRelY"] - first["markerRelY"])
+    if shift > _MAX_POST_EXPAND_SHIFT_PX:
+        problems.append(
+            f"content below the diagram shifted {shift:.0f}px after the first open frame "
+            f"(baseline relY={first['markerRelY']:.0f}, worst relY={worst['markerRelY']:.0f} "
+            f"at +{worst['t'] - first['t']:.0f}ms)"
         )
+
+    # A code block that gains tokens after the first open frame was highlighted
+    # again on expand: the reported unhighlighted-then-highlighted flash.
+    rehighlighted = next((f for f in open_frames if f["codeTokens"] > first["codeTokens"]), None)
+    if rehighlighted is not None:
+        problems.append(
+            f"the code block opened with {first['codeTokens']} highlighted tokens and had "
+            f"{rehighlighted['codeTokens']} at +{rehighlighted['t'] - first['t']:.0f}ms"
+        )
+
+    assert not problems, (
+        "expanding the settled fold re-rendered its already-settled markdown: "
+        + "; ".join(problems)
+    )
