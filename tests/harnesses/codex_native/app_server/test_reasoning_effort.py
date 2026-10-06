@@ -213,6 +213,46 @@ async def test_successful_catalog_discovery_is_shared_between_turn_clients(
     assert second.request.await_count == (0 if boundary == "same-server" else 1)
 
 
+async def test_cached_catalog_without_the_model_is_read_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model missing from the cached rows is looked up again instead of failing its reset."""
+    monkeypatch.setattr(app_server, "_effort_catalog_cache", TTLCache(maxsize=2, ttl=60))
+    client = AsyncMock(spec=app_server.CodexAppServerClient)
+    first = {
+        "id": "gpt-5.4",
+        "defaultReasoningEffort": "high",
+        "supportedReasoningEfforts": [{"reasoningEffort": "high"}],
+    }
+    client.request.return_value = {"result": {"data": [first]}}
+    transport = "ws://127.0.0.1:12345"
+    assert (
+        await app_server.resolve_codex_effort_for_model(
+            client, None, "gpt-5.4", transport=transport
+        )
+        == "high"
+    )
+    added = {
+        "id": "gpt-5.6-sol",
+        "defaultReasoningEffort": "medium",
+        "supportedReasoningEfforts": [{"reasoningEffort": "medium"}],
+    }
+    client.request.return_value = {"result": {"data": [first, added]}}
+    assert (
+        await app_server.resolve_codex_effort_for_model(
+            client, None, "gpt-5.6-sol", transport=transport
+        )
+        == "medium"
+    )
+    assert (
+        await app_server.resolve_codex_effort_for_model(
+            client, None, "gpt-5.4", transport=transport
+        )
+        == "high"
+    )
+    assert client.request.await_count == 2
+
+
 @pytest.mark.parametrize("failure", ["unavailable", "malformed", "empty", "timeout"])
 async def test_live_catalog_failures_do_not_block_effort_updates(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str
@@ -348,7 +388,7 @@ async def test_resume_effort_update_times_out_and_closes_client(
     else:
         client.request.side_effect = stalled
     monkeypatch.setattr(app_server, "client_for_transport", lambda *args, **kwargs: client)
-    monkeypatch.setattr(app_server, "_EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(app_server, "_EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(app_server, "_EFFORT_CONNECT_TIMEOUT_SECONDS", 0.01)
 
     task = asyncio.create_task(

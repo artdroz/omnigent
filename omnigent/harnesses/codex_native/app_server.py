@@ -119,6 +119,7 @@ _CONNECT_RETRY_DELAY_SECONDS = 0.05
 _EFFORT_CATALOG_TIMEOUT_SECONDS = 2.0
 _EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS = 2.0
 _EFFORT_CONNECT_TIMEOUT_SECONDS = 2.0
+_EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS = 2.0
 # Model discovery is a best-effort side process whose callers fall back to a
 # cached or bundled catalog, so it keeps a short readiness budget.
 _CONNECT_TIMEOUT_SECONDS = 10.0
@@ -794,6 +795,8 @@ async def resolve_codex_effort_for_model(
     treats a null effort in ``thread/settings/update`` as unchanged.
     """
     catalog = _effort_catalog_cache.get(transport) if transport is not None else None
+    if catalog is not None and model and _codex_model_catalog_entry(catalog, model) is None:
+        catalog = None  # The cached rows predate this model, so refetch them.
     if model and catalog is None:
         try:
             catalog = await asyncio.wait_for(
@@ -804,8 +807,11 @@ async def resolve_codex_effort_for_model(
             if transport is not None and catalog:
                 _effort_catalog_cache[transport] = catalog
         except Exception:  # noqa: BLE001 — discovery must not prevent a turn
-            _logger.warning(
-                "Could not read Codex model capabilities for effort validation", exc_info=True
+            log_once(
+                _logger,
+                logging.WARNING,
+                "Could not read Codex model capabilities for effort validation",
+                exc_info=True,
             )
     if effort is None:
         entry = _codex_model_catalog_entry(catalog, model) if model else None
@@ -4451,7 +4457,7 @@ async def apply_codex_thread_effort(
                 "thread/settings/update",
                 {"threadId": thread_id, "effort": applied_effort},
             ),
-            timeout=_EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS,
+            timeout=_EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS,
         )
         if bridge_dir is not None and not write_codex_config_effort(bridge_dir, applied_effort):
             _logger.warning("Failed to mirror resumed Codex reasoning effort into config.toml")

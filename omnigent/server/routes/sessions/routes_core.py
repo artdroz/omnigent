@@ -151,6 +151,7 @@ from omnigent.server.routes._sessions.helpers import (
     _require_collaboration_mode_forward,
     _require_cost_control_label_authority,
     _require_permission_mode_forward,
+    _RunnerForwardResult,
     _same_provider_family,
     _session_status_cache,
     _set_read_state,
@@ -313,19 +314,32 @@ async def _wake_runner_for_model_change(
     return conv
 
 
+# Orders changes within one server process; the store's compare-and-restore
+# keeps a rollback from overwriting a newer selection across processes.
 # custom-lint: disable-next=workspace-scoped-cache -- session ids are globally unique
 _SESSION_SETTINGS_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
 
 
-def _runner_acknowledged_rollback(body: str) -> bool:
-    """Return whether a runner refusal confirms it did not keep the effort change."""
+_CODEX_SETTINGS_RESTORED_MESSAGE = (
+    "The terminal did not apply the model and reasoning effort changes. "
+    "The previous selections have been restored."
+)
+
+
+def _runner_reply_field(body: str, key: str) -> object:
+    """Return *key* from a runner's JSON reply, or ``None`` when it has none."""
     try:
         result = json.loads(body)
     except ValueError:
-        return False
-    return isinstance(result, dict) and result.get("rollback_on_refusal") is True
+        return None
+    return result.get(key) if isinstance(result, dict) else None
+
+
+def _codex_update_unconfirmed(result: _RunnerForwardResult) -> bool:
+    """Return whether Codex timed out before confirming a settings update it may still apply."""
+    return _runner_reply_field(result.body, "error") == "codex_native_settings_update_timeout"
 
 
 def _session_settings_lock(session_id: str) -> asyncio.Lock:
@@ -2757,21 +2771,19 @@ def register_core_routes(
         combined_model_forward = False
         _model_forward = None
         if live_forward and (effort is not None or clear_effort):
+            codex_native = (
+                updated.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+                == _CODEX_NATIVE_WRAPPER_LABEL_VALUE
+            )
             effort_event: dict[str, object] = {
                 "type": "effort_change",
                 "effort": updated.reasoning_effort,
             }
-            if (
-                updated.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-                == _CODEX_NATIVE_WRAPPER_LABEL_VALUE
-            ):
+            if codex_native:
                 # Codex refusals are rolled back below, so the runner must not save them.
                 effort_event["rollback_on_refusal"] = True
             combined_model_forward = bool(
-                live_model_change
-                and updated.model_override
-                and updated.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-                == _CODEX_NATIVE_WRAPPER_LABEL_VALUE
+                live_model_change and updated.model_override and codex_native
             )
             event = (
                 {
@@ -2800,13 +2812,7 @@ def register_core_routes(
                 _model_forward = effort_forward
             if model_applied:
                 assert effort_forward is not None
-                combined_applied = False
-                with contextlib.suppress(ValueError):
-                    result = json.loads(effort_forward.body)
-                    combined_applied = (
-                        isinstance(result, dict) and result.get("codex_settings_applied") is True
-                    )
-                if not combined_applied:
+                if _runner_reply_field(effort_forward.body, "codex_settings_applied") is not True:
                     # Older runners apply only the model; reset against that
                     # model after its update has completed.
                     effort_forward = await _forward_session_change_to_runner(
@@ -2815,19 +2821,15 @@ def register_core_routes(
                         effort_event,
                         timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
                     )
-            if (
-                updated.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-                == _CODEX_NATIVE_WRAPPER_LABEL_VALUE
-                and conv is not None
-                and (
-                    (effort_forward is None and model_applied)
-                    or (
-                        effort_forward is not None
-                        and not 200 <= effort_forward.status_code < 300
-                        and (
-                            (combined_model_forward and not model_applied)
-                            or _runner_acknowledged_rollback(effort_forward.body)
-                        )
+            if codex_native and (
+                (effort_forward is None and model_applied)
+                or (
+                    effort_forward is not None
+                    and not 200 <= effort_forward.status_code < 300
+                    and not _codex_update_unconfirmed(effort_forward)
+                    and (
+                        (combined_model_forward and not model_applied)
+                        or _runner_reply_field(effort_forward.body, "rollback_on_refusal") is True
                     )
                 )
             ):
@@ -2835,16 +2837,16 @@ def register_core_routes(
                 # Older runners keep a refused effort themselves, so roll back only
                 # when the runner confirms it did not, or after a lost fallback reply.
                 restore_model = live_model_change and not model_applied
-                await asyncio.to_thread(
-                    conversation_store.restore_session_settings_if_matches,
-                    session_id,
-                    previous=conv,
-                    attempted=updated,
-                    restore_model=restore_model,
-                )
+                if conv is not None:
+                    await asyncio.to_thread(
+                        conversation_store.restore_session_settings_if_matches,
+                        session_id,
+                        previous=conv,
+                        attempted=updated,
+                        restore_model=restore_model,
+                    )
                 raise OmnigentError(
-                    "The terminal did not apply the model and reasoning effort changes. "
-                    "The previous selections have been restored."
+                    _CODEX_SETTINGS_RESTORED_MESSAGE
                     if restore_model
                     else "The terminal did not apply the reasoning effort change. Please try again.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
@@ -2867,7 +2869,12 @@ def register_core_routes(
             if _is_native_terminal_session(updated):
                 # A recovered runner can disconnect again before the forward;
                 # neither a lost request nor a refusal confirms a model switch.
-                forward_failed = _surface_model_change_forward_failure(
+                # Codex may still apply an unconfirmed update, and the next turn
+                # re-applies the kept selection either way.
+                unconfirmed = _model_forward is not None and _codex_update_unconfirmed(
+                    _model_forward
+                )
+                forward_failed = not unconfirmed and _surface_model_change_forward_failure(
                     session_id,
                     updated.model_override,
                     _model_forward,
@@ -2876,6 +2883,18 @@ def register_core_routes(
                     (wake_for_model_change and (_model_forward is None or forward_failed))
                     or (forward_failed and configured_snapshot(conv.inference_snapshot))
                 ):
+                    if combined_model_forward:
+                        # The lost request also carried the effort, so restore both.
+                        await asyncio.to_thread(
+                            conversation_store.restore_session_settings_if_matches,
+                            session_id,
+                            previous=conv,
+                            attempted=updated,
+                            restore_model=True,
+                        )
+                        raise OmnigentError(
+                            _CODEX_SETTINGS_RESTORED_MESSAGE, code=ErrorCode.RUNNER_UNAVAILABLE
+                        )
                     await asyncio.to_thread(
                         conversation_store.update_conversation,
                         session_id,

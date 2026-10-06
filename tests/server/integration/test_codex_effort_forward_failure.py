@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -176,13 +177,13 @@ async def test_successful_update_mirrors_unchanged_native_effort_without_notific
     )
 
 
-@pytest.mark.parametrize("legacy_runner", [False, True])
+@pytest.mark.parametrize("runner_ignores_combined_effort", [False, True])
 @pytest.mark.parametrize(("requested", "expected"), [("default", "low"), ("max", "max")])
 async def test_combined_model_and_effort_uses_target_model_capabilities(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
     monkeypatch: pytest.MonkeyPatch,
-    legacy_runner: bool,
+    runner_ignores_combined_effort: bool,
     requested: str,
     expected: str,
 ) -> None:
@@ -194,8 +195,8 @@ async def test_combined_model_and_effort_uses_target_model_capabilities(
     async def forward(url: str, **kwargs: Any) -> httpx.Response:
         body = dict(kwargs["json"])
         forwarded.append(body)
-        if legacy_runner and body.get("type") == "model_change":
-            # Older runners ignore an effort included in a model-change event.
+        if runner_ignores_combined_effort and body.get("type") == "model_change":
+            # Covers the server's split fallback; its effort step still runs this runner.
             body.pop("effort", None)
         return await original_post(url, **{**kwargs, "json": body})
 
@@ -214,7 +215,7 @@ async def test_combined_model_and_effort_uses_target_model_capabilities(
     updates = [
         params for method, params in session.codex.requests if method == "thread/settings/update"
     ]
-    if legacy_runner:
+    if runner_ignores_combined_effort:
         assert [event["type"] for event in forwarded] == ["model_change", "effort_change"]
         assert updates[-1] == {"threadId": "thread_codex", "effort": expected}
     else:
@@ -522,16 +523,24 @@ async def test_legacy_runner_refusal_keeps_the_effort_it_cached(
     assert session.remembered_efforts[session.session_id] == "high"
 
 
+@pytest.mark.parametrize("combined_model_change", [False, True])
 async def test_unconfirmed_effort_update_is_kept_for_the_next_turn(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    combined_model_change: bool,
 ) -> None:
     """A timed-out native update may still apply, so it is kept rather than rolled back."""
     from omnigent.runner import turn_routing
+    from omnigent.server.routes._sessions import helpers as session_helpers
 
     session = native_session
     session.codex.failure = None
+    # Host-bound terminals roll back model changes that the runner refused.
+    session.store.set_host_id(session.session_id, uuid.uuid4().hex, workspace=str(tmp_path))
+    notices = Mock()
+    monkeypatch.setattr(session_helpers, "_publish_error_event", notices)
     monkeypatch.setattr(turn_routing, "SETTINGS_UPDATE_TIMEOUT_S", 0.05)
     real_request = session.codex.request
 
@@ -541,16 +550,49 @@ async def test_unconfirmed_effort_update_is_kept_for_the_next_turn(
         return await real_request(method, params)
 
     monkeypatch.setattr(session.codex, "request", stall_update)
-    response = await client.patch(
-        f"/v1/sessions/{session.session_id}", json={"reasoning_effort": "high"}
-    )
+    body = {"reasoning_effort": "high"}
+    if combined_model_change:
+        body["model_override"] = "gpt-6-sol"
+    response = await client.patch(f"/v1/sessions/{session.session_id}", json=body)
 
     assert response.status_code == 200, response.text
     assert response.json()["reasoning_effort"] == "high"
     saved = session.store.get_conversation(session.session_id)
     assert saved is not None
     assert saved.reasoning_effort == "high"
+    assert saved.model_override == ("gpt-6-sol" if combined_model_change else "gpt-5.4")
     assert session.remembered_efforts[session.session_id] == "high"
+    notices.assert_not_called()
+
+
+async def test_lost_combined_change_restores_the_model_and_effort(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A model and effort change that never reached the terminal restores both selections."""
+    session = native_session
+    session.store.set_host_id(session.session_id, uuid.uuid4().hex, workspace=str(tmp_path))
+    original_post = session.runner.post
+
+    async def lose_model_change(url: str, **kwargs: Any) -> httpx.Response:
+        if kwargs["json"].get("type") == "model_change":
+            raise httpx.ConnectError("Runner disconnected before the settings update")
+        return await original_post(url, **kwargs)
+
+    monkeypatch.setattr(session.runner, "post", lose_model_change)
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}",
+        json={"model_override": "gpt-6-sol", "reasoning_effort": "max"},
+    )
+
+    assert response.status_code == 503, response.text
+    assert "did not apply the model and reasoning effort changes" in response.text
+    saved = session.store.get_conversation(session.session_id)
+    assert saved is not None
+    assert saved.model_override == "gpt-5.4"
+    assert saved.reasoning_effort == "xhigh"
 
 
 @pytest.mark.parametrize("silent", [False, True])

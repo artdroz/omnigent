@@ -6562,22 +6562,18 @@ def create_runner_app(
             if harness == "codex-native":
                 # The native handler remembers the applied effort only after
                 # Codex confirms it; a refused reset must retain the old value.
+                server_rolls_back = body.get("rollback_on_refusal") is True
                 response = await _handle_codex_native_settings_update(
                     conversation_id,
                     {"effort": effort},
+                    # An older server keeps a refused selection for the next turn.
+                    keep_refused_effort=not server_rolls_back,
                 )
-                if 200 <= response.status_code < 300:
-                    return response
-                if body.get("rollback_on_refusal") is True and response.status_code != 504:
+                if server_rolls_back and not (
+                    200 <= response.status_code < 300 or response.status_code == 504
+                ):
                     # Confirm the refusal was not kept, so the server may roll it back.
                     return _acknowledge_settings_rollback(response)
-                if response.status_code in (503, 504):
-                    # The server keeps this selection (older server or unconfirmed
-                    # update), so the next turn applies it.
-                    if effort:
-                        _session_reasoning_effort[conversation_id] = effort
-                    else:
-                        _session_reasoning_effort.pop(conversation_id, None)
                 return response
             # In-process harnesses apply the effort on their next turn, from the
             # forwarded turn body (see ``_turn_reasoning``).

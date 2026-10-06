@@ -131,6 +131,9 @@ Cross-harness journeys:
   Concurrent runner controls are covered by
   `tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_concurrent_settings_use_the_applied_model`
   (component test): an overlapping effort pick uses the newly applied model.
+  `tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_effort_uses_the_applied_model_after_a_failed_mirror`
+  covers a model whose private-config write failed: later effort picks still
+  use it and retry the write until a terminal switch rewrites the config.
 - **`model-and-effort`, rejected Codex reset (server/runner integration):**
   `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_reset_returns_error_and_preserves_applied_settings`,
   `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_reset_preserves_concurrent_selection_and_sibling_settings`,
@@ -145,7 +148,8 @@ Cross-harness journeys:
   `tests/runner/test_app_sessions_native_workflow_messages.py::test_refused_codex_startup_effort_follows_the_server_rollback_contract`,
   `tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_settings_update_times_out_and_releases_the_lock`,
   `tests/server/integration/test_codex_effort_forward_failure.py::test_legacy_runner_refusal_keeps_the_effort_it_cached`,
-  `tests/server/integration/test_codex_effort_forward_failure.py::test_unconfirmed_effort_update_is_kept_for_the_next_turn`.
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_unconfirmed_effort_update_is_kept_for_the_next_turn`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_lost_combined_change_restores_the_model_and_effort`.
   Run with plain `uv run pytest`. Both HTTP apps and persistence are real;
   Codex RPC failures inject missing defaults and discovery timeouts. A refused
   reset returns an error and preserves applied settings and concurrent edits;
@@ -165,8 +169,9 @@ Cross-harness journeys:
   Retry once the terminal is ready; fully offline and silent saves remain deferred.
   An older server keeps such a refused change, so the updated runner applies it
   on the next turn; an older runner keeps it itself, so the updated server keeps
-  it too. A hung connect fails after five seconds; a hung update is unconfirmed
-  and is kept for the next turn instead of rolled back.
+  it too. A hung connect fails after five seconds; a hung update is unconfirmed,
+  so an effort or combined model/effort change is kept for the next turn instead
+  of rolled back. A combined change that never reaches the runner restores both.
 - **`approvals`:**
   `tests/e2e_ui/approvals/test_native_edit_tools_approval_card.py::test_native_file_edit_tools_require_approval_card`
 - **`resume`, bare picker scoped to this host:**

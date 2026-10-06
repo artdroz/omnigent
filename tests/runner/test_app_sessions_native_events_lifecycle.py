@@ -472,6 +472,98 @@ async def test_codex_native_settings_change_clamps_and_mirrors_effort(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mirror_recovers", "terminal_model", "expected_effort", "expected_config_model"),
+    [
+        pytest.param(False, None, "max", "gpt-5.4", id="mirror_still_failing"),
+        pytest.param(True, None, "max", "gpt-6-sol", id="mirror_retried"),
+        pytest.param(True, "gpt-5.5", "high", "gpt-5.5", id="terminal_switched_model"),
+    ],
+)
+async def test_codex_native_effort_uses_the_applied_model_after_a_failed_mirror(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mirror_recovers: bool,
+    terminal_model: str | None,
+    expected_effort: str,
+    expected_config_model: str,
+) -> None:
+    """A stale config model must not decide which efforts the applied model accepts."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    conv_id = uuid.uuid4().hex
+    transport = str(tmp_path / "codex.sock")
+    monkeypatch.setattr(codex_native_app_server, "_effort_catalog_cache", {})
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_home = codex_native_bridge.codex_home_for_bridge_dir(bridge_dir)
+    codex_home.mkdir(parents=True)
+    config = codex_home / "config.toml"
+    config.write_text('model = "gpt-5.4"\nmodel_reasoning_effort = "medium"\n')
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path=transport,
+            thread_id="thread_codex",
+            codex_home=str(codex_home),
+        ),
+    )
+    fake = _RecordingCodexAppServerClient(transport, "effort-test")
+    fake.model_list_responses = [
+        {
+            "result": {
+                "data": [
+                    {
+                        "id": model,
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": value} for value in levels
+                        ],
+                    }
+                    for model, levels in [
+                        ("gpt-5.4", ["low", "medium", "high", "xhigh"]),
+                        ("gpt-6-sol", ["low", "medium", "high", "xhigh", "max"]),
+                        ("gpt-5.5", ["low", "medium", "high"]),
+                    ]
+                ],
+                "nextCursor": None,
+            }
+        }
+    ]
+    monkeypatch.setattr(codex_native_app_server, "client_for_transport", lambda *a, **kw: fake)
+    write_model = codex_native_bridge.write_codex_config_model
+    mirror = {"works": False}
+
+    def flaky_write_model(bridge_dir: Path, model: str) -> bool:
+        return mirror["works"] and write_model(bridge_dir, model)
+
+    monkeypatch.setattr(codex_native_bridge, "write_codex_config_model", flaky_write_model)
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native", model="gpt-5.4"))
+    async with _runner_client(app) as client:
+        create = await client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": uuid.uuid4().hex}
+        )
+        assert create.status_code == 201, create.text
+        switched = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "model_change", "model": "gpt-6-sol"},
+        )
+        assert switched.status_code == 204, switched.text
+        assert codex_native_bridge.read_codex_config_model(bridge_dir) == "gpt-5.4"
+        mirror["works"] = mirror_recovers
+        if terminal_model is not None:
+            # A later in-terminal /model rewrites the config itself.
+            config.write_text(config.read_text().replace('"gpt-5.4"', f'"{terminal_model}"'))
+        picked = await client.post(
+            f"/v1/sessions/{conv_id}/events", json={"type": "effort_change", "effort": "max"}
+        )
+        assert picked.status_code == 204, picked.text
+    updates = [params for method, params in fake.requests if method == "thread/settings/update"]
+    assert updates[-1] == {"threadId": "thread_codex", "effort": expected_effort}
+    assert codex_native_bridge.read_codex_config_model(bridge_dir) == expected_config_model
+
+
+@pytest.mark.asyncio
 async def test_codex_native_concurrent_settings_use_the_applied_model(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
