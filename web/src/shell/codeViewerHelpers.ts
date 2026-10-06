@@ -433,13 +433,19 @@ export const HTML_PREVIEW_HEAD = '<base target="_blank">' + SAME_PAGE_ANCHOR_SCR
  * `<script>` blocks (to their end tag, or to end of input when unterminated) are
  * consumed whole so a look-alike tag inside them cannot attract the injection,
  * whose `</script>` would end the artifact's own script. Like the HTML parser, a
- * tag name must end at whitespace, `/` or `>`, so `</script-x>` is plain text.
+ * tag name must end at whitespace, `/` or `>`, so `</script-x>` is plain text,
+ * and a tag or quoted attribute value still open at end of input swallows the
+ * rest. This runs on the host page before the sandbox applies, so every
+ * alternative succeeds once its opening is found and the scan only moves
+ * forward: an incomplete tag is never rescanned, keeping the time linear.
  */
 function startTagEnd(html: string, tag: "head" | "html"): number {
   const scanner =
-    /<!--[\s\S]*?(?:--!?>|$)|<script(?=[\s/>])(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?(?:<\/script(?=[\s/>])[^>]*>|$)|<(head|html)(?=[\s/>])(?:"[^"]*"|'[^']*'|[^>"'])*>/gi;
+    /<!--[\s\S]*?(?:--!?>|$)|<script(?=[\s/>])(?:"[^"]*"|'[^']*'|[^>"'])*(?:>[\s\S]*?(?:<\/script(?=[\s/>])[^>]*(?:>|$)|$)|["'][\s\S]*|$)|<(head|html)(?=[\s/>])(?:"[^"]*"|'[^']*'|[^>"'])*(>|["'][\s\S]*|$)/gi;
   for (let match = scanner.exec(html); match; match = scanner.exec(html)) {
-    if (match[1]?.toLowerCase() === tag) return match.index + match[0].length;
+    // A start tag left open at end of input is dropped by the parser: no insertion point.
+    if (match[1]?.toLowerCase() !== tag || match[2] !== ">") continue;
+    return match.index + match[0].length;
   }
   return -1;
 }

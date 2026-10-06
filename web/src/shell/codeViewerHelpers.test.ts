@@ -508,12 +508,30 @@ describe("prepareHtmlPreviewDoc", () => {
     );
   });
 
-  it("scans an unterminated, quote-heavy script start tag in linear time", () => {
-    const hostile = `<p>ok</p><script ${'"'.repeat(36)}`;
-    const started = performance.now();
-    expect(prepareHtmlPreviewDoc(hostile)).toBe(`${HEAD}${hostile}`);
-    // Overlapping attribute alternatives took seconds on this input; disjoint ones are instant.
-    expect(performance.now() - started).toBeLessThan(500);
+  it("scans unterminated and repeated incomplete tags in linear time", () => {
+    // An incomplete tag must not cause excessive backtracking, nor be rescanned once the
+    // scan has moved past it; each case stays near-instant when progress is linear.
+    const cases = [
+      `<p>ok</p><script ${'"'.repeat(36)}`,
+      '<script "'.repeat(8000),
+      "<head '".repeat(8000),
+      `<script>${"</script ".repeat(8000)}`,
+      `<p>ok</p>${"<script a>".repeat(8000)}`,
+    ];
+    for (const hostile of cases) {
+      const started = performance.now();
+      expect(prepareHtmlPreviewDoc(hostile)).toBe(`${HEAD}${hostile}`);
+      expect(performance.now() - started).toBeLessThan(500);
+    }
+  });
+
+  it("does not treat a start tag still open at end of input as the head", () => {
+    // The parser drops such a tag, so markup placed after it would vanish; the <html>
+    // fallback supplies a real head instead, and a bare open tag gets the prepend.
+    expect(prepareHtmlPreviewDoc('<html><head data-x="a>b')).toBe(
+      `<html><head>${HEAD}</head><head data-x="a>b`,
+    );
+    expect(prepareHtmlPreviewDoc("<head ")).toBe(`${HEAD}<head `);
   });
 
   it("treats an unterminated <script> or comment as swallowing the rest of the document", () => {
