@@ -384,25 +384,15 @@ export const HTML_PREVIEW_SANDBOX =
 /**
  * In-frame handler for same-page links: a srcdoc document resolves `#x` against its
  * embedder, so with `<base target="_blank">` the host page would open in a new window.
- * Setting the frame's own hash scrolls like a native anchor (by hand if it is unchanged).
+ * For a plain click the browser's own activation behavior is steered instead: for the
+ * rest of the dispatch the injected base points at this document and targets this frame,
+ * so the link is a same-document fragment navigation (scroll, `:target`, `hashchange`,
+ * history) and a listener the artifact registered later still sees an untouched event
+ * it can cancel or route. Nothing else in the artifact is modified.
  */
 const SAME_PAGE_ANCHOR_SCRIPT = `<script>(function () {
-  function potentialIndicatedElement(id) {
-    const byId = document.getElementById(id);
-    if (byId) return byId;
-    const named = document.getElementsByName(id);
-    for (let i = 0; i < named.length; i++) if (named[i].localName === "a") return named[i];
-    return null;
-  }
-  function indicatedElement(fragment) {
-    // Native order: the literal fragment first, then its percent-decoded form.
-    const raw = fragment.slice(1);
-    const literal = potentialIndicatedElement(raw);
-    if (literal) return literal;
-    let decoded;
-    try { decoded = decodeURIComponent(raw); } catch (e) { return null; }
-    return decoded === raw ? null : potentialIndicatedElement(decoded);
-  }
+  // The base element (target _blank) injected right before this script.
+  const ownBase = document.currentScript ? document.currentScript.previousElementSibling : null;
   function activatedLink(event) {
     const path = event.composedPath ? event.composedPath() : [];
     for (let i = 0; i < path.length; i++) {
@@ -411,44 +401,37 @@ const SAME_PAGE_ANCHOR_SCRIPT = `<script>(function () {
     const target = event.target;
     return target && target.closest ? target.closest("a[href],area[href]") : null;
   }
+  function fragmentHref(anchor) {
+    // Clean the href as URL parsing does: ASCII tab/newline go anywhere, other C0 controls
+    // and spaces only at the ends; a non-breaking space stays and makes a relative path.
+    const href = anchor.getAttribute("href").replace(/[\\t\\n\\r]/g, "").replace(/^[\\u0000-\\u0020]+|[\\u0000-\\u0020]+$/g, "");
+    return href.charAt(0) === "#" ? href : "";
+  }
+  function leavesFrame(event, anchor) {
+    const target = anchor.getAttribute("target");
+    return event.type !== "click" || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey ||
+      (target !== null && target.toLowerCase() !== "_self");
+  }
   function onActivate(event) {
     if (event.defaultPrevented || (event.type === "auxclick" && event.button !== 1)) return;
     const anchor = activatedLink(event);
-    // Clean the href as URL parsing does: ASCII tab/newline go anywhere, other C0 controls
-    // and spaces only at the ends; a non-breaking space stays and makes a relative path.
-    const href = anchor
-      ? anchor.getAttribute("href").replace(/[\\t\\n\\r]/g, "").replace(/^[\\u0000-\\u0020]+|[\\u0000-\\u0020]+$/g, "")
-      : "";
-    if (href.charAt(0) !== "#") return;
-    // Modifier and middle clicks too: a new tab could only reopen the host app, never this document.
-    // Cancel the browser's navigation now, but commit the in-frame one only once dispatch has
-    // finished, so a listener the artifact registered later (on window too) can still cancel; its
-    // preventDefault() or returnValue = false is observed through own properties of this event.
-    const nativePreventDefault = event.preventDefault;
-    nativePreventDefault.call(event);
-    let cancelled = false;
-    event.preventDefault = function () {
-      cancelled = true;
-      nativePreventDefault.call(this);
-    };
-    Object.defineProperty(event, "returnValue", {
-      configurable: true,
-      get: function () { return false; },
-      set: function (value) { if (value === false) cancelled = true; },
-    });
-    setTimeout(function () {
-      delete event.preventDefault;
-      delete event.returnValue;
-      if (!cancelled) navigateTo(href);
-    }, 0);
-  }
-  function navigateTo(href) {
-    const before = location.href;
-    location.hash = href;
-    if (location.href !== before) return;
-    const element = indicatedElement(href);
-    if (element) element.scrollIntoView();
-    else if (href === "#" || href.toLowerCase() === "#top") window.scrollTo(0, 0);
+    const href = anchor ? fragmentHref(anchor) : "";
+    if (!href) return;
+    const documentUrl = location.href.split("#")[0];
+    const base = ownBase && ownBase.localName === "base" && ownBase.isConnected ? ownBase : document.querySelector("base");
+    if (!leavesFrame(event, anchor) && base && !base.hasAttribute("href")) {
+      base.setAttribute("href", documentUrl);
+      base.setAttribute("target", "_self");
+      setTimeout(function () {
+        base.removeAttribute("href");
+        base.setAttribute("target", "_blank");
+      }, 0);
+      return;
+    }
+    // Modifier and middle clicks, and links with their own target, would leave the frame, where
+    // this document cannot be shown: keep them here (a later window listener cannot cancel these).
+    event.preventDefault();
+    location.assign(documentUrl + href);
   }
   // On window, so handlers the artifact delegates to document run first and can cancel; one
   // that only stops propagation there hides the click from this handler (accepted).

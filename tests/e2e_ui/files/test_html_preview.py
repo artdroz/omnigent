@@ -10,7 +10,9 @@ Regression coverage for two bugs in the HTML artifact preview
     relaxes the sandbox so links open a real new tab.
   * Same-page ``#fragment`` links escaped to a new window at the host page's
     URL (a ``srcdoc`` frame resolves fragment-only links against its embedder,
-    and the base target sent them out); they must scroll the preview in place.
+    and the base target sent them out); they must scroll the preview in place,
+    while a handler the artifact registers on ``window`` afterwards must still
+    be able to cancel such a click.
 
 It also covers the new "Open in new tab" toolbar button, which pops the
 artifact into a blank, app-controlled tab and renders it inside the same
@@ -72,7 +74,13 @@ _HTML_CONTENT = f"""\
     <a id="static-link" href="https://example.com/static">static link</a>
     <p id="dynamic-link-host"></p>
     <a id="toc-link" href="#section-3">Jump to section 3</a>
+    <a id="guarded-link" href="#section-3">Guarded jump</a>
     <script>
+      // An artifact handler registered on window after the preview's own script must still
+      // be able to cancel a same-page link, here through the legacy return-false form.
+      window.onclick = function (event) {{
+        return !(event.target && event.target.id === "guarded-link");
+      }};
       // Proof that scripts run (#778).
       document.getElementById("js-status").textContent = "js-ran";
       // A link created at runtime — covered by the injected <base target>.
@@ -94,8 +102,10 @@ def _cleanup_session_workdir(session_id: str) -> None:
     shutil.rmtree(_REPO_ROOT / session_id, ignore_errors=True)
 
 
-def _click_without_popup(page: Page, link: Locator, target: Locator) -> None:
-    """Click ``link`` and require ``target`` to scroll into view with no new page opening."""
+def _click_without_popup(
+    page: Page, link: Locator, target: Locator, *, scrolls: bool = True
+) -> None:
+    """Click ``link`` with no new page opening; ``target`` scrolls into view, or stays put."""
     opened: list[Page] = []
     pages_before = len(page.context.pages)
 
@@ -105,9 +115,12 @@ def _click_without_popup(page: Page, link: Locator, target: Locator) -> None:
     page.context.on("page", note_popup)
     try:
         link.click()
-        expect(target).to_be_in_viewport()
+        if scrolls:
+            expect(target).to_be_in_viewport()
         # The click itself would have created a popup; a brief settle catches a late event.
         page.wait_for_timeout(500)
+        if not scrolls:
+            expect(target).not_to_be_in_viewport()
     finally:
         page.context.remove_listener("page", note_popup)
     assert len(page.context.pages) == pages_before
@@ -173,6 +186,11 @@ def test_html_preview_runs_scripts_and_targets_links(
     # externally.
     target = preview.locator("#section-3")
     expect(target).not_to_be_in_viewport()
+    # The artifact's own ``window.onclick`` (registered after the preview's script) cancels the
+    # guarded link, so nothing scrolls or opens: artifact handlers keep precedence.
+    _click_without_popup(
+        page, preview.get_by_role("link", name="Guarded jump"), target, scrolls=False
+    )
     _click_without_popup(page, preview.get_by_role("link", name="Jump to section 3"), target)
     expect(page).to_have_url(f"{base_url}/c/{session_id}?file={_HTML_PATH}")
 
