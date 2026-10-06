@@ -168,6 +168,24 @@ async def test_effort_reset_requires_the_models_advertised_default(default: str 
         assert await app_server.resolve_codex_effort_for_model(client, None, "gpt-5.4") == default
 
 
+async def test_effort_reset_for_an_unlisted_model_is_refused() -> None:
+    """A reset never borrows another model's default when the catalog lacks the model."""
+    client = AsyncMock(spec=app_server.CodexAppServerClient)
+    client.request.return_value = {
+        "result": {
+            "data": [
+                {
+                    "id": "gpt-5.4",
+                    "defaultReasoningEffort": "high",
+                    "supportedReasoningEfforts": [{"reasoningEffort": "high"}],
+                }
+            ]
+        }
+    }
+    with pytest.raises(ValueError, match="capabilities unavailable"):
+        await app_server.resolve_codex_effort_for_model(client, None, "gpt-unlisted")
+
+
 @pytest.mark.parametrize("boundary", ["same-server", "new-server", "expired"])
 async def test_successful_catalog_discovery_is_shared_between_turn_clients(
     monkeypatch: pytest.MonkeyPatch, boundary: str

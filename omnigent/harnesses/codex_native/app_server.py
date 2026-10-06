@@ -778,7 +778,7 @@ def clamp_codex_effort_for_model(
 
 _effort_catalog_cache: TTLCache[str, list[_JsonObject]] = TTLCache(maxsize=128, ttl=60.0)
 # Models a fresh catalog lacked, so an unlisted model does not refetch on every turn.
-_effort_catalog_misses: TTLCache[tuple[str, str], bool] = TTLCache(maxsize=256, ttl=60.0)
+_effort_catalog_misses: TTLCache[str, set[str]] = TTLCache(maxsize=128, ttl=60.0)
 
 
 async def resolve_codex_effort_for_model(
@@ -802,7 +802,7 @@ async def resolve_codex_effort_for_model(
         and transport is not None
         and model
         and _codex_model_catalog_entry(catalog, model) is None
-        and (transport, model) not in _effort_catalog_misses
+        and model not in _effort_catalog_misses.get(transport, ())
     ):
         catalog = None  # The cached rows may predate this model, so refetch them.
     if model and catalog is None:
@@ -815,7 +815,7 @@ async def resolve_codex_effort_for_model(
             if transport is not None and catalog:
                 _effort_catalog_cache[transport] = catalog
                 if _codex_model_catalog_entry(catalog, model) is None:
-                    _effort_catalog_misses[(transport, model)] = True
+                    _effort_catalog_misses.setdefault(transport, set()).add(model)
         except Exception:  # noqa: BLE001 — discovery must not prevent a turn
             log_once(
                 _logger,
@@ -1257,9 +1257,11 @@ async def list_codex_model_options(
             # Older servers list visible models by default but reject this field.
             include_hidden_supported = False
             if include_hidden:
-                _logger.info(
+                log_once(
+                    _logger,
+                    logging.INFO,
                     "Codex model/list rejected includeHidden; hidden model capabilities "
-                    "are unavailable from this server"
+                    "are unavailable from this server",
                 )
             continue
         result = response.get("result")
@@ -2115,6 +2117,7 @@ class CodexNativeAppServer:
         resolved_listen = self.listen_url or f"unix://{self.socket_path}"
         effort_catalog_transport = self.listen_url or str(self.socket_path)
         _effort_catalog_cache.pop(effort_catalog_transport, None)
+        _effort_catalog_misses.pop(effort_catalog_transport, None)
         self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
         tagged_argv0 = (
             f"{Path(self.codex_path).name} "
@@ -4470,7 +4473,13 @@ async def apply_codex_thread_effort(
             timeout=_EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS,
         )
         if bridge_dir is not None and not write_codex_config_effort(bridge_dir, applied_effort):
-            _logger.warning("Failed to mirror resumed Codex reasoning effort into config.toml")
+            _logger.warning(
+                "Failed to mirror resumed Codex reasoning effort %s into config.toml "
+                "(thread=%s, bridge=%s)",
+                applied_effort,
+                thread_id,
+                bridge_dir,
+            )
     finally:
         await client.close()
 

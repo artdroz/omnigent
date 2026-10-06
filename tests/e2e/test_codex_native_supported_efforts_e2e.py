@@ -16,7 +16,7 @@ import subprocess
 import time
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -203,8 +203,10 @@ def _session(rig: _Rig, model: str, effort: str, *, inherited: bool = False) -> 
         yield session
         assert (rig.source_home / "config.toml").read_text() == source_config
     finally:
-        transcript = rig.api.get(f"/v1/sessions/{session_id}/items", params={"limit": 100})
-        (rig.stack.root / f"{session_id}-transcript.json").write_text(transcript.text)
+        # The transcript is diagnostic only; deleting the session must still happen.
+        with suppress(httpx.HTTPError, OSError):
+            transcript = rig.api.get(f"/v1/sessions/{session_id}/items", params={"limit": 100})
+            (rig.stack.root / f"{session_id}-transcript.json").write_text(transcript.text)
         rig.api.delete(f"/v1/sessions/{session_id}")
 
 

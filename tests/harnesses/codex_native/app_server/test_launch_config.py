@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 import tomlkit
+from cachetools import TTLCache
 
 try:
     import tomllib
@@ -488,6 +489,16 @@ async def test_start_without_catalog_snapshot_checks_the_live_models(
     trust = AsyncMock()
     monkeypatch.setattr(app_server.CodexNativeAppServer, "_trust_policy_hooks", trust)
     server = _test_app_server(tmp_path, private_home, tmp_path / "bridge", tmp_path)
+    # A previous server on this transport left capabilities that allowed max.
+    transport = str(server.socket_path)
+    stale_catalog: TTLCache[str, list[dict[str, Any]]] = TTLCache(maxsize=2, ttl=60)
+    stale_catalog[transport] = [
+        {"id": "gpt-5.4", "supportedReasoningEfforts": [{"reasoningEffort": "max"}]}
+    ]
+    stale_misses: TTLCache[str, set[str]] = TTLCache(maxsize=2, ttl=60)
+    stale_misses[transport] = {"gpt-5.4"}
+    monkeypatch.setattr(app_server, "_effort_catalog_cache", stale_catalog)
+    monkeypatch.setattr(app_server, "_effort_catalog_misses", stale_misses)
 
     try:
         await server.start()

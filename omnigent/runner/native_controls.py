@@ -224,6 +224,7 @@ def build_native_controls(
     _begin_turn_slot: Callable[[str], None],
     _claude_model_options_rows: dict[str, tuple[float, list[dict[str, object]]]],
     _codex_native_bridge_state_for_session: _CodexNativeBridgeStateForSessionFn,
+    _codex_unmirrored_models: dict[str, tuple[str, tuple[int, int] | None]],
     _ensure_comment_relay_started: _EnsureCommentRelayStartedFn,
     _ensure_native_terminal_for_turn: Callable[[str, str | None], Coroutine[Any, Any, None]],
     _fetch_session_model_override: Callable[[str], Coroutine[Any, Any, str | None]],
@@ -258,8 +259,6 @@ def build_native_controls(
     _codex_settings_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
         weakref.WeakValueDictionary()
     )
-    # Applied models whose config write failed, with the config revision after that update.
-    _codex_unmirrored_models: dict[str, tuple[str, tuple[int, int] | None]] = {}
 
     async def _handle_codex_native_settings_update(
         conv_id: str,
