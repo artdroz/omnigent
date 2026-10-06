@@ -15,6 +15,13 @@ from omnigent.harnesses.codex_native.bridge import read_codex_config_effort
 from omnigent.server.smart_routing import RoutingSettings, parse_routing_tables
 
 
+@pytest.fixture(autouse=True)
+def _fresh_effort_caches(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep each case's capability discovery out of the shared module caches."""
+    monkeypatch.setattr(app_server, "_effort_catalog_cache", TTLCache(maxsize=8, ttl=60))
+    monkeypatch.setattr(app_server, "_effort_catalog_misses", TTLCache(maxsize=8, ttl=60))
+
+
 @pytest.mark.parametrize(
     ("requested", "fallback", "advertised", "expected"),
     [
@@ -231,12 +238,8 @@ async def test_successful_catalog_discovery_is_shared_between_turn_clients(
     assert second.request.await_count == (0 if boundary == "same-server" else 1)
 
 
-async def test_cached_catalog_without_the_model_is_read_again(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_cached_catalog_without_the_model_is_read_again() -> None:
     """A model missing from the cached rows is looked up again instead of failing its reset."""
-    monkeypatch.setattr(app_server, "_effort_catalog_cache", TTLCache(maxsize=2, ttl=60))
-    monkeypatch.setattr(app_server, "_effort_catalog_misses", TTLCache(maxsize=2, ttl=60))
     client = AsyncMock(spec=app_server.CodexAppServerClient)
     first = {
         "id": "gpt-5.4",

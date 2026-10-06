@@ -102,6 +102,9 @@ _CODEX_PERMISSION_CONFIRM_BUDGET_S = 4.0
 # (Read Only appears only with a read-only permission profile), so the digit is
 # read from the live popup when possible rather than hardcoded.
 _CODEX_PERMISSION_MENU_BUDGET_S = 5.0
+# Older servers read any reply as a confirmed result, so outlast their
+# 20-second forward instead of reporting an unconfirmed timeout.
+_LEGACY_SERVER_UPDATE_TIMEOUT_S = 30.0
 
 
 class _CodexNativeBridgeStateForSessionFn(Protocol):
@@ -158,7 +161,7 @@ class _HandleCodexNativePlanModeChangeFn(Protocol):
 
 class _HandleCodexNativeSettingsUpdateFn(Protocol):
     async def __call__(
-        self, conv_id: str, settings: _JsonObject, *, keep_refused_effort: bool = False
+        self, conv_id: str, settings: _JsonObject, *, legacy_server: bool = False
     ) -> Response: ...
 
 
@@ -224,7 +227,7 @@ def build_native_controls(
     _begin_turn_slot: Callable[[str], None],
     _claude_model_options_rows: dict[str, tuple[float, list[dict[str, object]]]],
     _codex_native_bridge_state_for_session: _CodexNativeBridgeStateForSessionFn,
-    _codex_unmirrored_models: dict[str, tuple[str, tuple[int, int] | None]],
+    _codex_unmirrored_settings: dict[str, tuple[dict[str, str], tuple[int, int] | None]],
     _ensure_comment_relay_started: _EnsureCommentRelayStartedFn,
     _ensure_native_terminal_for_turn: Callable[[str, str | None], Coroutine[Any, Any, None]],
     _fetch_session_model_override: Callable[[str], Coroutine[Any, Any, str | None]],
@@ -256,6 +259,7 @@ def build_native_controls(
 
     The keyword arguments are the runner app's shared session state and helpers.
     """
+    # Weak values drop idle sessions, so a holder must keep its lock in a local.
     _codex_settings_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
         weakref.WeakValueDictionary()
     )
@@ -264,7 +268,7 @@ def build_native_controls(
         conv_id: str,
         settings: _JsonObject,
         *,
-        keep_refused_effort: bool = False,
+        legacy_server: bool = False,
     ) -> Response:
         if not settings:
             return Response(status_code=204)
@@ -273,10 +277,11 @@ def build_native_controls(
             lock = _codex_settings_locks[conv_id] = asyncio.Lock()
         # The lock also covers the public mirror so the server sees efforts in apply order.
         async with lock:
-            response = await _apply_codex_native_settings_update(conv_id, settings)
+            response = await _apply_codex_native_settings_update(
+                conv_id, settings, legacy_server=legacy_server
+            )
             if "effort" in settings and (
-                response.status_code == 504
-                or (keep_refused_effort and response.status_code == 503)
+                response.status_code == 504 or (legacy_server and response.status_code == 503)
             ):
                 # The server keeps this selection, so the next turn applies it.
                 effort = settings["effort"]
@@ -286,25 +291,31 @@ def build_native_controls(
                     _session_reasoning_effort.pop(conv_id, None)
             return response
 
-    def _current_codex_model(conv_id: str, bridge_dir: Path) -> str | None:
-        """Return the thread's model, preferring one applied while its config write failed."""
+    def _unmirrored_codex_settings(conv_id: str, bridge_dir: Path) -> dict[str, str]:
+        """Return applied settings the config still lacks, retrying their writes."""
         from omnigent.harnesses.codex_native.bridge import (
             codex_config_revision,
-            read_codex_config_model,
+            write_codex_config_effort,
             write_codex_config_model,
         )
 
-        unmirrored = _codex_unmirrored_models.pop(conv_id, None)
-        # Any later rewrite, such as a terminal model switch, makes the config current.
-        if unmirrored is None or unmirrored[1] != codex_config_revision(bridge_dir):
-            return read_codex_config_model(bridge_dir)
-        if not write_codex_config_model(bridge_dir, unmirrored[0]):
-            _codex_unmirrored_models[conv_id] = unmirrored
-        return unmirrored[0]
+        entry = _codex_unmirrored_settings.pop(conv_id, None)
+        # Any later rewrite, such as a terminal switch, makes the config current.
+        if entry is None or entry[1] != codex_config_revision(bridge_dir):
+            return {}
+        writers = {"model": write_codex_config_model, "effort": write_codex_config_effort}
+        failed = {
+            key: value for key, value in entry[0].items() if not writers[key](bridge_dir, value)
+        }
+        if failed:
+            _codex_unmirrored_settings[conv_id] = (failed, codex_config_revision(bridge_dir))
+        return entry[0]
 
     async def _apply_codex_native_settings_update(
         conv_id: str,
         settings: _JsonObject,
+        *,
+        legacy_server: bool,
     ) -> Response:
         from omnigent.harnesses.codex_native.app_server import (
             client_for_transport,
@@ -314,6 +325,7 @@ def build_native_controls(
             bridge_dir_for_codex_home,
             codex_config_revision,
             read_codex_config_effort,
+            read_codex_config_model,
             write_codex_config_effort,
             write_codex_config_model,
         )
@@ -336,8 +348,15 @@ def build_native_controls(
         bridge_dir = bridge_dir_for_codex_home(Path(state.codex_home))
         settings = dict(settings)
         model = None
+        unmirrored: dict[str, str] = {}
         if "model" in settings or "effort" in settings:
-            model = settings.get("model") or _current_codex_model(conv_id, bridge_dir)
+            # A failed config write must not make the stale value the next update's base.
+            unmirrored = _unmirrored_codex_settings(conv_id, bridge_dir)
+            model = (
+                settings.get("model")
+                or unmirrored.get("model")
+                or read_codex_config_model(bridge_dir)
+            )
         if "effort" in settings and settings["effort"] is None and not isinstance(model, str):
             return JSONResponse(
                 status_code=400,
@@ -364,7 +383,7 @@ def build_native_controls(
                 effort = (
                     settings["effort"]
                     if "effort" in settings
-                    else read_codex_config_effort(bridge_dir)
+                    else unmirrored.get("effort") or read_codex_config_effort(bridge_dir)
                 )
                 if (
                     "model" in settings
@@ -391,7 +410,11 @@ def build_native_controls(
                             **settings,
                         },
                     ),
-                    timeout=SETTINGS_UPDATE_TIMEOUT_S,
+                    timeout=(
+                        _LEGACY_SERVER_UPDATE_TIMEOUT_S
+                        if legacy_server
+                        else SETTINGS_UPDATE_TIMEOUT_S
+                    ),
                 )
             except TimeoutError:
                 # Codex may still apply the update, so this is not a refusal.
@@ -428,22 +451,25 @@ def build_native_controls(
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
+        # This update's values replace older pending ones; untouched keys stay pending.
+        pending = dict(_codex_unmirrored_settings.pop(conv_id, ({}, None))[0])
         model = settings.get("model")
         if isinstance(model, str):
-            if write_codex_config_model(bridge_dir, model):
-                _codex_unmirrored_models.pop(conv_id, None)
-            else:
+            pending.pop("model", None)
+            if not write_codex_config_model(bridge_dir, model):
                 _logger.warning("Could not mirror Codex model for session=%s", conv_id)
-                _codex_unmirrored_models[conv_id] = (model, None)
+                pending["model"] = model
         effort = settings.get("effort")
-        if isinstance(effort, str):
+        if isinstance(effort, str) and effort:
             _session_reasoning_effort[conv_id] = effort
+            pending.pop("effort", None)
             if not write_codex_config_effort(bridge_dir, effort):
                 _logger.warning("Could not mirror Codex effort for session=%s", conv_id)
-        if (unmirrored := _codex_unmirrored_models.get(conv_id)) is not None:
-            # Stamp after this update's own writes, so only later rewrites supersede it.
-            _codex_unmirrored_models[conv_id] = (unmirrored[0], codex_config_revision(bridge_dir))
-        if isinstance(effort, str):
+                pending["effort"] = effort
+        if pending:
+            # Stamp after this update's own writes, so only later rewrites supersede them.
+            _codex_unmirrored_settings[conv_id] = (pending, codex_config_revision(bridge_dir))
+        if isinstance(effort, str) and effort:
             # Codex emits no settings notification when normalization leaves
             # its effort unchanged, so confirm the applied value explicitly.
             if server_client is not None:
@@ -812,7 +838,7 @@ def build_native_controls(
         from omnigent.entities.session_resources import terminal_resource_id
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
 
-        _codex_unmirrored_models.pop(conv_id, None)
+        _codex_unmirrored_settings.pop(conv_id, None)
         terminal_registry = resource_registry.terminal_registry
         if terminal_registry is None:
             return

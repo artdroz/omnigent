@@ -132,8 +132,10 @@ Cross-harness journeys:
   `tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_concurrent_settings_use_the_applied_model`
   (component test): an overlapping effort pick uses the newly applied model.
   `tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_effort_uses_the_applied_model_after_a_failed_mirror`
-  covers a model whose private-config write failed: later effort picks still
-  use it and retry the write until a terminal switch rewrites the config.
+  and
+  `tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_model_switch_inherits_an_effort_whose_config_write_failed`
+  cover a model or effort whose private-config write failed: later updates
+  still use it and retry the write until a terminal switch rewrites the config.
 - **`model-and-effort`, rejected Codex reset (server/runner integration):**
   `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_reset_returns_error_and_preserves_applied_settings`,
   `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_change_preserves_concurrent_selection_and_sibling_settings`,
@@ -174,6 +176,8 @@ Cross-harness journeys:
   it too. A hung connect fails after five seconds; a hung update is unconfirmed,
   so an effort or combined model/effort change is kept for the next turn instead
   of rolled back. A combined change that never reaches the runner restores both.
+  An older server gets no early timeout; it waits for Codex as before
+  (`tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_late_settings_ack_still_reaches_an_older_server`).
 - **`approvals`:**
   `tests/e2e_ui/approvals/test_native_edit_tools_approval_card.py::test_native_file_edit_tools_require_approval_card`
 - **`resume`, bare picker scoped to this host:**

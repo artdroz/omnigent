@@ -2706,11 +2706,14 @@ def register_core_routes(
                 request, conv, conversation_store, runner_router
             )
 
-        if body.silent:
-            # A refusal of an active live change must not roll back over this write.
-            _note_settings_write(
-                session_id, {"reasoning_effort", "model_override"} & body.model_fields_set
-            )
+        silent_settings = (
+            {"reasoning_effort", "model_override"} & body.model_fields_set
+            if body.silent
+            else set()
+        )
+        # A refusal of an active live change must not roll back over this write,
+        # whether that change began before or during it.
+        _note_settings_write(session_id, silent_settings)
         updated = await asyncio.to_thread(
             conversation_store.update_conversation,
             session_id,
@@ -2733,6 +2736,7 @@ def register_core_routes(
         )
         if updated is None:
             raise _session_not_found()
+        _note_settings_write(session_id, silent_settings)
         # Archiving hides the session from the default view (and its unread
         # dot), so drop its per-user read-state to bound in-memory growth.
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).
@@ -2763,20 +2767,21 @@ def register_core_routes(
         # The runner applies native settings live. Silent startup metadata
         # writes skip both recovery and forwarding to avoid recursive launches.
         live_forward = not body.silent
+        codex_native = (
+            updated.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+            == _CODEX_NATIVE_WRAPPER_LABEL_VALUE
+        )
+        # This server rolls back Codex refusals and keeps unconfirmed changes, so the
+        # runner neither saves a refusal nor waits out this server's forward timeout.
+        negotiation: dict[str, object] = {"rollback_on_refusal": True} if codex_native else {}
         combined_model_forward = False
         _model_forward = None
         if live_forward and (effort is not None or clear_effort):
-            codex_native = (
-                updated.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-                == _CODEX_NATIVE_WRAPPER_LABEL_VALUE
-            )
             effort_event: dict[str, object] = {
                 "type": "effort_change",
                 "effort": updated.reasoning_effort,
+                **negotiation,
             }
-            if codex_native:
-                # Codex refusals are rolled back below, so the runner must not save them.
-                effort_event["rollback_on_refusal"] = True
             combined_model_forward = bool(
                 live_model_change and updated.model_override and codex_native
             )
@@ -2785,6 +2790,7 @@ def register_core_routes(
                     "type": "model_change",
                     "model": updated.model_override,
                     "effort": updated.reasoning_effort,
+                    **negotiation,
                 }
                 if combined_model_forward
                 else effort_event
@@ -2805,8 +2811,7 @@ def register_core_routes(
             )
             if combined_model_forward:
                 _model_forward = effort_forward
-            if model_applied:
-                assert effort_forward is not None
+            if model_applied and effort_forward is not None:
                 if _runner_reply_field(effort_forward.body, "codex_settings_applied") is not True:
                     # Older runners apply only the model; reset against that
                     # model after its update has completed.
@@ -2832,16 +2837,20 @@ def register_core_routes(
                 # Older runners keep a refused effort themselves, so roll back only
                 # when the runner confirms it did not, or after a lost fallback reply.
                 restore_model = live_model_change and not model_applied
-                if conv is not None:
-                    rewritten = live_change.rewritten(writes_before) if live_change else set()
-                    await asyncio.to_thread(
-                        conversation_store.restore_session_settings_if_matches,
-                        session_id,
-                        previous=conv,
-                        attempted=updated,
-                        restore_effort="reasoning_effort" not in rewritten,
-                        restore_model=restore_model and "model_override" not in rewritten,
+                if conv is None:
+                    raise OmnigentError(
+                        "The terminal did not apply the settings change.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
                     )
+                rewritten = live_change.rewritten(writes_before) if live_change else set()
+                await asyncio.to_thread(
+                    conversation_store.restore_session_settings_if_matches,
+                    session_id,
+                    previous=conv,
+                    attempted=updated,
+                    restore_effort="reasoning_effort" not in rewritten,
+                    restore_model=restore_model and "model_override" not in rewritten,
+                )
                 raise OmnigentError(
                     _CODEX_SETTINGS_RESTORED_MESSAGE
                     if restore_model
@@ -2853,7 +2862,7 @@ def register_core_routes(
                 _model_forward = await _forward_session_change_to_runner(
                     session_id,
                     runner_router,
-                    {"type": "model_change", "model": updated.model_override},
+                    {"type": "model_change", "model": updated.model_override, **negotiation},
                     # The runner can answer by confirming a TUI model dialog.
                     timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
                 )
@@ -2864,10 +2873,8 @@ def register_core_routes(
             # full rationale. live_forward (== not silent) already excludes
             # bind-time auto-applies, so only an explicit /model lands a note.
             if _is_native_terminal_session(updated):
-                # A recovered runner can disconnect again before the forward;
-                # neither a lost request nor a refusal confirms a model switch.
-                # Codex may still apply an unconfirmed update, and the next turn
-                # re-applies the kept selection either way.
+                # Neither a lost request nor a refusal confirms a model switch, but an
+                # unconfirmed Codex update may still apply; the next turn re-applies it.
                 unconfirmed = _model_forward is not None and _codex_update_unconfirmed(
                     _model_forward
                 )

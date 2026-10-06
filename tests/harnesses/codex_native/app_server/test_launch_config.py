@@ -378,7 +378,12 @@ async def test_start_pins_reasoning_effort_in_config(
 
 @pytest.mark.parametrize(
     ("requested", "inherited", "expected"),
-    [("minimal", "medium", "low"), ("max", "medium", "xhigh"), (None, "max", "xhigh")],
+    [
+        ("minimal", "medium", "low"),
+        ("max", "medium", "xhigh"),
+        (None, "max", "xhigh"),
+        (None, "high", "high"),
+    ],
 )
 @pytest.mark.parametrize("pin_model", [True, False])
 async def test_start_clamps_effort_to_catalog(

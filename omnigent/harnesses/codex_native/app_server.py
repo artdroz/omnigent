@@ -2183,14 +2183,14 @@ class CodexNativeAppServer:
                     and effective_effort
                     and _codex_model_catalog_entry(catalog, effective_model) is None
                 ):
-                    resolved_effort = await resolve_codex_effort_for_model(
-                        startup_client,
-                        effective_effort,
-                        effective_model,
-                        transport=effort_catalog_transport,
-                    )
-                    if resolved_effort != effective_effort:
-                        try:
+                    try:
+                        resolved_effort = await resolve_codex_effort_for_model(
+                            startup_client,
+                            effective_effort,
+                            effective_model,
+                            transport=effort_catalog_transport,
+                        )
+                        if resolved_effort != effective_effort:
                             await asyncio.wait_for(
                                 startup_client.request(
                                     "config/batchWrite",
@@ -2207,11 +2207,11 @@ class CodexNativeAppServer:
                                 ),
                                 timeout=_EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS,
                             )
-                        except Exception:  # noqa: BLE001 - optional repair must not block startup
-                            _logger.warning(
-                                "Could not persist supported Codex reasoning effort at startup",
-                                exc_info=True,
-                            )
+                    except Exception:  # noqa: BLE001 - optional repair must not block startup
+                        _logger.warning(
+                            "Could not persist supported Codex reasoning effort at startup",
+                            exc_info=True,
+                        )
                 if self.policy_hook_disabled_reason is None:
                     try:
                         await self._trust_policy_hooks(client=startup_client)

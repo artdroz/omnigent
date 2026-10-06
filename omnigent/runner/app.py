@@ -1204,8 +1204,8 @@ def create_runner_app(
     # snapshot and updated by ``effort_change``. In-process harnesses learn the
     # effort only from the forwarded turn body, which is built field by field.
     _session_reasoning_effort: dict[str, str] = {}
-    # session_id → (applied Codex model, config revision) while its config write fails.
-    _codex_unmirrored_models: dict[str, tuple[str, tuple[int, int] | None]] = {}
+    # session_id → (applied Codex settings whose config write failed, config revision).
+    _codex_unmirrored_settings: dict[str, tuple[dict[str, str], tuple[int, int] | None]] = {}
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
@@ -3357,7 +3357,7 @@ def create_runner_app(
         _session_snapshot_locks.pop(session_id, None)
         _session_init_envelopes.pop(session_id, None)
         _session_reasoning_effort.pop(session_id, None)
-        _codex_unmirrored_models.pop(session_id, None)
+        _codex_unmirrored_settings.pop(session_id, None)
         _session_spec_locks.pop(session_id, None)
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
@@ -6570,7 +6570,7 @@ def create_runner_app(
                     conversation_id,
                     {"effort": effort},
                     # An older server keeps a refused selection for the next turn.
-                    keep_refused_effort=not server_rolls_back,
+                    legacy_server=not server_rolls_back,
                 )
                 if server_rolls_back and not (
                     200 <= response.status_code < 300 or response.status_code == 504
@@ -6631,7 +6631,9 @@ def create_runner_app(
                             return invalid
                         settings["effort"] = effort
                     response = await _handle_codex_native_settings_update(
-                        conversation_id, settings
+                        conversation_id,
+                        settings,
+                        legacy_server=body.get("rollback_on_refusal") is not True,
                     )
                     if "effort" in settings and 200 <= response.status_code < 300:
                         return JSONResponse({"codex_settings_applied": True})
@@ -7035,7 +7037,7 @@ def create_runner_app(
         _begin_turn_slot=_begin_turn_slot,
         _claude_model_options_rows=_claude_model_options_rows,
         _codex_native_bridge_state_for_session=_codex_native_bridge_state_for_session,
-        _codex_unmirrored_models=_codex_unmirrored_models,
+        _codex_unmirrored_settings=_codex_unmirrored_settings,
         _ensure_comment_relay_started=_ensure_comment_relay_started,
         _ensure_native_terminal_for_turn=_ensure_native_terminal_for_turn,
         _fetch_session_model_override=_fetch_session_model_override,
