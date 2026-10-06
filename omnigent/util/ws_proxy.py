@@ -12,9 +12,9 @@ clients: :func:`ws_env_proxy_url` picks the proxy the standard environment
 variables configure for a ``ws(s)://`` URL (honoring ``NO_PROXY`` and never
 proxying loopback), and :func:`open_proxy_connect_socket` establishes the
 CONNECT tunnel so the connected socket can be handed to ``websockets`` via
-its ``sock=`` parameter. No dependency bump is required, nothing changes when
-no proxy is configured, and the explicit socket keeps working if the
-``websockets`` pin is ever lifted.
+its ``sock=`` parameter. A pre-connected socket means WebSocket-level
+redirects are not followed; the tunnel endpoints never redirect, and HTTP(S)
+login redirects still surface as ``InvalidURI`` for the callers to classify.
 """
 
 from __future__ import annotations
@@ -186,15 +186,16 @@ def ws_env_proxy_url(ws_url: str, environ: Mapping[str, str] | None = None) -> s
 
 
 def redact_proxy_url(proxy_url: str) -> str:
-    """Return *proxy_url* with any userinfo credentials removed, for logging.
+    """Return *proxy_url* reduced to ``scheme://host[:port]`` for logging.
+
+    Userinfo credentials and any path, query, or fragment (unused by the
+    dialer, and a place for stray secrets) are dropped.
 
     :param proxy_url: Proxy URL, possibly carrying ``user:pass@``.
-    :returns: The URL without credentials.
+    :returns: The URL's scheme and authority only.
     """
     parts = urlsplit(proxy_url)
-    if "@" not in parts.netloc:
-        return proxy_url
-    return proxy_url.replace(parts.netloc, parts.netloc.rpartition("@")[2], 1)
+    return f"{parts.scheme}://{parts.netloc.rpartition('@')[2]}"
 
 
 async def open_proxy_connect_socket(

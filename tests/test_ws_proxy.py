@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextlib
 import datetime
+import logging
 import socket
 import ssl
 import time
@@ -94,6 +95,20 @@ def test_no_proxy(host, no_proxy, bypass):
 @pytest.mark.parametrize("userinfo", ["", "user:secret@"])
 def test_redact_proxy_url(userinfo):
     assert redact_proxy_url(f"http://{userinfo}proxy:3128") == "http://proxy:3128"
+    assert redact_proxy_url(f"http://{userinfo}proxy:3128/path?token=x#f") == "http://proxy:3128"
+
+
+def test_unsupported_scheme_warns_once_without_credentials(monkeypatch, caplog):
+    from omnigent.util import ws_proxy
+
+    monkeypatch.setattr(ws_proxy, "_warned_unsupported_schemes", set())
+    env = {"http_proxy": "socks5://user:secret@p:1"}
+    with caplog.at_level(logging.WARNING, logger="omnigent.util.ws_proxy"):
+        assert ws_env_proxy_url(_TUNNEL_URL, env) is None
+        assert ws_env_proxy_url(_TUNNEL_URL, env) is None
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "socks5" in warnings[0] and "secret" not in warnings[0]
 
 
 @asynccontextmanager
