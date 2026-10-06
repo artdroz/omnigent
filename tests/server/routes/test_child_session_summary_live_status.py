@@ -87,7 +87,7 @@ def test_no_state_anywhere_is_none() -> None:
 
 
 def test_durable_task_error_forces_failed() -> None:
-    """A durable ``last_task_error`` overrides a stale idle status."""
+    """A durable ``last_task_error`` overrides even a live running status."""
     _session_status_cache["conv_child"] = "running"
     labels = {
         _LAST_TASK_ERROR_CODE_LABEL_KEY: "runner_disconnected",

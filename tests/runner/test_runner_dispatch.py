@@ -6490,7 +6490,7 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
     # c3 (explicitly closed despite its mixed-type label map), c5
     # (legacy title tombstone), and c4
     # (no colon) dropped; the ui:-added child surfaces under its bound
-    # agent + label. ``status`` mirrors the row's live status (absent → None).
+    # agent + label.
     assert out["sub_agents"] == [
         {"agent": "researcher", "title": "auth", "conversation_id": "c1", "status": "running"},
         {"agent": "claude-native-ui", "title": "1", "conversation_id": "c2", "status": None},

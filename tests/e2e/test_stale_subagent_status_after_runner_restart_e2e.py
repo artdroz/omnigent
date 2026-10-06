@@ -24,11 +24,12 @@ from tests.e2e.helpers import POLL_INTERVAL_S
 
 pytestmark = [
     pytest.mark.timeout(600, method="signal"),
-    pytest.mark.min_server_version("0.3.0"),
+    # ``ChildSessionSummary.status`` ships with 0.17.0; older servers omit it.
+    pytest.mark.min_server_version("0.17.0"),
 ]
 
 _STATUS_TOKEN = "STATUSCHECK"
-_RUNNING_STATUSES = {"running", "waiting"}
+_SETTLED_STATUSES = {"idle", "failed"}
 
 
 def _tool_call(name: str, arguments: dict[str, object], call_id: str) -> dict[str, object]:
@@ -197,7 +198,9 @@ def test_supervisor_sees_stopped_subagent_status_after_runner_restart(
         (c for c in _child_sessions(http_client, parent_id) if str(c["id"]) == child_id),
         None,
     )
-    server_snapshot_status = http_client.get(f"/v1/sessions/{child_id}").json().get("status")
+    snapshot = http_client.get(f"/v1/sessions/{child_id}")
+    snapshot.raise_for_status()
+    server_snapshot_status = snapshot.json().get("status")
 
     send_user_message_to_session(
         http_client,
@@ -230,8 +233,8 @@ def test_supervisor_sees_stopped_subagent_status_after_runner_restart(
         f"cannot tell the child stopped. child_row={child_row}; server child view="
         f"{server_child_view}; server snapshot status={server_snapshot_status!r}"
     )
-    assert child_row["status"] not in _RUNNING_STATUSES, (
-        "sys_session_list still reports the interrupted child as running after its runner "
-        f"died. child_row={child_row}; server child view={server_child_view}; "
-        f"server snapshot status={server_snapshot_status!r}"
+    assert child_row["status"] in _SETTLED_STATUSES, (
+        "sys_session_list did not report a settled, non-running status for the interrupted "
+        f"child after its runner died. child_row={child_row}; server child view="
+        f"{server_child_view}; server snapshot status={server_snapshot_status!r}"
     )
