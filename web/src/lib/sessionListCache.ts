@@ -349,6 +349,56 @@ export function unmarkRecentlyCreated(id: string): void {
 }
 
 /**
+ * Sidebar row for a session the client knows only from its session snapshot
+ * (a fresh fork's `POST` response, the cached `["session", id]` entry). A
+ * snapshot carries no `owner`, so the row reads as viewer-owned — true for
+ * anything the viewer just created.
+ */
+export function conversationRowFromSession(session: Session): Conversation {
+  return {
+    id: session.id,
+    object: "conversation",
+    title: session.title,
+    created_at: session.createdAt,
+    updated_at: session.updatedAt ?? session.createdAt,
+    labels: session.labels ?? {},
+    permission_level: session.permissionLevel,
+    agent_id: session.agentId,
+    agent_name: session.agentName,
+    runner_id: session.runnerId ?? null,
+    host_id: session.hostId ?? null,
+    workspace: session.workspace ?? null,
+    git_branch: session.gitBranch ?? null,
+    archived: session.archived,
+    parent_session_id: session.parentSessionId,
+    project_id: session.projectId ?? null,
+  };
+}
+
+/**
+ * Paint a session the viewer just created (a fork) into every cached sidebar
+ * list and arm the recently-created keep-alive, as the create path and the
+ * `session_added` push do. Without this the row exists only once that push
+ * lands: a list refetch that lags the write replaces the cache without the new
+ * session, and if the push also misses the event the session stays hidden
+ * until the index catches up. Filter-aware via `insertNewRowsIntoPages`.
+ */
+export function insertCreatedRowIntoCaches(queryClient: QueryClient, row: Conversation): void {
+  markRecentlyCreated(row);
+  const candidates = new Map([[row.id, row]]);
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["conversations"],
+  })) {
+    const { data: next } = insertNewRowsIntoPages(
+      data,
+      candidates,
+      filtersFromConversationQueryKey(key),
+    );
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+}
+
+/**
  * Prepend brand-new rows (a create here or elsewhere, a share) to page 0 so the
  * sidebar shows them the instant the push lands, instead of after the debounced
  * refetch (which lags the search index). A new row sorts newest-first, so page 0
