@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
+import secrets
+import shutil
+import signal
+import socket
 import subprocess
+import sys
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -17,12 +24,10 @@ import yaml
 from playwright.sync_api import Page, expect
 from websockets.sync.client import connect as ws_connect
 
-from tests.e2e_ui.conftest import (
-    _create_native_claude_session,
-    _ensure_runner_online,
-    _server_state,
-    set_fallback_mock_llm,
-)
+from tests._helpers.native_session import create_native_session
+from tests.e2e_ui.conftest import set_fallback_mock_llm
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 _OPUS = "system.ai.claude-opus-5"
 _SONNET = "system.ai.claude-sonnet-5"
@@ -33,6 +38,7 @@ _TERMINAL = '[data-testid="terminal-view"]'
 _XTERM_INPUT = ".xterm-helper-textarea"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _WORKING = '[data-testid="working-indicator"]'
+_HEALTH_TIMEOUT_S = 90.0
 # claude-native auto-launch + first-run pre-accept + WS attach.
 _TERMINAL_READY_TIMEOUT_MS = 240_000
 _MOCK_TURN_TIMEOUT_MS = 120_000
@@ -41,32 +47,50 @@ _SNAPSHOT_WINDOW_TIMEOUT_S = 45.0
 # ``53.1k/200k tokens (27%)`` as Claude Code's /context prints it.
 _TOKENS_RE = re.compile(r"([\d.]+)\s*([km]?)/([\d.]+)\s*([km]?)\s+tokens\s*\(", re.IGNORECASE)
 _UNITS = {"": 1, "k": 1_000, "m": 1_000_000}
-_PREPARED_ENV = Path(".omnigent/repro-env/environment.json")
+
+# Ambient provider, credential, and runner state that would otherwise leak
+# into the rig's provider resolution or make its runner take the zygote path.
+_AMBIENT_ENV_PREFIXES = (
+    "OPENAI_",
+    "ANTHROPIC_",
+    "CLAUDE_",
+    "DATABRICKS_",
+    "OMNIGENT_RUNNER_",
+    "OMNIGENT_HOST_",
+)
+_AMBIENT_ENV_KEYS = frozenset(
+    {"RUNNER_SERVER_URL", "OMNIGENT_REMOTE_AUTH_TOKEN", "OMNIGENT_CONFIG_HOME", "LLM_API_KEY"}
+)
+
+# Proxy-blind client: CI forces an egress proxy that must not intercept loopback.
+_client = httpx.Client(trust_env=False)
 
 
-def _provider_config_path() -> Path:
-    """The provider config the runner launching Claude Code reads."""
-    if _server_state.get("workflow_owned") and _PREPARED_ENV.is_file():
-        prepared = json.loads(_PREPARED_ENV.read_text(encoding="utf-8"))
-        return Path(prepared["config_home"]) / "config.yaml"
-    from omnigent.config import global_config_path
+@dataclass
+class Gateway1mRig:
+    """A dedicated server + runner pair whose provider pins the 1M-capable Opus."""
 
-    return global_config_path().resolve()
+    base_url: str
+    runner_id: str
+    work: Path
+    server_log: Path
+    runner_log: Path
+
+    def runner_log_tail(self, chars: int = 2500) -> str:
+        """The runner's own log file under its data dir, else its captured stdout."""
+        logs = sorted((self.work / "data" / "logs" / "runner").glob("*.log"))
+        source = logs[-1] if logs else self.runner_log
+        return source.read_text(errors="replace")[-chars:]
 
 
-@pytest.fixture
-def gateway_1m_claude_provider(live_server: str, mock_llm_server_url: str) -> Iterator[None]:
-    """Route Claude Code to the mock with opus/sonnet pinned to bare 1M-capable gateway ids."""
-    config_path = _provider_config_path()
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    backup = config_path.with_name(config_path.name + ".context-window-pin-backup")
-    if backup.exists():
-        raise RuntimeError(f"Unrestored provider-config backup at {backup}")
-    original = config_path.read_bytes() if config_path.exists() else None
-    if original is not None:
-        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(original)
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def write_gateway_1m_provider(config_home: Path, mock_url: str) -> Path:
+    """Write the kind:key provider routing Claude Code to the mock with bare 1M-capable ids."""
     config = {
         "runner": {"idle_timeout_s": 0},
         "providers": {
@@ -74,25 +98,192 @@ def gateway_1m_claude_provider(live_server: str, mock_llm_server_url: str) -> It
                 "kind": "key",
                 "default": ["anthropic"],
                 "anthropic": {
-                    "base_url": mock_llm_server_url,
+                    "base_url": mock_url,
                     "api_key": "mock-key",
                     "models": {"default": _OPUS, "opus": _OPUS, "sonnet": _SONNET},
                 },
             }
         },
     }
+    config_home.mkdir(parents=True, exist_ok=True)
+    config_path = config_home / "config.yaml"
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
-    try:
-        yield
-    finally:
-        if original is not None:
-            backup.replace(config_path)
-        else:
-            config_path.unlink(missing_ok=True)
+    return config_path
+
+
+def _seed_claude_first_run(claude_dir: Path, workspace: Path) -> None:
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    (claude_dir / ".claude.json").write_text(
+        json.dumps(
+            {
+                "hasCompletedOnboarding": True,
+                "projects": {str(workspace): {"hasTrustDialogAccepted": True}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _rig_env(work: Path) -> dict[str, str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(_AMBIENT_ENV_PREFIXES) and key not in _AMBIENT_ENV_KEYS
+    }
+    for var in ("NO_PROXY", "no_proxy"):
+        env[var] = ",".join(filter(None, [env.get(var, ""), "127.0.0.1,localhost"]))
+    env.update(
+        PYTHONPATH=os.pathsep.join(
+            [
+                str(_REPO_ROOT),
+                str(_REPO_ROOT / "sdks" / "python-client"),
+                str(_REPO_ROOT / "sdks" / "ui"),
+                os.environ.get("PYTHONPATH", ""),
+            ]
+        ),
+        OMNIGENT_CONFIG_HOME=str(work / "config-home"),
+        OMNIGENT_DATA_DIR=str(work / "data"),
+        CLAUDE_CONFIG_DIR=str(work / "claude-config"),
+        OMNIGENT_DISABLE_CATALOG_LOOKUP="1",
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1",
+    )
+    return env
+
+
+def _wait_online(
+    base_url: str, runner_id: str, procs: list[subprocess.Popen[bytes]], logs: list[Path]
+) -> None:
+    deadline = time.monotonic() + _HEALTH_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if any(proc.poll() is not None for proc in procs):
+            break
+        try:
+            if _client.get(f"{base_url}/health", timeout=2).status_code == 200:
+                status = _client.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2)
+                if status.status_code == 200 and status.json().get("online"):
+                    return
+        except httpx.HTTPError:
+            pass
+        time.sleep(0.5)
+    tails = "\n".join(f"{log.name}:\n{log.read_text()[-3000:]}" for log in logs)
+    raise RuntimeError(
+        f"gateway-1m rig did not come online within {_HEALTH_TIMEOUT_S:.0f}s.\n{tails}"
+    )
+
+
+@contextlib.contextmanager
+def gateway_1m_rig(work: Path, mock_url: str) -> Iterator[Gateway1mRig]:
+    """Boot an isolated server + runner whose provider config already pins the Opus.
+
+    The pin is written before the runner starts, so the launch reads it from its own
+    ``OMNIGENT_CONFIG_HOME`` regardless of where the test process runs.
+    """
+    from omnigent.runner.identity import token_bound_runner_id
+
+    write_gateway_1m_provider(work / "config-home", mock_url)
+    _seed_claude_first_run(work / "claude-config", _REPO_ROOT)
+    artifacts = work / "artifacts"
+    artifacts.mkdir(exist_ok=True)
+    env = _rig_env(work)
+    port = _free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    binding_token = secrets.token_urlsafe(32)
+    runner_id = token_bound_runner_id(binding_token)
+    server_log = work / "server.log"
+    runner_log = work / "runner.log"
+    procs: list[subprocess.Popen[bytes]] = []
+    with server_log.open("w") as server_out, runner_log.open("w") as runner_out:
+        try:
+            procs.append(
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-m",
+                        "omnigent.cli",
+                        "server",
+                        "--host",
+                        "127.0.0.1",
+                        "--port",
+                        str(port),
+                        "--database-uri",
+                        f"sqlite:///{work}/test.db",
+                        "--artifact-location",
+                        str(artifacts),
+                    ],
+                    env={**env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token},
+                    stdout=server_out,
+                    stderr=subprocess.STDOUT,
+                    cwd=str(_REPO_ROOT),
+                )
+            )
+            procs.append(
+                subprocess.Popen(
+                    [sys.executable, "-m", "omnigent.runner._entry"],
+                    env={
+                        **env,
+                        "OMNIGENT_RUNNER_ID": runner_id,
+                        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
+                        "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
+                        "RUNNER_SERVER_URL": base_url,
+                    },
+                    stdout=runner_out,
+                    stderr=subprocess.STDOUT,
+                    cwd=str(_REPO_ROOT),
+                )
+            )
+            _wait_online(base_url, runner_id, procs, [server_log, runner_log])
+            yield Gateway1mRig(
+                base_url=base_url,
+                runner_id=runner_id,
+                work=work,
+                server_log=server_log,
+                runner_log=runner_log,
+            )
+        finally:
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.send_signal(signal.SIGTERM)
+            for proc in procs:
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+
+
+@pytest.fixture
+def gateway_1m_claude_rig(
+    built_spa: None,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+    request: pytest.FixtureRequest,
+) -> Iterator[Gateway1mRig]:
+    if request.config.getoption("--ui-base-url"):
+        pytest.skip("the 1M-window journey needs its own spawned server + runner")
+    if shutil.which("claude") is None:
+        pytest.skip("claude CLI is required for the native 1M-window e2e")
+    work = tmp_path_factory.mktemp("claude_1m_window")
+    with gateway_1m_rig(work, mock_llm_server_url) as rig:
+        yield rig
+
+
+def create_pinned_claude_session(rig: Gateway1mRig) -> str:
+    """Create the claude-native wrapper session; binding the rig runner launches Claude Code."""
+    created = create_native_session(
+        _client, rig.base_url, harness="claude", metadata={"workspace": str(_REPO_ROOT)}
+    )
+    session_id = str(created["session_id"])
+    bind = _client.patch(
+        f"{rig.base_url}/v1/sessions/{session_id}",
+        json={"runner_id": rig.runner_id},
+        timeout=10.0,
+    )
+    bind.raise_for_status()
+    return session_id
 
 
 def _terminal_id(base_url: str, session_id: str) -> str | None:
-    response = httpx.get(f"{base_url}/v1/sessions/{session_id}/resources", timeout=10.0)
+    response = _client.get(f"{base_url}/v1/sessions/{session_id}/resources", timeout=10.0)
     response.raise_for_status()
     payload = response.json()
     rows = payload.get("data") if isinstance(payload, dict) else payload
@@ -102,7 +293,7 @@ def _terminal_id(base_url: str, session_id: str) -> str | None:
     return None
 
 
-def _pane_text(base_url: str, session_id: str, *, seconds: float = 2.0) -> str:
+def pane_text(base_url: str, session_id: str, *, seconds: float = 2.0) -> str:
     """Render the terminal screen from a read-only attach, seeded by ``capture-pane``."""
     terminal_id = _terminal_id(base_url, session_id)
     if terminal_id is None:
@@ -126,18 +317,18 @@ def _pane_text(base_url: str, session_id: str, *, seconds: float = 2.0) -> str:
     return "\n".join(line.rstrip() for line in screen.display)
 
 
-def _wait_pane(base_url: str, session_id: str, needle: str, *, timeout_s: float) -> str:
+def wait_pane(base_url: str, session_id: str, needle: str, *, timeout_s: float) -> str:
     deadline = time.monotonic() + timeout_s
     text = ""
     while time.monotonic() < deadline:
-        text = _pane_text(base_url, session_id)
+        text = pane_text(base_url, session_id)
         if needle.lower() in text.lower():
             return text
         time.sleep(1.0)
     return text
 
 
-def _context_window_from_readout(pane: str) -> tuple[int | None, str]:
+def context_window_from_readout(pane: str) -> tuple[int | None, str]:
     """Parse the window out of Claude Code's ``/context`` usage line."""
     for line in pane.splitlines():
         match = _TOKENS_RE.search(line)
@@ -147,7 +338,7 @@ def _context_window_from_readout(pane: str) -> tuple[int | None, str]:
     return None, ""
 
 
-def _open_terminal(page: Page, base_url: str, session_id: str) -> None:
+def open_terminal(page: Page, base_url: str, session_id: str) -> None:
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_test_id("view-mode-toggle")).to_be_visible(
         timeout=_TERMINAL_READY_TIMEOUT_MS
@@ -157,10 +348,10 @@ def _open_terminal(page: Page, base_url: str, session_id: str) -> None:
     expect(terminal).to_have_attribute(
         "data-state", "connected", timeout=_TERMINAL_READY_TIMEOUT_MS
     )
-    _wait_pane(base_url, session_id, "manual mode", timeout_s=90.0)
+    wait_pane(base_url, session_id, "manual mode", timeout_s=90.0)
 
 
-def _type_slash_command(page: Page, command: str) -> None:
+def type_slash_command(page: Page, command: str) -> None:
     xterm_input = page.locator(_TERMINAL).last.locator(_XTERM_INPUT)
     expect(xterm_input).to_be_attached(timeout=30_000)
     xterm_input.focus()
@@ -169,7 +360,7 @@ def _type_slash_command(page: Page, command: str) -> None:
     page.keyboard.press("Enter")
 
 
-def _send_turn(page: Page) -> None:
+def send_turn(page: Page) -> None:
     page.get_by_test_id("view-mode-chat").click()
     composer = page.get_by_role("textbox", name="Message the agent")
     expect(composer).to_be_visible(timeout=30_000)
@@ -181,10 +372,10 @@ def _send_turn(page: Page) -> None:
     expect(page.locator(_WORKING)).to_have_count(0, timeout=_MOCK_TURN_TIMEOUT_MS)
 
 
-def _snapshot_context_window(base_url: str, session_id: str) -> int | None:
+def snapshot_context_window(base_url: str, session_id: str) -> int | None:
     deadline = time.monotonic() + _SNAPSHOT_WINDOW_TIMEOUT_S
     while time.monotonic() < deadline:
-        snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
+        snapshot = _client.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
         window = snapshot.get("context_window")
         if isinstance(window, int) and snapshot.get("last_total_tokens"):
             return window
@@ -195,47 +386,43 @@ def _snapshot_context_window(base_url: str, session_id: str) -> int | None:
 @pytest.mark.timeout(600)
 def test_claude_native_1m_capable_default_model_gets_1m_window(
     request: pytest.FixtureRequest,
-    live_server: str,
     mock_llm_server_url: str,
-    gateway_1m_claude_provider: None,
-    tmp_path_factory: pytest.TempPathFactory,
+    gateway_1m_claude_rig: Gateway1mRig,
 ) -> None:
     """Claude Code reports a 1M window for the pinned 1M-capable Opus, and so does Omnigent."""
+    rig = gateway_1m_claude_rig
     for key in ("default", _OPUS, _SONNET):
         set_fallback_mock_llm(mock_llm_server_url, key, _REPLY)
-    respawned = _ensure_runner_online(live_server, tmp_path_factory)
-    runner_id = str(_server_state["runner_id"])
-    session_id = _create_native_claude_session(live_server, runner_id)
+    session_id = create_pinned_claude_session(rig)
     try:
         page: Page = request.getfixturevalue("page")
-        _open_terminal(page, live_server, session_id)
-        _type_slash_command(page, "/context")
-        pane = _wait_pane(
-            live_server, session_id, "tokens (", timeout_s=_CONTEXT_READOUT_TIMEOUT_S
+        open_terminal(page, rig.base_url, session_id)
+        type_slash_command(page, "/context")
+        pane = wait_pane(
+            rig.base_url, session_id, "tokens (", timeout_s=_CONTEXT_READOUT_TIMEOUT_S
         )
-        assert _OPUS in pane, f"/context did not name the pinned model {_OPUS}:\n{pane[-2000:]}"
-        claude_window, tokens_line = _context_window_from_readout(pane)
+        # Setup check, not the bug: the launch must be running the pinned model at all.
+        assert _OPUS in pane, (
+            f"Claude Code is not running the pinned model {_OPUS}, so the provider pin "
+            f"never reached this launch (setup failure, not the window bug):\n{pane[-1500:]}\n"
+            f"Runner log tail:\n{rig.runner_log_tail()}"
+        )
+        claude_window, tokens_line = context_window_from_readout(pane)
         assert claude_window is not None, f"/context printed no usage line:\n{pane[-2000:]}"
 
-        # Primary check: Claude Code sizes the window from the pinned id, so the bug
-        # surfaces here before any composer turn. Fails at 200K on the buggy build.
+        # Claude Code sizes the window from the launch; the bug surfaces here before
+        # any composer turn, at 200K on the buggy build.
         assert claude_window >= _ONE_MILLION, (
             f"{_OPUS} is a 1M-capable model, but Claude Code sized the session at "
             f"{claude_window:,} tokens ({tokens_line!r})"
         )
 
-        _send_turn(page)
-        omnigent_window = _snapshot_context_window(live_server, session_id)
+        send_turn(page)
+        omnigent_window = snapshot_context_window(rig.base_url, session_id)
         assert (omnigent_window or 0) >= _ONE_MILLION, (
             f"Claude Code reported {claude_window:,} tokens for {_OPUS}, but Omnigent's "
             f"session snapshot sizes the composer ring at context_window={omnigent_window}"
         )
     finally:
-        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        if respawned is not None:
-            respawned.terminate()
-            try:
-                respawned.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                respawned.kill()
-                respawned.wait(timeout=5)
+        with contextlib.suppress(httpx.HTTPError):
+            _client.delete(f"{rig.base_url}/v1/sessions/{session_id}", timeout=10.0)

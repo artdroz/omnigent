@@ -121,23 +121,31 @@ def normalized_model_id(model: str) -> str:
     return prefix_folded_model_id(model).removesuffix("[1m]")
 
 
-#: Context window a 1M-capable Opus/Sonnet model serves, in tokens.
-LONG_CONTEXT_WINDOW_TOKENS = 1_000_000
-
-#: Claude Code env var raising the window it computes for a custom gateway id.
-#: A managed launch sets it rather than appending ``[1m]`` to the id, which would
-#: break the bare id's match against the pinned family slot.
-CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+#: Claude Code's 1M-window marker. It sizes a session's context window
+#: client-side from the model id and reads 1M only when the id carries this
+#: marker; a bare custom gateway id otherwise caps the session at the 200K
+#: default. Claude Code strips the marker before any request, so it stays
+#: client-side and never reaches the gateway.
+LONG_CONTEXT_MARKER = "[1m]"
 
 _LONG_CONTEXT_FAMILIES: frozenset[str] = frozenset({"opus", "sonnet"})
 
 
-def is_long_context_claude_model(model_id: str) -> bool:
-    """Whether a served id is a 1M-context Opus/Sonnet model (Haiku, Fable, aliases are not)."""
-    canonical = canonical_claude_id(model_id)
+def model_id_with_1m_marker(model_id: str) -> str:
+    """Add the ``[1m]`` window marker to a 1M-capable Opus/Sonnet id, else return it unchanged.
+
+    Non-Claude ids, bare family aliases, 200K-only families (Haiku, Fable), and
+    already-marked ids all pass through untouched.
+    """
+    spelled = model_id.strip()
+    if not spelled or spelled.lower().endswith(LONG_CONTEXT_MARKER):
+        return model_id
+    canonical = canonical_claude_id(spelled)
     if canonical is None:
-        return False
-    return not _LONG_CONTEXT_FAMILIES.isdisjoint(_SEGMENT_RE.split(canonical))
+        return model_id
+    if _LONG_CONTEXT_FAMILIES.isdisjoint(_SEGMENT_RE.split(canonical)):
+        return model_id
+    return f"{spelled}{LONG_CONTEXT_MARKER}"
 
 
 def alias_pins(env: Mapping[str, str] | None = None) -> dict[str, str]:
