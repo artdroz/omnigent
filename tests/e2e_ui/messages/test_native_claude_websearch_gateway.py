@@ -105,12 +105,14 @@ def _script_gateway(mock_url: str) -> None:
             ],
         },
     )
+    # Guard on Bash: the main turn always advertises it, while Claude Code's
+    # tool-less background requests (title generation) must not consume the reply.
     _configure(
         mock_url,
         {
             "match": _NO_SEARCH_MATCH,
-            "required_tools": [],
-            "responses": [{"text": _NO_SEARCH_TEXT}],
+            "required_tools": ["Bash"],
+            "responses": [{"text": _NO_SEARCH_TEXT}] * 3,
         },
     )
     rejection = [{"error": _RESTRICTION, "status_code": 400}] * 6
