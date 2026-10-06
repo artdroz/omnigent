@@ -187,6 +187,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _TERMINAL_RESPONSE_EVENT_TYPES,
     _TURN_ACTOR_LABEL,
     _deferred_elicitation_clear_tasks,
+    _InflightRunnerStatusProbe,
     _intentional_runner_stop_locks,
     _intentional_stop_sessions,
     _interrupt_fenced_sessions,
@@ -7412,6 +7413,7 @@ def _relinquish_session_live_state(session_id: str) -> None:
     """Drop local live state for a session now owned by another replica."""
     _session_status_cache.pop(session_id, None)
     _session_active_response_cache.pop(session_id, None)
+    _session_status_edge_seq.pop(session_id, None)
     session_live_state.forget_live_status(session_id)
 
 
@@ -11865,9 +11867,10 @@ async def _probe_runner_live_status(
     Concurrent snapshots of one session await the same in-flight probe. A 200
     records the status in ``_session_status_cache`` unless doing so would
     false-settle a live row to ``idle`` (see ``_should_settle_probe_status``);
-    a probe that timed out, failed in transport, or answered slowly without a
-    status puts the session in a skip window that doubles per consecutive slow
-    probe.
+    a live row it does settle is replayed through ``_publish_status`` as the
+    lost terminal edge. A probe that timed out, failed in transport, or
+    answered slowly without a status puts the session in a skip window that
+    doubles per consecutive slow probe.
 
     :param runner_client: HTTP client pointed at the session's runner.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
@@ -11877,35 +11880,46 @@ async def _probe_runner_live_status(
     :returns: The runner's raw status, e.g. ``"running"``, or ``None`` when the
         probe is in backoff, timed out, failed, or returned a non-200.
     """
-    probe = _runner_status_probe_inflight.get(session_id)
-    if probe is None:
+    inflight = _runner_status_probe_inflight.get(session_id)
+    if inflight is None or inflight.runner_id != runner_id:
+        # No shared probe, or the session rebound to a different runner since
+        # the in-flight one started: start a runner-affine probe so a stale
+        # answer from the previous runner cannot settle the new binding.
         backoff = _runner_status_probe_backoff.get(session_id)
         if backoff is not None and backoff.runner_id != runner_id:
             _runner_status_probe_backoff.pop(session_id, None)
         elif backoff is not None and time.monotonic() < backoff.skip_until:
             return None
-        probe = asyncio.create_task(_run_runner_status_probe(runner_client, session_id, runner_id))
-        _runner_status_probe_inflight[session_id] = probe
+        task = asyncio.create_task(_run_runner_status_probe(runner_client, session_id, runner_id))
+        inflight = _InflightRunnerStatusProbe(task=task, runner_id=runner_id)
+        _runner_status_probe_inflight[session_id] = inflight
     # Shielded so one cancelled snapshot request does not abort the probe the
     # other waiters share.
-    return await asyncio.shield(probe)
+    return await asyncio.shield(inflight.task)
 
 
 def _should_settle_probe_status(
-    session_id: str, raw: str, payload: dict[str, object], start_epoch: int
+    session_id: str,
+    raw: str,
+    payload: dict[str, object],
+    start_epoch: int,
+    runner_id: str | None,
 ) -> bool:
     """
     Decide whether a runner status probe may write ``raw`` to the status cache.
 
     Filling a cache miss or confirming ``running``/``waiting``/``failed`` always
-    proceeds. Using the probe to DOWNGRADE a live ``running``/``waiting`` row to
-    ``idle`` is only safe when the answer is both authoritative and current;
-    three ways it is not:
+    proceeds. A cached ``failed`` is sticky (see ``_publish_status``), so an
+    ``idle`` never downgrades it. Using the probe to DOWNGRADE a live
+    ``running``/``waiting`` row to ``idle`` is only safe when the answer is both
+    authoritative and current; three ways it is not:
 
     - the runner predates native-pane turn tracking (it omits
       ``counts_native_turns``), so its ``idle`` can be a false idle for a live
       native turn whose terminal the runner does not count;
     - a newer turn opened and named a response id while the probe was in flight;
+    - the session rebound to a different runner mid-probe, so this ``idle`` is
+      the previous runner's answer and does not describe the current binding;
     - any status edge landed during the probe (a bumped ``_session_status_edge_seq``),
       so its cache value is fresher than this probe's now-stale ``idle``.
 
@@ -11913,11 +11927,16 @@ def _should_settle_probe_status(
     the runner is native-aware or the session is genuinely idle again.
     """
     current = _session_status_cache.get(session_id)
-    if raw != "idle" or current not in ("running", "waiting"):
+    if raw != "idle" or current not in ("running", "waiting", "failed"):
         return True
+    if current == "failed":
+        return False
     if payload.get("counts_native_turns") is not True:
         return False
     if _session_active_response_cache.get(session_id) is not None:
+        return False
+    inflight = _runner_status_probe_inflight.get(session_id)
+    if inflight is not None and inflight.runner_id != runner_id:
         return False
     return _session_status_edge_seq.get(session_id, 0) == start_epoch
 
@@ -11958,10 +11977,19 @@ async def _run_runner_status_probe(
                     payload = None
                 if isinstance(payload, dict):
                     raw = str(payload.get("status", "idle"))
-                    if _should_settle_probe_status(session_id, raw, payload, start_epoch):
-                        _session_status_cache[session_id] = raw
-                        if raw in ("idle", "running", "waiting", "failed"):
-                            session_live_state.persist_live_status(session_id, raw)
+                    current = _session_status_cache.get(session_id)
+                    if _should_settle_probe_status(
+                        session_id, raw, payload, start_epoch, runner_id
+                    ):
+                        if raw == "idle" and current in ("running", "waiting"):
+                            # Replay the lost terminal edge through the normal
+                            # publish path so the scheduled run completes and
+                            # open live views settle, not just the list cache.
+                            _publish_status(session_id, "idle")
+                        else:
+                            _session_status_cache[session_id] = raw
+                            if raw in ("idle", "running", "waiting", "failed"):
+                                session_live_state.persist_live_status(session_id, raw)
                     _runner_status_probe_backoff.pop(session_id, None)
                     return raw
                 failure = "HTTP 200 with a malformed body"
@@ -11991,7 +12019,11 @@ async def _run_runner_status_probe(
         )
         return None
     finally:
-        _runner_status_probe_inflight.pop(session_id, None)
+        # Only clear our own entry: a rebind may have replaced it with a probe
+        # for the new runner, which must keep sharing its in-flight task.
+        inflight = _runner_status_probe_inflight.get(session_id)
+        if inflight is not None and inflight.runner_id == runner_id:
+            _runner_status_probe_inflight.pop(session_id, None)
 
 
 async def _get_session_snapshot(

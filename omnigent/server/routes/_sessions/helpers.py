@@ -4868,11 +4868,12 @@ def _publish_status(
         return
     previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
+    # Every authoritative edge invalidates any runner probe mid-flight, so bump
+    # the epoch even on a repeat of the same value: a fresh native ``running``
+    # for a new turn reuses the ``running`` string, and the probe must still be
+    # able to tell its ``idle`` answer went stale rather than overwrite it.
+    _session_status_edge_seq[session_id] = _session_status_edge_seq.get(session_id, 0) + 1
     if previous_status != status:
-        # A fresh edge invalidates any runner probe mid-flight: bump the epoch
-        # so the probe can tell its ``idle`` answer went stale (e.g. a new
-        # native ``running`` arrived) and must not overwrite this value.
-        _session_status_edge_seq[session_id] = _session_status_edge_seq.get(session_id, 0) + 1
         _publish_child_status_to_parent(session_id, status)
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's

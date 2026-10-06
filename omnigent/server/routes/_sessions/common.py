@@ -613,8 +613,25 @@ _runner_status_probe_backoff: WorkspaceScopedCache[str, _RunnerStatusProbeBackof
     WorkspaceScopedCache()
 )
 
-# The one runner status probe in flight per session; concurrent snapshots await it.
-_runner_status_probe_inflight: WorkspaceScopedCache[str, asyncio.Task[str | None]] = (
+
+@dataclass
+class _InflightRunnerStatusProbe:
+    """
+    A runner status probe in flight for a session, tagged with its runner.
+
+    :param task: The shared probe task that concurrent snapshots await.
+    :param runner_id: Runner the probe is pointed at, e.g.
+        ``"runner_0123456789abcdef"``; a rebind to another runner starts a
+        fresh probe so a stale answer cannot settle the new binding.
+    """
+
+    task: asyncio.Task[str | None]
+    runner_id: str | None
+
+
+# The one runner status probe in flight per session; concurrent snapshots on the
+# same runner await it, while a rebind starts a runner-affine probe.
+_runner_status_probe_inflight: WorkspaceScopedCache[str, _InflightRunnerStatusProbe] = (
     WorkspaceScopedCache()
 )
 
@@ -1202,6 +1219,7 @@ __all__ = [
     "_UI_ADDED_AGENT_TITLE_PREFIX",
     "_UPLOAD_READ_CHUNK_BYTES",
     "_WATCHER_TASKS",
+    "_InflightRunnerStatusProbe",
     "_MirroredToolCall",
     "_PendingPolicyAskWrites",
     "_RelayHandle",

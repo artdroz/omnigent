@@ -18,8 +18,9 @@ import time
 import httpx
 
 # The settle is a background probe scheduled by the list read, so a healthy run
-# clears within a poll or two; the deadline only bounds a regression.
-SETTLE_DEADLINE_SECONDS = 30.0
+# clears within a poll or two. The deadline spans more than one 30s probe
+# cooldown so a single transient probe failure retries instead of failing.
+SETTLE_DEADLINE_SECONDS = 75.0
 POLL_INTERVAL_SECONDS = 1.0
 
 
