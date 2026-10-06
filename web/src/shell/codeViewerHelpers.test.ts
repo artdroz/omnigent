@@ -498,6 +498,11 @@ describe("prepareHtmlPreviewDoc", () => {
     expect(prepareHtmlPreviewDoc("<!-- <head> --!><html><head></head></html>")).toBe(
       `<!-- <head> --!><html><head>${HEAD}</head></html>`,
     );
+    // A hyphen continues a tag name, so this is script text, not an end tag.
+    const fake = "<script>const sample = '</script-not-real><html><head>';</script><p>hi</p>";
+    expect(prepareHtmlPreviewDoc(fake)).toBe(`${HEAD}${fake}`);
+    const quoted = "<script data-x=\"a>b\">var t = '<head>';</script><p>hi</p>";
+    expect(prepareHtmlPreviewDoc(quoted)).toBe(`${HEAD}${quoted}`);
   });
 
   it("treats an unterminated <script> or comment as swallowing the rest of the document", () => {
@@ -576,6 +581,7 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
       { once: true },
     );
     const element = typeof target === "string" ? document.querySelector(target) : target;
+    expect(element).not.toBeNull();
     element?.dispatchEvent(
       new MouseEvent(type, { bubbles: true, cancelable: true, composed: true, ...init }),
     );
@@ -615,6 +621,14 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
     expect(link).not.toBeNull();
     expect(click(link as Element)).toBe(true);
     expect(location.hash).toBe("#shadow");
+    // A light-DOM anchor wrapping a shadow host is found along the composed path too.
+    document.body.innerHTML = '<a href="#wrap"><span id="wrapped"></span></a>';
+    const inner = (document.getElementById("wrapped") as HTMLElement).attachShadow({
+      mode: "open",
+    });
+    inner.innerHTML = "<b>inside</b>";
+    expect(click(inner.querySelector("b") as Element)).toBe(true);
+    expect(location.hash).toBe("#wrap");
   });
 
   it("handles clicks on elements nested in the anchor and on <area> hotspots", () => {

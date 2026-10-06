@@ -97,6 +97,7 @@ def _cleanup_session_workdir(session_id: str) -> None:
 def _click_without_popup(page: Page, link: Locator, target: Locator) -> None:
     """Click ``link`` and require ``target`` to scroll into view with no new page opening."""
     opened: list[Page] = []
+    pages_before = len(page.context.pages)
 
     def note_popup(popup: Page) -> None:
         opened.append(popup)
@@ -109,6 +110,7 @@ def _click_without_popup(page: Page, link: Locator, target: Locator) -> None:
         page.wait_for_timeout(500)
     finally:
         page.context.remove_listener("page", note_popup)
+    assert len(page.context.pages) == pages_before
     assert not opened, "same-page anchor opened a new window at " + ", ".join(
         p.url for p in opened
     )

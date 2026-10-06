@@ -397,11 +397,17 @@ const SAME_PAGE_ANCHOR_SCRIPT = `<script>(function () {
     for (let i = 0; i < named.length; i++) if (named[i].localName === "a") return named[i];
     return null;
   }
+  function activatedLink(event) {
+    const path = event.composedPath ? event.composedPath() : [];
+    for (let i = 0; i < path.length; i++) {
+      if (path[i].matches && path[i].matches("a[href],area[href]")) return path[i];
+    }
+    const target = event.target;
+    return target && target.closest ? target.closest("a[href],area[href]") : null;
+  }
   function onActivate(event) {
     if (event.defaultPrevented || (event.type === "auxclick" && event.button !== 1)) return;
-    const path = event.composedPath ? event.composedPath() : [];
-    const target = path.length ? path[0] : event.target;
-    const anchor = target && target.closest ? target.closest("a[href],area[href]") : null;
+    const anchor = activatedLink(event);
     const href = anchor ? anchor.getAttribute("href").trim() : "";
     if (href.charAt(0) !== "#") return;
     // Modifier and middle clicks too: a new tab could only reopen the host app, never this document.
@@ -413,7 +419,8 @@ const SAME_PAGE_ANCHOR_SCRIPT = `<script>(function () {
     if (element) element.scrollIntoView();
     else if (href === "#" || href.toLowerCase() === "#top") window.scrollTo(0, 0);
   }
-  // On window, so handlers the artifact delegates to document run first and can cancel.
+  // On window, so handlers the artifact delegates to document run first and can cancel; one
+  // that only stops propagation there hides the click from this handler (accepted).
   window.addEventListener("click", onActivate);
   window.addEventListener("auxclick", onActivate);
 })();</script>`;
@@ -425,11 +432,12 @@ export const HTML_PREVIEW_HEAD = '<base target="_blank">' + SAME_PAGE_ANCHOR_SCR
  * End offset of the first real `<head>`/`<html>` start tag, or -1. Comments and
  * `<script>` blocks (to their end tag, or to end of input when unterminated) are
  * consumed whole so a look-alike tag inside them cannot attract the injection,
- * whose `</script>` would end the artifact's own script.
+ * whose `</script>` would end the artifact's own script. Like the HTML parser, a
+ * tag name must end at whitespace, `/` or `>`, so `</script-x>` is plain text.
  */
 function startTagEnd(html: string, tag: "head" | "html"): number {
   const scanner =
-    /<!--[\s\S]*?(?:--!?>|$)|<script\b[^>]*>[\s\S]*?(?:<\/script\b[^>]*>|$)|<(head|html)\b[^>]*>/gi;
+    /<!--[\s\S]*?(?:--!?>|$)|<script(?=[\s/>])(?:"[^"]*"|'[^']*'|[^>])*>[\s\S]*?(?:<\/script(?=[\s/>])[^>]*>|$)|<(head|html)(?=[\s/>])[^>]*>/gi;
   for (let match = scanner.exec(html); match; match = scanner.exec(html)) {
     if (match[1]?.toLowerCase() === tag) return match.index + match[0].length;
   }
