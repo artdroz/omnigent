@@ -84,13 +84,16 @@ function makeImageQuery(contentType: string, truncated = false): ReturnType<type
 // parses it, so any base64 payload with the application/pdf content type is enough
 // to exercise routing.
 const PDF_BASE64 = "JVBERi0xLjQK";
+// Different header bytes ("%PDF-1.7"), standing in for a rewritten file.
+const UPDATED_PDF_BASE64 = "JVBERi0xLjcK";
 
 function makePdfQuery(
   contentType: string | null = "application/pdf",
   truncated = false,
+  content = PDF_BASE64,
 ): ReturnType<typeof useFileContent> {
   return {
-    data: { content: PDF_BASE64, encoding: "base64", content_type: contentType, truncated },
+    data: { content, encoding: "base64", content_type: contentType, truncated },
     isLoading: false,
     isError: false,
     isSuccess: true,
@@ -932,7 +935,13 @@ describe("CodeViewer PDF routing", () => {
       "another conversation shows the same path",
       (props) => ({ ...props, conversationId: "conv_2" }),
     ],
-    ["new content arrives for the same file", (props) => ({ ...props, fileQuery: makePdfQuery() })],
+    [
+      "new content arrives for the same file",
+      (props) => ({
+        ...props,
+        fileQuery: makePdfQuery("application/pdf", false, UPDATED_PDF_BASE64),
+      }),
+    ],
   ])("recovers from a PDF render failure when %s", async (_case, next) => {
     const props = pdfProps();
     const { rerender, teardown } = await renderFailedPdf(props);
@@ -957,16 +966,23 @@ describe("CodeViewer PDF routing", () => {
     }
   });
 
-  it("keeps a healthy PDF viewer mounted when new content arrives for the same file", async () => {
+  it("remounts a healthy PDF viewer only when the file changes, not when its content updates", async () => {
     const props = pdfProps();
     pdfRendering.mounts = 0;
     const { rerender } = render(<CodeViewer {...props} />);
     expect(await screen.findByTestId("pdf-viewer-stub")).toBeInTheDocument();
     expect(pdfRendering.mounts).toBe(1);
 
-    rerender(<CodeViewer {...props} fileQuery={makePdfQuery()} />);
+    const updated = makePdfQuery("application/pdf", false, UPDATED_PDF_BASE64);
+    rerender(<CodeViewer {...props} fileQuery={updated} />);
     expect(await screen.findByTestId("pdf-viewer-stub")).toBeInTheDocument();
     expect(pdfRendering.mounts).toBe(1);
+
+    // Each file starts with a fresh viewer (and 100% zoom) because the boundary
+    // is keyed by conversation and path.
+    rerender(<CodeViewer {...props} fileQuery={updated} path="other.pdf" />);
+    expect(await screen.findByTestId("pdf-viewer-stub")).toBeInTheDocument();
+    expect(pdfRendering.mounts).toBe(2);
   });
 
   function renderPdf(
