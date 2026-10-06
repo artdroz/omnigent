@@ -557,18 +557,14 @@ export function liveCandidateAssistantIndex(bubbles: readonly Bubble[]): number 
 }
 
 /**
- * Where the live-turn Working… indicator belongs in the bubble list.
+ * Index at which to splice a `working` marker row so the Working… indicator
+ * stays WITH the active turn — directly after its content and above a follow-up
+ * steered in behind it. A steered follow-up is promoted to a bubble immediately,
+ * so a tail indicator would sit beneath it and read as that follow-up being
+ * processed while the earlier turn is the one still running.
  *
- * It normally rides the transcript tail. But a message steered forward while
- * the agent is still working is POSTed and promoted to a bubble right away, so
- * it lands below the active turn's output — and a tail indicator then sits
- * beneath that follow-up and reads as the follow-up being processed, while the
- * earlier turn is the one still running. Return the index at which to splice a
- * `working` marker row so the indicator stays WITH the active turn: directly
- * after its content and above any such trailing follow-up.
- *
- * Returns -1 when no reposition is needed — the indicator rides the tail (no
- * trailing follow-up) or the session is not working.
+ * Returns -1 when no reposition is needed: no trailing follow-up (ride the tail)
+ * or the session is not working.
  *
  * @param bubbles - the rendered bubble list, without any injected marker.
  * @param activeResponse - the in-flight response, when the harness streams one.

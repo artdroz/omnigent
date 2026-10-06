@@ -4188,6 +4188,9 @@ describe("workingIndicatorInsertIndex", () => {
   });
 
   it("rides the tail (-1) without a streaming response (buffer-drain harness)", () => {
+    // No streaming response to anchor to and the rendered turn (r1) has already
+    // produced its reply, so there is no in-flight turn above the follow-up to
+    // hold the indicator — the tail is correct here.
     const bubbles = buildBubbles(
       [userMsg("u1", "q"), textDone("m1", "r1", "answer"), userMsg("u2", "follow-up")],
       null,

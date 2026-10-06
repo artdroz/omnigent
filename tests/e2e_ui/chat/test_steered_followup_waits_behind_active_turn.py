@@ -76,6 +76,32 @@ def _follow_up_presented_as_active(page: Page) -> bool:
     )
 
 
+def _working_sits_above_follow_up(page: Page) -> bool:
+    """Whether exactly one Working… indicator is visible above the follow-up.
+
+    The fix keeps the shimmer with the active turn, so while the first request
+    runs there is exactly one visible indicator and it precedes the steered
+    follow-up. A vanished indicator (count 0) must not read as success.
+    """
+    return bool(
+        page.evaluate(
+            """([workingSel, bubbleSel, followUp]) => {
+              const workings = [...document.querySelectorAll(workingSel)];
+              if (workings.length !== 1) return false;
+              const followUpBubble = [...document.querySelectorAll(bubbleSel)].find((b) =>
+                b.innerText.includes(followUp),
+              );
+              if (!followUpBubble) return false;
+              return Boolean(
+                workings[0].compareDocumentPosition(followUpBubble) &
+                  Node.DOCUMENT_POSITION_FOLLOWING,
+              );
+            }""",
+            [_WORKING, _USER_BUBBLE, _FOLLOW_UP],
+        )
+    )
+
+
 def test_steered_followup_is_not_presented_as_active_while_first_turn_runs(
     request: pytest.FixtureRequest,
     paused_mid_turn_session: tuple[str, str, str],
@@ -103,6 +129,7 @@ def test_steered_followup_is_not_presented_as_active_while_first_turn_runs(
     page.wait_for_timeout(3_000)
     assert _gate_pending(mock_url), "the first request must still be executing here"
     presented_as_active = _follow_up_presented_as_active(page)
+    working_above_follow_up = _working_sits_above_follow_up(page)
     follow_up_item_id = follow_up.get_attribute("data-message-id")
     page.screenshot(path=os.path.join(output_path, "follow-up-while-first-turn-runs.png"))
 
@@ -113,10 +140,18 @@ def test_steered_followup_is_not_presented_as_active_while_first_turn_runs(
     page.screenshot(path=os.path.join(output_path, "first-reply-after-release.png"))
     expect(page.locator(_WORKING)).to_be_hidden(timeout=60_000)
     page.wait_for_timeout(1_500)
-    print(f"follow_up_item_id={follow_up_item_id} presented_as_active={presented_as_active}")
+    print(
+        f"follow_up_item_id={follow_up_item_id} presented_as_active={presented_as_active} "
+        f"working_above_follow_up={working_above_follow_up}"
+    )
 
     assert not presented_as_active, (
         "the follow-up was shown as the request being processed (committed bubble "
         f"{follow_up_item_id!r} followed by the Working… indicator, no queued marker) "
         "while the first request was still executing"
+    )
+    assert working_above_follow_up, (
+        "while the first request runs, exactly one Working… indicator must stay "
+        "visible with the active turn, above the steered follow-up — not beneath it "
+        "and not gone"
     )
