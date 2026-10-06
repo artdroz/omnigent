@@ -5,26 +5,27 @@ import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import App from "./App.tsx";
+import { PageLoading } from "./components/PageLoading";
 import { ThemeProvider } from "./components/theme/ThemeProvider";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
 import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
+import { prefetchSessionHostChain } from "./hooks/useSession";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 import { getBasePath, withBasePath } from "./lib/basePath";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { createBootServerInfo, withBootTimeout } from "./lib/bootCapabilities";
-import { isLoginRedirectPending, resolveIdentity } from "./lib/identity";
+import { isLoginRedirectPending, resolveIdentity, setSessionHostResolver } from "./lib/identity";
 import { hideNativeChatTerminalBar } from "./lib/nativeChatTerminalBar";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
 import {
-  applyDesktopUiFontSize,
+  applyStoredUiFontSize,
   applyUiFontFamily,
   readUiFontFamily,
-  readUiFontSizePx,
 } from "./lib/uiFontPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
@@ -55,6 +56,11 @@ const queryClient = new QueryClient({
 // conversation is created server-side).
 initChatStore(queryClient);
 
+// Let a host-scoped request resolve its session's routing host on demand,
+// walking a hostless sub-agent child up to its host-bound ancestor (a cold
+// /c/<child> open) before the request is keyed.
+setSessionHostResolver((sessionId) => prefetchSessionHostChain(queryClient, sessionId));
+
 // Discover the current user identity from the server. Once resolved,
 // all subsequent fetch calls include X-Forwarded-Email so session
 // routes know who's making the request.
@@ -79,8 +85,9 @@ initNativeInsets();
 // can never float it — on any route, chat or auth. No-op off the iOS shell.
 hideNativeChatTerminalBar();
 
-// Apply the saved desktop UI font size and family before first paint so there's no flash.
-applyDesktopUiFontSize(readUiFontSizePx());
+// Apply saved font preferences before first paint. Without a saved size, CSS
+// keeps its viewport-specific default.
+applyStoredUiFontSize();
 applyUiFontFamily(readUiFontFamily());
 
 // The standalone sidebar font size control was removed. Clear its legacy value
@@ -174,9 +181,9 @@ root.render(
 );
 
 // `/v1/me` came back 401 with a login page and we're already on our way
-// there. Unmount to stop the shell's queries firing against an invalid
+// there. Replace the shell to stop its queries firing against an invalid
 // session mid-redirect. Header mode never lands here (no login page), so
 // a proxy-less deploy is unaffected.
 void bootIdentityGate.then(() => {
-  if (isLoginRedirectPending()) root.unmount();
+  if (isLoginRedirectPending()) root.render(<PageLoading label="Opening sign-in…" />);
 });

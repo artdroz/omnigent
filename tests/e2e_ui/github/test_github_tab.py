@@ -350,23 +350,33 @@ def test_composer_pr_link_opens_github_tab(
         expect(panel).to_have_attribute("data-state", "closed")
         expect(pr_link).to_be_in_viewport()
 
-    expected_font_size = font_size * 0.9 * (14 / 13 if is_mobile else 1)
+    expected_font_size = font_size * 0.9
     for test_id, actual_font_size in font_sizes.items():
         assert actual_font_size == pytest.approx(expected_font_size, abs=0.01), (
             f"{test_id} should use the caption size at {font_size}px preference: {font_sizes}"
         )
     reference_center = centers["composer-workspace-dir.icon"]
-    assert bar_bounds["height"] == pytest.approx(37, abs=0.1)
-    assert reference_center == pytest.approx(bar_bounds["y"] + 19, abs=0.5)
+    expected_bar_height = 28 if is_mobile else 37
+    expected_center_offset = 14 if is_mobile else 19
+    assert bar_bounds["height"] == pytest.approx(expected_bar_height, abs=0.1)
+    assert reference_center == pytest.approx(bar_bounds["y"] + expected_center_offset, abs=0.5)
     for name, center in centers.items():
         assert center == pytest.approx(reference_center, abs=0.5), (name, centers)
     for name, pair_gap in pair_gaps.items():
         assert pair_gap == pytest.approx(4, abs=0.1), (name, pair_gaps)
     for name, painted_gap in painted_gaps.items():
-        assert painted_gap == pytest.approx(4, abs=0.1), (name, painted_gaps)
-    worktree_bounds = page.get_by_test_id("composer-git-branch").bounding_box()
-    assert worktree_bounds is not None
-    assert context_bounds["x"] >= worktree_bounds["x"] + worktree_bounds["width"]
+        assert painted_gap == pytest.approx(7.5, abs=0.1), (name, painted_gaps)
+    directory_bounds = page.get_by_test_id("composer-workspace-dir").bounding_box()
+    branch_bounds = page.get_by_test_id("composer-git-branch").bounding_box()
+    assert directory_bounds is not None and branch_bounds is not None
+    selector_gaps = (
+        branch_bounds["x"] - directory_bounds["x"] - directory_bounds["width"],
+        pr_bounds["x"] - branch_bounds["x"] - branch_bounds["width"],
+    )
+    expected_selector_gap = 2 if is_mobile else 8
+    for gap in selector_gaps:
+        assert gap == pytest.approx(expected_selector_gap, abs=0.1), selector_gaps
+    assert context_bounds["x"] >= pr_bounds["x"] + pr_bounds["width"]
     assert group_gap > 0
 
 
