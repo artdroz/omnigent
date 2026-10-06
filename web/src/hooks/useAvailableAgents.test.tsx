@@ -1014,10 +1014,8 @@ describe("prefetchAvailableAgentDetails", () => {
   });
 
   it("removes a session agent when enrichment reveals it is a native shadow", async () => {
-    // A session bound a clone of the kiro wrapper. On initial load harness is
-    // null so it passes the kiro filter; prefetchAvailableAgentDetails detects
-    // harness: "kiro-native" after enrichment and removes the clone since the
-    // seeded kiro built-in exists.
+    // A session bound a clone of the kiro wrapper; its harness only arrives with
+    // enrichment, after which the clone folds into the seeded kiro built-in.
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const kiroBuiltin = testAgent("ag_kiro", "kiro-native-ui", {
       display_name: "Kiro",

@@ -67,11 +67,9 @@ const DISPLAY_NAMES: Record<string, string> = {
 };
 
 /**
- * The vendor whose stock harness row this agent is: the canonical wrapper
+ * The vendor whose stock harness row this is: the canonical wrapper name
  * (`claude-native-ui`) or a clone of it. A custom agent that merely runs on a
- * native harness still resolves to that vendor for icons and capabilities
- * (see {@link nativeCodingAgentForAvailableAgent}), but it is its own picker
- * entry: labelled by its own name and never folded into the stock row.
+ * native harness is its own picker entry, labelled by its own name.
  */
 function stockNativeAgent(
   agent: Pick<AvailableAgent, "name" | "harness">,

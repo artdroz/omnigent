@@ -1,11 +1,8 @@
-"""E2E: custom claude-native agents registered at startup stay identifiable in the New Chat picker.
+"""E2E: custom claude-native agents registered at startup keep their own New Chat picker rows.
 
-``omnigent server --agent <spec>`` registers a user template (``builtin: false``)
-and ``OMNIGENT_BUILTIN_AGENT_DIRS`` seeds a built-in (``builtin: true``). Both
-must appear beside the stock Claude Code row, named by their own name. The rig
-boots a real server with both agents and a real ``omnigent host`` so the landing
-composer's picker is enabled; the browser drives the real SPA against the
-genuine catalog.
+Boots a real ``omnigent server`` with ``--agent autoresearch.yaml`` (a user
+template) and ``OMNIGENT_BUILTIN_AGENT_DIRS=teamresearch.yaml`` (a seeded
+built-in), plus a real ``omnigent host`` so the landing picker is enabled.
 """
 
 from __future__ import annotations
