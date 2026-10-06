@@ -25,6 +25,7 @@ interface SpeechRecognitionLike {
   lang: string;
   start: () => void;
   stop: () => void;
+  abort: () => void;
   addEventListener: (type: string, listener: (event: Event) => void) => void;
   removeEventListener: (type: string, listener: (event: Event) => void) => void;
 }
@@ -102,9 +103,9 @@ export interface ComposerMicButtonProps {
 
 export interface ComposerMicButtonHandle {
   /** End an in-progress take, keeping whatever was already dictated but never
-   *  flushing a trailing server utterance. Parents call this when they commit
-   *  the draft (e.g. a Send tap, which on touch devices never reaches the
-   *  Enter-commit handler). No-op when idle. */
+   *  flushing a trailing utterance into the just-cleared composer. Parents call
+   *  this when they commit the draft (e.g. a Send tap, which on touch devices
+   *  never reaches the Enter-commit handler). No-op when idle. */
   endTake: () => void;
 }
 
@@ -162,6 +163,10 @@ function ComposerMicButtonImpl(
   // Set by the Esc handler so late results after a discard don't repopulate the
   // composer the parent just reverted. Cleared on the next start.
   const discardingRef = useRef(false);
+  // Set by endTake when a server take is still mid-handshake (session not yet
+  // attached): toggleServer sees it once start resolves and discards the
+  // just-opened session instead of recording into the cleared composer.
+  const endPendingRef = useRef(false);
   // Synced prop ref so the recognition result handler (closure over the
   // mount-time effect) can drop late events when the composer goes
   // disabled mid-utterance.
@@ -397,6 +402,7 @@ function ComposerMicButtonImpl(
     try {
       // Snapshot point: let the parent record the text so Esc can revert to it.
       discardingRef.current = false;
+      endPendingRef.current = false;
       interimRef.current = "";
       setConnecting(true);
       onVoiceStartRef.current?.();
@@ -432,6 +438,16 @@ function ComposerMicButtonImpl(
           setIsListening(false);
         },
       });
+      if (endPendingRef.current) {
+        // The take was ended (e.g. a Send tap) while the socket was still
+        // connecting. Discard the session we just opened instead of attaching
+        // it, so it can't record into the composer the parent already cleared.
+        endPendingRef.current = false;
+        next.cancel();
+        setConnecting(false);
+        serverBusyRef.current = false;
+        return;
+      }
       sessionRef.current = next;
       setError(null);
       setIsListening(true);
@@ -483,8 +499,8 @@ function ComposerMicButtonImpl(
     }
   }, [isListening, Ctor, serverAvailable, toggleServer]);
 
-  // Server takes are cancelled (no trailing flush into the cleared composer);
-  // Web Speech is stopped so its end event keeps whatever was already dictated.
+  // End an in-progress take without flushing a trailing utterance into the
+  // composer the parent just cleared on send.
   const endTake = useCallback(() => {
     const session = sessionRef.current;
     if (session) {
@@ -494,9 +510,16 @@ function ComposerMicButtonImpl(
       setIsListening(false);
       return;
     }
+    // A server take may still be mid-handshake (session not yet attached):
+    // flag it so toggleServer discards the session it is about to open.
+    if (serverBusyRef.current) {
+      endPendingRef.current = true;
+      return;
+    }
     if (!isListening && !transitionRef.current) return;
     try {
-      recognitionRef.current?.stop();
+      // abort() discards buffered audio so a trailing final can't flush.
+      recognitionRef.current?.abort();
     } catch {
       // Already stopping — the end event will reconcile state.
     }

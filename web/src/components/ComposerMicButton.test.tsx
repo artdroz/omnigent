@@ -65,6 +65,7 @@ function installDictationSession() {
 let handlers: Record<string, (event: unknown) => void>;
 let startSpy: ReturnType<typeof vi.fn>;
 let stopSpy: ReturnType<typeof vi.fn>;
+let abortSpy: ReturnType<typeof vi.fn>;
 let recognitionLang: string | undefined;
 /** Original navigator.mediaDevices descriptor, restored after each test. */
 let originalMediaDevices: PropertyDescriptor | undefined;
@@ -75,6 +76,7 @@ function installSpeechRecognition() {
   handlers = {};
   startSpy = vi.fn();
   stopSpy = vi.fn();
+  abortSpy = vi.fn();
   recognitionLang = undefined;
   // A class (not an arrow fn) so `new Ctor()` is constructable — the component
   // does `new Ctor()` in its mount effect.
@@ -91,6 +93,7 @@ function installSpeechRecognition() {
     interimResults = false;
     start = startSpy;
     stop = stopSpy;
+    abort = abortSpy;
     addEventListener(type: string, handler: (event: unknown) => void) {
       handlers[type] = handler;
     }
@@ -667,7 +670,7 @@ describe("ComposerMicButton (server dictation)", () => {
 // draft. On touch devices Send is a button tap that never reaches the
 // Enter-commit handler, so without this the mic keeps recording after send.
 describe("ComposerMicButton (endTake)", () => {
-  it("stops a Web Speech take and keeps the dictated text (no discard)", () => {
+  it("aborts a Web Speech take and keeps the dictated text (no discard)", () => {
     const onVoiceDiscard = vi.fn();
     const ref = createRef<ComposerMicButtonHandle>();
     render(<ComposerMicButton ref={ref} onTranscript={vi.fn()} onVoiceDiscard={onVoiceDiscard} />);
@@ -678,11 +681,13 @@ describe("ComposerMicButton (endTake)", () => {
 
     act(() => ref.current?.endTake());
 
-    // Unlike Esc, a send keeps what was dictated: it only stops the recognizer.
-    expect(stopSpy).toHaveBeenCalledTimes(1);
+    // Unlike Esc, a send keeps what was dictated. abort() (not stop()) is used
+    // so a trailing final can't flush into the composer the parent just cleared.
+    expect(abortSpy).toHaveBeenCalledTimes(1);
+    expect(stopSpy).not.toHaveBeenCalled();
     expect(onVoiceDiscard).not.toHaveBeenCalled();
 
-    // Real stop() fires "end"; the fake doesn't, so drive it to confirm the
+    // Real abort() fires "end"; the fake doesn't, so drive it to confirm the
     // button settles back to idle.
     act(() => handlers.end?.({}));
     expect(button).toHaveAttribute("aria-pressed", "false");
@@ -694,6 +699,7 @@ describe("ComposerMicButton (endTake)", () => {
 
     act(() => ref.current?.endTake());
 
+    expect(abortSpy).not.toHaveBeenCalled();
     expect(stopSpy).not.toHaveBeenCalled();
   });
 
@@ -720,6 +726,43 @@ describe("ComposerMicButton (endTake)", () => {
     expect(sessionCancelMock).toHaveBeenCalledTimes(1);
     expect(sessionStopMock).not.toHaveBeenCalled();
     expect(onTranscript).not.toHaveBeenCalledWith("tail words");
+    expect(button).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("discards a server take ended mid-handshake instead of letting it go live", async () => {
+    vi.stubGlobal("SpeechRecognition", undefined);
+    vi.stubGlobal("webkitSpeechRecognition", undefined);
+    // Hold the handshake open so the send (endTake) lands while start is still
+    // pending and no session is attached yet — the race the fix closes.
+    let resolveStart!: (s: SessionStub) => void;
+    sessionStartMock = vi.fn((events: DictationSessionEvents) => {
+      sessionEvents = events;
+      return new Promise<SessionStub>((resolve) => {
+        resolveStart = resolve;
+      });
+    });
+    const ref = createRef<ComposerMicButtonHandle>();
+    render(
+      <CapabilitiesContext.Provider value={DICTATION_INFO}>
+        <ComposerMicButton ref={ref} onTranscript={vi.fn()} />
+      </CapabilitiesContext.Provider>,
+    );
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+
+    await act(async () => {
+      fireEvent.click(button);
+    });
+    // Handshake in flight when the parent sends.
+    expect(button).toHaveAttribute("aria-busy", "true");
+    act(() => ref.current?.endTake());
+
+    // Resolving the handshake must discard the session, not attach a live take.
+    await act(async () => {
+      resolveStart({ stop: sessionStopMock, cancel: sessionCancelMock });
+    });
+    expect(sessionCancelMock).toHaveBeenCalledTimes(1);
+    expect(sessionStopMock).not.toHaveBeenCalled();
+    expect(button).toHaveAttribute("aria-busy", "false");
     expect(button).toHaveAttribute("aria-pressed", "false");
   });
 });
