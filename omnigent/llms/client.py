@@ -56,11 +56,18 @@ async def _aclose(stream: AsyncIterator[Any] | None) -> None:
     Close ``stream`` when it supports ``aclose``, releasing the
     provider connection an adapter generator may still hold.
 
+    Close-time errors are logged, not raised: cleanup must not
+    replace the failure being handled or abort a retry.
+
     :param stream: The iterator to close, or ``None``.
     """
     aclose = getattr(stream, "aclose", None)
-    if aclose is not None:
+    if aclose is None:
+        return
+    try:
         await aclose()
+    except Exception:
+        _logger.debug("Ignoring error while closing LLM stream", exc_info=True)
 
 
 async def _tee_stream_for_usage(
@@ -363,7 +370,8 @@ async def _retry_stream_open(
         while True:
             if current is None:
                 reopened = await _execute_with_retry(call_fn, attempts)
-                assert not isinstance(reopened, Response)
+                if isinstance(reopened, Response):
+                    raise TypeError("stream=True call returned a non-streaming Response")
                 current = reopened
             try:
                 first = await anext(current)

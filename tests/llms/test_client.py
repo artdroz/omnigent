@@ -333,6 +333,52 @@ def _streaming_adapter() -> OpenAICompatibleAdapter:
     return OpenAICompatibleAdapter(base_url="https://fake-host/v1")
 
 
+class _FlakyCreationAdapter(OpenAICompatibleAdapter):
+    """
+    Chat Completions adapter whose first ``creation_failures`` calls
+    fail before any HTTP request exists, like a transient error while
+    the iterator is being created.
+
+    :param creation_failures: Calls to fail before delegating.
+    """
+
+    def __init__(self, creation_failures: int) -> None:
+        super().__init__(base_url="https://fake-host/v1")
+        self.creation_failures = creation_failures
+
+    async def chat_completions(
+        self, *args: Any, **kwargs: Any
+    ) -> dict[str, Any] | AsyncIterator[dict[str, Any]]:
+        if self.creation_failures:
+            self.creation_failures -= 1
+            raise httpx.ConnectTimeout("creation timed out")
+        return await super().chat_completions(*args, **kwargs)
+
+
+@dataclass(frozen=True)
+class _StreamRoute:
+    """
+    A lazily opened streaming route: the real adapter, the endpoint
+    path it posts to, and a one-word SSE reply in its wire format.
+
+    :param adapter: Builds the adapter under test.
+    :param path: Request path the adapter must hit.
+    :param sse_hello: Successful streaming body saying ``Hello``.
+    """
+
+    adapter: Callable[[], BaseAdapter]
+    path: str
+    sse_hello: bytes
+
+
+_CHAT_COMPLETIONS_ROUTE = _StreamRoute(
+    _streaming_adapter, "/v1/chat/completions", _CHAT_COMPLETIONS_SSE_HELLO
+)
+_RESPONSES_ROUTE = _StreamRoute(
+    lambda: OpenAIAdapter(base_url="https://fake-host/v1"), "/v1/responses", _RESPONSES_SSE_HELLO
+)
+
+
 # ── Fixtures ─────────────────────────────────────────────────
 
 
@@ -479,6 +525,11 @@ async def test_create_with_retry_http_429_then_success(
 
 
 @pytest.mark.parametrize(
+    "route",
+    [_CHAT_COMPLETIONS_ROUTE, _RESPONSES_ROUTE],
+    ids=["chat_completions", "responses"],
+)
+@pytest.mark.parametrize(
     "first_attempt_fault",
     ["http_503", "connect_error"],
 )
@@ -487,17 +538,19 @@ async def test_create_streaming_retries_failure_at_stream_open(
     monkeypatch: pytest.MonkeyPatch,
     retry_config: RetryPolicy,
     first_attempt_fault: str,
+    route: _StreamRoute,
 ) -> None:
     """
     A transient failure on the first streaming HTTP attempt consumes
-    the configured retry budget just like the non-streaming path.
+    the configured retry budget just like the non-streaming path, on
+    both the Chat Completions and the native OpenAI Responses route.
 
     The real adapter opens the connection only when the returned
     iterator is first consumed, so the failure surfaces during
     iteration rather than inside ``create()``; the retry policy must
     still cover it when no event has reached the caller yet.
     """
-    tracker = _patch_client_deps(monkeypatch, _streaming_adapter())
+    tracker = _patch_client_deps(monkeypatch, route.adapter())
     first_attempt: httpx.Response | Exception
     if first_attempt_fault == "http_503":
         first_attempt = httpx.Response(
@@ -513,7 +566,7 @@ async def test_create_streaming_retries_failure_at_stream_open(
             httpx.Response(
                 200,
                 headers=_SSE_EVENT_STREAM_HEADERS,
-                content=_CHAT_COMPLETIONS_SSE_HELLO,
+                content=route.sse_hello,
             ),
         ],
     )
@@ -525,7 +578,7 @@ async def test_create_streaming_retries_failure_at_stream_open(
     )
     events = [event async for event in stream]
 
-    assert [req.url.path for req in http.requests] == ["/v1/chat/completions"] * 2
+    assert [req.url.path for req in http.requests] == [route.path] * 2
     assert len(tracker.calls) == 1
     assert [e.delta for e in events if isinstance(e, ResponseTextDeltaEvent)] == ["Hello"]
     completed = events[-1]
@@ -585,16 +638,24 @@ async def test_create_streaming_retries_body_closed_before_output_over_loopback(
     assert isinstance(events[-1], ResponseCompletedEvent)
 
 
+@pytest.mark.parametrize(
+    ("max_retries", "recovers"),
+    [(2, True), (1, False)],
+    ids=["budget_covers_both", "budget_exhausted"],
+)
 @pytest.mark.asyncio
-async def test_create_streaming_retry_covers_openai_responses_path(
+async def test_create_streaming_creation_and_open_failures_share_one_budget(
     monkeypatch: pytest.MonkeyPatch,
-    retry_config: RetryPolicy,
+    max_retries: int,
+    recovers: bool,
 ) -> None:
     """
-    The native OpenAI Responses stream is opened lazily too, so a
-    transient failure at its open shares the same retry budget.
+    A retryable failure while creating the iterator and one while
+    opening the stream are charged to the same budget: with room for
+    both the stream recovers after two backoffs, with room for only
+    one it is exhausted by the second failure.
     """
-    tracker = _patch_client_deps(monkeypatch, OpenAIAdapter(base_url="https://fake-host/v1"))
+    tracker = _patch_client_deps(monkeypatch, _FlakyCreationAdapter(creation_failures=1))
     http = _serve_http_sequence(
         monkeypatch,
         [
@@ -602,22 +663,28 @@ async def test_create_streaming_retry_covers_openai_responses_path(
             httpx.Response(
                 200,
                 headers=_SSE_EVENT_STREAM_HEADERS,
-                content=_RESPONSES_SSE_HELLO,
+                content=_CHAT_COMPLETIONS_SSE_HELLO,
             ),
         ],
     )
+    policy = RetryPolicy(max_retries=max_retries, backoff_base_s=2.0, backoff_max_s=30.0)
 
     stream = await Client().responses.create(
         **_default_create_kwargs(),
         stream=True,
-        retry=retry_config,
+        retry=policy,
     )
-    events = [event async for event in stream]
-
-    assert [req.url.path for req in http.requests] == ["/v1/responses"] * 2
-    assert len(tracker.calls) == 1
-    assert [e.delta for e in events if isinstance(e, ResponseTextDeltaEvent)] == ["Hello"]
-    assert isinstance(events[-1], ResponseCompletedEvent)
+    if recovers:
+        events = [event async for event in stream]
+        assert [e.delta for e in events if isinstance(e, ResponseTextDeltaEvent)] == ["Hello"]
+        assert len(http.requests) == 2
+    else:
+        with pytest.raises(RetryableLLMError) as exc_info:
+            _ = [event async for event in stream]
+        assert exc_info.value.code == "503"
+        assert len(http.requests) == 1
+    # One backoff per failed attempt: the creation failure, then the 503.
+    assert len(tracker.calls) == max_retries
 
 
 @pytest.mark.asyncio
