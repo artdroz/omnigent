@@ -382,12 +382,51 @@ export const HTML_PREVIEW_SANDBOX =
   "allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals";
 
 /**
- * Prepare HTML artifact content for the preview iframe by forcing every link to
- * open in a new tab (issue #777: "We should always make it open in a new
- * window").
+ * Inline script for the preview document that keeps same-page `#fragment`
+ * links inside the frame.
  *
- * We inject `<base target="_blank">` rather than rewriting individual anchors so
- * it covers links created at runtime by scripts too. Placement matters: a
+ * A `srcdoc` document resolves relative URLs against its embedder, so under
+ * `<base target="_blank">` a fragment-only link would open the host page's own
+ * URL in a new window (the desktop shell then hands it to the OS browser).
+ * Setting the frame's hash instead scrolls to the target, styles `:target`, and
+ * fires `hashchange` like a native anchor; when that hash is already current
+ * (assigning it again is a no-op) the scroll is repeated by hand. Clicks the
+ * page handled itself (`preventDefault`) and every other link are left alone.
+ */
+const SAME_PAGE_ANCHOR_SCRIPT = `<script>(function () {
+  function indicatedElement(fragment) {
+    var raw = fragment.slice(1);
+    var id = raw;
+    try { id = decodeURIComponent(raw); } catch (e) { /* malformed escape: match the raw id */ }
+    return document.getElementById(id) || document.getElementsByName(id)[0] || null;
+  }
+  document.addEventListener("click", function (event) {
+    if (event.defaultPrevented) return;
+    var target = event.target;
+    var anchor = target && target.closest ? target.closest("a[href],area[href]") : null;
+    var href = anchor ? anchor.getAttribute("href").trim() : "";
+    if (href.charAt(0) !== "#") return;
+    event.preventDefault();
+    var before = location.href;
+    location.hash = href;
+    if (location.href !== before) return;
+    var element = indicatedElement(href);
+    if (element) element.scrollIntoView();
+    else if (href === "#" || href.toLowerCase() === "#top") window.scrollTo(0, 0);
+  });
+})();</script>`;
+
+/** Markup `prepareHtmlPreviewDoc` places at the start of `<head>`. */
+export const HTML_PREVIEW_HEAD = '<base target="_blank">' + SAME_PAGE_ANCHOR_SCRIPT;
+
+/**
+ * Prepare HTML artifact content for the preview iframe: force every link to
+ * open in a new tab (issue #777: "We should always make it open in a new
+ * window") while same-page `#fragment` links keep scrolling the preview.
+ *
+ * We inject `<base target="_blank">` (with the anchor script) rather than
+ * rewriting individual anchors so it covers links created at runtime by scripts
+ * too. Placement matters: a
  * `<base>` (or anything) before the `<!DOCTYPE>` would push the document into
  * quirks mode and change how the artifact renders, so we insert *inside* the
  * existing `<head>`/`<html>` when present and only fall back to prepending for
@@ -397,40 +436,38 @@ export const HTML_PREVIEW_SANDBOX =
  * and re-serializing untrusted artifact content could subtly alter how it
  * renders. The known trade-off is that a `<head>` literal appearing earlier in
  * the source (e.g. inside a comment or a script string) is matched textually.
- * That only ever mis-places the base tag *inside the sandboxed preview* — it
- * can break that one artifact's own link-targeting, never the host app's
+ * That only ever mis-places the injected markup *inside the sandboxed preview*
+ * — it can break that one artifact's own link handling, never the host app's
  * security — so it's an accepted limitation rather than a bug to parse around.
  */
 export function prepareHtmlPreviewDoc(html: string): string {
-  const baseTag = '<base target="_blank">';
-
   const headMatch = html.match(/<head[^>]*>/i);
   if (headMatch?.index !== undefined) {
     const insertAt = headMatch.index + headMatch[0].length;
     // Idempotency guard, scoped to the actual injection point: only skip if our
-    // base tag is ALREADY right after <head> (i.e. content was prepared twice).
-    // We must NOT use a loose `html.includes(baseTag)` — the literal string can
+    // markup is ALREADY right after <head> (i.e. content was prepared twice).
+    // We must NOT use a loose `html.includes(...)` — the literal string can
     // legitimately appear elsewhere in artifact content (a comment, a code
     // sample), and skipping injection there would leave the document with no
     // real <base>, so links navigate the preview in place instead of opening a
     // new tab.
-    if (html.startsWith(baseTag, insertAt)) return html;
-    return html.slice(0, insertAt) + baseTag + html.slice(insertAt);
+    if (html.startsWith(HTML_PREVIEW_HEAD, insertAt)) return html;
+    return html.slice(0, insertAt) + HTML_PREVIEW_HEAD + html.slice(insertAt);
   }
 
-  // No <head>: create one right after <html> so the base still lands inside the
-  // document head (after the doctype, preserving standards mode). A second pass
-  // matches the <head> we created above, so this path is idempotent too.
+  // No <head>: create one right after <html> so the markup still lands inside
+  // the document head (after the doctype, preserving standards mode). A second
+  // pass matches the <head> we created above, so this path is idempotent too.
   const htmlMatch = html.match(/<html[^>]*>/i);
   if (htmlMatch?.index !== undefined) {
     const insertAt = htmlMatch.index + htmlMatch[0].length;
-    return `${html.slice(0, insertAt)}<head>${baseTag}</head>${html.slice(insertAt)}`;
+    return `${html.slice(0, insertAt)}<head>${HTML_PREVIEW_HEAD}</head>${html.slice(insertAt)}`;
   }
 
   // Bare fragment (no <html>/<head>, hence no doctype to displace) — the browser
-  // wraps it in an implicit head, so a leading base tag is safe.
-  if (html.startsWith(baseTag)) return html;
-  return baseTag + html;
+  // wraps it in an implicit head, so leading head markup is safe.
+  if (html.startsWith(HTML_PREVIEW_HEAD)) return html;
+  return HTML_PREVIEW_HEAD + html;
 }
 
 /**

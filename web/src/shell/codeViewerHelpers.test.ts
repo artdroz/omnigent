@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  HTML_PREVIEW_HEAD,
   HTML_PREVIEW_SANDBOX,
   detectLang,
   getSelectionOffsets,
@@ -406,39 +407,41 @@ describe("indexToLine", () => {
 });
 
 // ---------------------------------------------------------------------------
-// prepareHtmlPreviewDoc — force links to open in a new tab
+// prepareHtmlPreviewDoc — new-tab links; same-page anchors stay in the frame
 // ---------------------------------------------------------------------------
 
 describe("prepareHtmlPreviewDoc", () => {
+  const HEAD = HTML_PREVIEW_HEAD;
   const BASE = '<base target="_blank">';
 
-  it("injects the base tag inside an existing <head>", () => {
+  it("injects the head markup, base target first, inside an existing <head>", () => {
     const html = "<!DOCTYPE html><html><head><title>x</title></head><body>hi</body></html>";
     const out = prepareHtmlPreviewDoc(html);
-    expect(out).toContain(`<head>${BASE}<title>x</title>`);
+    expect(HEAD.startsWith(BASE)).toBe(true);
+    expect(out).toContain(`<head>${HEAD}<title>x</title>`);
     // Doctype stays first so the document keeps standards mode.
     expect(out.indexOf("<!DOCTYPE html>")).toBe(0);
   });
 
   it("matches <head> with attributes", () => {
     const out = prepareHtmlPreviewDoc('<head lang="en"><meta></head>');
-    expect(out).toContain(`<head lang="en">${BASE}<meta>`);
+    expect(out).toContain(`<head lang="en">${HEAD}<meta>`);
   });
 
   it("creates a <head> after <html> when none exists", () => {
     const out = prepareHtmlPreviewDoc("<!DOCTYPE html><html><body>hi</body></html>");
-    expect(out).toContain(`<html><head>${BASE}</head><body>`);
+    expect(out).toContain(`<html><head>${HEAD}</head><body>`);
     expect(out.indexOf("<!DOCTYPE html>")).toBe(0);
   });
 
-  it("prepends the base tag for a bare fragment (no doctype to displace)", () => {
+  it("prepends the head markup for a bare fragment (no doctype to displace)", () => {
     const out = prepareHtmlPreviewDoc('<a href="https://example.com">link</a>');
-    expect(out).toBe(`${BASE}<a href="https://example.com">link</a>`);
+    expect(out).toBe(`${HEAD}<a href="https://example.com">link</a>`);
   });
 
   it("is case-insensitive on the HEAD tag", () => {
     const out = prepareHtmlPreviewDoc("<HEAD></HEAD>");
-    expect(out).toContain(`<HEAD>${BASE}`);
+    expect(out).toContain(`<HEAD>${HEAD}`);
   });
 
   it("preserves an existing <base href>; the injected target tag wins by order", () => {
@@ -447,16 +450,17 @@ describe("prepareHtmlPreviewDoc", () => {
     // forcing links to a new tab.
     const html = '<head><base href="https://cdn.example.com/"></head>';
     const out = prepareHtmlPreviewDoc(html);
-    expect(out).toBe(`<head>${BASE}<base href="https://cdn.example.com/"></head>`);
+    expect(out).toBe(`<head>${HEAD}<base href="https://cdn.example.com/"></head>`);
     expect(out.indexOf(BASE)).toBeLessThan(out.indexOf("<base href"));
   });
 
-  it("injects exactly one base tag per call (no duplicates)", () => {
+  it("injects exactly one base tag and one anchor script per call (no duplicates)", () => {
     const out = prepareHtmlPreviewDoc("<head></head>");
     expect(out.match(/<base target="_blank">/g)).toHaveLength(1);
+    expect(out.match(/<script>/g)).toHaveLength(1);
   });
 
-  it("is idempotent: re-preparing already-prepared content adds no second base tag", () => {
+  it("is idempotent: re-preparing already-prepared content adds no second copy", () => {
     const once = prepareHtmlPreviewDoc("<head></head>");
     const twice = prepareHtmlPreviewDoc(once);
     expect(twice).toBe(once);
@@ -470,15 +474,129 @@ describe("prepareHtmlPreviewDoc", () => {
     // instead of opening a new tab. The base must still land in <head>.
     const html = '<html><head></head><body><!-- <base target="_blank"> --></body></html>';
     const out = prepareHtmlPreviewDoc(html);
-    expect(out).toContain(`<head>${BASE}</head>`);
+    expect(out).toContain(`<head>${HEAD}</head>`);
   });
 
   it("documents the matcher limitation: a <head> literal in earlier markup is matched textually", () => {
     // A simple regex (not a full parser) matches the first <head> string, even
-    // inside a comment. This only mis-places the harmless base tag inside the
+    // inside a comment. This only mis-places the harmless markup inside the
     // sandboxed preview — never a security issue — so we lock in the behavior.
     const out = prepareHtmlPreviewDoc("<!-- <head> --><html><head></head></html>");
-    expect(out).toBe(`<!-- <head>${BASE} --><html><head></head></html>`);
+    expect(out).toBe(`<!-- <head>${HEAD} --><html><head></head></html>`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Same-page anchor script — the in-frame click handler prepareHtmlPreviewDoc injects
+// ---------------------------------------------------------------------------
+
+describe("prepareHtmlPreviewDoc same-page anchor script", () => {
+  const SCRIPT_BODY = /<script>([\s\S]*)<\/script>/.exec(HTML_PREVIEW_HEAD)?.[1] ?? "";
+  /** Elements the handler scrolled into view by hand (`this` of each call). */
+  let scrolled: Element[];
+
+  beforeAll(() => {
+    expect(SCRIPT_BODY).not.toBe("");
+    // Registers the document-level click listener on this file's jsdom document.
+    new Function(SCRIPT_BODY)();
+  });
+
+  beforeEach(() => {
+    history.replaceState(null, "", "/preview");
+    document.body.innerHTML = "";
+    scrolled = [];
+    vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(function (this: Element) {
+      scrolled.push(this);
+    });
+    vi.spyOn(window, "scrollTo").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * Click `selector` and report whether the in-frame handler cancelled the
+   * click. The window-level listener runs after it and cancels whatever is
+   * left, so jsdom never attempts the navigation of links the handler skipped.
+   */
+  function click(selector: string): boolean {
+    let cancelled = false;
+    window.addEventListener(
+      "click",
+      (event) => {
+        cancelled = event.defaultPrevented;
+        event.preventDefault();
+      },
+      { once: true },
+    );
+    document
+      .querySelector(selector)
+      ?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    return cancelled;
+  }
+
+  it("keeps a fragment-only link in the frame by setting the frame's own hash", () => {
+    document.body.innerHTML = '<a id="link" href="#section-3">Jump</a><h2 id="section-3">S3</h2>';
+    expect(click("#link")).toBe(true);
+    expect(location.hash).toBe("#section-3");
+    expect(location.pathname).toBe("/preview");
+    expect(scrolled).toEqual([]);
+  });
+
+  it("handles clicks on elements nested in the anchor and on <area> hotspots", () => {
+    document.body.innerHTML =
+      '<a href="#a"><span id="inner">in</span></a><map><area id="hot" href="#b" shape="default"></map>';
+    expect(click("#inner")).toBe(true);
+    expect(location.hash).toBe("#a");
+    expect(click("#hot")).toBe(true);
+    expect(location.hash).toBe("#b");
+  });
+
+  it("re-scrolls to the target when the hash is already current", () => {
+    document.body.innerHTML = '<a id="link" href="#section-3">Jump</a><h2 id="section-3">S3</h2>';
+    location.hash = "#section-3";
+    expect(click("#link")).toBe(true);
+    expect(scrolled).toHaveLength(1);
+    expect(scrolled[0]).toBe(document.getElementById("section-3"));
+  });
+
+  it("resolves named anchors and percent-encoded ids for the repeat scroll", () => {
+    document.body.innerHTML =
+      '<a id="named" href="#spot">n</a><a name="spot"></a>' +
+      '<a id="encoded" href="#caf%C3%A9">e</a><h3 id="café">Café</h3>';
+    location.hash = "#spot";
+    click("#named");
+    location.hash = "#caf%C3%A9";
+    click("#encoded");
+    expect(scrolled).toHaveLength(2);
+    expect(scrolled[0]).toBe(document.querySelector('a[name="spot"]'));
+    expect(scrolled[1]).toBe(document.getElementById("café"));
+  });
+
+  it("scrolls to the top for '#' and '#top' when no element matches", () => {
+    document.body.innerHTML = '<a id="empty" href="#">top</a><a id="top-link" href="#top">top</a>';
+    click("#empty");
+    // The first click changed the URL (a trailing "#"), so the browser scrolled.
+    expect(window.scrollTo).not.toHaveBeenCalled();
+    click("#empty");
+    expect(window.scrollTo).toHaveBeenCalledTimes(1);
+    location.hash = "#top";
+    click("#top-link");
+    expect(window.scrollTo).toHaveBeenCalledTimes(2);
+  });
+
+  it("leaves clicks the page handled itself and non-fragment links alone", () => {
+    document.body.innerHTML =
+      '<a id="own" href="#section-3">own</a><a id="ext" href="https://example.com/x">ext</a>' +
+      '<a id="rel" href="other.html#frag">rel</a><h2 id="section-3">S3</h2>';
+    document.getElementById("own")?.addEventListener("click", (event) => event.preventDefault());
+    expect(click("#own")).toBe(true);
+    expect(location.hash).toBe("");
+    expect(click("#ext")).toBe(false);
+    expect(click("#rel")).toBe(false);
+    expect(location.hash).toBe("");
+    expect(scrolled).toEqual([]);
   });
 });
 

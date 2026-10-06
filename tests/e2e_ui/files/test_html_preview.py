@@ -8,6 +8,9 @@ Regression coverage for two bugs in the HTML artifact preview
   * #777 — links in a rendered HTML file did not open. The same empty sandbox
     blocked popups/navigation; the fix injects ``<base target="_blank">`` and
     relaxes the sandbox so links open a real new tab.
+  * Same-page ``#fragment`` links escaped to a new window at the host page's
+    URL (a ``srcdoc`` frame resolves fragment-only links against its embedder,
+    and the base target sent them out); they must scroll the preview in place.
 
 It also covers the new "Open in new tab" toolbar button, which pops the
 artifact into a blank, app-controlled tab and renders it inside the same
@@ -49,9 +52,14 @@ _EXPECTED_SANDBOX = (
 
 _HTML_PATH = "preview_artifact.html"
 
+# Tall filler so the same-page anchor target starts well below the preview fold.
+_FILLER = "\n".join(
+    f"    <p>Filler paragraph {i} providing vertical space.</p>" for i in range(60)
+)
+
 # Self-contained fixture: a script flips a sentinel element from a "blocked"
 # marker to a "ran" marker, and creates a link at runtime. No network needed.
-_HTML_CONTENT = """\
+_HTML_CONTENT = f"""\
 <!DOCTYPE html>
 <html lang="en">
   <head>
@@ -63,6 +71,7 @@ _HTML_CONTENT = """\
     <p id="js-status">js-blocked</p>
     <a id="static-link" href="https://example.com/static">static link</a>
     <p id="dynamic-link-host"></p>
+    <a id="toc-link" href="#section-3">Jump to section 3</a>
     <script>
       // Proof that scripts run (#778).
       document.getElementById("js-status").textContent = "js-ran";
@@ -73,6 +82,9 @@ _HTML_CONTENT = """\
       a.textContent = "dynamic link";
       document.getElementById("dynamic-link-host").appendChild(a);
     </script>
+{_FILLER}
+    <h2 id="section-3">Section 3</h2>
+    <p>Target of the in-page link.</p>
   </body>
 </html>
 """
@@ -103,7 +115,7 @@ def test_html_preview_runs_scripts_and_targets_links(
     page: Page,
     seeded_html: tuple[str, str],
 ) -> None:
-    """HTML preview runs JS (#778) and forces links to open in a new tab (#777)."""
+    """HTML preview runs JS (#778), opens links in a new tab (#777), scrolls same-page anchors."""
     base_url, session_id = seeded_html
     # Keep the viewport wide so the responsive toolbar renders its actions
     # inline (the "Open in new tab" button is found by role, not via overflow).
@@ -133,6 +145,22 @@ def test_html_preview_runs_scripts_and_targets_links(
     expect(preview.locator("#js-status")).to_have_text("js-ran", timeout=10_000)
     # The runtime-created link is present, confirming the script fully executed.
     expect(preview.locator("#dynamic-link")).to_have_text("dynamic link")
+
+    # A same-page ``#fragment`` link scrolls the preview in place. A srcdoc frame
+    # resolves it against the host page's URL, so with the ``_blank`` base target
+    # it used to open a new window at the session URL instead.
+    target = preview.locator("#section-3")
+    expect(target).not_to_be_in_viewport()
+    opened: list[Page] = []
+    page.context.on("page", lambda popup: opened.append(popup))
+    preview.get_by_role("link", name="Jump to section 3").click()
+    # A popup would surface within this window; a correct build never opens one.
+    page.wait_for_timeout(2_000)
+    assert not opened, "same-page anchor opened a new window at " + ", ".join(
+        p.url for p in opened
+    )
+    expect(target).to_be_in_viewport()
+    expect(page).to_have_url(f"{base_url}/c/{session_id}?file={_HTML_PATH}")
 
 
 def test_html_preview_open_in_new_tab_button(
@@ -196,5 +224,16 @@ def test_html_preview_open_in_new_tab_button(
         }"""
     )
     assert parent_access_blocked
+
+    # Same-page links stay inside the popped tab's frame too (its host page is
+    # ``about:blank``, so the fragment would otherwise resolve there).
+    target = preview.locator("#section-3")
+    expect(target).not_to_be_in_viewport()
+    open_pages = len(page.context.pages)
+    preview.get_by_role("link", name="Jump to section 3").click()
+    expect(target).to_be_in_viewport()
+    page.wait_for_timeout(1_000)
+    assert len(page.context.pages) == open_pages
+    assert popped.url == "about:blank"
 
     popped.close()
