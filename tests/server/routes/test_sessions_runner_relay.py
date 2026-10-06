@@ -2674,19 +2674,22 @@ async def test_relay_reads_handoff_evidence_with_conversation_database_unavailab
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("conversation_backend_unavailable", [False, True])
+@pytest.mark.parametrize("sibling_writer", ["blip", "old_writer"])
 async def test_relay_stays_quiet_when_runner_is_live_on_another_replica(
     monkeypatch: pytest.MonkeyPatch,
     conversation_backend_unavailable: bool,
+    sibling_writer: str,
 ) -> None:
     """
     A runner already re-tunnelled to another replica is not failed here.
 
     The runner may reconnect elsewhere before this replica's grace expires
-    (ingress recycle, a 4003 close after a silent stretch). That replica's
-    fresh ``runner_last_connected`` stamp means it now owns the turn — even
-    when that replica's own tunnel briefly blipped and cleared
-    ``runner_last_seen`` — so this drop must publish no ``failed`` status and
-    persist no ``runner_disconnected`` labels, mirroring the idle-session case.
+    (ingress recycle, a 4003 close after a silent stretch). Two sibling kinds
+    prove it owns the turn now without a fresh ``runner_last_seen`` here: a
+    current replica whose own tunnel blipped (connect stamp fresh, seen cleared)
+    and an older replica that refreshes only ``runner_last_seen``. Either way
+    this drop must publish no ``failed`` status and persist no
+    ``runner_disconnected`` labels, mirroring the idle-session case.
     """
     import time
 
@@ -2703,15 +2706,16 @@ async def test_relay_stays_quiet_when_runner_is_live_on_another_replica(
     runner_id = "runner_live_elsewhere"
     session_id = "d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6"
     now = int(time.time())
-    # This replica's own last stamp is a minute old; the row's fresh connect
-    # stamp can only come from the replica the runner re-tunnelled to. Its
-    # ``runner_last_seen`` is cleared (None) to model that replica's own tunnel
-    # briefly blipping, which must not erase the cross-replica liveness signal.
+    reference = now - 60
+    # This replica's own last stamp is a minute old; the sibling that re-tunnelled
+    # supplies the fresh evidence. The blip clears ``runner_last_seen`` (connect
+    # fresh); the older writer refreshes only ``runner_last_seen``.
     monkeypatch.setattr(
         "omnigent.server.session_live_state.last_liveness_stamp",
-        lambda _runner_id: now - 60,
+        lambda _runner_id: reference,
     )
-    store = _RecordingLabelStore(runner_liveness={session_id: (runner_id, None, now)})
+    seen, connected = {"blip": (None, now), "old_writer": (now, reference)}[sibling_writer]
+    store = _RecordingLabelStore(runner_liveness={session_id: (runner_id, seen, connected)})
     if conversation_backend_unavailable:
 
         def unavailable(conversation_id: str) -> Any:
@@ -2753,10 +2757,11 @@ async def test_relay_stays_quiet_when_runner_is_live_on_another_replica(
 def test_runner_live_elsewhere_uses_preloaded_conversation_stamps() -> None:
     """The grace path detects a newer replica from already-loaded rows.
 
-    With ``use_connect_stamp=True`` it reads the never-cleared
-    ``runner_last_connected`` and ignores ``runner_last_seen`` (cleared here
-    to None), so a sibling's transient reconnect blip cannot look like the
-    runner vanishing.
+    With ``for_disconnect_decision=True`` it uses the freshest of
+    ``runner_last_seen`` and the never-cleared ``runner_last_connected``, so a
+    reconnect blip (connect fresh, seen cleared) and an older replica that
+    refreshes only ``runner_last_seen`` both keep the runner live. The default
+    (message re-addressing) path reads ``runner_last_seen`` alone.
     """
     import time
     from types import SimpleNamespace
@@ -2768,26 +2773,38 @@ def test_runner_live_elsewhere_uses_preloaded_conversation_stamps() -> None:
 
     now = int(time.time())
     expired_stamp = now - RUNNER_LIVENESS_TTL_S - 1
-    conversations = [
-        SimpleNamespace(runner_id="runner_a", runner_last_seen=None, runner_last_connected=now)
-    ]
 
-    assert _runner_live_on_another_replica_from_conversations(
-        conversations, "runner_a", now - 1, use_connect_stamp=True
-    )
-    assert not _runner_live_on_another_replica_from_conversations(
-        conversations, "runner_a", now, use_connect_stamp=True
-    )
-    assert not _runner_live_on_another_replica_from_conversations(
-        [
+    def rows(seen: int | None, connected: int | None) -> list[SimpleNamespace]:
+        return [
             SimpleNamespace(
-                runner_id="runner_a", runner_last_seen=None, runner_last_connected=expired_stamp
+                runner_id="runner_a", runner_last_seen=seen, runner_last_connected=connected
             )
-        ],
-        "runner_a",
-        expired_stamp - 1,
-        use_connect_stamp=True,
+        ]
+
+    # Reconnect blip: seen cleared, but the fresh connect stamp proves liveness.
+    assert _runner_live_on_another_replica_from_conversations(
+        rows(None, now), "runner_a", now - 1, for_disconnect_decision=True
     )
+    # Older replica: connect stamp stuck at this replica's reference, but the
+    # fresh ``runner_last_seen`` it refreshed wins.
+    assert _runner_live_on_another_replica_from_conversations(
+        rows(now, now - 1), "runner_a", now - 1, for_disconnect_decision=True
+    )
+    # No stamp beats this replica's own reference -> not live elsewhere.
+    assert not _runner_live_on_another_replica_from_conversations(
+        rows(None, now), "runner_a", now, for_disconnect_decision=True
+    )
+    # Both stamps expired -> not live elsewhere.
+    assert not _runner_live_on_another_replica_from_conversations(
+        rows(None, expired_stamp), "runner_a", expired_stamp - 1, for_disconnect_decision=True
+    )
+    # Default path (message re-addressing) reads ``runner_last_seen`` only: a
+    # cleared seen is not a live sibling even with a fresh connect stamp, and a
+    # fresh seen is.
+    assert not _runner_live_on_another_replica_from_conversations(
+        rows(None, now), "runner_a", now - 1
+    )
+    assert _runner_live_on_another_replica_from_conversations(rows(now, None), "runner_a", now - 1)
 
 
 @pytest.mark.asyncio

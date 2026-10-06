@@ -6808,6 +6808,34 @@ def test_clear_runner_liveness_without_not_after_still_clears_unconditionally(
     assert connectivity[conv.id].runner_last_seen is None
 
 
+def test_clear_runner_liveness_preserves_the_connect_stamp(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A graceful clear drops ``runner_last_seen`` but keeps the connect stamp.
+
+    The cross-replica disconnect check reads ``runner_last_connected``; a
+    sibling's reconnect blip clears ``runner_last_seen`` and must not erase the
+    only evidence the runner is live elsewhere.
+    """
+    conv = conversation_store.create_conversation(title="preserve-connect-stamp")
+    assert conversation_store.set_runner_id(conv.id, "runner_preserve_connect")
+
+    conversation_store.touch_runner_liveness(["runner_preserve_connect"], now=1_000_000)
+    assert conversation_store.get_runner_liveness(conv.id) == (
+        "runner_preserve_connect",
+        1_000_000,
+        1_000_000,
+    )
+
+    conversation_store.clear_runner_liveness("runner_preserve_connect")
+
+    assert conversation_store.get_runner_liveness(conv.id) == (
+        "runner_preserve_connect",
+        None,
+        1_000_000,
+    )
+
+
 def test_live_state_writes_via_chokepoint_land_in_scoped_workspace(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

@@ -877,6 +877,13 @@ def test_new_replica_blip_at_old_deadline_does_not_fail_the_recovered_turn(
             f"Failure lines: {failed_edges}\n"
             f"Replica A log tail:\n{server_a_log[-4000:]}"
         )
+        decisions = _relay_decisions(server_a_log, session_id)
+        assert "live_elsewhere" in decisions, (
+            f"Replica A never recorded a live_elsewhere decision for session {session_id} "
+            "at its old deadline; the turn would otherwise pass only because the window "
+            f"elapsed. decisions={decisions}\n"
+            f"Replica A log tail:\n{server_a_log[-4000:]}"
+        )
 
         release_mock_gate(mock_llm_server_url)
         _poll_until(
