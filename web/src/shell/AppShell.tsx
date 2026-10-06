@@ -2293,7 +2293,8 @@ export function AppShell() {
           overflow-hidden + inert), and while peeking the floating card's
           inset-2 would drag them off the lights' centre line. The sidebar's own
           copy is hidden on mac by CSS; this one is positioned by
-          .electron-sidebar-header-actions in index.css. */}
+          .electron-sidebar-header-actions in index.css. Below md the phone
+          drawer's copy takes over and this one hides (same rules). */}
             {/* Hidden on /settings: the settings nav replaces the session list
           INSIDE the sidebar, and its "Back" row is the only way out. Leaving a
           collapse toggle up here would let the user hide the one exit and strand
