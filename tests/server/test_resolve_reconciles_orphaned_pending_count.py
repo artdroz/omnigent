@@ -20,15 +20,16 @@ from omnigent.server.routes import sessions as S
 
 @pytest.fixture
 def _clean_index():
-    """Isolate the module-global pending-elicitation index per test."""
-    # reset_for_tests clears the index but not the count-persist hook; a hook
-    # leaked from another test would bypass the per-test persist_pending_count
-    # patch, so clear it too.
-    pending_elicitations.reset_for_tests()
+    """Isolate the module-global count-persist hook per test.
+
+    The autouse ``_reset_elicitation_state`` fixture already clears the index;
+    it does not touch the persist hook. A hook leaked from another test would
+    bypass the per-test ``persist_pending_count`` patch, so save and restore it.
+    """
+    prior_hook = pending_elicitations._count_persist_hook
     pending_elicitations.set_count_persist_hook(None)
     yield
-    pending_elicitations.reset_for_tests()
-    pending_elicitations.set_count_persist_hook(None)
+    pending_elicitations.set_count_persist_hook(prior_hook)
 
 
 def _request_event(elicitation_id: str) -> dict:
@@ -202,6 +203,36 @@ async def test_offline_runner_via_router_resolve_reconciles(_clean_index, monkey
     assert (sid, 0) in persisted, (
         "a confirmed-offline runner (RUNNER_UNAVAILABLE) must reconcile the "
         f"persisted count to the live count (0) via the router path; got {persisted}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_routing_router_error_resolve_does_not_reconcile(_clean_index, monkeypatch):
+    """Only ``RUNNER_UNAVAILABLE`` confirms the runner is gone. A non-routing
+    ``OmnigentError`` (here ``NOT_FOUND``, as the resource lookup raises for a
+    missing conversation) is inconclusive, so the resolve must not reconcile and
+    risk clobbering the authoritative count."""
+    sid = "conv_router_notfound"
+    eid = "elicit_evaluate_88888888888888888888888888888888"
+
+    async def _no_local_client(session_id, runner_router, **kwargs):
+        return None
+
+    monkeypatch.setattr(S, "_get_runner_client", _no_local_client)
+
+    persisted: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        session_live_state,
+        "persist_pending_count",
+        lambda conv_id, count: persisted.append((conv_id, count)),
+    )
+
+    router = _RaisingRouter(ErrorCode.NOT_FOUND)
+    await S._resolve_elicitation(sid, {"elicitation_id": eid, "action": "accept"}, router)
+
+    assert persisted == [], (
+        "a non-routing OmnigentError is not proof the runner is offline, so the "
+        f"reconcile must be skipped rather than clobber the count; got {persisted}"
     )
 
 

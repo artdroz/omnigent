@@ -2164,19 +2164,19 @@ async def _persist_model_change_note(
 async def _runner_confirmed_offline(session_id: str, runner_router: RunnerRouter | None) -> bool:
     """Whether the session's bound runner is confirmed gone, not merely elsewhere.
 
-    ``_get_runner_client`` returns ``None`` both for a genuinely offline runner
-    and for a ``WRONG_REPLICA`` miss, where the runner is live on another replica
-    that owns the authoritative pending count. The orphaned-count reconcile must
-    fire only in the former case: reconciling on a wrong-replica miss would zero
-    the durable count from an empty local index and clear the badge without the
-    answer ever reaching the runner.
+    The orphaned-count reconcile may fire only on positive proof the runner is
+    gone (``RUNNER_UNAVAILABLE``). Any other outcome leaves the authoritative
+    count untouched: a ``WRONG_REPLICA`` miss means the runner is live on another
+    replica that owns the count, and a ``NOT_FOUND``/``CONFLICT``/transient error
+    is inconclusive. Reconciling on those would zero the durable count from an
+    empty local index and clear the badge without the answer ever landing.
     """
     if runner_router is None:
         return await _get_runner_client(session_id, runner_router) is None
     try:
         runner_router.client_for_session_resources(session_id)
     except OmnigentError as exc:
-        return exc.code != ErrorCode.WRONG_REPLICA
+        return exc.code == ErrorCode.RUNNER_UNAVAILABLE
     except (LookupError, httpx.HTTPError):
         # A routing/transport failure is not proof the runner is gone; the
         # reconcile is best-effort, so never fail an already-resolved answer.
