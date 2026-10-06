@@ -82,9 +82,7 @@ async def post_supersession_notice(
         f"Continue in [the new chat](/c/{urllib.parse.quote(new_session_id, safe='')})."
     )
     if old_session_resumable:
-        # Claude keeps the old conversation's executor bound, so a message here
-        # resumes it; Codex and Antigravity hand the bridge to the replacement,
-        # so the old conversation can only continue in the new chat.
+        # Only Claude keeps the old executor bound, so only it can resume in place.
         notice += " You can also send a message here to resume this conversation."
     try:
         item_resp = await client.post(
