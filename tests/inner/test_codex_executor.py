@@ -3768,8 +3768,7 @@ def test_populate_codex_home_config_copies_remote_mcp_oauth_store_across_filesys
     assert not bridged.is_symlink()
     assert not os.path.samefile(bridged, source / ".credentials.json")
     assert stat.S_IMODE(bridged.stat().st_mode) == 0o600
-    fd = os.open(bridged, os.O_WRONLY | os.O_NOFOLLOW)
-    os.close(fd)
+    os.close(os.open(bridged, os.O_WRONLY | os.O_NOFOLLOW))
     assert bridged.read_text() == '{"linear|abc": {"access_token": "t"}}'
 
     # Codex refreshes the token in this session-local copy. Repopulating the
@@ -3896,6 +3895,110 @@ def test_populate_codex_home_config_migrates_legacy_credential_symlink(
     finally:
         os.close(fd)
     assert store.read_text() == refreshed
+
+
+@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="requires O_NOFOLLOW")
+def test_populate_codex_home_config_recovers_from_failed_fallback_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted fallback copy leaves no store, and a retry completes it.
+
+    The cross-filesystem fallback must not publish a truncated store: a later
+    populate would see the regular file and relink it (a no-op across
+    filesystems), stranding Codex on a corrupt ``.credentials.json`` forever.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    def _cross_device_link(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(os, "link", _cross_device_link)
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    store = source / ".credentials.json"
+    store.write_text('{"linear|abc": {"access_token": "t"}}')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    real_read_bytes = Path.read_bytes
+    fail_once = {"pending": True}
+
+    def _flaky_read_bytes(self: Path) -> bytes:
+        if self == store and fail_once["pending"]:
+            fail_once["pending"] = False
+            raise OSError(errno.EIO, "injected read failure")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _flaky_read_bytes)
+
+    with pytest.raises(OSError):
+        _populate_codex_home_config(target, source)
+
+    bridged = target / ".credentials.json"
+    assert not bridged.exists()
+    assert not (target / ".credentials.json.copy").exists()
+
+    _populate_codex_home_config(target, source)
+    assert bridged.is_file()
+    assert not bridged.is_symlink()
+    assert stat.S_IMODE(bridged.stat().st_mode) == 0o600
+    assert bridged.read_text() == '{"linear|abc": {"access_token": "t"}}'
+
+
+def test_populate_codex_home_config_removes_dangling_legacy_credential_symlink(
+    tmp_path: Path,
+) -> None:
+    """A dangling legacy symlink is removed even when there is no store to bridge.
+
+    After logging out of every remote MCP the source ``.credentials.json`` is
+    gone, but a reused home from the old scheme still holds its symlink. Left in
+    place, a fresh in-session OAuth login's ``O_NOFOLLOW`` create fails with
+    ELOOP, so population must drop the dangling symlink regardless of the source.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    missing = source / ".credentials.json"
+    target = tmp_path / "reused_codex_home"
+    target.mkdir()
+    legacy = target / ".credentials.json"
+    legacy.symlink_to(missing)
+    assert legacy.is_symlink()
+    assert not legacy.exists()
+
+    _populate_codex_home_config(target, source)
+
+    assert not legacy.is_symlink()
+    assert not legacy.exists()
+
+
+def test_private_codex_home_config_source_ignores_dangling_companion(
+    tmp_path: Path,
+) -> None:
+    """A dangling companion symlink is not mistaken for a source pointer.
+
+    If a reused private home's custom source was deleted, its ``mcp-oauth-locks``
+    symlink dangles and ``Path.resolve()`` would yield a nonexistent directory.
+    The resolver must ignore it and report no source so the caller falls back to
+    the default ``~/.codex`` home instead of a bogus path.
+    """
+    from omnigent.inner.codex_executor import (
+        _private_codex_home_config_source,
+        _resolve_codex_home_config_source,
+    )
+
+    private = tmp_path / ".omnigent" / "codex-native" / "abc123" / "codex-home"
+    private.mkdir(parents=True)
+    deleted_source = tmp_path / "custom-codex-home"
+    companion = private / "mcp-oauth-locks"
+    companion.symlink_to(deleted_source / "mcp-oauth-locks")
+    assert companion.is_symlink()
+    assert not companion.exists()
+
+    assert _private_codex_home_config_source(private) is None
+    default_home = tmp_path / "default-home" / ".codex"
+    assert _resolve_codex_home_config_source(private, default_home) == default_home
 
 
 def test_populate_codex_home_config_symlinks_memories(tmp_path: Path) -> None:

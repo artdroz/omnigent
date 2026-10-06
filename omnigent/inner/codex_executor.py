@@ -161,12 +161,9 @@ _WORKER_SPAWN_CLEANUP_TIMEOUT_SECONDS = 5.0
 _WORKER_LAUNCH_CLEANUP_TIMEOUT_SECONDS = 7.0
 _STDERR_CHUNK_LIMIT = 65536
 _STREAM_READ_CHUNK_SIZE = 65536
-# Files symlinked from the real CODEX_HOME into the per-session temp home.
-# Symlinks (not copies) so credential refreshes in the real home propagate
-# to running sessions without any action from Omnigent.
-# ``memories_1.sqlite`` is Codex's memories database; without it a private
-# home starts with no memories and past-conversation context is lost. The ``_1``
-# suffix is Codex's schema version — update if Codex migrates to a newer schema.
+# Symlinked (not copied) from the real CODEX_HOME so credential refreshes
+# propagate to running sessions. ``memories_1``'s ``_1`` suffix is Codex's
+# memories-schema version — update it if Codex migrates to a newer schema.
 _CODEX_HOME_SYMLINK_FILES = ("auth.json", "memories_1.sqlite")
 # Codex's OAuth store for remote (``url =``) MCP servers. Codex rewrites it
 # through an ``O_NOFOLLOW`` open that rejects symlinks with ELOOP, so it is
@@ -1011,12 +1008,14 @@ def _private_codex_home_config_source(path: Path) -> Path | None:
     source_dirs: set[Path] = set()
     for filename in _CODEX_HOME_SYMLINK_FILES:
         config_file = path / filename
-        if not config_file.is_symlink():
+        # A dangling symlink points at a deleted source and is not a usable
+        # pointer; ``exists()`` follows the link and is False when it dangles.
+        if not config_file.is_symlink() or not config_file.exists():
             continue
         with suppress(OSError):
             source_dirs.add(config_file.resolve().parent)
     companion = path / _CODEX_HOME_CREDENTIAL_COMPANION_DIR
-    if companion.is_symlink():
+    if companion.is_symlink() and companion.exists():
         with suppress(OSError):
             source_dirs.add(companion.resolve().parent)
     if len(source_dirs) == 1:
@@ -1094,11 +1093,19 @@ def _bridge_codex_credential_store(source_file: Path, dest_path: Path) -> None:
             dest_path.parent,
             exc,
         )
-        # Create the copy already restricted so the OAuth secrets are never
-        # briefly readable through the source's wider modes.
-        fd = os.open(dest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as dest:
-            dest.write(source_file.read_bytes())
+        # Stage the copy at 0600 and rename it in: the OAuth secrets are never
+        # readable through the source's wider modes, and a failed write never
+        # leaves a truncated store that a later populate would treat as valid.
+        staging = dest_path.with_name(f"{dest_path.name}.copy")
+        staging.unlink(missing_ok=True)
+        fd = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as dest:
+                dest.write(source_file.read_bytes())
+        except OSError:
+            staging.unlink(missing_ok=True)
+            raise
+        os.replace(staging, dest_path)
 
 
 def _relink_rotated_codex_credential_store(source_file: Path, dest_path: Path) -> None:
@@ -1111,6 +1118,10 @@ def _relink_rotated_codex_credential_store(source_file: Path, dest_path: Path) -
     orphaned by a delete-then-recreate login; relink it to the current store so
     the session stops serving revoked tokens. Linking succeeds only in that
     same-filesystem case, which is exactly when relinking is the right choice.
+
+    This repairs the link at population time; a session already running on an
+    orphaned link keeps it until restart, while in-place refreshes stay shared
+    through the inode.
 
     :param source_file: The real store, e.g. ``~/.codex/.credentials.json``.
     :param dest_path: Its existing regular-file path inside the private home.
@@ -1243,15 +1254,16 @@ def _populate_codex_home_config(
 
     if include_credentials:
         for filename in _CODEX_HOME_HARDLINK_FILES:
+            dest_path = target_dir / filename
+            if dest_path.is_symlink():
+                # The legacy scheme symlinked the store, and a reused home can
+                # still hold that symlink (even dangling after a logout); Codex's
+                # O_NOFOLLOW rewrite fails on it, so always drop it first.
+                dest_path.unlink()
             source_file = source_dir / filename
             if not source_file.is_file():
                 continue
-            dest_path = target_dir / filename
-            if dest_path.is_symlink():
-                # The legacy scheme symlinked the store; Codex's O_NOFOLLOW
-                # rewrite fails on a symlink, so migrate it to a regular file.
-                dest_path.unlink()
-            elif dest_path.exists():
+            if dest_path.exists():
                 _relink_rotated_codex_credential_store(source_file, dest_path)
                 continue
             _bridge_codex_credential_store(source_file, dest_path)
