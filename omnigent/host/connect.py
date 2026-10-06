@@ -4281,10 +4281,14 @@ class HostProcess:
             _RECONNECT_OPEN_TIMEOUT_S if self._ever_connected else _INITIAL_CONNECT_OPEN_TIMEOUT_S
         )
 
-        # In a sandbox whose only egress is a mandatory CONNECT proxy, the
-        # pinned websockets<15 client would dial the server directly and fail
-        # name resolution forever; honor the proxy env like the host's own
-        # HTTP calls by establishing the CONNECT tunnel ourselves.
+        # Build a verifying SSL context from a real CA bundle for wss:// — a bare
+        # default context loads zero roots on uv / python-build-standalone Pythons
+        # (no OpenSSL default cert path), which fails handshake verification.
+        # ``ssl=None`` for ws:// is the library default (no TLS).
+        ssl_ctx = client_ssl_context() if url.startswith("wss://") else None
+        # websockets<15 has no proxy support and dials direct, which fails forever
+        # behind a mandatory CONNECT proxy; establish the CONNECT tunnel ourselves,
+        # last before connect() so nothing in between can fail and leak it.
         proxy_url = ws_env_proxy_url(url)
         proxy_sock: socket.socket | None = None
         if proxy_url is None:
@@ -4292,11 +4296,6 @@ class HostProcess:
         else:
             _logger.info("Connecting to %s via CONNECT proxy %s", url, redact_proxy_url(proxy_url))
             proxy_sock = await open_proxy_connect_socket(proxy_url, url, timeout=open_timeout)
-        # Build a verifying SSL context from a real CA bundle for wss:// — a bare
-        # default context loads zero roots on uv / python-build-standalone Pythons
-        # (no OpenSSL default cert path), which fails handshake verification.
-        # ``ssl=None`` for ws:// is the library default (no TLS).
-        ssl_ctx = client_ssl_context() if url.startswith("wss://") else None
         try:
             ws_cm = websockets.asyncio.client.connect(
                 url,

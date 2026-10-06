@@ -8202,6 +8202,31 @@ async def test_connect_and_serve_proxy_socket(
             dial.assert_not_awaited()
 
 
+async def test_connect_and_serve_builds_ssl_context_before_dialing_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CA-bundle failure surfaces before any proxied socket is opened."""
+    import ssl
+
+    from omnigent.host import connect as connect_mod
+
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:3128")
+    host = HostProcess(
+        HostIdentity(host_id="host_test_connect", name="test-laptop"),
+        "https://server.sandbox.test:8443",
+    )
+    monkeypatch.setattr(host, "_build_connect_headers", dict)
+    monkeypatch.setattr(
+        connect_mod, "client_ssl_context", Mock(side_effect=ssl.SSLError("bad CA bundle"))
+    )
+    dial = AsyncMock()
+    monkeypatch.setattr(connect_mod, "open_proxy_connect_socket", dial)
+
+    with pytest.raises(ssl.SSLError, match="bad CA bundle"):
+        await host._connect_and_serve()
+    dial.assert_not_awaited()
+
+
 @pytest.mark.parametrize("action", ["attach", "remove"])
 async def test_github_pr_update_reports_lock_contention_on_host(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str

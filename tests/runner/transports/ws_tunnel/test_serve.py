@@ -2164,8 +2164,9 @@ async def test_serve_tunnel_proxy_socket(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["constructor", "enter"])
 async def test_serve_tunnel_closes_proxy_socket_when_connect_fails(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
     """A connect failure before the loop adopts the proxied socket must not leak it."""
     import websockets
@@ -2173,7 +2174,10 @@ async def test_serve_tunnel_closes_proxy_socket_when_connect_fails(
     monkeypatch.setenv("http_proxy", "http://127.0.0.1:3128")
     monkeypatch.setattr("omnigent.cli_auth.databricks_request_headers", lambda *_a, **_k: {})
     connect = Mock(return_value=AsyncMock())
-    connect.return_value.__aenter__.side_effect = ConnectionError("test rejection")
+    if failure == "constructor":
+        connect.side_effect = ConnectionError("test rejection")
+    else:
+        connect.return_value.__aenter__.side_effect = ConnectionError("test rejection")
     monkeypatch.setattr(websockets, "connect", connect)
 
     with socket.socket() as proxy_sock:

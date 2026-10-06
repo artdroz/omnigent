@@ -48,42 +48,47 @@ def _mandatory_proxy(server_port: int) -> Iterator[tuple[str, list[tuple[str, st
         def handle(self) -> None:
             client = self.request
             client.settimeout(5)
-            with contextlib.suppress(OSError):
-                head = b""
-                while b"\r\n\r\n" not in head:
-                    chunk = client.recv(65536)
-                    if not chunk or len(head) + len(chunk) > 65536:
-                        return
-                    head += chunk
-                raw_head, _, buffered = head.partition(b"\r\n\r\n")
-                lines = raw_head.decode("latin-1").split("\r\n")
-                method, target, version = lines[0].split(" ")
-                parts = urlsplit(f"//{target}" if method == "CONNECT" else target)
-                if parts.hostname != _SERVER_HOST or parts.port != server_port:
-                    client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = client.recv(65536)
+                if not chunk or len(head) + len(chunk) > 65536:
                     return
-                requests.append((method, target))
-                with socket.create_connection(("127.0.0.1", server_port), timeout=5) as upstream:
-                    if method == "CONNECT":
-                        client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                    else:
-                        path = parts.path or "/"
-                        if parts.query:
-                            path += f"?{parts.query}"
-                        headers = [
-                            line
-                            for line in lines[1:]
-                            if line.split(":", 1)[0].lower()
-                            not in {
-                                "connection",
-                                "proxy-connection",
-                                "proxy-authorization",
-                                "keep-alive",
-                            }
-                        ]
-                        forwarded = [f"{method} {path} {version}", *headers, "Connection: close"]
-                        upstream.sendall("\r\n".join(forwarded).encode("latin-1") + b"\r\n\r\n")
-                    upstream.sendall(buffered)
+                head += chunk
+            raw_head, _, buffered = head.partition(b"\r\n\r\n")
+            lines = raw_head.decode("latin-1").split("\r\n")
+            request_line = lines[0].split(" ", 2)
+            if len(request_line) != 3:
+                return
+            method, target, version = request_line
+            parts = urlsplit(f"//{target}" if method == "CONNECT" else target)
+            if parts.hostname != _SERVER_HOST or parts.port != server_port:
+                client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                return
+            requests.append((method, target))
+            with socket.create_connection(("127.0.0.1", server_port), timeout=5) as upstream:
+                if method == "CONNECT":
+                    client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                else:
+                    path = parts.path or "/"
+                    if parts.query:
+                        path += f"?{parts.query}"
+                    headers = [
+                        line
+                        for line in lines[1:]
+                        if line.split(":", 1)[0].lower()
+                        not in {
+                            "connection",
+                            "proxy-connection",
+                            "proxy-authorization",
+                            "keep-alive",
+                        }
+                    ]
+                    forwarded = [f"{method} {path} {version}", *headers, "Connection: close"]
+                    upstream.sendall("\r\n".join(forwarded).encode("latin-1") + b"\r\n\r\n")
+                upstream.sendall(buffered)
+                # Either peer dropping the connection simply ends this relay;
+                # setup failures above still surface through socketserver.
+                with contextlib.suppress(OSError):
                     while not stopped.is_set():
                         for source in select.select([client, upstream], [], [], 0.2)[0]:
                             data = source.recv(65536)

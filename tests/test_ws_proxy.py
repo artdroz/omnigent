@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import datetime
 import ssl
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -78,6 +80,8 @@ def test_proxy_selection(url, env, expected):
         ("10.1.2.3:8000", "localhost,10.1.2.3,fd00::1", True),
         ("[fd00::1]:8000", "localhost,10.1.2.3,fd00::1", True),
         ("[fd00::1]:8000", "[fd00::1]:8000", True),
+        ("[fd00:0:0:0:0:0:0:1]:8000", "fd00::1", True),
+        ("evil.10.1.2.3:8000", "10.1.2.3", False),
         ("server.sandbox.test:8000", "localhost,10.1.2.3,fd00::1", False),
     ],
 )
@@ -141,6 +145,8 @@ async def test_connect_tunnel(userinfo):
     ("reply", "error"),
     [
         (b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n", "refused CONNECT"),
+        (b"GARBAGE 200 OK\r\n\r\n", "non-HTTP response"),
+        (b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 65607 + b"\r\n\r\n", "oversized"),
         (_OK + b"GARBAGE", "unexpected bytes"),
         (b"", "closed the connection"),
     ],
@@ -149,6 +155,33 @@ async def test_connect_error(reply, error):
     async with _connect_proxy(reply) as (port, _requests):
         with pytest.raises(OSError, match=error):
             await open_proxy_connect_socket(f"http://127.0.0.1:{port}", _TUNNEL_URL, timeout=5)
+
+
+async def test_connect_rejects_malformed_proxy_port():
+    with pytest.raises(OSError, match="invalid port"):
+        await open_proxy_connect_socket("http://127.0.0.1:bad", _TUNNEL_URL, timeout=5)
+
+
+async def test_connect_timeout_bounds_the_whole_handshake():
+    """A proxy that drips its CONNECT reply cannot stretch past the total budget."""
+
+    async def drip(reader, writer):
+        with contextlib.suppress(OSError, asyncio.IncompleteReadError):
+            await reader.readuntil(b"\r\n\r\n")
+            for byte in _OK:
+                if reader.at_eof():
+                    break
+                writer.write(bytes([byte]))
+                await writer.drain()
+                await asyncio.sleep(0.1)
+        writer.close()
+
+    async with await asyncio.start_server(drip, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            await open_proxy_connect_socket(f"http://127.0.0.1:{port}", _TUNNEL_URL, timeout=0.5)
+        assert time.monotonic() - started < 2
 
 
 def _self_signed_cert(directory: Path, hostname: str) -> Path:

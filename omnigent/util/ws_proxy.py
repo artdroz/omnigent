@@ -22,9 +22,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import ipaddress
 import logging
 import os
 import socket
+import time
 from collections.abc import Mapping
 from urllib.parse import unquote, urlsplit
 
@@ -71,7 +73,8 @@ def _bypassed_by_no_proxy(host: str, port: int, no_proxy: str) -> bool:
 
     Standard comma-separated entries: ``*`` disables proxying entirely; a
     plain name matches itself and its subdomains (a leading dot is
-    equivalent); a ``host:port`` entry additionally requires the port.
+    equivalent); an IP literal matches that address exactly, as in httpx;
+    a ``host:port`` entry additionally requires the port.
 
     :param host: Target hostname (no brackets), lowercase or not.
     :param port: Target port.
@@ -105,9 +108,26 @@ def _bypassed_by_no_proxy(host: str, port: int, no_proxy: str) -> bool:
             continue
         if entry_port is not None and entry_port != port:
             continue
+        entry_ip = _ip_literal(entry_host)
+        if entry_ip is not None:
+            if entry_ip == _ip_literal(host):
+                return True
+            continue
         if host == entry_host or host.endswith("." + entry_host):
             return True
     return False
+
+
+def _ip_literal(text: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Parse *text* as an IP address, or return None for a hostname.
+
+    :param text: Candidate address or hostname.
+    :returns: The parsed address, or None.
+    """
+    try:
+        return ipaddress.ip_address(text)
+    except ValueError:
+        return None
 
 
 def ws_env_proxy_url(ws_url: str, environ: Mapping[str, str] | None = None) -> str | None:
@@ -188,10 +208,11 @@ async def open_proxy_connect_socket(
 
     :param proxy_url: HTTP proxy URL from :func:`ws_env_proxy_url`.
     :param ws_url: Tunnel URL whose origin the proxy should reach.
-    :param timeout: Per-operation socket timeout for the dial + handshake.
+    :param timeout: Overall budget, in seconds, for the dial and CONNECT handshake.
     :returns: The connected socket, ready for ``websockets``' ``sock=``.
-    :raises OSError: When the proxy is unreachable, refuses the CONNECT,
-        or answers with something other than HTTP.
+    :raises OSError: When either URL is unusable, the proxy is unreachable,
+        refuses the CONNECT, answers with something other than HTTP, or
+        exhausts the budget.
     """
     proxy = urlsplit(proxy_url)
     target = urlsplit(ws_url)
@@ -199,7 +220,14 @@ async def open_proxy_connect_socket(
         raise OSError(f"proxy URL has no host: {redact_proxy_url(proxy_url)!r}")
     if not target.hostname:
         raise OSError(f"tunnel URL has no host: {ws_url!r}")
-    target_port = target.port or _DEFAULT_PORT_BY_WS_SCHEME.get((target.scheme or "").lower(), 80)
+    try:
+        proxy_port = proxy.port or 80
+        target_port = target.port or _DEFAULT_PORT_BY_WS_SCHEME.get(
+            (target.scheme or "").lower(), 80
+        )
+    except ValueError as exc:
+        # urlsplit only rejects a non-numeric port when it is read.
+        raise OSError(f"invalid port in proxy or tunnel URL: {exc}") from exc
     auth_header: str | None = None
     if proxy.username is not None:
         credentials = f"{unquote(proxy.username)}:{unquote(proxy.password or '')}"
@@ -207,7 +235,7 @@ async def open_proxy_connect_socket(
     return await asyncio.to_thread(
         _connect_sync,
         proxy.hostname,
-        proxy.port or 80,
+        proxy_port,
         target.hostname,
         target_port,
         auth_header,
@@ -230,12 +258,14 @@ def _connect_sync(
     :param target_host: Origin hostname the proxy must reach.
     :param target_port: Origin port.
     :param auth_header: Optional ``Proxy-Authorization`` value.
-    :param timeout: Socket timeout for the dial and each handshake read.
+    :param timeout: Overall budget, in seconds, for the dial and handshake.
     :returns: The connected socket with its timeout cleared.
-    :raises OSError: On dial failure or a refused/garbled CONNECT.
+    :raises OSError: On dial failure, a refused/garbled CONNECT, or an
+        exhausted budget.
     """
     authority = f"[{target_host}]" if ":" in target_host else target_host
     authority = f"{authority}:{target_port}"
+    deadline = time.monotonic() + timeout
     sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
     try:
         request_lines = [f"CONNECT {authority} HTTP/1.1", f"Host: {authority}"]
@@ -244,18 +274,28 @@ def _connect_sync(
         sock.sendall(("\r\n".join(request_lines) + "\r\n\r\n").encode("latin-1"))
         response = b""
         while b"\r\n\r\n" not in response:
-            if len(response) > _MAX_CONNECT_RESPONSE_BYTES:
-                raise OSError(f"proxy sent an oversized response to CONNECT {authority}")
+            # One budget for the whole handshake, so a proxy that drips bytes
+            # cannot stretch it across many per-read timeouts.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"proxy did not complete CONNECT to {authority} within {timeout:g}s"
+                )
+            sock.settimeout(remaining)
             chunk = sock.recv(4096)
             if not chunk:
                 raise OSError(f"proxy closed the connection during CONNECT to {authority}")
             response += chunk
+            if len(response) > _MAX_CONNECT_RESPONSE_BYTES:
+                raise OSError(f"proxy sent an oversized response to CONNECT {authority}")
         head, _, residue = response.partition(b"\r\n\r\n")
         status_line = head.split(b"\r\n", 1)[0].decode("latin-1", "replace")
         status_parts = status_line.split(" ", 2)
-        status_code = (
-            int(status_parts[1]) if len(status_parts) >= 2 and status_parts[1].isdigit() else 0
-        )
+        if len(status_parts) < 2 or not status_parts[0].startswith("HTTP/"):
+            raise OSError(
+                f"proxy sent a non-HTTP response to CONNECT {authority}: {status_line!r}"
+            )
+        status_code = int(status_parts[1]) if status_parts[1].isdigit() else 0
         if not 200 <= status_code < 300:
             raise OSError(f"proxy refused CONNECT to {authority}: {status_line!r}")
         if residue:

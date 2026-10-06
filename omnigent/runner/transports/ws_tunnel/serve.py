@@ -944,10 +944,9 @@ async def _serve_tunnel_once(
         if shutdown_event is not None
         else _RUNNER_TUNNEL_CLOSE_TIMEOUT_S
     )
-    # In a sandbox whose only egress is a mandatory CONNECT proxy, the pinned
-    # websockets<15 client would dial the server directly and fail name
-    # resolution forever; honor the proxy env by establishing the CONNECT
-    # tunnel ourselves. Symmetric with the host tunnel (host/connect.py).
+    # websockets<15 has no proxy support and dials direct, which fails forever
+    # behind a mandatory CONNECT proxy; establish the CONNECT tunnel ourselves,
+    # symmetric with the host tunnel (host/connect.py).
     proxy_url = ws_env_proxy_url(tunnel_url)
     proxy_sock: socket.socket | None = None
     if proxy_url is not None:
@@ -960,27 +959,30 @@ async def _serve_tunnel_once(
             proxy_url, tunnel_url, timeout=_PROXY_CONNECT_TIMEOUT_S
         )
     connection_id = connection_id or uuid.uuid4().hex
-    connect_cm = websockets.connect(
-        tunnel_url,
-        additional_headers=headers,
-        close_timeout=close_timeout,
-        max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
-        ssl=ssl_ctx,
-        # Pre-connected through the mandatory egress proxy (None dials
-        # direct); TLS for wss:// is layered on top by connect().
-        sock=proxy_sock,
-        # Protocol keepalive aligned to the server's 90 s app-level budget (not the
-        # 20 s library default that drops a busy-but-healthy tunnel — issue #1116).
-        # Also the runner's only liveness probe for a silently-dead server.
-        ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
-        ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
-    )
     async with contextlib.AsyncExitStack() as stack:
         try:
-            ws = await stack.enter_async_context(connect_cm)
+            ws = await stack.enter_async_context(
+                websockets.connect(
+                    tunnel_url,
+                    additional_headers=headers,
+                    close_timeout=close_timeout,
+                    max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+                    ssl=ssl_ctx,
+                    # Pre-connected through the mandatory egress proxy (None dials
+                    # direct); TLS for wss:// is layered on top by connect().
+                    sock=proxy_sock,
+                    # Protocol keepalive aligned to the server's 90 s app-level budget
+                    # (not the 20 s library default that drops a busy-but-healthy tunnel,
+                    # issue #1116). Also the runner's only liveness probe for a
+                    # silently-dead server.
+                    ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+                    ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+                )
+            )
         except BaseException:
             # The event loop owns the proxied socket once create_connection is
-            # reached; close it for failures before that hand-off.
+            # reached; close it for failures before that hand-off (including
+            # websockets versions that parse the URI in the constructor).
             if proxy_sock is not None:
                 with contextlib.suppress(OSError):
                     proxy_sock.close()
