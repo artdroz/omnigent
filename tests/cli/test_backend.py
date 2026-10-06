@@ -952,8 +952,7 @@ def test_registration_wait_names_server_while_waiting(
         monkeypatch, cli._HostHttpResult(status_code=200, body={"status": "offline"})
     )
 
-    with pytest.raises(click.ClickException):
-        cli._confirm_background_host_registered(_server_record())
+    assert cli._confirm_background_host_registered(_server_record()) is False
 
     captured = capsys.readouterr()
     assert "Waiting for the host daemon to register with http://127.0.0.1:59999" in captured.err
@@ -970,7 +969,7 @@ def test_registration_wait_prints_nothing_when_immediately_online(
         monkeypatch, cli._HostHttpResult(status_code=200, body={"status": "online"})
     )
 
-    cli._confirm_background_host_registered(_server_record())
+    assert cli._confirm_background_host_registered(_server_record()) is True
 
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -1050,18 +1049,15 @@ def test_registration_target_display_preserves_ipv6_brackets() -> None:
     assert cli._registration_target_display(record) == "http://[::1]:59999"
 
 
-def test_registration_timeout_keeps_hint_when_server_answered_then_dropped(
+def test_registration_wait_stays_pending_when_server_answered_then_dropped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A server that answered once and then became unreachable keeps the hint.
+    """A server that answered once and then became unreachable is not "unreachable".
 
     ``server_responded`` must stick across later transport failures: a
-    server that ever answered can genuinely have a stale host process, so
-    the generic registration timeout — with its recovery hint — applies,
-    not the unreachable-server wording.
+    server that ever answered is running, so the wait ends as a pending
+    registration rather than the unreachable-server error.
     """
-    from omnigent.cli_diagnostics import suppresses_recovery_hint
-
     responses = iter([cli._HostHttpResult(status_code=200, body={"status": "offline"})])
     refused = cli._HostHttpResult(
         status_code=0,
@@ -1074,35 +1070,38 @@ def test_registration_timeout_keeps_hint_when_server_answered_then_dropped(
         cli, "_daemon_host_status_probe", lambda record, **_kw: next(responses, refused)
     )
 
-    with pytest.raises(click.ClickException) as excinfo:
-        cli._confirm_background_host_registered(_server_record())
-
-    message = str(excinfo.value)
-    assert "did not register with the server at http://127.0.0.1:59999" in message
-    assert suppresses_recovery_hint(excinfo.value) is False
+    assert cli._confirm_background_host_registered(_server_record()) is False
 
 
-def test_registration_timeout_keeps_stale_host_hint_when_server_answers(
+def test_registration_wait_reports_pending_when_server_answers_but_host_is_offline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A reachable server that never reports the host online keeps the hint.
+    """A reachable server that has not reported the host online yet is pending.
 
-    Here a stale host process really can be the cause (e.g. a rejected
-    tunnel), so the generic timeout still names the server but the
-    recovery hint stays.
+    The daemon is alive and the server answers, so registration may still
+    complete; the wait must end without an error that would tear the
+    daemon down.
     """
-    from omnigent.cli_diagnostics import suppresses_recovery_hint
-
     _patch_registration_wait(
         monkeypatch, cli._HostHttpResult(status_code=200, body={"status": "offline"})
     )
 
+    assert cli._confirm_background_host_registered(_server_record()) is False
+
+
+def test_registration_wait_fails_when_daemon_exits_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A daemon that dies before registering is an error, not a pending wait."""
+    _patch_registration_wait(
+        monkeypatch, cli._HostHttpResult(status_code=200, body={"status": "offline"})
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: False)
+
     with pytest.raises(click.ClickException) as excinfo:
         cli._confirm_background_host_registered(_server_record())
 
-    message = str(excinfo.value)
-    assert "did not register with the server at http://127.0.0.1:59999" in message
-    assert suppresses_recovery_hint(excinfo.value) is False
+    assert "exited before registering with the server" in str(excinfo.value)
 
 
 # Every proxy variable httpx consults, so the cases below see exactly the

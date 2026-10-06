@@ -885,16 +885,19 @@ def test_host_background_spawns_detached_daemon(
     assert "server: http://127.0.0.1:6767" in result.output
 
 
-def test_host_background_fails_when_daemon_never_registers(
+def test_host_background_leaves_unregistered_daemon_running(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A live PID without a registered channel must not be reported as started."""
+    """A daemon still connecting when the grace ends is reported, not torn down.
+
+    Killing it would turn a slow registration into a permanent failure: the
+    host never comes online and ``stop`` finds nothing left to stop.
+    """
     _spawned, log_path = _patch_background_host_spawn(monkeypatch, tmp_path)
-    log_path.write_text("Host registration failed: database unavailable\n")
     monkeypatch.setattr("omnigent.cli._daemon_host_online", lambda record, **kwargs: False)
-    # The server answers (host row offline), so the failure is the generic
-    # registration timeout rather than the unreachable-server error.
+    # The server answers (host row offline): registration is pending, not
+    # the unreachable-server failure.
     monkeypatch.setattr(
         "omnigent.cli._daemon_host_status_probe",
         lambda record, **kwargs: cli_module._HostHttpResult(
@@ -916,10 +919,53 @@ def test_host_background_fails_when_daemon_never_registers(
         ["host", "--background", "--server", "https://example.databricksapps.com"],
     )
 
+    assert result.exit_code == 0, result.output
+    assert "still connecting (pid 4242)" in result.output
+    assert "keeps retrying in the background" in result.output
+    assert "Started the host daemon" not in result.output
+    assert "omnigent host status" in result.output
+    assert log_path.name in result.output
+    assert terminated == []
+
+
+def test_host_background_tears_down_daemon_that_exits_before_registering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A daemon that dies during the registration wait fails loud, with its log."""
+    _spawned, log_path = _patch_background_host_spawn(monkeypatch, tmp_path)
+    log_path.write_text("Host registration failed: database unavailable\n")
+    monkeypatch.setattr("omnigent.cli._daemon_host_online", lambda record, **kwargs: False)
+    probed = False
+
+    def _probe(record: object, **kwargs: object) -> cli_module._HostHttpResult:
+        nonlocal probed
+        probed = True
+        return cli_module._HostHttpResult(status_code=200, body={"status": "offline"})
+
+    monkeypatch.setattr("omnigent.cli._daemon_host_status_probe", _probe)
+    # Alive through the spawn and first probe, gone on the next liveness check.
+    monkeypatch.setattr("omnigent.cli._pid_alive", lambda checked: checked == 4242 and not probed)
+    monkeypatch.setattr("omnigent.cli._BACKGROUND_HOST_REGISTRATION_GRACE_S", 5.0)
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_databricks_server_auth", lambda *args, **kwargs: None
+    )
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        "omnigent.cli._terminate_daemon",
+        lambda record, *, force: terminated.append(record.pid),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["host", "--background", "--server", "https://example.databricksapps.com"],
+    )
+
     assert result.exit_code != 0
-    assert "did not register with the server" in result.output
+    assert "exited before registering with the server" in result.output
     assert "database unavailable" in result.output
     assert "Started the host daemon" not in result.output
+    assert "still connecting" not in result.output
     assert terminated == [4242]
 
 
