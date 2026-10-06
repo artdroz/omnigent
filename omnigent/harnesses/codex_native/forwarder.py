@@ -5037,9 +5037,8 @@ def _claim_completed_item(
     if forwarder_state is None:
         return _source_id(params, item)
     item_key, is_anon = _completed_item_key(params, item, forwarder_state)
-    # Positional anonymous keys are intentionally legacy: they are claimed
-    # immediately and their counter advances before delivery, as before. Only
-    # stable native ids can safely be reserved for replay.
+    # Anonymous positional keys advance a shared counter on claim, so releasing
+    # one would reassign its slot; only stable native ids are safe to reserve.
     if defer_commit and not is_anon:
         if not forwarder_state.reserve_item_key(item_key):
             return None
@@ -5183,7 +5182,14 @@ async def _handle_completed_item_inner(
         "plan",
         *_REVIEW_MODE_ITEM_TYPES,
     }
-    replayable_item = message_item and _completed_item_has_stable_id(item)
+    # Only a stable-id item that actually posts content is reserved for replay.
+    # An empty item posts nothing, so releasing it would re-fetch it every
+    # replay; keep its eager claim instead.
+    replayable_item = (
+        message_item
+        and _completed_item_has_stable_id(item)
+        and _completed_message_has_content(item_type, item)
+    )
     source_id = _claim_completed_item(
         params,
         item,
@@ -5209,23 +5215,10 @@ async def _handle_completed_item_inner(
     if item_type == "agentMessage":
 
         async def _deliver_agent_message() -> bool:
-            # User-before-assistant ordering guarantee. On a fresh thread the
-            # forwarder subscribes via ``thread/resume`` only after the first
-            # turn starts, so the early ``userMessage`` event can stream past
-            # before the subscription lands — it is then recovered only via a
-            # later resume backfill, which can post it AFTER this reply. Since
-            # Omnigent assigns each mirrored item a position by POST arrival order
-            # and the web UI renders strictly by position, that inverts the
-            # bubbles. Recover and post the turn's user message first so it
-            # always takes the earlier position.
-            user_ready = await _ensure_user_message_posted(
-                client, session_id, params, forwarder_state
-            )
-            if user_ready is False and replayable_item:
-                # The user item is still in flight elsewhere. Skip this
-                # stable-id reply for now; releasing its reservation lets the
-                # delivery that follows the user bubble post it in order.
-                return False
+            # Omnigent positions items by POST arrival order, so recover and
+            # post the turn's user message before this reply to keep
+            # user-before-assistant order on a fresh thread's resume backfill.
+            await _ensure_user_message_posted(client, session_id, params, forwarder_state)
             return await _post_agent_message(client, session_id, params, item, source_id=source_id)
 
         await _deliver_claimed_message(
@@ -6095,9 +6088,9 @@ async def _ensure_user_message_posted(
     session_id: str,
     params: _JsonObject,
     forwarder_state: _CodexForwarderState | None,
-) -> bool | None:
+) -> None:
     """
-    Guarantee a turn's user message is posted before its assistant reply.
+    Post a turn's user message before its assistant reply when possible.
 
     The forwarder's live stream normally delivers ``userMessage`` before
     ``agentMessage`` for a turn, so this is a no-op. But on a fresh thread
@@ -6107,6 +6100,11 @@ async def _ensure_user_message_posted(
     reply. The recovered item carries Codex's resume id (e.g. ``item-1``),
     matching the id the resume backfill would later use — so the dedup
     gate drops the backfill's duplicate.
+
+    Best effort: when recovery is unavailable or the recovered POST is not
+    accepted, the caller still delivers the reply. A rejected stable-id user
+    item is released so a later backfill can retry it, and the reservation is
+    never held across the delivery lock the recovering POST needs.
 
     No-op when ``forwarder_state`` is absent (tests bypassing
     ``supervise_forwarder``), when no Codex client is wired, or when the
@@ -6118,21 +6116,17 @@ async def _ensure_user_message_posted(
         message whose turn's user message must already be posted.
     :param forwarder_state: Mutable forwarder state tracking posted user
         turns and holding the Codex app-server client.
-    :returns: ``True`` when the user item is already or newly posted,
-        ``False`` when its stable-id key is still reserved by another
-        in-flight POST (the caller should defer the reply), or ``None``
-        when no recoverable user item was found or the recovered POST was
-        rejected.
+    :returns: None.
     """
     if forwarder_state is None:
-        return None
+        return
     turn_id = _turn_id_from_payload(params)
     if not turn_id or forwarder_state.has_posted_user_message(turn_id):
-        return True if turn_id else None
+        return
     codex_client = forwarder_state.codex_client
     thread_id = _thread_id_from_params(params)
     if codex_client is None or thread_id is None:
-        return None
+        return
     try:
         response = await codex_client.request("thread/resume", {"threadId": thread_id})
     except asyncio.CancelledError:
@@ -6144,16 +6138,18 @@ async def _ensure_user_message_posted(
             turn_id,
             exc_info=True,
         )
-        return None
+        return
     user_item = _find_turn_user_message(response, turn_id)
     if user_item is None:
-        return None
+        return
     recovered_params: _JsonObject = {
         "threadId": thread_id,
         "turnId": turn_id,
         "item": user_item,
     }
-    replayable_user = _completed_item_has_stable_id(user_item)
+    replayable_user = _completed_item_has_stable_id(user_item) and _completed_message_has_content(
+        "userMessage", user_item
+    )
     source_id = _claim_completed_item(
         recovered_params,
         user_item,
@@ -6161,31 +6157,21 @@ async def _ensure_user_message_posted(
         defer_commit=replayable_user,
     )
     if source_id is None:
-        pending_key, _ = _completed_item_key(recovered_params, user_item, forwarder_state)
-        if replayable_user and pending_key in forwarder_state.pending_item_claims:
-            return False
-        return True if forwarder_state.has_posted_user_message(turn_id) else None
-    try:
-        posted = await _post_user_message(
+        return
+    posted = await _deliver_claimed_message(
+        forwarder_state,
+        source_id,
+        replayable=replayable_user,
+        deliver=lambda: _post_user_message(
             client,
             session_id,
             recovered_params,
             user_item,
             source_id=source_id,
-        )
-    except BaseException:
-        forwarder_state.release_item_key(source_id)
-        raise
+        ),
+    )
     if posted:
-        if replayable_user:
-            forwarder_state.commit_item_key(source_id)
         forwarder_state.note_user_message_posted(turn_id)
-        return True
-    if replayable_user:
-        forwarder_state.release_item_key(source_id)
-    # Let the assistant output through: a rejected stable-id user item stays
-    # replayable by the next backfill, an anonymous one has no replay identity.
-    return None
 
 
 def _find_turn_user_message(response: CodexMessage, turn_id: str) -> _JsonObject | None:
@@ -8444,3 +8430,13 @@ def _completed_item_has_stable_id(item: _JsonObject) -> bool:
     """Whether a completed item carries a replay-safe native id."""
     item_id = item.get("id")
     return isinstance(item_id, str) and bool(item_id)
+
+
+def _completed_message_has_content(item_type: str | None, item: _JsonObject) -> bool:
+    """Whether a completed message item would post any transcript content."""
+    if item_type == "userMessage":
+        return bool(_user_message_text(item)) or _user_message_has_file_content(item)
+    if item_type in {"agentMessage", "plan"}:
+        text = item.get("text")
+        return isinstance(text, str) and bool(text)
+    return item_type in _REVIEW_MODE_ITEM_TYPES

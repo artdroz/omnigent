@@ -18,7 +18,9 @@ class _ScriptedEventClient(httpx.AsyncClient):
     """Return scripted event responses while recording accepted POST attempts."""
 
     def __init__(self, statuses: list[int]) -> None:
-        super().__init__()
+        # MockTransport opens no connection pool: every POST is served from the
+        # overridden ``post`` below, so no real transport is created or leaked.
+        super().__init__(transport=httpx.MockTransport(lambda request: httpx.Response(204)))
         self.statuses = list(statuses)
         self.posts: list[dict[str, Any]] = []
         self.accepted_posts: list[dict[str, Any]] = []
@@ -32,6 +34,7 @@ class _ScriptedEventClient(httpx.AsyncClient):
     ) -> httpx.Response:
         del timeout
         self.posts.append(json)
+        assert self.statuses, "scripted client ran out of statuses"
         status = self.statuses.pop(0)
         if status < 400:
             self.accepted_posts.append(json)
@@ -192,9 +195,8 @@ async def test_recovered_user_claim_is_retried_by_resume_backfill() -> None:
     await fwd._handle_completed_item_inner(
         client, "conv_x", assistant_params, forwarder_state=state
     )
-    # A permanent rejection must not hide the valid assistant output forever.
-    # The later resume replay still retries the user item because its stable
-    # claim was released.
+    # A permanent rejection must not hide valid assistant output: the later
+    # resume replay retries the user item because its stable claim was released.
     await fwd._handle_completed_item_inner(client, "conv_x", _user_params(), forwarder_state=state)
     await fwd._handle_completed_item_inner(
         client, "conv_x", assistant_params, forwarder_state=state
@@ -325,9 +327,69 @@ async def test_rejected_assistant_side_claim_is_retried_on_replay(item: dict[str
 
 
 @pytest.mark.asyncio
-async def test_assistant_defers_while_recovered_user_post_is_in_flight() -> None:
-    """A stable-id reply waits for the user bubble whose POST another task still owns."""
+@pytest.mark.parametrize(
+    "item,expected_source_id",
+    [
+        (
+            {"type": "agentMessage", "id": "assistant_1", "text": "reply"},
+            "thread_1:turn_1:assistant_1",
+        ),
+        ({"type": "agentMessage", "text": "reply"}, "thread_1:turn_1:anon-0"),
+    ],
+    ids=["stable", "anonymous"],
+)
+async def test_assistant_is_posted_even_while_recovered_user_claim_is_held(
+    item: dict[str, Any], expected_source_id: str
+) -> None:
+    """
+    A reply is delivered even when another task still owns the user claim.
+
+    Recovery finds the user's stable key reserved elsewhere and leaves it for
+    that delivery to settle. The reply must still post: dropping it behind a
+    claim this task cannot settle would lose the assistant message, since
+    replay runs once per connection and nothing re-delivers it.
+    """
     client = _ScriptedEventClient([202])
+    state = fwd._CodexForwarderState(
+        codex_client=_ResumeClient(),  # type: ignore[arg-type]
+    )
+    assistant_params: dict[str, Any] = {
+        "threadId": "thread_1",
+        "turnId": "turn_1",
+        "item": item,
+    }
+    assert state.reserve_item_key("thread_1:turn_1:user_1")
+
+    await fwd._handle_completed_item_inner(
+        client, "conv_x", assistant_params, forwarder_state=state
+    )
+
+    assert [post["data"]["source_id"] for post in client.accepted_posts] == [expected_source_id]
+    # The other delivery still owns the user reservation; recovery left it alone.
+    assert state.pending_item_claims == {"thread_1:turn_1:user_1"}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_recovery_user_post_releases_claim() -> None:
+    """Cancelling the recovered user POST releases its claim for a later backfill."""
+    entered = asyncio.Event()
+    pending = asyncio.get_running_loop().create_future()
+
+    class _BlockingClient(_ScriptedEventClient):
+        async def post(
+            self,
+            url: str,
+            *,
+            json: dict[str, Any],
+            timeout: float | None = None,
+        ) -> httpx.Response:
+            self.posts.append(json)
+            if len(self.posts) == 1:
+                entered.set()
+                await pending
+            return httpx.Response(202, request=httpx.Request("POST", url), json={})
+
+    client = _BlockingClient([])
     state = fwd._CodexForwarderState(
         codex_client=_ResumeClient(),  # type: ignore[arg-type]
     )
@@ -336,48 +398,23 @@ async def test_assistant_defers_while_recovered_user_post_is_in_flight() -> None
         "turnId": "turn_1",
         "item": {"type": "agentMessage", "id": "assistant_1", "text": "reply"},
     }
-    assert state.reserve_item_key("thread_1:turn_1:user_1")
-
-    await fwd._handle_completed_item_inner(
-        client, "conv_x", assistant_params, forwarder_state=state
+    task = asyncio.create_task(
+        fwd._handle_completed_item_inner(client, "conv_x", assistant_params, forwarder_state=state)
     )
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
-    assert client.posts == []
-    assert state.pending_item_claims == {"thread_1:turn_1:user_1"}
+    assert state.pending_item_claims == set()
     assert state.synced_item_keys == set()
+    assert not state.has_posted_user_message("turn_1")
 
-    state.commit_item_key("thread_1:turn_1:user_1")
-    state.note_user_message_posted("turn_1")
+    healthy = _ScriptedEventClient([202, 202])
     await fwd._handle_completed_item_inner(
-        client, "conv_x", assistant_params, forwarder_state=state
+        healthy, "conv_x", assistant_params, forwarder_state=state
     )
-
-    assert [post["data"]["source_id"] for post in client.accepted_posts] == [
-        "thread_1:turn_1:assistant_1"
+    assert [post["data"]["item_data"]["role"] for post in healthy.accepted_posts] == [
+        "user",
+        "assistant",
     ]
-    assert state.synced_item_keys == {"thread_1:turn_1:user_1", "thread_1:turn_1:assistant_1"}
-
-
-@pytest.mark.asyncio
-async def test_anonymous_assistant_posts_while_recovered_user_post_is_in_flight() -> None:
-    """An anonymous reply has no replay identity, so it is posted rather than dropped."""
-    client = _ScriptedEventClient([202])
-    state = fwd._CodexForwarderState(
-        codex_client=_ResumeClient(),  # type: ignore[arg-type]
-    )
-    assistant_params: dict[str, Any] = {
-        "threadId": "thread_1",
-        "turnId": "turn_1",
-        "item": {"type": "agentMessage", "text": "reply"},
-    }
-    assert state.reserve_item_key("thread_1:turn_1:user_1")
-
-    await fwd._handle_completed_item_inner(
-        client, "conv_x", assistant_params, forwarder_state=state
-    )
-
-    assert [post["data"]["source_id"] for post in client.accepted_posts] == [
-        "thread_1:turn_1:anon-0"
-    ]
-    assert state.synced_item_keys == {"thread_1:turn_1:anon-0"}
-    assert state.pending_item_claims == {"thread_1:turn_1:user_1"}
