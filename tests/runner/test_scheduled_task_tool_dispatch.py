@@ -17,12 +17,15 @@ import json
 
 import pytest
 
+from omnigent.runner import client_timezone
+from omnigent.runner.client_timezone import remember_client_timezone
 from omnigent.runner.tool_dispatch import (
     _ALL_LOCAL_TOOLS,
     _NATIVE_RELAY_BUILTIN_TOOLS,
     _SCHEDULED_TASK_TOOLS,
     _execute_scheduled_task_tool,
 )
+from omnigent.tools.builtins.scheduled_tasks import SysScheduledTaskCreateTool
 
 _ALL_NAMES = {
     "sys_scheduled_task_create",
@@ -100,6 +103,80 @@ async def test_create_posts_payload() -> None:
         "host_id": "host_1",
     }  # unknown fields filtered out
     assert json.loads(out)["id"] == "t1"
+
+
+@pytest.fixture
+def _client_timezones(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(client_timezone, "_session_client_timezones", {})
+
+
+_CREATE_ARGS = {
+    "name": "Daily inbox summary",
+    "prompt": "Summarize my inbox.",
+    "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+    "agent_id": "ag_1",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_client_timezones")
+async def test_create_without_timezone_uses_the_sessions_client_zone() -> None:
+    """ "Every day at 9:00 AM" asked in chat means 9:00 AM where the user is."""
+    remember_client_timezone("conv_1", "America/Los_Angeles")
+    client = _RecordingClient()
+
+    await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create",
+        json.dumps(_CREATE_ARGS),
+        server_client=client,
+        conversation_id="conv_1",
+    )
+
+    _, _, body = client.calls[0]
+    assert body == {**_CREATE_ARGS, "timezone": "America/Los_Angeles"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_client_timezones")
+async def test_create_keeps_an_explicit_timezone_over_the_client_zone() -> None:
+    remember_client_timezone("conv_1", "America/Los_Angeles")
+    client = _RecordingClient()
+
+    await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create",
+        json.dumps({**_CREATE_ARGS, "timezone": "Asia/Tokyo"}),
+        server_client=client,
+        conversation_id="conv_1",
+    )
+
+    assert client.calls[0][2] == {**_CREATE_ARGS, "timezone": "Asia/Tokyo"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_client_timezones")
+@pytest.mark.parametrize("conversation_id", ["conv_without_client_zone", None])
+async def test_create_without_a_client_zone_leaves_the_server_default(
+    conversation_id: str | None,
+) -> None:
+    """A session whose client never reported a zone keeps the server's UTC default."""
+    remember_client_timezone("conv_other", "America/Los_Angeles")
+    client = _RecordingClient()
+
+    await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create",
+        json.dumps(_CREATE_ARGS),
+        server_client=client,
+        conversation_id=conversation_id,
+    )
+
+    assert client.calls[0][2] == _CREATE_ARGS
+
+
+def test_create_tool_schema_describes_the_client_zone_default() -> None:
+    schema = SysScheduledTaskCreateTool().get_schema()
+    description = schema["function"]["parameters"]["properties"]["timezone"]["description"]
+    assert "user's local timezone" in description
+    assert "UTC" in description
 
 
 @pytest.mark.asyncio

@@ -2395,6 +2395,7 @@ describe("chatStore — send (first-send ordering)", () => {
         content: [{ type: "input_text", text: "hi" }],
         stable_id: expect.any(String),
       },
+      client_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     });
 
     expect(navigatedTo).toBe("conv_new");
@@ -3598,6 +3599,7 @@ describe("chatStore — first message during native model startup", () => {
       {
         type: "message",
         data: expect.objectContaining({ content: [{ type: "input_text", text: original }] }),
+        client_timezone: expect.any(String),
       },
     ]);
     expect(useChatStore.getState().pendingUserMessages[0]?.initialDraft).toBeUndefined();
@@ -3641,6 +3643,7 @@ describe("chatStore — first message during native model startup", () => {
         data: expect.objectContaining({
           content: [{ type: "input_text", text: "final correction" }],
         }),
+        client_timezone: expect.any(String),
       },
     ]);
   });
@@ -3874,6 +3877,7 @@ describe("chatStore — sending during a model switch", () => {
         data: expect.objectContaining({
           content: [{ type: "input_text", text: "use the new model" }],
         }),
+        client_timezone: expect.any(String),
       },
     ]);
     expect(useChatStore.getState().pendingUserMessages[0]?.initialDraft).toBeUndefined();
@@ -3924,6 +3928,7 @@ describe("chatStore — sending during a model switch", () => {
         data: expect.objectContaining({
           content: [{ type: "input_text", text: "corrected instructions" }],
         }),
+        client_timezone: expect.any(String),
       },
     ]);
   });
@@ -4251,6 +4256,7 @@ describe("chatStore — send while streaming (queueing)", () => {
         content: [{ type: "input_text", text: "queue me" }],
         stable_id: expect.any(String),
       },
+      client_timezone: expect.any(String),
     });
 
     const state = useChatStore.getState();
@@ -5348,6 +5354,7 @@ describe("chatStore — send (file attachments)", () => {
         content: [{ type: "input_text", text }],
         stable_id: expect.any(String),
       },
+      client_timezone: expect.any(String),
     });
     expect(useChatStore.getState().failedSendDraft).toMatchObject({ text, replyDraft, files: [] });
   });
