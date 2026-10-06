@@ -14,9 +14,9 @@
  * on Arca instances.)
  *
  * The remote daemon then opens the ordinary outbound host tunnel using the
- * Arca box's own Databricks credentials (synced by arca), so no secret ever
- * leaves this machine. `--background` exits 0 only once the daemon survived
- * startup, and `--non-interactive` fails loud instead of dangling on a browser
+ * Arca box's own Omnigent OAuth grant; generic Arca sign-in is not sufficient.
+ * `--background` exits 0 only once the daemon registered with the server,
+ * and `--non-interactive` fails loud instead of dangling on a browser
  * login — both are what make the exit code a trustworthy signal here.
  *
  * This module is main-process-free: the binary probe and process spawn are
@@ -156,9 +156,11 @@ function resolveArcaPathAsync(deps = {}) {
  * after "ssh" is passed through to ssh and runs as the remote command.
  *
  * @param {string} serverUrl
+ * @param {boolean} [login] Prepare the remote grant instead of starting a host.
  * @returns {string[]}
  */
-function buildConnectArgs(serverUrl) {
+function buildArcaArgs(serverUrl, login = false) {
+  const quotedServerUrl = quoteRemoteServerUrl(serverUrl);
   return [
     "ssh",
     // Ordinary arca ssh inherits -R 19222 from ~/.ssh/config. Arca Companion
@@ -169,14 +171,18 @@ function buildConnectArgs(serverUrl) {
     "ClearAllForwardings=yes",
     "isaac",
     "omni",
-    "host",
-    "--server",
-    // Quoted for the remote shell, which would glob a `?` (zsh fails on no
-    // match); SAFE_URL_RE already bars `'`, so the quotes can't be broken out of.
-    quoteRemoteServerUrl(serverUrl),
-    "--background",
-    "--non-interactive",
+    ...(login
+      ? ["login", quotedServerUrl]
+      : ["host", "--server", quotedServerUrl, "--background", "--non-interactive"]),
   ];
+}
+
+function buildConnectArgs(serverUrl) {
+  return buildArcaArgs(serverUrl);
+}
+
+function buildLoginArgs(serverUrl) {
+  return buildArcaArgs(serverUrl, true);
 }
 
 /**
@@ -203,7 +209,7 @@ function describeConnectFailure(run) {
   }
   // `omni host --non-interactive` fails loud with a sign-in hint when the
   // Arca box's Databricks credentials can't mint a server token.
-  if (/not signed in/i.test(output)) {
+  if (/OMNIGENT_AUTH_REQUIRED|not signed in|authentication failed \(HTTP 401\)/i.test(output)) {
     return {
       ok: false,
       authError: true,
@@ -294,7 +300,7 @@ function lastLine(text) {
  *   cancel: () => void,
  * }}
  */
-function startArcaConnect(serverUrl, deps = {}) {
+function startArcaCommand(serverUrl, deps = {}, login = false) {
   const timeoutMs = deps.timeoutMs ?? CONNECT_TIMEOUT_MS;
   const onOutput = deps.onOutput || (() => {});
   const arcaPath = (deps.resolveArcaPath || resolveArcaPath)();
@@ -310,7 +316,7 @@ function startArcaConnect(serverUrl, deps = {}) {
   }
   let args;
   try {
-    args = buildConnectArgs(serverUrl);
+    args = buildArcaArgs(serverUrl, login);
   } catch (error) {
     return {
       command: null,
@@ -319,14 +325,31 @@ function startArcaConnect(serverUrl, deps = {}) {
     };
   }
   const spawnFn = deps.spawn || spawn;
-  const child = spawnFn(arcaPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+  let child;
+  try {
+    child = spawnFn(arcaPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+  } catch {
+    return {
+      command: `arca ${args.join(" ")}`,
+      promise: Promise.resolve({ ok: false, error: "Couldn't start the Arca command." }),
+      cancel: () => {},
+    };
+  }
   let stdout = "";
   let stderr = "";
-  let timedOut = false;
-  let canceled = false;
+  let settle;
   const promise = new Promise((resolve) => {
     const timer = setTimeout(() => {
-      timedOut = true;
+      settle(
+        login
+          ? {
+              ok: false,
+              errorKind: "timeout",
+              error:
+                "Arca sign-in timed out. Check Arca Companion, finish browser sign-in, and try again.",
+            }
+          : describeConnectFailure({ code: null, stdout: "", stderr: "", timedOut: true }),
+      );
       try {
         child.kill();
       } catch {
@@ -336,16 +359,21 @@ function startArcaConnect(serverUrl, deps = {}) {
     if (typeof timer.unref === "function") timer.unref();
     child.stdout?.on("data", (chunk) => {
       const text = String(chunk);
-      stdout += text;
-      onOutput(text);
+      if (!login) {
+        stdout = (stdout + text).slice(-8000);
+        onOutput(text);
+      }
     });
     child.stderr?.on("data", (chunk) => {
       const text = String(chunk);
-      stderr += text;
-      onOutput(text);
+      // Login output can contain an OAuth ticket; keep it out of every renderer.
+      if (!login) {
+        stderr = (stderr + text).slice(-8000);
+        onOutput(text);
+      }
     });
     let settled = false;
-    const settle = (result) => {
+    settle = (result) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -355,24 +383,47 @@ function startArcaConnect(serverUrl, deps = {}) {
       settle({ ok: false, error: `Couldn't run arca: ${error.message}` });
     });
     child.on("exit", (code) => {
-      if (canceled) {
-        settle({ ok: false, canceled: true, error: "Connecting to Arca was canceled." });
-        return;
-      }
       if (code === 0) {
         // `omni host --background` reuses a healthy daemon and says so — the
         // caller can then skip waiting for a host that was online all along.
         settle({ ok: true, alreadyRunning: /already running/i.test(stdout + stderr) });
         return;
       }
-      settle(describeConnectFailure({ code, stdout, stderr, timedOut }));
+      if (login) {
+        if (code === 127) {
+          settle(describeConnectFailure({ code, stdout: "", stderr: "" }));
+          return;
+        }
+        if (code === 255) {
+          settle({
+            ok: false,
+            errorKind: "unreachable",
+            error:
+              "Arca sign-in couldn't reach the remote command. Check `arca ssh` in a terminal and try again.",
+          });
+          return;
+        }
+        settle({
+          ok: false,
+          authError: true,
+          errorKind: "omni-auth",
+          error:
+            "Arca sign-in didn't complete. Check Arca Companion, finish browser sign-in, and try again.",
+        });
+        return;
+      }
+      settle(describeConnectFailure({ code, stdout, stderr }));
     });
   });
   return {
     command: `arca ${args.join(" ")}`,
     promise,
     cancel: () => {
-      canceled = true;
+      settle({
+        ok: false,
+        canceled: true,
+        error: login ? "Arca sign-in was canceled." : "Connecting to Arca was canceled.",
+      });
       try {
         child.kill();
       } catch {
@@ -380,6 +431,14 @@ function startArcaConnect(serverUrl, deps = {}) {
       }
     },
   };
+}
+
+function startArcaConnect(serverUrl, deps = {}) {
+  return startArcaCommand(serverUrl, deps);
+}
+
+function startArcaLogin(serverUrl, deps = {}) {
+  return startArcaCommand(serverUrl, deps, true);
 }
 
 /**
@@ -397,6 +456,7 @@ function connectArcaHost(serverUrl, deps = {}) {
 module.exports = {
   CONNECT_TIMEOUT_MS,
   buildConnectArgs,
+  buildLoginArgs,
   connectArcaHost,
   describeConnectFailure,
   normalizeSafeServerUrl,
@@ -405,4 +465,5 @@ module.exports = {
   resolveArcaPath,
   resolveArcaPathAsync,
   startArcaConnect,
+  startArcaLogin,
 };
