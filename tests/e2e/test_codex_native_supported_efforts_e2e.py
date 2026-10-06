@@ -265,6 +265,14 @@ def _assert_turn(
         # Let Codex finish classifying the burst as pasted text before Enter.
         time.sleep(0.3)
         session.tmux("send-keys", "Enter")
+        # A slow TUI can still be absorbing the paste when Enter lands, which drops
+        # the submit; resend it until the turn's request reaches the model.
+        for _ in range(10):
+            time.sleep(1)
+            sent = _json(rig.model.get("/mock/requests"))["requests"][before:]
+            if any(marker in json.dumps(request) for request in sent):
+                break
+            session.tmux("send-keys", "Enter")
     else:
         _json(
             rig.api.post(

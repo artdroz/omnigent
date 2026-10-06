@@ -1079,3 +1079,13 @@ def test_mirror_applied_codex_settings_holds_its_lock_while_writing(
     assert codex_native_bridge.mirror_applied_codex_settings(bridge_dir, {"effort": "high"}) == {}
     assert held == [True]
     assert read_codex_config_effort(bridge_dir) == "high"
+
+
+def test_unmirrored_codex_settings_need_a_readable_config(bridge_dir: Path) -> None:
+    """Without a readable config, no revision can show a later rewrite, so nothing is trusted."""
+    codex_home_for_bridge_dir(bridge_dir).mkdir(parents=True, exist_ok=True)
+
+    codex_native_bridge.write_unmirrored_codex_settings(bridge_dir, {"effort": "high"})
+
+    assert codex_native_bridge.read_unmirrored_codex_settings(bridge_dir) == {}
+    assert not (bridge_dir / "unmirrored_settings.json").exists()

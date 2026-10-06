@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -1149,8 +1150,6 @@ def test_routed_model_switch_keeps_an_effort_whose_config_write_failed(
     expected: str,
 ) -> None:
     """Routing inherits the applied effort, not a stale config, until the config is replaced."""
-    import os
-
     from omnigent.harnesses.codex_native.bridge import write_unmirrored_codex_settings
 
     home = codex_home_for_bridge_dir(bridge_dir)

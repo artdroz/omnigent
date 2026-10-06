@@ -508,18 +508,24 @@ def write_unmirrored_codex_settings(bridge_dir: Path, settings: Mapping[str, str
     such as an in-terminal ``/model``, replaces the config.
     """
     path = bridge_dir / _UNMIRRORED_SETTINGS_FILE
-    if not settings:
+    revision = codex_config_revision(bridge_dir)
+    # Without a readable config there is no revision a later rewrite could change.
+    if not settings or revision is None:
         with contextlib.suppress(OSError):
             path.unlink(missing_ok=True)
         return
-    revision = codex_config_revision(bridge_dir)
-    payload = {"settings": dict(settings), "config_revision": list(revision or ())}
+    payload = {"settings": dict(settings), "config_revision": list(revision)}
     try:
         fd, tmp_name = tempfile.mkstemp(
             prefix=f"{_UNMIRRORED_SETTINGS_FILE}.", dir=str(bridge_dir)
         )
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            try:
+                handle = os.fdopen(fd, "w", encoding="utf-8")
+            except OSError:
+                os.close(fd)
+                raise
+            with handle:
                 json.dump(payload, handle, sort_keys=True)
             os.replace(tmp_name, path)
         finally:
@@ -539,7 +545,11 @@ def read_unmirrored_codex_settings(bridge_dir: Path) -> dict[str, str]:
         return {}
     revision = codex_config_revision(bridge_dir)
     settings = payload.get("settings")
-    if payload.get("config_revision") != list(revision or ()) or not isinstance(settings, dict):
+    if (
+        revision is None
+        or payload.get("config_revision") != list(revision)
+        or not isinstance(settings, dict)
+    ):
         return {}
     return {
         key: value
