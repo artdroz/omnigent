@@ -5918,17 +5918,20 @@ describe("saved sandbox inference policy", () => {
 describe("Composer voice dictation", () => {
   let handlers: Record<string, (event: unknown) => void>;
   let stopSpy: ReturnType<typeof vi.fn>;
+  let abortSpy: ReturnType<typeof vi.fn>;
   let originalMediaDevices: PropertyDescriptor | undefined;
 
   beforeEach(() => {
     handlers = {};
     stopSpy = vi.fn();
+    abortSpy = vi.fn();
     class FakeRecognition {
       continuous = false;
       interimResults = false;
       lang = "en-US";
       start = vi.fn();
       stop = stopSpy;
+      abort = abortSpy;
       addEventListener(type: string, handler: (event: unknown) => void) {
         handlers[type] = handler;
       }
@@ -5973,6 +5976,32 @@ describe("Composer voice dictation", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
     expect(onSend).toHaveBeenCalledWith("voice dictated message", undefined);
-    expect(stopSpy).toHaveBeenCalledTimes(1);
+    // endTake aborts (not stops) the recognizer so a trailing final can't flush
+    // into the composer that was just cleared on send.
+    expect(abortSpy).toHaveBeenCalledTimes(1);
+    expect(stopSpy).not.toHaveBeenCalled();
+  });
+
+  it("ends the voice take when a known slash command is sent", () => {
+    // The slash-command branch clears the composer and returns before the
+    // plaintext send path, so the mic must still stop on this accepted send.
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name: "deslop", description: "Remove AI slop" }],
+    });
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    const mic = screen.getByRole("button", { name: "Voice dictation" });
+    fireEvent.click(mic);
+    act(() => handlers.start?.({}));
+    expect(mic).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.change(textarea(), { target: { value: "/deslop fix the bug" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "fix the bug");
+    expect(onSend).not.toHaveBeenCalled();
+    expect(abortSpy).toHaveBeenCalledTimes(1);
   });
 });

@@ -3316,6 +3316,11 @@ function ComposerImpl(
     // guard so guarded no-ops don't emit, matching the disabled Send button.
     trackClick("chat.composer.send", "button");
 
+    // End any live voice take here so the mic stops for every accepted send
+    // path, including the slash-command branches below that clear the composer
+    // and return before reaching the plaintext send.
+    micRef.current?.endTake();
+
     // A generic (non-Codex) side chat forks the conversation and runs it on the
     // SAME host/sandbox as the source (no new sandbox), then opens it as a rail
     // tab; the typed text seeds the new side chat's composer so it isn't fired
@@ -3441,8 +3446,6 @@ function ComposerImpl(
     } else {
       onSend(mentionPreamble + trimmed, sendFiles);
     }
-    // A sent message ends any live voice take so the mic stops recording.
-    micRef.current?.endTake();
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);
     clearAttachments();

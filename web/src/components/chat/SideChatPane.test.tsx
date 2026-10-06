@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { createPortal } from "react-dom";
-import { forwardRef, StrictMode } from "react";
+import { forwardRef, StrictMode, useImperativeHandle } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { toast } from "sonner";
@@ -17,10 +17,14 @@ vi.mock("@/store/chatStore", async (importOriginal) => ({
 }));
 
 vi.mock("@/components/composer/ComposerAddMenu", () => ({ ComposerAddMenu: () => null }));
+const micEndTake = vi.hoisted(() => vi.fn());
 vi.mock("@/components/ComposerMicButton", () => ({
-  // forwardRef so the pane's mic ref (used to end the take on send) attaches
-  // without React's "function components cannot be given refs" warning.
-  ComposerMicButton: forwardRef(() => null),
+  // forwardRef + a real endTake handle so a test can assert the pane ends the
+  // voice take on send; a bare ref would attach but prove nothing.
+  ComposerMicButton: forwardRef((_props, ref) => {
+    useImperativeHandle(ref, () => ({ endTake: micEndTake }));
+    return null;
+  }),
 }));
 const sessionLabels = vi.hoisted(() => ({ current: {} as Record<string, string> }));
 vi.mock("@/hooks/useSession", () => ({
@@ -41,6 +45,7 @@ const renderPane = (ui: ReactNode) =>
 
 beforeEach(() => {
   sessionLabels.current = {};
+  micEndTake.mockClear();
   conversationRegistry.clear();
   send.mockReset().mockResolvedValue(undefined);
   vi.spyOn(sessionsApi, "interrupt").mockResolvedValue({ queued: true });
@@ -130,6 +135,8 @@ describe("side-chat working indicator", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
 
     expect(onStart).toHaveBeenCalledExactlyOnceWith("Explain the approach");
+    // Starting the fork is an accepted send, so the pending branch ends the take.
+    expect(micEndTake).toHaveBeenCalledTimes(1);
     expect(screen.getByTestId("working-indicator")).toHaveTextContent("Working…");
     expect(screen.queryByTestId("side-chat-interrupt")).toBeNull();
     expect(input).toBeDisabled();
@@ -425,6 +432,8 @@ describe("unsent composer state survives the pane moving", () => {
     await waitFor(() => expect(send).toHaveBeenCalledOnce());
     expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();
     expect(screen.getByTestId("side-chat-input")).toHaveValue("");
+    // Sending ends any live voice take so the mic stops recording.
+    expect(micEndTake).toHaveBeenCalledTimes(1);
   });
 });
 
