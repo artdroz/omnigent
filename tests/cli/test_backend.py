@@ -1073,18 +1073,17 @@ def test_registration_wait_stays_pending_when_server_answered_then_dropped(
     assert cli._confirm_background_host_registered(_server_record()) is False
 
 
-def test_registration_wait_reports_pending_when_server_answers_but_host_is_offline(
+def test_registration_wait_stays_pending_without_a_host_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A reachable server that has not reported the host online yet is pending.
+    """A live daemon that cannot be probed yet (no host id) is pending, not failed.
 
-    The daemon is alive and the server answers, so registration may still
-    complete; the wait must end without an error that would tear the
-    daemon down.
+    Nothing was learned about the server either way, so neither the
+    unreachable-server error nor a teardown is justified.
     """
-    _patch_registration_wait(
-        monkeypatch, cli._HostHttpResult(status_code=200, body={"status": "offline"})
-    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_BACKGROUND_HOST_REGISTRATION_GRACE_S", 0.0)
+    monkeypatch.setattr(cli, "_daemon_host_status_probe", lambda record, **_kw: None)
 
     assert cli._confirm_background_host_registered(_server_record()) is False
 
@@ -1097,6 +1096,31 @@ def test_registration_wait_fails_when_daemon_exits_first(
         monkeypatch, cli._HostHttpResult(status_code=200, body={"status": "offline"})
     )
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: False)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        cli._confirm_background_host_registered(_server_record())
+
+    assert "exited before registering with the server" in str(excinfo.value)
+
+
+def test_registration_wait_fails_when_daemon_exits_during_final_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A daemon that dies while the last probe is in flight is not "still connecting".
+
+    The probe can block for a second after the liveness check; the deadline
+    path must look again before accepting a pending registration.
+    """
+    alive = True
+
+    def _probe(record: object, **_kw: object) -> cli._HostHttpResult:
+        nonlocal alive
+        alive = False
+        return cli._HostHttpResult(status_code=200, body={"status": "offline"})
+
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: alive)
+    monkeypatch.setattr(cli, "_BACKGROUND_HOST_REGISTRATION_GRACE_S", 0.0)
+    monkeypatch.setattr(cli, "_daemon_host_status_probe", _probe)
 
     with pytest.raises(click.ClickException) as excinfo:
         cli._confirm_background_host_registered(_server_record())

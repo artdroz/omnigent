@@ -21,10 +21,12 @@ Set ``OMNIGENT_REPRO_SERVER_URL`` to reuse an already-running server.
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import json
 import os
 import select
+import signal
 import socket
 import socketserver
 import subprocess
@@ -96,12 +98,6 @@ class StallingTunnelProxy:
     def stop(self) -> None:
         self._server.shutdown()
         self._server.server_close()
-
-    def reset(self) -> None:
-        """Start a fresh stall window for the next host that connects."""
-        with self._lock:
-            self._first_upgrade_at = None
-            self.upgrade_attempts = []
 
     def _handle(self, client: socket.socket) -> None:
         client.settimeout(10.0)
@@ -269,7 +265,6 @@ def upstream_server_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[st
 
 @dataclass
 class _CliRun:
-    argv: list[str]
     lines: list[tuple[float, str]]
     returncode: int | None
     elapsed_s: float
@@ -358,7 +353,6 @@ class _CliState:
             reader.join(timeout=10)
             sampler.join(timeout=10)
         return _CliRun(
-            argv=argv,
             lines=lines,
             returncode=proc.returncode,
             elapsed_s=time.monotonic() - start,
@@ -377,13 +371,18 @@ def _host_status(server_url: str, host_id: str) -> str:
 
 
 def _wait_host_online(server_url: str, host_id: str, *, deadline: float) -> float | None:
-    """Return seconds until the server reports *host_id* online, or ``None`` at *deadline*."""
+    """Return seconds until the server reports *host_id* online, or ``None`` at *deadline*.
+
+    Probes at least once, so a deadline that has already passed still observes
+    a host that is online.
+    """
     started = time.monotonic()
-    while time.monotonic() < deadline:
+    while True:
         if _host_status(server_url, host_id) == "online":
             return time.monotonic() - started
+        if time.monotonic() >= deadline:
+            return None
         time.sleep(1.0)
-    return None
 
 
 def test_start_brings_late_registering_host_online(
@@ -398,8 +397,10 @@ def test_start_brings_late_registering_host_online(
     proxy.start()
     state = _CliState.create(tmp_path, proxy.url)
     launched = time.monotonic()
+    spawned_pids: list[int] = []
     try:
         run = state.run("start", "--non-interactive", timeout=_START_DEADLINE_S)
+        spawned_pids = run.daemon_pids
         host_id = state.host_id()
         assert host_id, (
             f"`omnigent start` left no host identity in config.yaml; output:\n{run.output}"
@@ -429,4 +430,9 @@ def test_start_brings_late_registering_host_online(
         )
     finally:
         state.run("stop", "--force", timeout=120)
+        # `stop` only knows daemons still in its registry; never leak the rest.
+        for pid in spawned_pids:
+            if _pid_alive(pid):
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
         proxy.stop()

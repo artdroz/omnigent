@@ -8921,14 +8921,22 @@ def _server_unreachable_error(
     return exc
 
 
+def _daemon_exited_error(record: _HostDaemonRecord) -> click.ClickException:
+    """Build the error for a daemon that exited before the server reported it online."""
+    return click.ClickException(
+        "The host daemon exited before registering with the server."
+        f"{_background_host_log_detail(record.log_path)}"
+    )
+
+
 def _confirm_background_host_registered(record: _HostDaemonRecord) -> bool:
     """Wait for the detached daemon to complete server registration.
 
     :param record: Registry record of the daemon to wait on.
     :returns: ``True`` once the server reports the host online. ``False`` when
-        the grace period ends with the daemon alive and the server answering:
-        registration is pending, not failed, and the daemon keeps retrying on
-        its own.
+        the grace period ends with the daemon still alive and nothing proving
+        the server unreachable: registration is pending, not failed, and the
+        daemon keeps retrying on its own.
     :raises click.ClickException: If the daemon exits first, or if no probe
         reached the server at all — an unreachable server will not resolve
         itself.
@@ -8939,10 +8947,9 @@ def _confirm_background_host_registered(record: _HostDaemonRecord) -> bool:
     last_transport_error: str | None = None
     while True:
         if not _pid_alive(record.pid):
-            raise click.ClickException(
-                "The host daemon exited before registering with the server."
-                f"{_background_host_log_detail(record.log_path)}"
-            )
+            raise _daemon_exited_error(record)
+        # ``None`` means there was nothing to probe yet (no host id or server
+        # URL); it neither proves nor rules out reachability.
         result = _daemon_host_status_probe(record, timeout_s=1.0)
         if result is not None and result.status_code == 0:
             last_transport_error = str(result.body)
@@ -8965,6 +8972,10 @@ def _confirm_background_host_registered(record: _HostDaemonRecord) -> bool:
         if time.monotonic() >= deadline:
             if not server_responded and last_transport_error is not None:
                 raise _server_unreachable_error(record, transport_error=last_transport_error)
+            # The probe above may have blocked for a second; a daemon that died
+            # meanwhile must not be reported as still connecting.
+            if not _pid_alive(record.pid):
+                raise _daemon_exited_error(record)
             return False
         time.sleep(0.2)
 
@@ -9116,7 +9127,9 @@ def _run_background_host(
         click.echo(f"  {_cli_style(f'{cli_invocation()} host status', bold=True)}")
     click.echo(_cli_style("Stop it with:", dim=True))
     click.echo(f"  {_cli_style(stop_command, bold=True)}")
-    _maybe_open_host_web_ui(server_url, non_interactive=non_interactive, no_open=no_open)
+    # The web UI would show this host offline until its registration completes.
+    if registered:
+        _maybe_open_host_web_ui(server_url, non_interactive=non_interactive, no_open=no_open)
 
 
 def _echo_host_field(label: str, value: str) -> None:

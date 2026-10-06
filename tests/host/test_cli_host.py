@@ -913,6 +913,11 @@ def test_host_background_leaves_unregistered_daemon_running(
         "omnigent.cli._terminate_daemon",
         lambda record, *, force: terminated.append(record.pid),
     )
+    opened: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.cli._maybe_open_host_web_ui",
+        lambda server_url, **kwargs: opened.append(server_url),
+    )
 
     result = CliRunner().invoke(
         cli,
@@ -924,8 +929,11 @@ def test_host_background_leaves_unregistered_daemon_running(
     assert "keeps retrying in the background" in result.output
     assert "Started the host daemon" not in result.output
     assert "omnigent host status" in result.output
+    assert "omnigent host stop" in result.output
     assert log_path.name in result.output
     assert terminated == []
+    # The UI would show the host offline until it registers.
+    assert opened == []
 
 
 def test_host_background_tears_down_daemon_that_exits_before_registering(
