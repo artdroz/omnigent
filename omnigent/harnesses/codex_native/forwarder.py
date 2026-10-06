@@ -3351,12 +3351,15 @@ def _refresh_effort_from_config(bridge_dir: Path, forwarder_state: _CodexForward
         updated in place.
     :returns: None.
     """
-    config_effort = read_codex_config_effort(bridge_dir)
-    if not config_effort:
-        return
+    # Stat before reading, so a rewrite that races this read shows on the next pass.
+    revision: tuple[int, int] | None = None
     with contextlib.suppress(OSError):
         config_stat = (codex_home_for_bridge_dir(bridge_dir) / "config.toml").stat()
         revision = (config_stat.st_ino, config_stat.st_mtime_ns)
+    config_effort = read_codex_config_effort(bridge_dir)
+    if not config_effort:
+        return
+    if revision is not None:
         if (
             forwarder_state.last_config_effort_revision is not None
             and revision != forwarder_state.last_config_effort_revision
