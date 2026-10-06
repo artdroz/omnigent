@@ -397,14 +397,14 @@ const SAME_PAGE_ANCHOR_SCRIPT = `<script>(function () {
     for (let i = 0; i < named.length; i++) if (named[i].localName === "a") return named[i];
     return null;
   }
-  // On window, so handlers the artifact delegates to document run first and can cancel.
-  window.addEventListener("click", function (event) {
-    if (event.defaultPrevented) return;
-    const target = event.target;
+  function onActivate(event) {
+    if (event.defaultPrevented || (event.type === "auxclick" && event.button !== 1)) return;
+    const path = event.composedPath ? event.composedPath() : [];
+    const target = path.length ? path[0] : event.target;
     const anchor = target && target.closest ? target.closest("a[href],area[href]") : null;
     const href = anchor ? anchor.getAttribute("href").trim() : "";
     if (href.charAt(0) !== "#") return;
-    // Modifier clicks too: a new tab could only reopen the host app, never this document.
+    // Modifier and middle clicks too: a new tab could only reopen the host app, never this document.
     event.preventDefault();
     const before = location.href;
     location.hash = href;
@@ -412,7 +412,10 @@ const SAME_PAGE_ANCHOR_SCRIPT = `<script>(function () {
     const element = indicatedElement(href);
     if (element) element.scrollIntoView();
     else if (href === "#" || href.toLowerCase() === "#top") window.scrollTo(0, 0);
-  });
+  }
+  // On window, so handlers the artifact delegates to document run first and can cancel.
+  window.addEventListener("click", onActivate);
+  window.addEventListener("auxclick", onActivate);
 })();</script>`;
 
 /** Markup `prepareHtmlPreviewDoc` places at the start of `<head>`. */
@@ -420,11 +423,13 @@ export const HTML_PREVIEW_HEAD = '<base target="_blank">' + SAME_PAGE_ANCHOR_SCR
 
 /**
  * End offset of the first real `<head>`/`<html>` start tag, or -1. Comments and
- * `<script>` blocks are consumed whole so a look-alike tag inside them cannot
- * attract the injection, whose `</script>` would end the artifact's own script.
+ * `<script>` blocks (to their end tag, or to end of input when unterminated) are
+ * consumed whole so a look-alike tag inside them cannot attract the injection,
+ * whose `</script>` would end the artifact's own script.
  */
 function startTagEnd(html: string, tag: "head" | "html"): number {
-  const scanner = /<!--[\s\S]*?-->|<script\b[^>]*>[\s\S]*?<\/script\s*>|<(head|html)\b[^>]*>/gi;
+  const scanner =
+    /<!--[\s\S]*?(?:--!?>|$)|<script\b[^>]*>[\s\S]*?(?:<\/script\b[^>]*>|$)|<(head|html)\b[^>]*>/gi;
   for (let match = scanner.exec(html); match; match = scanner.exec(html)) {
     if (match[1]?.toLowerCase() === tag) return match.index + match[0].length;
   }

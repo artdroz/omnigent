@@ -490,6 +490,24 @@ describe("prepareHtmlPreviewDoc", () => {
     expect(out).toBe(`${HEAD}${script}<p>hi</p>`);
   });
 
+  it("recognizes unusual script end tags and comment terminators while scanning", () => {
+    const script = "<script>var t = '<head>';</script\t\n bar>";
+    expect(prepareHtmlPreviewDoc(`${script}<html><head></head></html>`)).toBe(
+      `${script}<html><head>${HEAD}</head></html>`,
+    );
+    expect(prepareHtmlPreviewDoc("<!-- <head> --!><html><head></head></html>")).toBe(
+      `<!-- <head> --!><html><head>${HEAD}</head></html>`,
+    );
+  });
+
+  it("treats an unterminated <script> or comment as swallowing the rest of the document", () => {
+    const script = "<script>var t = '<head>';";
+    expect(prepareHtmlPreviewDoc(`${script}<html><head></head></html>`)).toBe(
+      `${HEAD}${script}<html><head></head></html>`,
+    );
+    expect(prepareHtmlPreviewDoc("<!-- <head><html>")).toBe(`${HEAD}<!-- <head><html>`);
+  });
+
   it("does not mistake <header> for <head>", () => {
     const out = prepareHtmlPreviewDoc("<header>Title</header><p>hi</p>");
     expect(out).toBe(`${HEAD}<header>Title</header><p>hi</p>`);
@@ -508,22 +526,24 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
   /** Elements the handler scrolled into view by hand (`this` of each call). */
   let scrolled: Element[];
 
-  /** The window-level click listener the script registers; removed again in afterAll. */
-  let handler: EventListener | undefined;
+  /** The window-level listeners the script registers; removed again in afterAll. */
+  let registered: [string, EventListener][] = [];
 
   beforeAll(() => {
     expect(SCRIPT_BODY).not.toBe("");
     const register = vi.spyOn(window, "addEventListener");
-    // vitest's jsdom does not run inserted <script> elements; the body is a compile-time constant.
+    // The handler body is a compile-time constant, so the Function constructor is safe here;
+    // vitest's jsdom does not execute inserted <script> elements.
     new Function(SCRIPT_BODY)();
-    const call = register.mock.calls.find(([type]) => type === "click");
+    registered = register.mock.calls
+      .filter(([type]) => type === "click" || type === "auxclick")
+      .map(([type, listener]) => [type, listener as EventListener]);
     register.mockRestore();
-    handler = call?.[1] as EventListener | undefined;
-    expect(handler).toBeDefined();
+    expect(registered.map(([type]) => type)).toEqual(["click", "auxclick"]);
   });
 
   afterAll(() => {
-    if (handler) window.removeEventListener("click", handler);
+    for (const [type, listener] of registered) window.removeEventListener(type, listener);
   });
 
   beforeEach(() => {
@@ -545,19 +565,20 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
    * listener runs after it and cancels whatever remains, so jsdom never attempts the
    * navigation of links the handler skipped.
    */
-  function click(selector: string, init: MouseEventInit = {}): boolean {
+  function click(target: string | Element, init: MouseEventInit = {}, type = "click"): boolean {
     let cancelled = false;
     window.addEventListener(
-      "click",
+      type,
       (event) => {
         cancelled = event.defaultPrevented;
         event.preventDefault();
       },
       { once: true },
     );
-    document
-      .querySelector(selector)
-      ?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, ...init }));
+    const element = typeof target === "string" ? document.querySelector(target) : target;
+    element?.dispatchEvent(
+      new MouseEvent(type, { bubbles: true, cancelable: true, composed: true, ...init }),
+    );
     return cancelled;
   }
 
@@ -575,6 +596,25 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
     expect(location.hash).toBe("#one");
     expect(click("#b", { metaKey: true, shiftKey: true })).toBe(true);
     expect(location.hash).toBe("#two");
+  });
+
+  it("handles middle clicks (auxclick) the same way and leaves right clicks alone", () => {
+    document.body.innerHTML = '<a id="link" href="#mid">m</a>';
+    expect(click("#link", { button: 2 }, "auxclick")).toBe(false);
+    expect(location.hash).toBe("");
+    expect(click("#link", { button: 1 }, "auxclick")).toBe(true);
+    expect(location.hash).toBe("#mid");
+  });
+
+  it("finds links inside an open shadow root through composedPath", () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = host.attachShadow({ mode: "open" });
+    root.innerHTML = '<a href="#shadow">s</a>';
+    const link = root.querySelector("a");
+    expect(link).not.toBeNull();
+    expect(click(link as Element)).toBe(true);
+    expect(location.hash).toBe("#shadow");
   });
 
   it("handles clicks on elements nested in the anchor and on <area> hotspots", () => {

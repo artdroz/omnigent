@@ -34,7 +34,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 # The hello_world agent spec uses ``os_env.cwd: .``, so the runner writes
 # seeded files into the server process's cwd — the repo root (this file is
@@ -94,6 +94,26 @@ def _cleanup_session_workdir(session_id: str) -> None:
     shutil.rmtree(_REPO_ROOT / session_id, ignore_errors=True)
 
 
+def _click_without_popup(page: Page, link: Locator, target: Locator) -> None:
+    """Click ``link`` and require ``target`` to scroll into view with no new page opening."""
+    opened: list[Page] = []
+
+    def note_popup(popup: Page) -> None:
+        opened.append(popup)
+
+    page.context.on("page", note_popup)
+    try:
+        link.click()
+        expect(target).to_be_in_viewport()
+        # The click itself would have created a popup; a brief settle catches a late event.
+        page.wait_for_timeout(500)
+    finally:
+        page.context.remove_listener("page", note_popup)
+    assert not opened, "same-page anchor opened a new window at " + ", ".join(
+        p.url for p in opened
+    )
+
+
 @pytest.fixture
 def seeded_html(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
     """Seed the HTML artifact and yield ``(base_url, session_id)``."""
@@ -151,15 +171,7 @@ def test_html_preview_runs_scripts_and_targets_links(
     # it used to open a new window at the session URL instead.
     target = preview.locator("#section-3")
     expect(target).not_to_be_in_viewport()
-    opened: list[Page] = []
-    page.context.on("page", lambda popup: opened.append(popup))
-    preview.get_by_role("link", name="Jump to section 3").click()
-    expect(target).to_be_in_viewport()
-    # The click itself would have created a popup; a brief settle catches a late event.
-    page.wait_for_timeout(500)
-    assert not opened, "same-page anchor opened a new window at " + ", ".join(
-        p.url for p in opened
-    )
+    _click_without_popup(page, preview.get_by_role("link", name="Jump to section 3"), target)
     expect(page).to_have_url(f"{base_url}/c/{session_id}?file={_HTML_PATH}")
 
 
@@ -229,14 +241,7 @@ def test_html_preview_open_in_new_tab_button(
     # ``about:blank``, so the fragment would otherwise resolve there).
     target = preview.locator("#section-3")
     expect(target).not_to_be_in_viewport()
-    opened: list[Page] = []
-    page.context.on("page", lambda stray: opened.append(stray))
-    preview.get_by_role("link", name="Jump to section 3").click()
-    expect(target).to_be_in_viewport()
-    page.wait_for_timeout(500)
-    assert not opened, "same-page anchor in the pop-out opened a new window at " + ", ".join(
-        p.url for p in opened
-    )
+    _click_without_popup(page, preview.get_by_role("link", name="Jump to section 3"), target)
     assert popped.url == "about:blank"
 
     popped.close()
