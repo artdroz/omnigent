@@ -1,13 +1,9 @@
-"""Browser e2e: a session forked from the web UI shows up in the sidebar list.
+"""Browser e2e: a forked session shows up in the sidebar even when the list lags.
 
-Drives the real chain — "Fork from here" → Fork dialog → Clone → navigate
-into the fork — under the conditions of a search-indexed deployment whose
-list read trails the write: ``GET /v1/sessions`` list responses omit the new
-fork for a while, and the ``/v1/sessions/updates`` socket is intercepted so
-no ``session_added`` push arrives either. The fork dialog has to paint the
-"Fork of …" row itself and hold it there, like a created session, until the
-list catches up; a fork that relies on the push alone stays invisible until
-the index reflects it.
+Forks through the real UI while ``GET /v1/sessions`` omits the new fork for a
+while and the ``/v1/sessions/updates`` socket delivers no ``session_added``
+push, as on a search-indexed deployment. The dialog must paint and hold the
+"Fork of …" row itself, like a created session, until the list catches up.
 """
 
 from __future__ import annotations

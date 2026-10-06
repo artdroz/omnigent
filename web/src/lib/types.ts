@@ -312,10 +312,7 @@ export interface Session {
    */
   backgroundTasks?: BackgroundTaskInfo[];
   createdAt: number;
-  /**
-   * Unix seconds of the last persisted change, the sidebar's sort key.
-   * Absent on older servers and recorded fixtures.
-   */
+  /** Unix seconds of the last persisted change (the sidebar's sort key); absent on older servers. */
   updatedAt?: number | null;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
@@ -469,9 +466,8 @@ export interface Session {
    */
   parentSessionId: string | null;
   /**
-   * First-class project the session is filed under (`projects.id`), or
-   * ``null``/absent when unfiled. Lets a snapshot-derived sidebar row land
-   * in its folder; the legacy ``omni_project`` label rides in `labels`.
+   * First-class project the session is filed under, or ``null``/absent when
+   * unfiled; lets a snapshot-derived sidebar row land in its folder.
    */
   projectId?: string | null;
   /**

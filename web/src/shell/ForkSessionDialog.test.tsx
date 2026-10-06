@@ -288,10 +288,9 @@ describe("ForkSessionDialog", () => {
   });
 
   it("paints the fork into the cached sidebar list and arms the recently-created keep-alive", async () => {
-    // The fork can't wait for the `session_added` push: on a search-indexed
-    // deployment the list refetch lags the write, and if the push misses the
-    // event too the fork stays hidden until the index catches up. The dialog
-    // inserts the row itself and holds it there like a created session.
+    // On a search-indexed deployment the list refetch lags the write; if the
+    // `session_added` push is missed too, the fork would stay hidden. The
+    // dialog inserts the row itself and holds it there like a created session.
     forkSessionMock.mockResolvedValue({
       id: "conv_fork",
       title: "Fork of My session",
