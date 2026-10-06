@@ -63,7 +63,6 @@ async def _drive_sleep_wake(base_url: str, session_a: str, session_b: str) -> No
     """Exercise the composer-to-session handoff against a real seeded session."""
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
-        # Close the context first so an optional video recording is flushed.
         context = await browser.new_context()
         page = await context.new_page()
         try:

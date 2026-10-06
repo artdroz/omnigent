@@ -458,7 +458,8 @@ export function hydrateLocalConversation(
   const store = useChatStore.getState();
   // Preserve an interrupted first send across a hard reload, but do not
   // replay its storage copy in this heap while the send below is in flight.
-  persistInitialPrompt(realId, { text, skill });
+  // A blank-text (image-only) draft has no recoverable storage copy, so skip it.
+  if (text) persistInitialPrompt(realId, { text, skill });
   dispatchedInitialPrompts.add(realId);
   if (skill !== null) {
     // Slash command: the server resolves the skill and emits its own receipt +
@@ -1824,7 +1825,7 @@ function loadPersistedInitialPrompts(): Record<string, PersistedInitialPrompt> {
     if (!raw) return {};
     const parsed: unknown = JSON.parse(raw);
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    const entries: Record<string, PersistedInitialPrompt> = {};
+    const entries: Record<string, PersistedInitialPrompt> = Object.create(null);
     for (const [id, value] of Object.entries(parsed)) {
       if (value === null || typeof value !== "object") continue;
       const { text, skill } = value as { text?: unknown; skill?: unknown };
@@ -1866,6 +1867,9 @@ function persistInitialPrompt(conversationId: string, prompt: PendingInitialProm
 
 /** Drop the stored first prompt after settlement or transcript reconciliation. */
 export function clearPersistedInitialPrompt(conversationId: string): void {
+  // Prune the in-heap guard too: once the storage copy is gone there is nothing
+  // left to replay, so the id need not linger for the life of the SPA session.
+  dispatchedInitialPrompts.delete(conversationId);
   const entries = loadPersistedInitialPrompts();
   if (!(conversationId in entries)) return;
   savePersistedInitialPrompts(
@@ -1910,7 +1914,9 @@ export function setPendingInitialPrompt(
 ): void {
   if (!prompt.text && !prompt.files?.length) return;
   pendingInitialPrompts.set(conversationId, prompt);
-  persistInitialPrompt(conversationId, prompt);
+  // Blank-text drafts can't be recovered from storage (load drops empty text),
+  // so only the in-memory handoff carries an image-only first message.
+  if (prompt.text) persistInitialPrompt(conversationId, prompt);
 }
 
 /**
@@ -2490,17 +2496,29 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const state = id === null ? get() : setterForState(id);
       return state?.pendingUserMessages.some((p) => p.tempId === tempId && p.initialDraft);
     };
+    // Interrupt before the POST lands abandons the first send; drop its storage
+    // recovery copy so a later reload can't resurrect the cancelled message.
+    const abandonInitialSend = () => {
+      const id = postedSessionId ?? submitConversationId;
+      if (id !== null) clearPersistedInitialPrompt(id);
+    };
 
     inFlightSends.set(stableId, false);
     try {
       await waitForPrior();
-      if (initialDraft && !initialSendPending()) return;
+      if (initialDraft && !initialSendPending()) {
+        abandonInitialSend();
+        return;
+      }
       // `rekey` runs INSIDE the call, the moment `createSession` returns and
       // before the new id is published — a send issued during the bind would
       // otherwise resolve that id, find an empty chain, and overtake this POST.
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
-      if (initialDraft && !(await waitForModelSelection(sessionId, tempId))) return;
+      if (initialDraft && !(await waitForModelSelection(sessionId, tempId))) {
+        abandonInitialSend();
+        return;
+      }
 
       if (compacts) {
         // Compact controls emit turn status edges, but no user
@@ -2520,7 +2538,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...fileBlocks,
         ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
       ];
-      if (initialDraft && !initialSendPending()) return;
+      if (initialDraft && !initialSendPending()) {
+        abandonInitialSend();
+        return;
+      }
 
       // Promote "pending:<filename>" to real file_ids. Claude-native's
       // session.input.consumed is text-only (transcript round-trip
@@ -2606,7 +2627,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // status transitions that happen during the turn.
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
-      if (initialDraft && !initialDispatched && !initialSendPending()) return;
+      if (initialDraft && !initialDispatched && !initialSendPending()) {
+        abandonInitialSend();
+        return;
+      }
       const { message, code } = describeSendFailure(err);
       // A codex `/side` that armed the side-chat latch (line ~2103) but then
       // failed — e.g. the host is too old and the server refused — must disarm

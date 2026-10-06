@@ -1602,9 +1602,17 @@ describe("isInitialPromptDelivered", () => {
     ).toBe(false);
   });
 
-  it("does not let a plain prompt match a skill receipt's echo text", () => {
+  it("does not let a plain prompt match a skill receipt alone", () => {
+    const receipt: AnyBlock = {
+      type: "slash_command",
+      ctx: ctx("item_slash"),
+      kind: "skill",
+      name: "review-pr",
+      arguments: "123",
+      output: null,
+    };
     expect(
-      isInitialPromptDelivered([userMessage("unrelated")], {
+      isInitialPromptDelivered([receipt], {
         text: "/review-pr 123",
         skill: null,
       }),

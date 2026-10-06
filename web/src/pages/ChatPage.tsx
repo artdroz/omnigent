@@ -592,13 +592,8 @@ export function ChatPage() {
     // predicate already guarantees these, so this never fires at runtime.
     if (initialPrompt === null || !agentId || !urlConvId) return;
     initialPromptSentForConvRef.current = urlConvId;
-    // An interrupted POST may have landed before reload. The hydrated
-    // transcript is authoritative, so skip replay when it contains the prompt.
-    if (isInitialPromptDelivered(useChatStore.getState().blocks, initialPrompt.prompt)) {
-      clearPersistedInitialPrompt(urlConvId);
-      return;
-    }
-    // Remove a failed-send draft that duplicates the recovered prompt.
+    // Clear a duplicate failed-send draft before the delivered check so a
+    // landed interrupt can't strand a copy in the composer for a second send.
     const draft = getSessionDraft(urlConvId);
     if (
       draft !== undefined &&
@@ -606,6 +601,12 @@ export function ChatPage() {
       draft.files.length === 0
     ) {
       setSessionDraft(urlConvId, { text: "", files: [] });
+    }
+    // An interrupted POST may have landed before reload. The hydrated
+    // transcript is authoritative, so skip replay when it contains the prompt.
+    if (isInitialPromptDelivered(useChatStore.getState().blocks, initialPrompt.prompt)) {
+      clearPersistedInitialPrompt(urlConvId);
+      return;
     }
     const { send, sendSlashCommand } = useChatStore.getState();
     dispatchInitialPrompt(initialPrompt.prompt, agentId, send, sendSlashCommand);

@@ -3609,6 +3609,31 @@ describe("chatStore — first message during native model startup", () => {
     expect(useChatStore.getState().failedSendDraft).toBeNull();
   });
 
+  it("drops the stored recovery copy when the first send is interrupted before dispatch", async () => {
+    const persistedFor = (id: string) => {
+      const raw = window.sessionStorage.getItem("omnigent.pendingInitialPrompts");
+      return raw ? (JSON.parse(raw) as Record<string, unknown>)[id] : undefined;
+    };
+    begin();
+    await settle();
+    // Parked waiting for the native model report. The recovery copy is live, so
+    // a forced-relogin reload at this point would still deliver the message.
+    expect(persistedFor(sessionId)).toMatchObject({ text: original, skill: null });
+    expect(eventBodies()).toEqual([]);
+
+    useChatStore.getState().stop();
+    await settle();
+
+    // The user cancelled before the POST: no message is sent and the recovery
+    // copy is gone, so a later reload cannot resurrect the cancelled message.
+    expect(eventBodies()).toEqual([]);
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      conversationId: sessionId,
+      text: original,
+    });
+    expect(persistedFor(sessionId)).toBeUndefined();
+  });
+
   it("cancels and restores repeated corrected drafts before native startup finishes", async () => {
     begin();
     await settle();

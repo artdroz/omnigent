@@ -140,14 +140,23 @@ def _spawn_user_runner(
     )
     auth = {"Authorization": f"Bearer {jwt}"}
     deadline = time.monotonic() + 45
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            raise RuntimeError(f"runner exited early with code {proc.returncode}")
-        status = httpx.get(f"{server.base_url}/v1/runners/{runner_id}/status", headers=auth)
-        if status.status_code == 200 and status.json().get("online") is True:
-            return proc, runner_id
-        time.sleep(0.5)
-    raise RuntimeError("runner never came online")
+    online = False
+    try:
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(f"runner exited early with code {proc.returncode}")
+            status = httpx.get(f"{server.base_url}/v1/runners/{runner_id}/status", headers=auth)
+            if status.status_code == 200 and status.json().get("online") is True:
+                online = True
+                return proc, runner_id
+            time.sleep(0.5)
+        raise RuntimeError("runner never came online")
+    finally:
+        # Only the success path hands proc/log_handle to the fixture teardown; a
+        # failed readiness check must not leak the runner subprocess.
+        if not online:
+            proc.kill()
+            log_handle.close()
 
 
 def _seed_routing_decision(db_path: Path, session_id: str) -> None:
@@ -180,7 +189,9 @@ def relogin_journey(oidc_lane: OIDCLane, browser: Browser) -> Iterator[ReloginJo
     """A signed-in user, their online runner, and the session the create will return."""
     server = oidc_lane.server
     cookies = _sign_in(browser, server)
-    jwt = next(str(c["value"]) for c in cookies if c["name"] == "ap_session")
+    cookie_names = [c["name"] for c in cookies]
+    jwt = next((str(c["value"]) for c in cookies if c["name"] == "ap_session"), None)
+    assert jwt is not None, f"ap_session cookie missing after sign-in; got {cookie_names}"
     auth = {"Authorization": f"Bearer {jwt}"}
     proc, runner_id = _spawn_user_runner(server, jwt, oidc_lane.log_dir / "runner.log")
     try:
@@ -267,6 +278,8 @@ def _install_routes(
     page.route(f"**/v1/hosts/{_HOST_ID}/worktrees?*", lambda r: r.fulfill(json={"data": []}))
     page.route("**/v1/agents", lambda r: r.fulfill(json=json.loads(_ROUTING_AGENTS_BODY)))
     page.route("**/v1/sessions/*/events", handle_events)
+    # Playwright matches routes in reverse registration order and _SESSIONS_RE
+    # also matches the mine-list URL, so _MINE_LIST_RE must stay registered last.
     page.route(_SESSIONS_RE, handle_sessions)
     page.route(_MINE_LIST_RE, handle_mine_list)
     page.add_init_script(
