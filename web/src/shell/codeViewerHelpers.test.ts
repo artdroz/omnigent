@@ -477,12 +477,22 @@ describe("prepareHtmlPreviewDoc", () => {
     expect(out).toContain(`<head>${HEAD}</head>`);
   });
 
-  it("documents the matcher limitation: a <head> literal in earlier markup is matched textually", () => {
-    // A simple regex (not a full parser) matches the first <head> string, even
-    // inside a comment. This only mis-places the harmless markup inside the
-    // sandboxed preview — never a security issue — so we lock in the behavior.
+  it("skips a <head> literal inside a comment and injects into the real head", () => {
     const out = prepareHtmlPreviewDoc("<!-- <head> --><html><head></head></html>");
-    expect(out).toBe(`<!-- <head>${HEAD} --><html><head></head></html>`);
+    expect(out).toBe(`<!-- <head> --><html><head>${HEAD}</head></html>`);
+  });
+
+  it("keeps an artifact script intact when it only mentions <head>/<html> (bare fragment)", () => {
+    // The injected markup carries its own </script>; landing inside this string
+    // would end the artifact's script early.
+    const script = "<script>var t = '<html><head><title>Example</title></head></html>';</script>";
+    const out = prepareHtmlPreviewDoc(`${script}<p>hi</p>`);
+    expect(out).toBe(`${HEAD}${script}<p>hi</p>`);
+  });
+
+  it("does not mistake <header> for <head>", () => {
+    const out = prepareHtmlPreviewDoc("<header>Title</header><p>hi</p>");
+    expect(out).toBe(`${HEAD}<header>Title</header><p>hi</p>`);
   });
 });
 
@@ -504,6 +514,7 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
   beforeAll(() => {
     expect(SCRIPT_BODY).not.toBe("");
     const register = vi.spyOn(window, "addEventListener");
+    // vitest's jsdom does not run inserted <script> elements; the body is a compile-time constant.
     new Function(SCRIPT_BODY)();
     const call = register.mock.calls.find(([type]) => type === "click");
     register.mockRestore();
@@ -534,7 +545,7 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
    * listener runs after it and cancels whatever remains, so jsdom never attempts the
    * navigation of links the handler skipped.
    */
-  function click(selector: string): boolean {
+  function click(selector: string, init: MouseEventInit = {}): boolean {
     let cancelled = false;
     window.addEventListener(
       "click",
@@ -546,7 +557,7 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
     );
     document
       .querySelector(selector)
-      ?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      ?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, ...init }));
     return cancelled;
   }
 
@@ -556,6 +567,14 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
     expect(location.hash).toBe("#section-3");
     expect(location.pathname).toBe("/preview");
     expect(scrolled).toEqual([]);
+  });
+
+  it("keeps modifier clicks in the frame too (a new tab could only reopen the host app)", () => {
+    document.body.innerHTML = '<a id="a" href="#one">1</a><a id="b" href="#two">2</a>';
+    expect(click("#a", { ctrlKey: true })).toBe(true);
+    expect(location.hash).toBe("#one");
+    expect(click("#b", { metaKey: true, shiftKey: true })).toBe(true);
+    expect(location.hash).toBe("#two");
   });
 
   it("handles clicks on elements nested in the anchor and on <area> hotspots", () => {

@@ -419,6 +419,19 @@ const SAME_PAGE_ANCHOR_SCRIPT = `<script>(function () {
 export const HTML_PREVIEW_HEAD = '<base target="_blank">' + SAME_PAGE_ANCHOR_SCRIPT;
 
 /**
+ * End offset of the first real `<head>`/`<html>` start tag, or -1. Comments and
+ * `<script>` blocks are consumed whole so a look-alike tag inside them cannot
+ * attract the injection, whose `</script>` would end the artifact's own script.
+ */
+function startTagEnd(html: string, tag: "head" | "html"): number {
+  const scanner = /<!--[\s\S]*?-->|<script\b[^>]*>[\s\S]*?<\/script\s*>|<(head|html)\b[^>]*>/gi;
+  for (let match = scanner.exec(html); match; match = scanner.exec(html)) {
+    if (match[1]?.toLowerCase() === tag) return match.index + match[0].length;
+  }
+  return -1;
+}
+
+/**
  * Prepare HTML artifact content for the preview iframe: force every link to
  * open in a new tab (issue #777: "We should always make it open in a new
  * window") while same-page `#fragment` links keep scrolling the preview.
@@ -433,30 +446,27 @@ export const HTML_PREVIEW_HEAD = '<base target="_blank">' + SAME_PAGE_ANCHOR_SCR
  *
  * The matcher is a deliberately simple regex, NOT a full HTML parser: parsing
  * and re-serializing untrusted artifact content could subtly alter how it
- * renders. The known trade-off is that a `<head>` literal appearing earlier in
- * the source (e.g. inside a comment or a script string) is matched textually.
- * That only ever mis-places the injected markup *inside the sandboxed preview*
- * — it can break that one artifact's own link handling, never the host app's
- * security — so it's an accepted limitation rather than a bug to parse around.
+ * renders. Comments and `<script>` blocks are skipped so a look-alike tag inside
+ * them is not mistaken for the real one; a literal in other text (a `<style>` or
+ * `<title>`) is still matched textually, which can only mis-place the markup
+ * *inside the sandboxed preview* — never affect the host app's security.
  */
 export function prepareHtmlPreviewDoc(html: string): string {
-  const headMatch = html.match(/<head[^>]*>/i);
-  if (headMatch?.index !== undefined) {
-    const insertAt = headMatch.index + headMatch[0].length;
+  const headEnd = startTagEnd(html, "head");
+  if (headEnd !== -1) {
     // Skip only if our markup is already right after <head> (prepared twice). A loose
     // `includes` check would false-positive on the literal appearing in artifact content
     // and leave the document without a real <base>.
-    if (html.startsWith(HTML_PREVIEW_HEAD, insertAt)) return html;
-    return html.slice(0, insertAt) + HTML_PREVIEW_HEAD + html.slice(insertAt);
+    if (html.startsWith(HTML_PREVIEW_HEAD, headEnd)) return html;
+    return html.slice(0, headEnd) + HTML_PREVIEW_HEAD + html.slice(headEnd);
   }
 
   // No <head>: create one right after <html> so the markup still lands inside
   // the document head (after the doctype, preserving standards mode). A second
   // pass matches the <head> we created above, so this path is idempotent too.
-  const htmlMatch = html.match(/<html[^>]*>/i);
-  if (htmlMatch?.index !== undefined) {
-    const insertAt = htmlMatch.index + htmlMatch[0].length;
-    return `${html.slice(0, insertAt)}<head>${HTML_PREVIEW_HEAD}</head>${html.slice(insertAt)}`;
+  const htmlEnd = startTagEnd(html, "html");
+  if (htmlEnd !== -1) {
+    return `${html.slice(0, htmlEnd)}<head>${HTML_PREVIEW_HEAD}</head>${html.slice(htmlEnd)}`;
   }
 
   // Bare fragment (no <html>/<head>, hence no doctype to displace) — the browser

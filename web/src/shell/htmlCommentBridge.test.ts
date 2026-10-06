@@ -30,6 +30,7 @@ describe("injectCommentBridge", () => {
   it("falls back to before </html> when there is no body", () => {
     const html = "<html><head></head><p>hi</p></html>";
     const out = injectCommentBridge(html, NONCE);
+    expect(out.indexOf(NONCE)).toBeGreaterThan(-1);
     expect(out.indexOf(NONCE)).toBeLessThan(out.indexOf("</html>"));
   });
 
