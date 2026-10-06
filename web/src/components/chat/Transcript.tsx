@@ -20,6 +20,7 @@ import {
   buildBubbles,
   createBubbleCache,
   liveCandidateAssistantIndex,
+  workingIndicatorInsertIndex,
 } from "@/lib/renderItems";
 import { useChatStore } from "@/store/chatStore";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
@@ -288,9 +289,23 @@ function TranscriptImpl({
     return out;
   }, [display.bubbles]);
 
+  const showWorkingIndicator = shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
+  // A message steered in behind the still-active turn is POSTed and promoted to
+  // a bubble below that turn; carry the live Working… indicator on a marker row
+  // beside the active turn so it is not read as the follow-up being processed.
+  const workingInsert = useMemo(
+    () => workingIndicatorInsertIndex(display.streamBubbles, activeResponse, showWorkingIndicator),
+    [display.streamBubbles, activeResponse, showWorkingIndicator],
+  );
+  const streamBubblesWithWorking = useMemo<Bubble[]>(() => {
+    if (workingInsert === -1) return display.streamBubbles;
+    const next = display.streamBubbles.slice();
+    next.splice(workingInsert, 0, { kind: "working", itemId: "working" });
+    return next;
+  }, [display.streamBubbles, workingInsert]);
   const lastAssistantIndex = useMemo(
-    () => liveCandidateAssistantIndex(display.streamBubbles),
-    [display.streamBubbles],
+    () => liveCandidateAssistantIndex(streamBubblesWithWorking),
+    [streamBubblesWithWorking],
   );
 
   // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) user-turn navigation.
@@ -307,7 +322,6 @@ function TranscriptImpl({
     return () => window.removeEventListener("keydown", handler);
   }, [nav]);
 
-  const showWorkingIndicator = shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
   return (
     <>
       {/* Task tracker pinned above the thread. Sibling of the viewport (not an
@@ -364,7 +378,7 @@ function TranscriptImpl({
                 {/* Older pages prepend here while their request is in flight. */}
                 {display.loadingMoreHistory && <HistoryLoadingIndicator />}
                 <VirtualBubbleList
-                  bubbles={display.streamBubbles}
+                  bubbles={streamBubblesWithWorking}
                   scrollEl={scroller?.el ?? null}
                   lastAssistantIndex={lastAssistantIndex}
                   showsWorking={display.showsWorking}
@@ -391,7 +405,7 @@ function TranscriptImpl({
                   </Message>
                 ))}
                 {/* Working… shimmer, lit for the whole busy turn. */}
-                {showWorkingIndicator && <WorkingIndicator />}
+                {showWorkingIndicator && workingInsert === -1 && <WorkingIndicator />}
                 {/* Managed-sandbox stage cue; only when Working is absent. */}
                 {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
                 {/* MCP-server startup band (codex-native); clears once the

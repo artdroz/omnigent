@@ -24,6 +24,7 @@ import {
   createBubbleCache,
   lastRenderableAssistantIndex,
   liveCandidateAssistantIndex,
+  workingIndicatorInsertIndex,
 } from "./renderItems";
 import type { ActiveResponse } from "@/store/types";
 
@@ -4064,6 +4065,69 @@ describe("liveCandidateAssistantIndex", () => {
       null,
     );
     expect(liveCandidateAssistantIndex(bubbles)).toBe(1);
+  });
+});
+
+describe("workingIndicatorInsertIndex", () => {
+  const textDone = (itemId: string, rid: string, text: string): AnyBlock => ({
+    type: "text_done",
+    ctx: ctx({ itemId, responseId: rid }),
+    fullText: text,
+    hasCodeBlocks: false,
+  });
+  const userMsg = (itemId: string, text: string): AnyBlock => ({
+    type: "user_message",
+    ctx: ctx({ itemId, responseId: "" }),
+    content: [{ type: "input_text", text }],
+  });
+  const streaming = (rid: string): ActiveResponse => ({
+    responseId: rid,
+    state: "streaming",
+    error: null,
+  });
+
+  it("rides the tail (-1) for a normal live turn with no trailing follow-up", () => {
+    const bubbles = buildBubbles(
+      [userMsg("u1", "q"), textDone("m1", "r1", "working…")],
+      streaming("r1"),
+    );
+    expect(workingIndicatorInsertIndex(bubbles, streaming("r1"), true)).toBe(-1);
+  });
+
+  it("splices above a follow-up steered in behind the streaming turn's reply", () => {
+    const bubbles = buildBubbles(
+      [userMsg("u1", "q"), textDone("m1", "r1", "working…"), userMsg("u2", "follow-up")],
+      streaming("r1"),
+    );
+    // [user u1, assistant r1 (streaming), user u2]: the marker sits after the
+    // active reply (index 1) and above the follow-up, not at the tail below it.
+    expect(workingIndicatorInsertIndex(bubbles, streaming("r1"), true)).toBe(2);
+  });
+
+  it("anchors to the active prompt when its reply has not streamed yet", () => {
+    const bubbles = buildBubbles(
+      [userMsg("u1", "q"), userMsg("u2", "follow-up")],
+      streaming("r_new"),
+    );
+    // No rendered reply yet: the indicator sits right after the prompt that is
+    // actually running (u1), above the steered follow-up.
+    expect(workingIndicatorInsertIndex(bubbles, streaming("r_new"), true)).toBe(1);
+  });
+
+  it("returns -1 when the Working… indicator is not shown", () => {
+    const bubbles = buildBubbles(
+      [userMsg("u1", "q"), textDone("m1", "r1", "working…"), userMsg("u2", "follow-up")],
+      streaming("r1"),
+    );
+    expect(workingIndicatorInsertIndex(bubbles, streaming("r1"), false)).toBe(-1);
+  });
+
+  it("rides the tail (-1) without a streaming response (buffer-drain harness)", () => {
+    const bubbles = buildBubbles(
+      [userMsg("u1", "q"), textDone("m1", "r1", "answer"), userMsg("u2", "follow-up")],
+      null,
+    );
+    expect(workingIndicatorInsertIndex(bubbles, null, true)).toBe(-1);
   });
 });
 

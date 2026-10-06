@@ -355,6 +355,7 @@ export function bubbleKey(bubble: Bubble): string {
   if (bubble.kind === "compaction") return `compaction:${bubble.itemId}`;
   if (bubble.kind === "routing_decision") return `routing_decision:${bubble.itemId}`;
   if (bubble.kind === "subagent_activity") return `subagent_activity:${bubble.itemId}`;
+  if (bubble.kind === "working") return "working";
   return `assistant:${bubble.stableId}`;
 }
 
@@ -582,6 +583,7 @@ export const BubbleView = memo(
         />
       );
     }
+    if (bubble.kind === "working") return <WorkingIndicator />;
     return (
       <AssistantBubble
         bubble={bubble}

@@ -235,6 +235,13 @@ export type Bubble =
       agent?: string;
       /** Routing identity (harness, scope, decision id …); absent on legacy rows. */
       routing?: RoutingDecisionExtras;
+    }
+  | {
+      // The live-turn Working… indicator, carried as its own row so it can sit
+      // with the active turn rather than below a follow-up steered in behind it.
+      kind: "working";
+      /** Fixed sentinel so the marker shares the union's itemId shape. */
+      itemId: "working";
     };
 
 const TEXT_BLOCK_TYPES = new Set(["text_chunk", "text_done"]);
@@ -547,6 +554,55 @@ export function liveCandidateAssistantIndex(bubbles: readonly Bubble[]): number 
     if (b.kind === "user" && !isSystemUserContent(b.content)) return -1;
   }
   return idx;
+}
+
+/**
+ * Where the live-turn Working… indicator belongs in the bubble list.
+ *
+ * It normally rides the transcript tail. But a message steered forward while
+ * the agent is still working is POSTed and promoted to a bubble right away, so
+ * it lands below the active turn's output — and a tail indicator then sits
+ * beneath that follow-up and reads as the follow-up being processed, while the
+ * earlier turn is the one still running. Return the index at which to splice a
+ * `working` marker row so the indicator stays WITH the active turn: directly
+ * after its content and above any such trailing follow-up.
+ *
+ * Returns -1 when no reposition is needed — the indicator rides the tail (no
+ * trailing follow-up) or the session is not working.
+ *
+ * @param bubbles - the rendered bubble list, without any injected marker.
+ * @param activeResponse - the in-flight response, when the harness streams one.
+ * @param showWorking - whether the Working… indicator is shown at all.
+ */
+export function workingIndicatorInsertIndex(
+  bubbles: readonly Bubble[],
+  activeResponse: ActiveResponse | null,
+  showWorking: boolean,
+): number {
+  if (!showWorking) return -1;
+  const isFollowUp = (b: Bubble): boolean => b.kind === "user" && !isSystemUserContent(b.content);
+  // End of the active turn's content: its own streaming reply bubble when it
+  // has rendered one, else the prompt that opened it (the first unanswered user
+  // turn after the last rendered assistant turn — FIFO, so the earliest wins).
+  const streamingIndex =
+    activeResponse?.state === "streaming"
+      ? bubbles.findIndex(
+          (b) =>
+            b.kind === "assistant" &&
+            b.responseId === activeResponse.responseId &&
+            b.items.length > 0,
+        )
+      : -1;
+  let activeTurnEnd: number;
+  if (streamingIndex !== -1) {
+    activeTurnEnd = streamingIndex;
+  } else {
+    const lastAssistant = lastRenderableAssistantIndex(bubbles);
+    activeTurnEnd = bubbles.findIndex((b, i) => i > lastAssistant && isFollowUp(b));
+  }
+  if (activeTurnEnd === -1) return -1;
+  const hasTrailingFollowUp = bubbles.slice(activeTurnEnd + 1).some(isFollowUp);
+  return hasTrailingFollowUp ? activeTurnEnd + 1 : -1;
 }
 
 /**
@@ -1872,5 +1928,6 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
   if (a.kind === "subagent_activity" && b.kind === "subagent_activity") {
     return a.itemId === b.itemId && a.data === b.data;
   }
+  if (a.kind === "working" && b.kind === "working") return true;
   return false;
 }
