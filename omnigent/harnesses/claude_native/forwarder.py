@@ -107,10 +107,12 @@ _MAX_SEEN_DELTA_KEYS = 5000
 # This heuristic does not establish that the sub-agent has completed.
 _SUBAGENT_IDLE_THRESHOLD_S = 5.0
 
-# Meta-file glob inside ``~/.claude/projects/<encoded>/<session>/subagents/``.
-# One per Claude Task-tool subagent; appears alongside the matching
-# ``agent-<id>.jsonl`` transcript.
+# Sub-agent file globs inside ``~/.claude/projects/<encoded>/<session>/subagents/``,
+# matched recursively: one ``.meta.json`` per Claude Task-tool subagent beside its
+# ``agent-<id>.jsonl`` transcript, flat for an ordinary spawn or nested under
+# ``workflows/<runId>/`` (Claude's per-agent ``transcriptSubdir``) for a workflow run.
 _SUBAGENT_META_GLOB = "agent-*.meta.json"
+_SUBAGENT_TRANSCRIPT_GLOB = "agent-*.jsonl"
 # Claude's built-in sub-agent spawn tool; its tool-use id is the ``toolUseId``
 # stamped into each ``agent-<id>.meta.json``. Reuse the router's canonical set so
 # both the current ``Agent`` name and the still-supported ``Task`` alias match.
@@ -588,6 +590,9 @@ class SubagentEntry:
         means no observation has been handled yet.
     :param delivery_error: Durable reason the mirrored transcript is
         incomplete. After inactivity it reports ``failed`` instead of idle.
+    :param transcript_subdir: Directory holding this sub-agent's files,
+        relative to ``subagents/``: ``""`` for a flat Task spawn,
+        ``"workflows/<runId>"`` for a workflow-run spawn.
     """
 
     subagent_id: str
@@ -598,6 +603,7 @@ class SubagentEntry:
     last_activity_ts: float | None = None
     last_status: str | None = None
     delivery_error: str | None = None
+    transcript_subdir: str = ""
 
 
 @dataclass(frozen=True)
@@ -1568,9 +1574,10 @@ def _subagents_dir_for_transcript(transcript_path: Path) -> Path:
 
     Claude Code writes each Task-tool sub-agent's transcript to
     ``~/.claude/projects/<encoded>/<session>/subagents/agent-*.jsonl``
-    where ``<session>`` matches the parent transcript's filename stem.
-    The parent transcript itself lives at
-    ``~/.claude/projects/<encoded>/<session>.jsonl`` alongside that
+    where ``<session>`` matches the parent transcript's filename stem;
+    a workflow-run spawn lands one level deeper, under
+    ``subagents/workflows/<runId>/``. The parent transcript itself lives
+    at ``~/.claude/projects/<encoded>/<session>.jsonl`` alongside that
     directory.
 
     :param transcript_path: Parent's transcript JSONL,
@@ -1580,6 +1587,17 @@ def _subagents_dir_for_transcript(transcript_path: Path) -> Path:
         sub-agents have been spawned yet" case).
     """
     return transcript_path.parent / transcript_path.stem / "subagents"
+
+
+def _subagent_transcript_subdir(subagents_dir: Path, agent_file: Path) -> str:
+    """Directory of ``agent_file`` relative to ``subagents/``; ``""`` for the flat layout."""
+    relative = agent_file.parent.relative_to(subagents_dir)
+    return "" if relative == Path() else relative.as_posix()
+
+
+def _subagent_transcript_path(subagents_dir: Path, entry: SubagentEntry) -> Path:
+    """Locate a tracked sub-agent's ``agent-<id>.jsonl`` under ``subagents/``."""
+    return subagents_dir / entry.transcript_subdir / f"agent-{entry.subagent_id}.jsonl"
 
 
 def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
@@ -1613,6 +1631,7 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
         seen_source_ids = row.get("seen_source_ids", [])
         last_activity_ts = row.get("last_activity_ts")
         last_status = row.get("last_status")
+        transcript_subdir = row.get("transcript_subdir")
         # Empty string is a valid parked sentinel written by
         # ``_forward_available_subagents`` after the start POST exhausts
         # its permanent-failure budget. Preserving it across restarts is
@@ -1631,6 +1650,8 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             last_activity_ts = None
         if last_status is not None and not isinstance(last_status, str):
             last_status = None
+        if not isinstance(transcript_subdir, str):
+            transcript_subdir = ""
         entries[subagent_id] = SubagentEntry(
             subagent_id=subagent_id,
             child_conversation_id=child_id,
@@ -1642,6 +1663,7 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             delivery_error=(
                 row.get("delivery_error") if isinstance(row.get("delivery_error"), str) else None
             ),
+            transcript_subdir=transcript_subdir,
         )
     return SubagentForwardState(subagents=entries)
 
@@ -1665,6 +1687,7 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
                 "last_activity_ts": entry.last_activity_ts,
                 "last_status": entry.last_status,
                 "delivery_error": entry.delivery_error,
+                "transcript_subdir": entry.transcript_subdir,
             }
             for entry in state.subagents.values()
         },
@@ -2101,7 +2124,7 @@ async def _forward_one_subagent(
         # The failed head item still owns the source cursor. Avoid reparsing a
         # large child transcript on every poll while its capped backoff runs.
         return
-    jsonl_path = subagents_dir / f"agent-{entry.subagent_id}.jsonl"
+    jsonl_path = _subagent_transcript_path(subagents_dir, entry)
     if not jsonl_path.exists():
         return
     result = await asyncio.to_thread(
@@ -2431,18 +2454,19 @@ def _subagent_parents_by_tool_use(
 ) -> dict[str, str | None]:
     """Correlate Claude spawn tool ids to their immediate transcript owner.
 
-    Reads the root transcript and every ``agent-*.jsonl`` in full. The caller
-    only invokes this when unregistered meta files exist, so idle sessions pay
-    nothing. The common case is a transient spawn burst; the exception is an
-    orphan meta whose spawn record never lands, which keeps the transcripts
-    re-read on every poll until it appears (or the process restarts).
+    Reads the root transcript and every ``agent-*.jsonl`` under ``subagents/``
+    (nested workflow runs included) in full. The caller only invokes this when
+    unregistered meta files exist, so idle sessions pay nothing. The common case
+    is a transient spawn burst; the exception is an orphan meta whose spawn
+    record never lands, which keeps the transcripts re-read on every poll until
+    it appears (or the process restarts).
     """
     owners: dict[str, str | None] = {}
     ambiguous: set[str] = set()
     transcript_owners: list[tuple[Path, str | None]] = [(transcript_path, None)]
     transcript_owners.extend(
         (path, _subagent_id_from_meta_path(path))
-        for path in sorted(subagents_dir.glob("agent-*.jsonl"))
+        for path in sorted(subagents_dir.rglob(_SUBAGENT_TRANSCRIPT_GLOB))
     )
     for path, owner_id in transcript_owners:
         for tool_use_id in _tool_use_ids_in_transcript(
@@ -2515,9 +2539,9 @@ async def _forward_available_subagents(
         status_capability = _SubagentStatusCapability()
 
     # ── Register newly-appeared sub-agents ──────────────
-    # ``glob`` is sync; offload to a thread so we don't stat the
+    # ``rglob`` is sync; offload to a thread so we don't stat the
     # filesystem on the event loop.
-    meta_paths = await asyncio.to_thread(lambda: sorted(subagents_dir.glob(_SUBAGENT_META_GLOB)))
+    meta_paths = await asyncio.to_thread(lambda: sorted(subagents_dir.rglob(_SUBAGENT_META_GLOB)))
     updated = state
     candidate_meta_paths = [
         path
@@ -2593,6 +2617,9 @@ async def _forward_available_subagents(
                                     subagent_id=subagent_id,
                                     child_conversation_id="",
                                     parent_subagent_id=parent_subagent_id,
+                                    transcript_subdir=_subagent_transcript_subdir(
+                                        subagents_dir, meta_path
+                                    ),
                                 ),
                             }
                         )
@@ -2644,6 +2671,9 @@ async def _forward_available_subagents(
                                 subagent_id=subagent_id,
                                 child_conversation_id="",
                                 parent_subagent_id=parent_subagent_id,
+                                transcript_subdir=_subagent_transcript_subdir(
+                                    subagents_dir, meta_path
+                                ),
                             ),
                         }
                     )
@@ -2671,6 +2701,7 @@ async def _forward_available_subagents(
                         subagent_id=subagent_id,
                         child_conversation_id=child_id,
                         parent_subagent_id=parent_subagent_id,
+                        transcript_subdir=_subagent_transcript_subdir(subagents_dir, meta_path),
                     ),
                 }
             )
@@ -2826,7 +2857,7 @@ def _session_cost_estimate(
         parent_transcript_path, include_sidechains=False, cache=cost_cache
     )
     for entry in active_subagents:
-        jsonl_path = subagents_dir / f"agent-{entry.subagent_id}.jsonl"
+        jsonl_path = _subagent_transcript_path(subagents_dir, entry)
         sub_cost = _transcript_cost_size_cached(
             jsonl_path, include_sidechains=True, cache=cost_cache
         )

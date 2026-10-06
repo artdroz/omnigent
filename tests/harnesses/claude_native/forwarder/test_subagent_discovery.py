@@ -698,3 +698,74 @@ async def test_subagent_watcher_preserves_parked_sentinel_across_restart(
             await task
 
     assert starts == [], f"forwarder retried a parked sub-agent after restart: {starts!r}"
+
+
+async def test_subagent_watcher_registers_workflow_nested_spawn(
+    tmp_path: Path,
+) -> None:
+    """
+    A workflow-run sub-agent nested under ``subagents/workflows/<runId>/``
+    registers alongside a flat sibling.
+
+    Claude Code writes a background workflow sub-agent's files to
+    ``subagents/workflows/<runId>/agent-<id>.{jsonl,meta.json}`` (its per-agent
+    ``transcriptSubdir``) and enumerates ``subagents/`` recursively, so its own
+    TUI shows the sub-agent; the Agents rail must list it too.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    # Flat spawn (control) — the layout that already registers today.
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="flat-worker",
+        agent_type="general-purpose",
+        description="flat background spawn",
+        tool_use_id="toolu_flat",
+    )
+    # Workflow-run spawn — same session, nested one level under subagents/.
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="nested-worker",
+        agent_type="general-purpose",
+        description="background workflow spawn",
+        tool_use_id="toolu_nested",
+        transcript_subdir="workflows/wf_run_abc123",
+    )
+
+    start_paths: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("type") != "external_subagent_start":
+            return httpx.Response(202, json={})
+        subagent_id = body["data"]["subagent_id"]
+        start_paths[subagent_id] = request.url.path
+        return httpx.Response(
+            202,
+            json={"queued": False, "child_session_id": f"conv_{subagent_id}"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert start_paths == {
+        "flat-worker": "/v1/sessions/conv_root/events",
+        "nested-worker": "/v1/sessions/conv_root/events",
+    }
+    assert "nested-worker" in state.subagents
+    assert state.subagents["nested-worker"].child_conversation_id == "conv_nested-worker"

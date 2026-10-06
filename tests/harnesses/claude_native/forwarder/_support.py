@@ -287,6 +287,7 @@ def _seed_subagent_on_disk(
     transcript_records: list[dict[str, Any]] | None = None,
     spawn_transcript_path: Path | None = None,
     spawn_tool_name: str = "Agent",
+    transcript_subdir: str | None = None,
 ) -> Path:
     """
     Create the ``.meta.json`` + ``.jsonl`` pair Claude Code would
@@ -311,6 +312,10 @@ def _seed_subagent_on_disk(
         tool call. Defaults to the top-level transcript.
     :param spawn_tool_name: Name on the spawning ``tool_use`` block.
         Defaults to ``"Agent"``; pass ``"Task"`` to exercise the alias.
+    :param transcript_subdir: Optional relative subdir under ``subagents/``
+        the agent files land in, mirroring the CLI's per-agent
+        ``transcriptSubdir`` (``workflows/<runId>`` for workflow-run spawns).
+        ``None`` writes the flat ``subagents/agent-<id>.*`` layout.
     :returns: Path to the sub-agent's ``.jsonl`` (handy for tests
         that append rows after the fact).
     """
@@ -338,6 +343,8 @@ def _seed_subagent_on_disk(
             + "\n"
         )
     subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    if transcript_subdir is not None:
+        subagents_dir = subagents_dir / transcript_subdir
     subagents_dir.mkdir(parents=True, exist_ok=True)
     meta_path = subagents_dir / f"agent-{subagent_id}.meta.json"
     meta_path.write_text(
