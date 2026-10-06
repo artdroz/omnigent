@@ -193,7 +193,7 @@ def test_pdf_worker_failure_keeps_session_and_download_available(
     file_button.click()
     file_viewer = page.locator('[data-testid="file-viewer"]:visible')
     expect(file_viewer.get_by_role("alert")).to_contain_text(
-        "Could not preview this PDF", timeout=30_000
+        "Unable to render PDF.", timeout=30_000
     )
     assert page.evaluate("window.__pdfWorkerBlocked") is True
     assert f"/c/{session_id}" in page.url

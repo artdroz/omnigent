@@ -901,7 +901,7 @@ describe("CodeViewer PDF routing", () => {
     };
     try {
       const { rerender } = render(<CodeViewer {...props} />);
-      expect(await screen.findByRole("alert")).toHaveTextContent("Could not preview this PDF");
+      expect(await screen.findByRole("alert")).toHaveTextContent("Unable to render PDF.");
       pdfRendering.error = null;
       rerender(<CodeViewer {...props} path="healthy.pdf" />);
       expect(await screen.findByTestId("pdf-viewer-stub")).toBeInTheDocument();
