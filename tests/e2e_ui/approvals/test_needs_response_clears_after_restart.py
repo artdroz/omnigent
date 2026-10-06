@@ -140,7 +140,8 @@ def _terminate(proc: subprocess.Popen) -> None:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.wait(timeout=5)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
 
 
 @pytest.mark.timeout(240)
@@ -180,21 +181,24 @@ def test_subagent_needs_response_survives_restart_and_answer(tmp_path: Path) -> 
         "OPENAI_API_KEY": "mock-key",
     }
 
-    server_log = open(tmp_path / "server.log", "w")  # noqa: SIM115
-    runner_log = open(tmp_path / "runner.log", "w")  # noqa: SIM115
-    server = subprocess.Popen(
-        _server_command(port, db_path, artifact_dir, agent_yaml),
-        env=server_env,
-        stdout=server_log,
-        stderr=subprocess.STDOUT,
-    )
-    runner = subprocess.Popen(
-        [sys.executable, "-m", "omnigent.runner._entry"],
-        env=runner_env,
-        stdout=runner_log,
-        stderr=subprocess.STDOUT,
-    )
+    server: subprocess.Popen | None = None
+    runner: subprocess.Popen | None = None
+    server_log = runner_log = None
     try:
+        server_log = open(tmp_path / "server.log", "w")  # noqa: SIM115
+        runner_log = open(tmp_path / "runner.log", "w")  # noqa: SIM115
+        server = subprocess.Popen(
+            _server_command(port, db_path, artifact_dir, agent_yaml),
+            env=server_env,
+            stdout=server_log,
+            stderr=subprocess.STDOUT,
+        )
+        runner = subprocess.Popen(
+            [sys.executable, "-m", "omnigent.runner._entry"],
+            env=runner_env,
+            stdout=runner_log,
+            stderr=subprocess.STDOUT,
+        )
         _wait_health(base_url, server, runner_id=runner_id)
 
         # 1. Create a runner-bound session (the sub-agent's session).
@@ -253,10 +257,14 @@ def test_subagent_needs_response_survives_restart_and_answer(tmp_path: Path) -> 
         )
         _wait_health(base_url, server, runner_id=None)
 
-        # 5. The user answers the restarted session (as they would from the chat
-        #    or the Inbox). A correct build clears the badge; the buggy build's
-        #    resolve() early-returns on the empty in-memory index and never
-        #    decrements the persisted count.
+        # The orphaned count survives the restart: the badge is still stuck at 1
+        # before any answer, so clearing it below is the resolve's doing.
+        assert _sidebar_badge_count(base_url, session_id) == 1, (
+            "restart did not preserve the orphaned 'Needs response' badge"
+        )
+
+        # 5. The user answers the restarted session. A correct build clears the
+        #    badge; the buggy build's resolve() no-ops on the empty index.
         resolve = httpx.post(
             f"{base_url}/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
             json={"action": "accept"},
@@ -278,7 +286,11 @@ def test_subagent_needs_response_survives_restart_and_answer(tmp_path: Path) -> 
             f"'Needs response' (pending_elicitations_count={final_count})."
         )
     finally:
-        _terminate(runner)
-        _terminate(server)
-        server_log.close()
-        runner_log.close()
+        if runner is not None:
+            _terminate(runner)
+        if server is not None:
+            _terminate(server)
+        if server_log is not None:
+            server_log.close()
+        if runner_log is not None:
+            runner_log.close()

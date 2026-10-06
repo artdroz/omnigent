@@ -9,15 +9,19 @@ the fix the user's answer never decremented the persisted count and the sidebar
 "Needs response" badge stayed lit forever.
 
 ``_resolve_elicitation`` now reconciles the persisted count to the authoritative
-live count whenever no runner tunnel is reachable, so an answer to an orphaned
-prompt finally clears the badge. A reachable runner is left untouched: its own
-resolve on the tunnel-holding replica writes the authoritative count.
+live count when the bound runner is confirmed offline, so an answer to an
+orphaned prompt finally clears the badge. A reachable runner is left untouched,
+and so is a runner that is merely live on another replica (``WRONG_REPLICA``):
+that replica owns the tunnel and the authoritative count, so reconciling off
+this replica's empty index would wrongly zero the badge without the answer ever
+reaching the runner.
 """
 
 from __future__ import annotations
 
 import pytest
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import pending_elicitations
 from omnigent.server import session_live_state
 from omnigent.server.routes import sessions as S
@@ -132,4 +136,74 @@ async def test_reachable_runner_resolve_does_not_reconcile(_clean_index, monkeyp
     assert persisted == [], (
         "a reachable runner must not trigger the offline reconcile — the "
         f"tunnel-holding replica owns the count; got {persisted}"
+    )
+
+
+class _RaisingRouter:
+    """Router whose resource lookup fails with a chosen absence code."""
+
+    def __init__(self, code: ErrorCode) -> None:
+        self._code = code
+
+    def client_for_session_resources(self, session_id: str):
+        raise OmnigentError("no local client", code=self._code)
+
+
+@pytest.mark.asyncio
+async def test_wrong_replica_runner_resolve_does_not_reconcile(_clean_index, monkeypatch):
+    """A runner live on another replica (``WRONG_REPLICA``) is reachable — just
+    not from here. Reconciling off this replica's empty index would clobber the
+    authoritative count the tunnel-holding replica owns, so the resolve must NOT
+    reconcile even though the local client lookup returns ``None``."""
+    sid = "conv_wrong_replica"
+    eid = "elicit_evaluate_44444444444444444444444444444444"
+
+    # The local-replica forward cannot reach the remote runner (returns None),
+    # yet the runner is alive elsewhere — the router reports WRONG_REPLICA.
+    async def _no_local_client(session_id, runner_router, **kwargs):
+        return None
+
+    monkeypatch.setattr(S, "_get_runner_client", _no_local_client)
+
+    persisted: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        session_live_state,
+        "persist_pending_count",
+        lambda conv_id, count: persisted.append((conv_id, count)),
+    )
+
+    router = _RaisingRouter(ErrorCode.WRONG_REPLICA)
+    await S._resolve_elicitation(sid, {"elicitation_id": eid, "action": "accept"}, router)
+
+    assert persisted == [], (
+        "a WRONG_REPLICA miss means the runner is live on another replica that "
+        f"owns the count; this replica must not reconcile; got {persisted}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_offline_runner_via_router_resolve_reconciles(_clean_index, monkeypatch):
+    """A ``RUNNER_UNAVAILABLE`` lookup confirms the runner is genuinely gone, so
+    the orphaned-count reconcile fires through the router path too."""
+    sid = "conv_router_offline"
+    eid = "elicit_evaluate_55555555555555555555555555555555"
+
+    async def _no_local_client(session_id, runner_router, **kwargs):
+        return None
+
+    monkeypatch.setattr(S, "_get_runner_client", _no_local_client)
+
+    persisted: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        session_live_state,
+        "persist_pending_count",
+        lambda conv_id, count: persisted.append((conv_id, count)),
+    )
+
+    router = _RaisingRouter(ErrorCode.RUNNER_UNAVAILABLE)
+    await S._resolve_elicitation(sid, {"elicitation_id": eid, "action": "accept"}, router)
+
+    assert (sid, 0) in persisted, (
+        "a confirmed-offline runner (RUNNER_UNAVAILABLE) must reconcile the "
+        f"persisted count to the live count (0) via the router path; got {persisted}"
     )

@@ -2161,6 +2161,25 @@ async def _persist_model_change_note(
     _publish_external_conversation_item(session_id, persisted_items[0])
 
 
+async def _runner_confirmed_offline(session_id: str, runner_router: RunnerRouter | None) -> bool:
+    """Whether the session's bound runner is confirmed gone, not merely elsewhere.
+
+    ``_get_runner_client`` returns ``None`` both for a genuinely offline runner
+    and for a ``WRONG_REPLICA`` miss, where the runner is live on another replica
+    that owns the authoritative pending count. The orphaned-count reconcile must
+    fire only in the former case: reconciling on a wrong-replica miss would zero
+    the durable count from an empty local index and clear the badge without the
+    answer ever reaching the runner.
+    """
+    if runner_router is None:
+        return await _get_runner_client(session_id, runner_router) is None
+    try:
+        runner_router.client_for_session_resources(session_id)
+    except OmnigentError as exc:
+        return exc.code != ErrorCode.WRONG_REPLICA
+    return False
+
+
 async def _resolve_elicitation(
     session_id: str,
     data: dict[str, Any],
@@ -2319,14 +2338,11 @@ async def _resolve_elicitation(
     # resolve when the canonical approval event reaches the runner.
     await _forward_approval_to_runner(session_id, data, runner_router)
 
-    # A dead sub-agent runner plus a server restart orphans the persisted
-    # pending count: the in-memory index is empty, so ``resolve`` above no-ops
-    # and ``_on_runner_connect`` never fires for a runner that never returns.
-    # With no runner reachable, persist the authoritative live count so
-    # answering clears the stuck "Needs response" badge; a reachable runner's
-    # own tunnel replica owns that write, so leave it untouched.
+    # A restart with a dead runner orphans the persisted pending count: the empty
+    # index makes ``resolve`` above a no-op. Reconcile the live count only when the
+    # runner is confirmed offline; a runner on another replica owns that write.
     if isinstance(elicitation_id, str) and elicitation_id:
-        if await _get_runner_client(session_id, runner_router) is None:
+        if await _runner_confirmed_offline(session_id, runner_router):
             session_live_state.persist_pending_count(
                 session_id, pending_elicitations.count_for(session_id)
             )
