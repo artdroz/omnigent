@@ -140,6 +140,7 @@ class _Session:
             )
         )
         deadline = time.monotonic() + 60
+        pane = ""
         while time.monotonic() < deadline:
             pane = self.tmux("capture-pane", "-p")
             # Ultra uses a double chevron; the final composer follows earlier user turns.
@@ -463,11 +464,10 @@ def test_codex_resume_clamps_persisted_effort(codex_effort_rig: _Rig) -> None:
         terminate_process(rig.stack.runner)
         rig.stack.runner = None
         deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            status = _json(rig.api.get(f"/v1/runners/{rig.stack.runner_id}/status"))
-            if not status["online"]:
-                break
+        status = _json(rig.api.get(f"/v1/runners/{rig.stack.runner_id}/status"))
+        while status["online"] and time.monotonic() < deadline:
             time.sleep(0.2)
+            status = _json(rig.api.get(f"/v1/runners/{rig.stack.runner_id}/status"))
         assert not status["online"], "The old runner must be offline before changing saved effort"
         _json(rig.api.patch(f"/v1/sessions/{session.id}", json={"reasoning_effort": "minimal"}))
         saved = _json(rig.api.get(f"/v1/sessions/{session.id}"))

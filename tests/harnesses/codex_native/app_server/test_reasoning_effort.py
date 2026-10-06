@@ -193,6 +193,15 @@ async def test_effort_reset_for_an_unlisted_model_is_refused() -> None:
         await app_server.resolve_codex_effort_for_model(client, None, "gpt-unlisted")
 
 
+async def test_effort_reset_names_a_catalog_it_could_not_read() -> None:
+    """A reset refused because discovery failed says so, unlike one for an unlisted model."""
+    client = AsyncMock(spec=app_server.CodexAppServerClient)
+    client.request.side_effect = ConnectionError("app-server unreachable")
+
+    with pytest.raises(ValueError, match="Could not read the Codex model catalog"):
+        await app_server.resolve_codex_effort_for_model(client, None, "gpt-5.4")
+
+
 @pytest.mark.parametrize("boundary", ["same-server", "new-server", "expired"])
 async def test_successful_catalog_discovery_is_shared_between_turn_clients(
     monkeypatch: pytest.MonkeyPatch, boundary: str

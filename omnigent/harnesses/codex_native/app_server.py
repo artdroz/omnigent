@@ -829,7 +829,12 @@ async def resolve_codex_effort_for_model(
     if effort is None:
         entry = _codex_model_catalog_entry(catalog, model) if model else None
         if entry is None:
-            raise ValueError(f"Codex model capabilities unavailable for {model!r}")
+            # Name the cause, since an unreachable server and an unlisted model differ.
+            raise ValueError(
+                "Could not read the Codex model catalog to resolve the default effort"
+                if model and catalog is None
+                else f"Codex model capabilities unavailable for {model!r}"
+            )
         default = entry.get("defaultReasoningEffort", entry.get("default_reasoning_level"))
         if not isinstance(default, str) or not default:
             raise ValueError("Codex model catalog did not provide a default reasoning effort")
@@ -4471,9 +4476,10 @@ async def apply_codex_thread_effort(
     try:
         await asyncio.wait_for(client.connect(), timeout=_EFFORT_CONNECT_TIMEOUT_SECONDS)
         if model is None and bridge_dir is not None:
-            model = read_unmirrored_codex_settings(bridge_dir).get(
-                "model"
-            ) or read_codex_config_model(bridge_dir)
+            pending = await asyncio.to_thread(read_unmirrored_codex_settings, bridge_dir)
+            model = pending.get("model") or await asyncio.to_thread(
+                read_codex_config_model, bridge_dir
+            )
         applied_effort = await resolve_codex_effort_for_model(
             client, effort, model, transport=transport
         )

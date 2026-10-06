@@ -1451,6 +1451,62 @@ def test_dispatch_uses_model_supported_effort(
     assert read_codex_config_model(tmp_path) == (model_override or "gpt-5.6-sol")
 
 
+def test_dispatch_validates_an_effort_whose_config_write_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Turn dispatch checks a recorded applied effort, not the stale config value."""
+    from omnigent.harnesses.codex_native.bridge import (
+        read_unmirrored_codex_settings,
+        write_unmirrored_codex_settings,
+    )
+
+    class CatalogClient(_FakeCodexNativeClient):
+        requests: list[tuple[str, dict[str, Any]]] = []
+        created = []
+        next_turn = 1
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "model/list":
+                type(self).requests.append((method, params))
+                return {
+                    "result": {
+                        "data": [
+                            {
+                                "id": "gpt-5.6-sol",
+                                "supportedReasoningEfforts": [
+                                    {"reasoningEffort": value}
+                                    for value in ("low", "medium", "high", "xhigh")
+                                ],
+                            }
+                        ],
+                        "nextCursor": None,
+                    }
+                }
+            return await super().request(method, params)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", CatalogClient
+    )
+    _start_state(tmp_path)
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    (home / "config.toml").write_text('model = "gpt-5.6-sol"\nmodel_reasoning_effort = "high"\n')
+    # A live update applied max, but its config write failed.
+    write_unmirrored_codex_settings(tmp_path, {"effort": "max"})
+
+    _run_turn_with_config(
+        CodexNativeExecutor(bridge_dir=tmp_path), "hello", ExecutorConfig(model=None, extra={})
+    )
+
+    updates = [
+        params for method, params in CatalogClient.requests if method == "thread/settings/update"
+    ]
+    assert updates == [{"threadId": "thread_123", "effort": "xhigh"}]
+    assert read_codex_config_effort(tmp_path) == "xhigh"
+    assert read_unmirrored_codex_settings(tmp_path) == {}
+
+
 def test_effort_only_settings_update_leaves_config_toml_model(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
