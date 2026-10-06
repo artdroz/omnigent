@@ -1,15 +1,4 @@
-"""E2E: a claude-native session on a 1M-capable gateway Claude model runs with a 1M window.
-
-Omnigent launches Claude Code with the alias pins (``ANTHROPIC_DEFAULT_*_MODEL``) and
-``--model`` derived from the provider / ucode catalog. Claude Code sizes its context
-window client-side from the effective model id, so the spelling Omnigent pins decides
-whether a 1M-capable Opus / Sonnet session gets 1M or Claude Code's 200K default.
-
-The journey is the reported one: start a Claude Code session whose default model is a
-1M-capable Opus served by a gateway (spelled bare, as the Databricks catalog lists it),
-open the Terminal view, type ``/context``, then send one message and read the window
-Omnigent shows in the session snapshot (what sizes the composer context ring).
-"""
+"""E2E: a claude-native session on a 1M-capable gateway Opus runs with a 1M context window."""
 
 from __future__ import annotations
 
@@ -17,7 +6,6 @@ import json
 import os
 import re
 import subprocess
-import textwrap
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -25,6 +13,7 @@ from pathlib import Path
 import httpx
 import pyte
 import pytest
+import yaml
 from playwright.sync_api import Page, expect
 from websockets.sync.client import connect as ws_connect
 
@@ -67,11 +56,7 @@ def _provider_config_path() -> Path:
 
 @pytest.fixture
 def gateway_1m_claude_provider(live_server: str, mock_llm_server_url: str) -> Iterator[None]:
-    """Route Claude Code to the mock with opus/sonnet pinned to 1M-capable gateway ids.
-
-    The ids are spelled bare, exactly as the Databricks catalog lists them; the
-    mock accepts any model id, so the launch and the turn succeed either way.
-    """
+    """Route Claude Code to the mock with opus/sonnet pinned to bare 1M-capable gateway ids."""
     config_path = _provider_config_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
     backup = config_path.with_name(config_path.name + ".context-window-pin-backup")
@@ -82,26 +67,21 @@ def gateway_1m_claude_provider(live_server: str, mock_llm_server_url: str) -> It
         fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as handle:
             handle.write(original)
-    config_path.write_text(
-        textwrap.dedent(
-            f"""\
-            runner:
-              idle_timeout_s: 0
-            providers:
-              gateway-1m-claude:
-                kind: key
-                default: [anthropic]
-                anthropic:
-                  base_url: "{mock_llm_server_url}"
-                  api_key: "mock-key"
-                  models:
-                    default: {_OPUS}
-                    opus: {_OPUS}
-                    sonnet: {_SONNET}
-            """
-        ),
-        encoding="utf-8",
-    )
+    config = {
+        "runner": {"idle_timeout_s": 0},
+        "providers": {
+            "gateway-1m-claude": {
+                "kind": "key",
+                "default": ["anthropic"],
+                "anthropic": {
+                    "base_url": mock_llm_server_url,
+                    "api_key": "mock-key",
+                    "models": {"default": _OPUS, "opus": _OPUS, "sonnet": _SONNET},
+                },
+            }
+        },
+    }
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     try:
         yield
     finally:
@@ -123,11 +103,7 @@ def _terminal_id(base_url: str, session_id: str) -> str | None:
 
 
 def _pane_text(base_url: str, session_id: str, *, seconds: float = 2.0) -> str:
-    """Render the session terminal's screen from a read-only attach.
-
-    The attach seeds the client with ``capture-pane`` output, so the rendered
-    screen is the TUI's own text regardless of where the runner's tmux lives.
-    """
+    """Render the terminal screen from a read-only attach, seeded by ``capture-pane``."""
     terminal_id = _terminal_id(base_url, session_id)
     if terminal_id is None:
         return ""

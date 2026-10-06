@@ -8698,11 +8698,9 @@ async def _auto_create_claude_terminal(
                         str(catalog_default.get("model") or catalog_default.get("id") or "")
                         or None
                     )
-    # A managed 1M-capable Opus/Sonnet launch serves a 1M window, but Claude Code
-    # caps a custom gateway id at its 200K default unless this env var raises it.
-    # Set it on the launch env, not the model id: the id must stay bare so it
-    # still resolves to the family slot the launch pinned (a trailing [1m] breaks
-    # that match and drops the pane onto the CLI's built-in default model).
+    # Claude Code caps a custom gateway id at its 200K default unless this env var
+    # raises it. Keep the id bare: a trailing [1m] breaks its match against the
+    # pinned family slot and drops the pane onto the CLI's built-in default model.
     from omnigent.models.claude_model_vocabulary import (
         CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV,
         LONG_CONTEXT_WINDOW_TOKENS,

@@ -1609,12 +1609,7 @@ async def test_auto_create_claude_terminal_leaves_a_non_1m_launch_at_the_default
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A 200K-only family (Haiku) keeps Claude Code's default window.
-
-    The window env is set only for the Opus/Sonnet families that serve 1M, so a
-    Haiku launch gets neither the env override nor a change to its recorded
-    config: the id launches bare and Claude Code sizes it at its own default.
-    """
+    """A Haiku (200K-only) launch gets neither the window env nor a changed recorded config."""
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
 
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)

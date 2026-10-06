@@ -124,29 +124,16 @@ def normalized_model_id(model: str) -> str:
 #: Context window a 1M-capable Opus/Sonnet model serves, in tokens.
 LONG_CONTEXT_WINDOW_TOKENS = 1_000_000
 
-#: Claude Code env var that overrides its computed context window. It is
-#: honoured only for a custom gateway id — one outside Claude Code's own
-#: registry, which is every id omnigent's managed gateway serves — so a managed
-#: launch sets it instead of marking the id, keeping the served id bare so it
-#: still resolves to the family slot the launch pinned.
+#: Claude Code env var raising the window it computes for a custom gateway id.
+#: A managed launch sets it rather than appending ``[1m]`` to the id, which would
+#: break the bare id's match against the pinned family slot.
 CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
 
 _LONG_CONTEXT_FAMILIES: frozenset[str] = frozenset({"opus", "sonnet"})
 
 
 def is_long_context_claude_model(model_id: str) -> bool:
-    """Whether a served id names a 1M-context Opus or Sonnet model.
-
-    Claude Code sizes a session's context window client-side. For a custom
-    gateway id it defaults to a 200K window even when the model and gateway
-    serve 1M, so a managed launch raises the window itself — but only for the
-    families that actually serve 1M. Opus and Sonnet do; Haiku, Fable, and
-    non-Claude models do not.
-
-    :param model_id: A served model id, e.g. ``"system.ai.claude-opus-5"``.
-    :returns: ``True`` for the long-context Opus/Sonnet families; ``False`` for
-        non-Claude ids, bare family aliases, and 200K-only families.
-    """
+    """Whether a served id is a 1M-context Opus/Sonnet model (Haiku, Fable, aliases are not)."""
     canonical = canonical_claude_id(model_id)
     if canonical is None:
         return False
