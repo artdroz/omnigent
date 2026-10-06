@@ -2588,12 +2588,12 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
 
         write = await _execute_os_env_tool(
             "sys_os_write",
-            {"path": "note.txt", "content": "hello\nplanet\n"},
+            {"path": "note.txt", "content": "Привет 世界\nplanet\n"},
             agent_spec=spec,
             conversation_id="conv_runner_os_env_test",
         )
         assert json.loads(write)["created"] is True
-        assert root.joinpath("note.txt").read_text() == "hello\nplanet\n"
+        assert root.joinpath("note.txt").read_text() == "Привет 世界\nplanet\n"
 
         edit = await _execute_os_env_tool(
             "sys_os_edit",
@@ -2609,7 +2609,8 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
             agent_spec=spec,
             conversation_id="conv_runner_os_env_test",
         )
-        assert json.loads(read)["content"] == "hello\nworld\n"
+        assert "Привет 世界" in read
+        assert json.loads(read)["content"] == "Привет 世界\nworld\n"
 
         shell = await _execute_os_env_tool(
             "sys_os_shell",
@@ -2620,6 +2621,112 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
         shell_result = json.loads(shell)
         assert shell_result["exit_code"] == 0
         assert Path(shell_result["stdout"].strip()).resolve() == root.resolve()
+
+
+@pytest.mark.asyncio
+async def test_runner_os_env_surrogate_path_is_httpx_transport_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """OS-tool results escape undecodable filename bytes before HTTPX delivery."""
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+    from omnigent.tools.builtins._arguments import parse_json_object_arguments
+
+    class _SurrogatePathEnvironment:
+        async def read(self, *, path: str, offset: int, limit: object) -> dict[str, object]:
+            del offset, limit
+            return {"path": path, "content": "Привет", "encoding": "utf-8"}
+
+        def close(self) -> None:
+            return None
+
+    filename = "recording-\udcff.txt"
+    environment = _SurrogatePathEnvironment()
+    monkeypatch.setattr(
+        "omnigent.inner.os_env.create_os_environment",
+        lambda *args, **kwargs: environment,
+    )
+
+    arguments, error = parse_json_object_arguments(json.dumps({"path": filename}))
+    assert error is None
+    assert arguments is not None
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+
+    result = await _execute_os_env_tool(
+        "sys_os_read",
+        arguments,
+        agent_spec=spec,
+        conversation_id="conv_runner_surrogate_path",
+    )
+
+    assert "Привет" in result
+    assert "\\udcff" in result
+    assert json.loads(result)["path"].endswith(filename)
+    request = httpx.Request(
+        "POST",
+        "https://harness.test/v1/sessions/test/events",
+        json={"type": "tool_result", "output": result},
+    )
+    request.content.decode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_runner_os_env_error_is_httpx_transport_safe(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """OS-tool exception results stay readable and UTF-8 encodable."""
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    class _FailingEnvironment:
+        async def read(self, *, path: str, offset: int, limit: object) -> dict[str, object]:
+            del path, offset, limit
+            raise RuntimeError("ошибка для recording-\udcff.txt")
+
+        def close(self) -> None:
+            return None
+
+    caplog.set_level(logging.CRITICAL + 1, logger="omnigent.runner.tool_dispatch")
+    environment = _FailingEnvironment()
+    monkeypatch.setattr(
+        "omnigent.inner.os_env.create_os_environment",
+        lambda *args, **kwargs: environment,
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+
+    result = await _execute_os_env_tool(
+        "sys_os_read",
+        {"path": "recording-\udcff.txt"},
+        agent_spec=spec,
+        conversation_id="conv_runner_surrogate_error",
+    )
+
+    assert "ошибка" in result
+    assert "\\udcff" in result
+    assert json.loads(result) == {"error": "ошибка для recording-\udcff.txt"}
+    request = httpx.Request(
+        "POST",
+        "https://harness.test/v1/sessions/test/events",
+        json={"type": "tool_result", "output": result},
+    )
+    request.content.decode("utf-8")
 
 
 @pytest.mark.asyncio
