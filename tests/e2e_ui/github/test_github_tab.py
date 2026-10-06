@@ -239,7 +239,14 @@ def test_composer_pr_link_opens_github_tab(
         "**/v1/hosts/composer-pr-host/worktrees?*",
         lambda route: route.fulfill(
             json={
-                "data": [{"path": workspace, "branch": branch, "is_main": True, "detached": False}]
+                "data": [
+                    {
+                        "path": workspace,
+                        "branch": branch,
+                        "is_main": False,
+                        "detached": False,
+                    }
+                ]
             }
         ),
     )
@@ -254,7 +261,7 @@ def test_composer_pr_link_opens_github_tab(
     expect(page.get_by_test_id("composer-workspace-dir")).to_have_text("demo-app")
     expect(page.get_by_test_id("composer-git-branch")).to_have_text(branch)
     context = page.get_by_test_id("composer-context-ring")
-    expect(context).to_have_text("66%")
+    expect(context).to_have_accessible_name("66% of context used")
     bar = page.get_by_test_id("composer-workspace-controls")
     expect(bar.get_by_test_id("background-task-pill")).to_have_count(0)
     expect(bar.get_by_test_id("subagent-task-pill")).to_have_count(0)
@@ -280,7 +287,7 @@ def test_composer_pr_link_opens_github_tab(
         # context percentage stay visible in a crowded bar.
         if collapsed and test_id in ("composer-workspace-dir", "composer-git-branch"):
             expect(label).to_be_hidden()
-        else:
+        elif test_id != "composer-context-ring":
             expect(label).to_be_visible()
             font_sizes[test_id] = label.evaluate("el => parseFloat(getComputedStyle(el).fontSize)")
             parts.insert(0, ("label", label))
@@ -293,17 +300,13 @@ def test_composer_pr_link_opens_github_tab(
     assert pr_bounds is not None and context_bounds is not None
     group_gap = context_bounds["x"] - pr_bounds["x"] - pr_bounds["width"]
     pair_gaps = {}
-    for test_id in ("composer-pr-link", "composer-context-ring"):
+    for test_id in ("composer-pr-link",):
         icon, label = bounds[f"{test_id}.icon"], bounds[f"{test_id}.label"]
         pair_gaps[test_id] = label["x"] - icon["x"] - icon["width"]
     painted_right_edges = {
         "composer-pr-link": pr_link.locator("path").evaluate(
             "path => path.getBoundingClientRect().right"
         ),
-        "composer-context-ring": context.locator("circle").first.evaluate("""circle => {
-            const stroke = parseFloat(getComputedStyle(circle).strokeWidth);
-            return circle.getBoundingClientRect().right + stroke * circle.getScreenCTM().a / 2;
-        }"""),
     }
     painted_gaps = {
         test_id: bounds[f"{test_id}.label"]["x"] - right
@@ -347,22 +350,34 @@ def test_composer_pr_link_opens_github_tab(
         expect(panel).to_have_attribute("data-state", "closed")
         expect(pr_link).to_be_in_viewport()
 
-    expected_font_size = font_size * 0.9 * (14 / 13 if is_mobile else 1)
+    expected_font_size = font_size * 0.9
     for test_id, actual_font_size in font_sizes.items():
         assert actual_font_size == pytest.approx(expected_font_size, abs=0.01), (
             f"{test_id} should use the caption size at {font_size}px preference: {font_sizes}"
         )
     reference_center = centers["composer-workspace-dir.icon"]
-    assert bar_bounds["height"] == pytest.approx(37, abs=0.1)
-    assert reference_center == pytest.approx(bar_bounds["y"] + 19, abs=0.5)
+    expected_bar_height = 28 if is_mobile else 37
+    expected_center_offset = 14 if is_mobile else 19
+    assert bar_bounds["height"] == pytest.approx(expected_bar_height, abs=0.1)
+    assert reference_center == pytest.approx(bar_bounds["y"] + expected_center_offset, abs=0.5)
     for name, center in centers.items():
         assert center == pytest.approx(reference_center, abs=0.5), (name, centers)
     for name, pair_gap in pair_gaps.items():
         assert pair_gap == pytest.approx(4, abs=0.1), (name, pair_gaps)
-        assert group_gap > pair_gap, (group_gap, pair_gaps)
     for name, painted_gap in painted_gaps.items():
-        assert painted_gap == pytest.approx(4, abs=0.1), (name, painted_gaps)
-    assert group_gap == pytest.approx(8, abs=0.1)
+        assert painted_gap == pytest.approx(7.5, abs=0.1), (name, painted_gaps)
+    directory_bounds = page.get_by_test_id("composer-workspace-dir").bounding_box()
+    branch_bounds = page.get_by_test_id("composer-git-branch").bounding_box()
+    assert directory_bounds is not None and branch_bounds is not None
+    selector_gaps = (
+        branch_bounds["x"] - directory_bounds["x"] - directory_bounds["width"],
+        pr_bounds["x"] - branch_bounds["x"] - branch_bounds["width"],
+    )
+    expected_selector_gap = 2 if is_mobile else 8
+    for gap in selector_gaps:
+        assert gap == pytest.approx(expected_selector_gap, abs=0.1), selector_gaps
+    assert context_bounds["x"] >= pr_bounds["x"] + pr_bounds["width"]
+    assert group_gap > 0
 
 
 def _stub_github_outdated_host(page: Page) -> None:

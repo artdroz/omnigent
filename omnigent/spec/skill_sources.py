@@ -12,6 +12,7 @@ per-family provider. Unknown harnesses fall back to the generic host walk
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -377,8 +378,15 @@ def _enabled_plugin_keys(ctx: SkillSourceContext) -> set[str]:
     return enabled | _managed_plugin_keys(ctx)
 
 
-def _plugin_install_paths(ctx: SkillSourceContext, enabled: set[str]) -> dict[str, Path]:
-    """Map ``<plugin>@<marketplace>`` → installPath for enabled+installed plugins."""
+def _plugin_asset_id(key: str, kind: str, source: str = "") -> str:
+    """Stable inventory identity without exposing a plugin asset's filesystem path."""
+    return hashlib.sha256(json.dumps([key, kind, source]).encode()).hexdigest()
+
+
+def _plugin_install_paths(
+    ctx: SkillSourceContext, enabled: set[str] | None = None
+) -> dict[str, Path]:
+    """Map installed plugin keys to trusted paths, optionally filtering by enablement."""
     data = _read_json(_claude_user_dir(ctx) / "plugins" / "installed_plugins.json")
     if data is None:
         return {}
@@ -392,7 +400,7 @@ def _plugin_install_paths(ctx: SkillSourceContext, enabled: set[str]) -> dict[st
     plugins_root = (_claude_user_dir(ctx) / "plugins").resolve()
     out: dict[str, Path] = {}
     for key, entries in plugins.items():
-        if key not in enabled or not isinstance(entries, list):
+        if (enabled is not None and key not in enabled) or not isinstance(entries, list):
             continue
         # A plugin may have multiple scope entries (user/project); take the
         # first one carrying a usable installPath rather than assuming it's
@@ -472,7 +480,7 @@ def claude_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
 
 def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
-    Codex skills: ``<bundle>/skills`` + the host codex skills dir under the filter.
+    Codex bundle, standalone, and enabled plugin skills under the filter.
 
     Reuses the Codex executor's own helpers — ``codex_skill_sources`` (the
     shared source-list builder) and ``select_codex_skill_dirs`` (the shared
@@ -488,14 +496,19 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     terminal. The in-process ``codex`` (SDK) harness has no such terminal, so it
     keeps the ``~/.codex`` host dir it used before this scoping.
 
-    Names are surfaced by **directory name** (the selector's key), not the
+    Standalone names use the **directory name** (the selector's key), not the
     frontmatter ``name``. Codex registers a skill's slash command under its
     directory, and the executor symlinks under that dir name — so when the
     two differ, the menu label must match the directory (mirrors the Cursor
     provider). The lazy import keeps the Codex-specific dependency out of
     ``omnigent.spec``'s module-load path.
+
+    Plugins are loaded directly by Codex from its cache, outside the symlinked
+    standalone sources. Ask the CLI for installed versions and enabled state
+    so plugin namespaces survive and stale cached skills stay hidden.
     """
     from omnigent.inner.codex_executor import codex_skill_sources, select_codex_skill_dirs
+    from omnigent.spec.codex_plugin_skills import discover_codex_plugin_skills
 
     host_override = ctx.codex_home if ctx.is_native else None
     sources = codex_skill_sources(ctx.bundle_dir, ctx.home, codex_home=host_override)
@@ -506,6 +519,9 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
         except (OmnigentError, OSError):  # best-effort discovery
             continue
         out.append(replace(spec, name=name))
+    codex_home = host_override if host_override is not None else ctx.home / ".codex"
+    cwd = ctx.roots[0] if ctx.roots else None
+    out.extend(discover_codex_plugin_skills(codex_home, ctx.skills_filter, cwd=cwd))
     return out
 
 

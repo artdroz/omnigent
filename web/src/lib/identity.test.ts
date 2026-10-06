@@ -120,6 +120,61 @@ describe("getCurrentUserId", () => {
   });
 });
 
+describe("resolveIdentity base-path login redirect", () => {
+  let originalLocation: Location;
+
+  beforeEach(() => {
+    originalLocation = window.location;
+  });
+
+  afterEach(() => {
+    Object.defineProperty(window, "location", { configurable: true, value: originalLocation });
+    delete window.__OMNIGENT_BASE_PATH__;
+  });
+
+  function mockLocation(pathname: string): void {
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: {
+        pathname,
+        search: "",
+        href: "",
+        origin: "http://localhost",
+        host: "localhost",
+        protocol: "http:",
+      },
+    });
+  }
+
+  it("redirects to the base-prefixed login URL on 401", async () => {
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+    mockLocation("/proxy/6767/c/abc");
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ user_id: null, login_url: "/login" }, { ok: false, status: 401 }),
+    );
+    const { resolveIdentity } = await import("./identity");
+
+    await resolveIdentity();
+
+    expect(window.location.href).toBe(
+      `/proxy/6767/login?return_to=${encodeURIComponent("/proxy/6767/c/abc")}`,
+    );
+  });
+
+  it("does not redirect when already on the base-prefixed login path", async () => {
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+    mockLocation("/proxy/6767/login");
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ user_id: null, login_url: "/login" }, { ok: false, status: 401 }),
+    );
+    const { resolveIdentity } = await import("./identity");
+
+    await resolveIdentity();
+
+    expect(window.location.href).toBe("");
+  });
+});
+
 describe("authenticatedFetch", () => {
   it("injects X-Forwarded-Email header once the identity is resolved", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ user_id: "alice" }));
@@ -352,6 +407,58 @@ describe("authenticatedFetch", () => {
       expect(secondHeaders.get("X-Databricks-Omnigent-Slice-Key")).toBeNull();
       expect(response.status).toBe(200);
     });
+
+    it.each([200, 400, 500, 503])(
+      "only drops the shared parent host key after a successful fallback (HTTP %s)",
+      async (fallbackStatus) => {
+        vi.doUnmock("./sessionHost");
+        const { setSessionHost, setSessionParent } = await import("./sessionHost");
+        setSessionHost("parent", "host_parent");
+        setSessionParent("child", "parent");
+        vi.doMock("./host", () => ({
+          getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+          hostFetch: fetchMock,
+          isDatabricksWorkspace: vi.fn(() => true),
+        }));
+        const { authenticatedFetch } = await import("./identity");
+        fetchMock
+          .mockResolvedValueOnce(
+            new Response(JSON.stringify({ error: { code: "wrong_replica" } }), { status: 400 }),
+          )
+          .mockResolvedValueOnce(
+            new Response(
+              JSON.stringify(
+                fallbackStatus === 200
+                  ? { queued: true }
+                  : { error: { code: "runner_unavailable" } },
+              ),
+              { status: fallbackStatus },
+            ),
+          )
+          .mockResolvedValue(mockJsonResponse({ queued: true }));
+
+        const response = await authenticatedFetch("/v1/sessions/child/events", {
+          method: "POST",
+          body: JSON.stringify({ type: "message", data: { content: "side question" } }),
+        });
+        expect(response.status).toBe(fallbackStatus);
+        await authenticatedFetch("/v1/sessions/child/events", {
+          method: "POST",
+          body: JSON.stringify({ type: "retry_session" }),
+        });
+        await authenticatedFetch("/v1/sessions/parent/events", {
+          method: "POST",
+          body: JSON.stringify({ type: "message", data: { content: "main question" } }),
+        });
+
+        const subsequentKey = fallbackStatus === 200 ? null : "host_parent";
+        expect(
+          fetchMock.mock.calls.map(([, init]) =>
+            new Headers((init as RequestInit).headers).get("X-Databricks-Omnigent-Slice-Key"),
+          ),
+        ).toEqual(["host_parent", null, subsequentKey, subsequentKey]);
+      },
+    );
 
     it("keys /v1/imports/local by its body host_id, not the modal host", async () => {
       // The import reads the CHOSEN host's transcripts over that host's tunnel,
