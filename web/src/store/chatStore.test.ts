@@ -12625,6 +12625,108 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  /** Route `id`'s stream to `sink`; serve snapshots whose `updated_at` the test advances. */
+  function routeSnapshotClock(
+    id: string,
+    sink: StreamSink,
+  ): { updatedAt: number; streamOpens: number; itemFetches: number } {
+    const clock = { updatedAt: 100, streamOpens: 0, itemFetches: 0 };
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === `/v1/sessions/${id}/stream`) {
+        clock.streamOpens += 1;
+        init?.signal?.addEventListener("abort", () =>
+          sink.error(new DOMException("aborted", "AbortError")),
+        );
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      if (url.startsWith(`/v1/sessions/${id}?`) && (init?.method ?? "GET") === "GET") {
+        return mockResponse({
+          id,
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          updated_at: clock.updatedAt,
+          items: [],
+          labels: {},
+        });
+      }
+      if (url.startsWith(`/v1/sessions/${id}/items`)) clock.itemFetches += 1;
+      return defaultFetchHandler(input, init);
+    });
+    return clock;
+  }
+
+  it("backfills items persisted while a heartbeat-only stream carries no events", async () => {
+    seedSession("conv_items_gap", []);
+    const sink = pushableStream();
+    const clock = routeSnapshotClock("conv_items_gap", sink);
+    const controller = new AbortController();
+    const bound = bindConversationForTest("conv_items_gap", { abortController: controller });
+    const loop = startStreamPump("conv_items_gap", controller, bound.set, bound.get);
+    await drainAsync();
+
+    // The first snapshot is the baseline: nothing changed, nothing to fetch.
+    await advanceWithHeartbeats(sink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+    expect(clock.itemFetches).toBe(0);
+
+    // A turn typed into the TUI lands on the server; this tab's stream only heartbeats.
+    clock.updatedAt = 160;
+    seedSessionItems("conv_items_gap", [
+      { ...userMessage("resp_tui", "typed in the TUI"), created_at: 160 },
+      { ...assistantMessage("resp_tui", "reply printed in the TUI"), created_at: 160 },
+    ]);
+    await advanceWithHeartbeats(sink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync(2);
+
+    expect(clock.streamOpens).toBe(1);
+    expect(clock.itemFetches).toBe(1);
+    expect(bound.get().blocks.map((b) => b.ctx.itemId)).toEqual([
+      "msg_resp_tui_user",
+      "msg_resp_tui_asst",
+    ]);
+
+    // With no further activity the next snapshot leaves the transcript alone.
+    await advanceWithHeartbeats(sink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+    expect(clock.itemFetches).toBe(1);
+
+    controller.abort();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("does not refetch items the live stream already mirrored", async () => {
+    seedSession("conv_items_live", []);
+    const sink = pushableStream();
+    const clock = routeSnapshotClock("conv_items_live", sink);
+    const controller = new AbortController();
+    const bound = bindConversationForTest("conv_items_live", { abortController: controller });
+    const loop = startStreamPump("conv_items_live", controller, bound.set, bound.get);
+    await drainAsync();
+    await advanceWithHeartbeats(sink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+
+    // The server persists a reply and the stream mirrors it, stamped from the same clock.
+    clock.updatedAt = 160;
+    sink.push(
+      sse("response.output_item.done", {
+        item: { ...assistantMessage("resp_live", "mirrored live"), created_at: 160 },
+      }),
+    );
+    await drainAsync();
+    expect(bound.get().blocks.map((b) => b.ctx.itemId)).toContain("msg_resp_live_asst");
+
+    await advanceWithHeartbeats(sink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+    expect(clock.itemFetches).toBe(0);
+
+    controller.abort();
+    await drainAsync(2);
+    await loop;
+  });
+
   it("keeps a live status event that arrives during snapshot reconciliation", async () => {
     seedSession("conv_status_race", []);
     const sink = pushableStream();
