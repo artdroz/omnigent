@@ -3700,6 +3700,7 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
     assert (target / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
 
 
+@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="requires O_NOFOLLOW")
 def test_populate_codex_home_config_hard_links_remote_mcp_oauth_store(tmp_path: Path) -> None:
     """The remote-MCP OAuth store survives Codex's ``O_NOFOLLOW`` rewrite.
 
@@ -3743,6 +3744,7 @@ def test_populate_codex_home_config_hard_links_remote_mcp_oauth_store(tmp_path: 
     assert (target / "mcp-oauth-locks" / "file-store.lock").is_file()
 
 
+@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="requires O_NOFOLLOW")
 def test_populate_codex_home_config_copies_remote_mcp_oauth_store_across_filesystems(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3769,6 +3771,17 @@ def test_populate_codex_home_config_copies_remote_mcp_oauth_store_across_filesys
     fd = os.open(bridged, os.O_WRONLY | os.O_NOFOLLOW)
     os.close(fd)
     assert bridged.read_text() == '{"linear|abc": {"access_token": "t"}}'
+
+    # Codex refreshes the token in this session-local copy. Repopulating the
+    # same home (e.g. cold resume) must not overwrite it with the source's
+    # stale token, which a cross-filesystem copy never receives.
+    refreshed = '{"linear|abc": {"access_token": "refreshed-in-session"}}'
+    bridged.write_text(refreshed)
+    _populate_codex_home_config(target, source)
+    assert not bridged.is_symlink()
+    assert not os.path.samefile(bridged, source / ".credentials.json")
+    assert bridged.read_text() == refreshed
+    assert stat.S_IMODE(bridged.stat().st_mode) == 0o600
 
 
 def test_private_codex_home_config_source_recovers_home_from_credential_companion(
@@ -3844,6 +3857,45 @@ def test_populate_codex_home_config_rebridges_rotated_remote_mcp_oauth_store(
     assert not bridged.is_symlink()
     assert os.path.samefile(bridged, store)
     assert json.loads(bridged.read_text()) == {"linear|abc": {"access_token": "new"}}
+
+
+@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="requires O_NOFOLLOW")
+def test_populate_codex_home_config_migrates_legacy_credential_symlink(
+    tmp_path: Path,
+) -> None:
+    """A reused home from the old symlink scheme is migrated to a hard link.
+
+    Earlier versions symlinked ``.credentials.json`` into the private home, and
+    native sessions reuse their home across cold resume. Without migration an
+    upgraded session keeps the symlink that fails Codex's ``O_NOFOLLOW`` rewrite
+    with ELOOP; repopulating must replace it with a shared regular file.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    store = source / ".credentials.json"
+    store.write_text('{"linear|abc": {"access_token": "t"}}')
+    target = tmp_path / "reused_codex_home"
+    target.mkdir()
+    legacy = target / ".credentials.json"
+    legacy.symlink_to(store)
+    assert legacy.is_symlink()
+
+    _populate_codex_home_config(target, source)
+
+    assert legacy.is_file()
+    assert not legacy.is_symlink()
+    assert os.path.samefile(legacy, store)
+    # The O_NOFOLLOW rewrite that ELOOP'd on the old symlink now succeeds.
+    refreshed = '{"linear|abc": {"access_token": "t2"}}'
+    fd = os.open(legacy, os.O_WRONLY | os.O_NOFOLLOW)
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, refreshed.encode())
+    finally:
+        os.close(fd)
+    assert store.read_text() == refreshed
 
 
 def test_populate_codex_home_config_symlinks_memories(tmp_path: Path) -> None:

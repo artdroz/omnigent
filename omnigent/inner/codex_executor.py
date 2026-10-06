@@ -172,10 +172,9 @@ _CODEX_HOME_SYMLINK_FILES = ("auth.json", "memories_1.sqlite")
 # through an ``O_NOFOLLOW`` open that rejects symlinks with ELOOP, so it is
 # hard-linked (same inode, refreshes still shared) or copied as a last resort.
 _CODEX_HOME_HARDLINK_FILES = (".credentials.json",)
-# Companion lock directory for ``.credentials.json``, symlinked into the
-# private home. A hard-linked store records no path back to its source, so this
-# symlink's target parent is the durable pointer to a custom source home that
-# carries only remote-MCP OAuth state.
+# Lock-dir companion for ``.credentials.json``, symlinked into the private
+# home; its target parent is the durable pointer to a custom source home,
+# since a hard-linked store records no path back to its source.
 _CODEX_HOME_CREDENTIAL_COMPANION_DIR = Path("mcp-oauth-locks")
 _CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md", "hooks.json")
 # Name of the hooks file inside a CODEX_HOME. Symlinked from the user's home
@@ -1095,8 +1094,37 @@ def _bridge_codex_credential_store(source_file: Path, dest_path: Path) -> None:
             dest_path.parent,
             exc,
         )
-        shutil.copy2(source_file, dest_path)
-        os.chmod(dest_path, 0o600)
+        # Create the copy already restricted so the OAuth secrets are never
+        # briefly readable through the source's wider modes.
+        fd = os.open(dest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as dest:
+            dest.write(source_file.read_bytes())
+
+
+def _relink_rotated_codex_credential_store(source_file: Path, dest_path: Path) -> None:
+    """
+    Re-point a bridged credential store orphaned by a source rotation.
+
+    An intact hard link already shares the source inode and is left alone. A
+    cross-filesystem copy holds tokens refreshed only in this session, so it is
+    preserved. A same-filesystem store on a different inode is a hard link
+    orphaned by a delete-then-recreate login; relink it to the current store so
+    the session stops serving revoked tokens. Linking succeeds only in that
+    same-filesystem case, which is exactly when relinking is the right choice.
+
+    :param source_file: The real store, e.g. ``~/.codex/.credentials.json``.
+    :param dest_path: Its existing regular-file path inside the private home.
+    """
+    with suppress(OSError):
+        if os.path.samefile(source_file, dest_path):
+            return
+    staging = dest_path.with_name(f"{dest_path.name}.relink")
+    staging.unlink(missing_ok=True)
+    try:
+        os.link(source_file, staging)
+    except OSError:
+        return
+    os.replace(staging, dest_path)
 
 
 def _populate_codex_home_config(
@@ -1220,16 +1248,12 @@ def _populate_codex_home_config(
                 continue
             dest_path = target_dir / filename
             if dest_path.is_symlink():
+                # The legacy scheme symlinked the store; Codex's O_NOFOLLOW
+                # rewrite fails on a symlink, so migrate it to a regular file.
+                dest_path.unlink()
+            elif dest_path.exists():
+                _relink_rotated_codex_credential_store(source_file, dest_path)
                 continue
-            if dest_path.exists():
-                with suppress(OSError):
-                    if os.path.samefile(source_file, dest_path):
-                        continue
-                # A reused home can hold a link or copy of a since-rotated
-                # store (the source was deleted and recreated with a new
-                # inode); drop the stale bridge so the session reads current
-                # tokens instead of revoked ones.
-                dest_path.unlink(missing_ok=True)
             _bridge_codex_credential_store(source_file, dest_path)
 
     if not minimal_config:
