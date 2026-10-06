@@ -59,18 +59,25 @@ describe("HtmlCommentViewer", () => {
     expect(srcDoc).not.toContain("new Function");
   });
 
-  it("warns and retries externally when the inline bridge never becomes ready", () => {
+  it("starts the diagnostic timer only after the iframe loads", () => {
     vi.useFakeTimers();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { container } = renderViewer("<body><p>doc</p></body>");
     const iframe = container.querySelector('iframe[title="HTML preview"]') as HTMLIFrameElement;
 
+    expect(vi.getTimerCount()).toBe(0);
+    act(() => vi.advanceTimersByTime(5_000));
+    expect(warn).not.toHaveBeenCalled();
+
     act(() => iframe.dispatchEvent(new Event("load")));
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
     act(() => vi.advanceTimersByTime(5_000));
 
     expect(warn).toHaveBeenCalledWith(
-      "HTML comment bridge did not become ready; retrying the external runtime.",
+      "HTML comment bridge did not become ready; comments are unavailable.",
     );
+    const srcDoc = iframe.getAttribute("srcdoc") ?? "";
+    expect(srcDoc).not.toContain("htmlCommentBridgeRuntime.js");
     warn.mockRestore();
   });
 

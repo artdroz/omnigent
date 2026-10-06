@@ -1,6 +1,7 @@
 (function () {
   var script = document.currentScript;
-  var NONCE = script && script.getAttribute("data-omni-nonce");
+  if (!(script instanceof HTMLScriptElement)) return;
+  var NONCE = script.getAttribute("data-omni-nonce");
   if (!NONCE) return;
   script.setAttribute("data-omni-loaded", "true");
   var SRC = "omni-html-comment";

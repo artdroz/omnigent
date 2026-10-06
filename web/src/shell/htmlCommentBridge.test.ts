@@ -67,6 +67,10 @@ describe("injectCommentBridge", () => {
     expect(out).not.toContain("<script src=");
   });
 
+  it("keeps the inline runtime body free of closing script tags", () => {
+    expect(HTML_COMMENT_BRIDGE_RUNTIME).not.toMatch(/<\/script/i);
+  });
+
   it("escapes runtime URLs and nonces as HTML attributes", () => {
     const out = injectCommentBridge(
       "<body></body>",
@@ -79,6 +83,7 @@ describe("injectCommentBridge", () => {
 
   it("keeps protocol constants in sync without dynamic compilation", () => {
     expect(HTML_COMMENT_BRIDGE_RUNTIME).not.toMatch(/\b(?:eval|Function)\s*\(/);
+    expect(HTML_COMMENT_BRIDGE_RUNTIME).toContain("script instanceof HTMLScriptElement");
     expect(HTML_COMMENT_BRIDGE_RUNTIME).toContain(`var SRC = "${BRIDGE_SOURCE}"`);
     for (const [name, value] of Object.entries(BRIDGE_MSG)) {
       expect(HTML_COMMENT_BRIDGE_RUNTIME).toContain(`${name}: "${value}"`);

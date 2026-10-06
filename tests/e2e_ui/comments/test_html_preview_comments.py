@@ -183,21 +183,12 @@ def test_html_preview_add_comment(
     assert comment["end_index"] == raw_idx + len(_ANCHOR_SENTENCE)
 
 
-def test_html_preview_add_comment_with_inherited_csp(
+def test_html_preview_standalone_does_not_retry_with_inherited_csp(
     page: Page,
     seeded_html: tuple[str, str, str],
 ) -> None:
-    """The static runtime starts when srcdoc inherits a strict script CSP."""
-    base_url, session_id, file_path = seeded_html
-    # The local test server is loopback; managed serves the runtime from a CDN.
-    page.context.grant_permissions(["local-network-access"], origin=base_url)
-    console_errors: list[str] = []
-    page_errors: list[str] = []
-    page.on(
-        "console",
-        lambda message: console_errors.append(message.text) if message.type == "error" else None,
-    )
-    page.on("pageerror", lambda error: page_errors.append(str(error)))
+    """Standalone keeps its inline-only bridge even when inherited CSP blocks it."""
+    base_url, session_id, _ = seeded_html
     document_url = re.compile(rf"^{re.escape(base_url)}/c/{re.escape(session_id)}(?:\?|$)")
 
     def add_managed_csp(route: Route) -> None:
@@ -215,29 +206,19 @@ def test_html_preview_add_comment_with_inherited_csp(
     page.route(document_url, add_managed_csp)
     file_viewer, preview = _open_preview(page, base_url, session_id)
     expect(preview.locator("#anchor")).to_have_text(_ANCHOR_SENTENCE, timeout=10_000)
-    expect(preview.locator('script[src][data-omni-loaded="true"]')).to_have_count(
-        1, timeout=10_000
-    )
+    expect(preview.locator("script[src]")).to_have_count(0)
     canary_ran = preview.locator("body").evaluate("() => window.__omniCspInlineCanary === true")
     assert not canary_ran, "fixture inline script ran; CSP did not reach the srcdoc frame"
-    preview.locator("#anchor").select_text()
-    add_btn = page.get_by_role("button", name="Add comment")
-    try:
-        expect(add_btn).to_be_visible(timeout=10_000)
-    except AssertionError as error:
-        diagnostics = "\n".join([*console_errors, *page_errors])
-        raise AssertionError(
-            f"HTML comment bridge did not become ready:\n{diagnostics}"
-        ) from error
-    add_btn.click()
-    textarea = file_viewer.locator("textarea[placeholder='Add a comment…']")
-    expect(textarea).to_be_visible()
-    textarea.fill("comment under inherited CSP")
-    file_viewer.get_by_role("button", name="Add Comment").click()
 
-    comments = _get_comments(base_url, session_id, file_path)
-    assert len(comments) == 1, comments
-    assert comments[0]["anchor_content"] == _ANCHOR_SENTENCE
+    # The diagnostic timeout is observational: it must not replace the iframe
+    # with an external-runtime retry after the bridge fails to become ready.
+    iframe_el = file_viewer.locator('iframe[title="HTML preview"]')
+    iframe_el.evaluate("frame => { frame.dataset.testIdentity = 'original'; }")
+    preview.locator("#anchor").select_text()
+    page.wait_for_timeout(5_100)
+    expect(iframe_el).to_have_attribute("data-test-identity", "original")
+    expect(preview.locator("script[src]")).to_have_count(0)
+    expect(page.get_by_role("button", name="Add comment")).not_to_be_visible()
 
 
 def _open_preview(page: Page, base_url: str, session_id: str):
