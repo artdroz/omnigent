@@ -518,8 +518,8 @@ retryable rather than becoming a product verdict.
   proxy standing in for a Databricks-network host) → **`likely_repro`**. Name
   the stand-in in `environment_fidelity` (see below). It still dispatches the
   fix workflow. A stand-in replaces the *environment* only; a trigger you
-  injected or scripted yourself is not a stand-in and never supports
-  `likely_repro`.
+  injected or scripted in place of the reported trigger is not a stand-in and
+  never supports `likely_repro`.
 - The reported trigger does **not** produce the failure, and the symptom appears
   only once you inject the state you hypothesize the product reaches → the
   sub-symptom did **not** reproduce. Verdict it **`not_reproduced`**, or
@@ -754,9 +754,10 @@ Field meanings:
   `stand-in: <what you drove> — could not drive <the reported surface>`, e.g.
   `stand-in: CI egress proxy — could not drive the Databricks-network host`, and
   say the same in `journey` and `evidence`. This field names the environment
-  only: a trigger you injected or scripted is not a stand-in, and declaring it
-  here does not make an unreproduced symptom `likely_repro` (Step 2); describe
-  that substitution in `evidence` instead. (When the stand-in *cannot exhibit*
+  only: a trigger you injected or scripted in place of the reported one is not
+  a stand-in, and declaring it here does not make an unreproduced symptom
+  `likely_repro` (Step 2); describe that substitution in `evidence` instead.
+  (When the stand-in *cannot exhibit*
   the reported failure at all — a native-chrome bug on the web SPA — you do not
   get a verdict from it: that is `needs_manual_review`, and you name the
   engine/device profile driven in the facet `evidence` rather than here.)
