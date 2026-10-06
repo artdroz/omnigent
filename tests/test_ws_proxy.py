@@ -61,6 +61,11 @@ _OK = b"HTTP/1.1 200 Connection Established\r\n\r\n"
             {"http_proxy": "http://p:1", "NO_PROXY": "server.sandbox.test", "no_proxy": ""},
             "http://p:1",
         ),
+        # Any capitalisation counts, as in urllib/httpx; a lowercase-suffixed
+        # spelling wins and may suppress.
+        (_TUNNEL_URL, {"Http_Proxy": "http://p:1"}, "http://p:1"),
+        (_TUNNEL_URL, {"http_proxy": "http://p:1", "No_Proxy": "server.sandbox.test"}, None),
+        (_TUNNEL_URL, {"HTTP_PROXY": "http://p:2", "HTTP_proxy": ""}, None),
         # Loopback never goes through a proxy, even without a no_proxy entry.
         ("ws://localhost:8000/t", {"http_proxy": "http://p:1"}, None),
         ("ws://127.0.0.1:8000/t", {"ALL_PROXY": "http://p:1"}, None),
@@ -87,6 +92,8 @@ def test_proxy_selection(url, env, expected):
         ("example.com:8443", "example.com:8443", True),
         ("sub.example.com:8443", "example.com:8443", True),
         ("example.com:8000", "example.com:8443", False),
+        ("example.com", "example.com:80", False),
+        ("example.com:80", "example.com:80", False),
         ("10.1.2.3:8000", "localhost,10.1.2.3,fd00::1", True),
         ("[fd00::1]:8000", "localhost,10.1.2.3,fd00::1", True),
         ("[fd00::1]:8000", "[fd00::1]:8000", True),
@@ -106,17 +113,19 @@ def test_redact_proxy_url(userinfo):
     assert redact_proxy_url(f"http://{userinfo}proxy:3128/path?token=x#f") == "http://proxy:3128"
 
 
-def test_unsupported_scheme_warns_once_without_credentials(monkeypatch, caplog):
+@pytest.mark.parametrize("variable", ["http_proxy", "ALL_PROXY"])
+def test_unsupported_scheme_warns_once_without_credentials(monkeypatch, caplog, variable):
     from omnigent.util import ws_proxy
 
     monkeypatch.setattr(ws_proxy, "_warned_proxy_env", set())
-    env = {"http_proxy": "socks5://user:secret@p:1"}
+    env = {variable: "socks5://user:secret@p:1"}
     with caplog.at_level(logging.WARNING, logger="omnigent.util.ws_proxy"):
         assert ws_env_proxy_url(_TUNNEL_URL, env) is None
         assert ws_env_proxy_url(_TUNNEL_URL, env) is None
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
-    assert "socks5" in warnings[0] and "secret" not in warnings[0]
+    assert variable.lower() in warnings[0] and "socks5" in warnings[0]
+    assert "secret" not in warnings[0]
 
 
 @asynccontextmanager

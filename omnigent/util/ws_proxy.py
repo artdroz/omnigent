@@ -59,24 +59,27 @@ def _warn_once(key: tuple[str, str], message: str, *args: object) -> None:
 
 
 def _env(environ: Mapping[str, str], name: str) -> str | None:
-    """Read a proxy env var with urllib's precedence: lowercase wins when set.
+    """Read a proxy variable with urllib's two-pass precedence, as httpx does.
 
-    A lowercase variable that is present but empty deliberately suppresses
-    its uppercase form (``http_proxy=""`` disables ``HTTP_PROXY``), exactly
-    as it does for the HTTP clients.
+    Any capitalisation of *name* counts; a spelling ending in lowercase
+    ``_proxy`` takes precedence, and such a spelling that is present but empty
+    suppresses the others (``http_proxy=""`` disables ``HTTP_PROXY``).
 
     :param environ: Environment mapping to read.
     :param name: Lowercase variable name, e.g. ``"http_proxy"``.
-    :returns: The value of the first form present, or None when that form
-        is empty or neither is set.
+    :returns: The selected value, or None when unset or suppressed.
     """
-    for key in (name, name.upper()):
-        if key in environ:
-            return environ[key] or None
-    return None
+    value: str | None = None
+    for key, candidate in environ.items():
+        if key.lower() == name and candidate:
+            value = candidate
+    for key, candidate in environ.items():
+        if key.lower() == name and key.endswith("_proxy"):
+            value = candidate or None
+    return value
 
 
-def _bypassed_by_no_proxy(host: str, port: int, no_proxy: str) -> bool:
+def _bypassed_by_no_proxy(host: str, port: int | None, no_proxy: str) -> bool:
     """Whether ``no_proxy`` exempts *host*:*port* from proxying, as httpx would.
 
     Mirrors the rules the host's own HTTP client applies, so HTTP requests and
@@ -86,7 +89,8 @@ def _bypassed_by_no_proxy(host: str, port: int, no_proxy: str) -> bool:
     ``localhost`` matches that exact text; ``host:port`` also requires the port.
 
     :param host: Target hostname (no brackets), lowercase or not.
-    :param port: Target port.
+    :param port: Target port when explicit and not the scheme default, else
+        None (httpx drops default ports before matching).
     :param no_proxy: Raw ``no_proxy`` value.
     :returns: True when the target must be dialed directly.
     """
@@ -170,13 +174,16 @@ def ws_env_proxy_url(ws_url: str, environ: Mapping[str, str] | None = None) -> s
     # machine's local server, so a local host must keep dialing direct.
     if is_loopback_url(ws_url):
         return None
-    proxy = _env(environ, proxy_env) or _env(environ, "all_proxy")
+    proxy = _env(environ, proxy_env)
+    if proxy is None:
+        # Remember which variable supplied the value so warnings name it.
+        proxy_env = "all_proxy"
+        proxy = _env(environ, proxy_env)
     if not proxy:
         return None
     no_proxy = _env(environ, "no_proxy")
-    if no_proxy and _bypassed_by_no_proxy(
-        host, port or _DEFAULT_PORT_BY_WS_SCHEME[scheme], no_proxy
-    ):
+    explicit_port = None if port == _DEFAULT_PORT_BY_WS_SCHEME[scheme] else port
+    if no_proxy and _bypassed_by_no_proxy(host, explicit_port, no_proxy):
         return None
     if "://" not in proxy:
         # Bare host:port proxy values are conventionally plain HTTP.

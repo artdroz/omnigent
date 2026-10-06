@@ -4286,9 +4286,8 @@ class HostProcess:
         # (no OpenSSL default cert path), which fails handshake verification.
         # ``ssl=None`` for ws:// is the library default (no TLS).
         ssl_ctx = client_ssl_context() if url.startswith("wss://") else None
-        # websockets<15 has no proxy support and dials direct, which fails forever
-        # behind a mandatory CONNECT proxy; establish the CONNECT tunnel ourselves,
-        # last before connect() so nothing in between can fail and leak it.
+        # Open the CONNECT tunnel (see omnigent.util.ws_proxy) immediately before
+        # handing its socket to websockets, so nothing in between can leak it.
         proxy_url = ws_env_proxy_url(url)
         proxy_sock: socket.socket | None = None
         if proxy_url is None:

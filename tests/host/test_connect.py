@@ -8227,6 +8227,32 @@ async def test_connect_and_serve_builds_ssl_context_before_dialing_proxy(
     dial.assert_not_awaited()
 
 
+async def test_connect_and_serve_closes_proxy_socket_when_connect_constructor_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connect() constructor failure must not leak the already dialed proxy socket."""
+    from omnigent.host import connect as connect_mod
+
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:3128")
+    host = HostProcess(
+        HostIdentity(host_id="host_test_connect", name="test-laptop"),
+        "http://server.sandbox.test:8000",
+    )
+    monkeypatch.setattr(host, "_build_connect_headers", dict)
+    monkeypatch.setattr(
+        connect_mod.websockets.asyncio.client,
+        "connect",
+        Mock(side_effect=ConnectionError("test rejection")),
+    )
+    with socket.socket() as proxy_sock:
+        monkeypatch.setattr(
+            connect_mod, "open_proxy_connect_socket", AsyncMock(return_value=proxy_sock)
+        )
+        with pytest.raises(ConnectionError, match="test rejection"):
+            await host._connect_and_serve()
+        assert proxy_sock.fileno() == -1
+
+
 @pytest.mark.parametrize("action", ["attach", "remove"])
 async def test_github_pr_update_reports_lock_contention_on_host(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
