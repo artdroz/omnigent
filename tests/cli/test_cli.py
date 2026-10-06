@@ -34,6 +34,7 @@ from omnigent.cli import (
     _dispatch_run,
     _display_db_uri,
     _ensure_sqlite_parent_dir,
+    _ensure_stdio_survives_unencodable_output,
     _expand_config_env_vars,
     _extract_global_logging_flags,
     _HostHttpResult,
@@ -84,7 +85,7 @@ from omnigent.runner.identity import (
     RUNNER_WORKSPACE_ENV_VAR,
     token_bound_runner_id,
 )
-from omnigent.runner.transports.ws_tunnel.limits import (
+from omnigent.util.tunnel_limits import (
     RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
@@ -523,7 +524,7 @@ def test_claude_command_resume_binds_session_and_passes_unknown_args(
 
     The wrapper's defensive strip (``_strip_resume_from_claude_args``)
     runs INSIDE ``run_claude_native`` and is tested separately at
-    ``tests/test_claude_native.py::test_strip_resume_from_claude_args_*``.
+    ``tests/harnesses/claude_native/test_claude_native.py::test_strip_resume_from_claude_args_*``.
     This test mocks ``run_claude_native`` so it covers the Click
     parsing seam: ``--resume`` is consumed by Click, the post-``--``
     tokens land in ``claude_args`` raw, and the wrapper takes it from
@@ -760,6 +761,9 @@ def test_codex_command_resume_binds_session_and_passes_unknown_args(
     ``omnigent codex --resume <conv_id>`` binds the Omnigent
     session and preserves Codex CLI passthrough args after ``--``.
     """
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_backend", lambda server: server or "http://localhost:0"
+    )
     captured: dict[str, object] = {}
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     monkeypatch.setattr(
@@ -1095,14 +1099,16 @@ def test_help_groups_harnesses_and_other_commands() -> None:
     assert commands_at < result.output.index("server")
 
 
-def test_help_hides_deprecated_update_spelling_but_keeps_it_runnable() -> None:
-    """``update`` is omitted from --help but stays registered and runnable."""
+def test_help_hides_update_alias_but_keeps_it_runnable() -> None:
+    """The ``update`` alias is omitted from --help but stays registered."""
     result = CliRunner().invoke(cli, ["--help"])
 
     assert result.exit_code == 0, result.output
     assert "upgrade" in result.output
+    # The alias line is suppressed so it doesn't duplicate ``upgrade``...
     assert "\n  update " not in result.output
-    assert cli.commands["update"].hidden is True
+    # ...but it's still a real, invokable command.
+    assert cli.commands["update"] is cli.commands["upgrade"]
 
 
 def test_help_hides_extras_gated_harness_when_sdk_missing(
@@ -1394,6 +1400,71 @@ def test_bundled_agent_command_rejects_extra_positional_target(
 
     assert result.exit_code != 0
     dispatch.assert_not_called()
+
+
+def test_copilot_command_forwards_to_run_on_the_copilot_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``omnigent copilot`` dispatches ``run --harness copilot`` with pass-through
+    flags intact and a canonical ``omnigent run --harness copilot`` resume prefix."""
+    result, dispatch = _invoke_bundled_agent_command(
+        monkeypatch, ["copilot", "-p", "review the last commit", "--model", "m1"]
+    )
+
+    assert result.exit_code == 0, result.output
+    dispatch.assert_called_once()
+    kwargs = dispatch.call_args.kwargs
+    assert kwargs["target"] is None
+    assert kwargs["harness"] == "copilot"
+    assert kwargs["prompt"] == "review the last commit"
+    assert kwargs["model"] == "m1"
+    assert kwargs["resume_parts"][:4] == ["omnigent", "run", "--harness", "copilot"]
+
+
+def test_copilot_command_rejects_explicit_harness(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--harness`` on the copilot shorthand is a usage error, not a silent override."""
+    result, dispatch = _invoke_bundled_agent_command(monkeypatch, ["copilot", "--harness=codex"])
+
+    assert result.exit_code != 0
+    assert "always uses the copilot harness" in result.output
+    dispatch.assert_not_called()
+
+
+def test_copilot_command_answers_help_and_is_rostered_as_a_harness() -> None:
+    """``omnigent copilot --help`` prints its own usage and the command is a harness row."""
+    from omnigent.cli import _HARNESS_COMMANDS, _harness_extra_checks
+
+    result = CliRunner().invoke(cli, ["copilot", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "copilot [OPTIONS] [RUN_ARGS]..." in result.output
+    assert "No such command" not in result.output
+    assert "copilot" in _CLICK_SUBCOMMANDS
+    assert "copilot" in _HARNESS_COMMANDS
+    # Extras-gated like cursor: the roster row follows the Copilot SDK extra.
+    assert "copilot" in _harness_extra_checks()
+
+
+def test_help_rosters_copilot_only_when_its_sdk_is_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The copilot row appears under Harnesses with its SDK, and hides without it."""
+    monkeypatch.setattr("omnigent.cli._harness_extra_checks", lambda: {"copilot": lambda: True})
+    shown = CliRunner().invoke(cli, ["--help"])
+
+    assert shown.exit_code == 0, shown.output
+    harnesses_at = shown.output.index("Harnesses:")
+    commands_at = shown.output.index("Commands:", harnesses_at)
+    assert harnesses_at < shown.output.index("\n  copilot ") < commands_at
+
+    monkeypatch.setattr("omnigent.cli._harness_extra_checks", lambda: {"copilot": lambda: False})
+    hidden = CliRunner().invoke(cli, ["--help"])
+
+    assert hidden.exit_code == 0, hidden.output
+    assert "\n  copilot " not in hidden.output
+    assert "Some harnesses need an optional extra" in hidden.output
+    # Still registered and runnable; only the listing is suppressed.
+    assert "copilot" in cli.commands
 
 
 def test_first_run_plan_and_polly_command_agree_on_bundled_path(
@@ -2337,6 +2408,9 @@ def test_server_explicit_config_overrides_omnigent_config_env(
         captured["config"] = os.environ["OMNIGENT_CONFIG"]
 
     monkeypatch.setattr(uvicorn.server.Server, "run", _fake_server_run)
+    # Config precedence does not depend on a machine-global port being free.
+    bind_probe = Mock()
+    monkeypatch.setattr("omnigent.cli._assert_server_port_bindable", bind_probe)
 
     result = CliRunner().invoke(
         cli,
@@ -2354,6 +2428,7 @@ def test_server_explicit_config_overrides_omnigent_config_env(
 
     assert result.exit_code == 0, result.output
     assert captured["config"] == str(explicit.resolve())
+    bind_probe.assert_called_once_with("127.0.0.1", 44771)
 
 
 def test_server_with_explicit_db_does_not_reuse_canonical_server(
@@ -2417,6 +2492,9 @@ def test_server_with_explicit_db_does_not_reuse_canonical_server(
         raise AssertionError("explicit-DB server must not register in the shared pidfile")
 
     monkeypatch.setattr(_local_server_mod, "register_local_server", _must_not_register)
+    # The dedicated server is stubbed; occupied-port behavior has its own test.
+    bind_probe = Mock()
+    monkeypatch.setattr("omnigent.cli._assert_server_port_bindable", bind_probe)
 
     db_path = tmp_path / "chat.db"
     result = CliRunner().invoke(
@@ -2440,6 +2518,7 @@ def test_server_with_explicit_db_does_not_reuse_canonical_server(
     assert "already running" not in result.output
     assert captured.get("uvicorn_called") is True
     assert captured["uvicorn_kwargs"]["port"] == 44769
+    bind_probe.assert_called_once_with("127.0.0.1", 44769)
 
 
 def test_server_with_explicit_port_does_not_check_canonical_server(
@@ -2453,7 +2532,9 @@ def test_server_with_explicit_port_does_not_check_canonical_server(
     ``omnigent server --port <new>`` reuse and exit. Explicit port
     selection is the user asking for another listener, while the
     canonical local-server reuse path is only for bare
-    ``omnigent server``.
+    ``omnigent server``. The bind preflight is spied rather than
+    really bound; port availability is covered by the adjacent
+    occupied-port and bind-probe tests.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test data directory for default server state.
@@ -2490,12 +2571,19 @@ def test_server_with_explicit_port_does_not_check_canonical_server(
         """
         raise AssertionError("explicit --port must not touch the shared pidfile")
 
+    bind_probes: list[tuple[str, int]] = []
+
+    def _spy_port_bindable(host: str, port: int) -> None:
+        """Record the preflight bind probe without opening a real socket."""
+        bind_probes.append((host, port))
+
     from omnigent.host import local_server as _local_server_mod
 
     monkeypatch.setattr(uvicorn.server.Server, "run", _fake_server_run)
     monkeypatch.setattr(_local_server_mod, "local_server_url_if_healthy", _must_not_check_existing)
     monkeypatch.setattr(_local_server_mod, "register_local_server", _must_not_touch_pidfile)
     monkeypatch.setattr(_local_server_mod, "clear_local_server_record", _must_not_touch_pidfile)
+    monkeypatch.setattr("omnigent.cli._assert_server_port_bindable", _spy_port_bindable)
     monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
 
@@ -2515,6 +2603,7 @@ def test_server_with_explicit_port_does_not_check_canonical_server(
     assert "already running" not in result.output
     assert captured["uvicorn_kwargs"]["port"] == 44770
     assert "Starting omnigent server on 127.0.0.1:44770" in result.output
+    assert bind_probes == [("127.0.0.1", 44770)]
 
 
 def test_server_command_explicit_occupied_port_fails() -> None:
@@ -3134,6 +3223,234 @@ def test_bundle_no_env_vars_preserves_files(
     assert parsed["llm"]["model"] == "openai/gpt-4o"
 
 
+# ── MCP url/headers/env through the upload path ────────────
+
+
+def _write_upload_agent(
+    agent_dir: Path,
+    tools: dict[str, Any] | None = None,
+) -> None:
+    """
+    Write a minimal agent ``config.yaml`` the server accepts on upload.
+
+    :param agent_dir: The agent image directory.
+    :param tools: Optional ``tools:`` block, e.g. inline MCP servers
+        ``{"search": {"type": "mcp", "url": "${SEARCH_URL}"}}``.
+    """
+    config: dict[str, Any] = {
+        "spec_version": 1,
+        "name": "mcp-upload-agent",
+        "prompt": "hi",
+        "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+    }
+    if tools is not None:
+        config["tools"] = tools
+    _write_config(agent_dir, config)
+
+
+def _upload_and_parse(agent_dir: Path) -> dict[str, Any]:
+    """
+    Bundle *agent_dir* as ``omnigent run`` does, then parse it the way
+    the server parses an uploaded session bundle.
+
+    :param agent_dir: The agent image directory.
+    :returns: ``{server_name: MCPServerConfig}`` from the server-side spec.
+    """
+    from omnigent.server.bundles import validate_agent_bundle
+
+    spec = validate_agent_bundle(_bundle(agent_dir), enforce_handler_allowlist=False)
+    return {server.name: server for server in spec.mcp_servers}
+
+
+def test_bundle_upload_resolves_directory_mcp_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``tools/mcp/*.yaml`` server's ``url: ${VAR}`` reaches the server
+    resolved, since the server re-parses uploads without expansion.
+    """
+    monkeypatch.setenv("UPLOAD_MCP_URL", "https://mcp.example.invalid")
+    monkeypatch.setenv("UPLOAD_MCP_TOKEN", "tok-dir")
+    _write_upload_agent(tmp_path)
+    _write_mcp_config(
+        tmp_path,
+        "pipeshub",
+        {
+            "name": "pipeshub",
+            "transport": "http",
+            "url": "${UPLOAD_MCP_URL}/mcp",
+            "headers": {"Authorization": "Bearer ${UPLOAD_MCP_TOKEN}"},
+        },
+    )
+
+    servers = _upload_and_parse(tmp_path)
+
+    assert servers["pipeshub"].url == "https://mcp.example.invalid/mcp"
+    assert servers["pipeshub"].headers == {"Authorization": "Bearer tok-dir"}
+
+
+def test_bundle_upload_resolves_inline_mcp_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Inline ``tools:`` MCP servers in config.yaml have ``url``,
+    ``headers`` and ``env`` resolved before upload.
+    """
+    monkeypatch.setenv("INLINE_MCP_URL", "https://inline.example.invalid/mcp")
+    monkeypatch.setenv("INLINE_MCP_TOKEN", "tok-inline")
+    monkeypatch.setenv("INLINE_STDIO_SECRET", "stdio-inline")
+    _write_upload_agent(
+        tmp_path,
+        tools={
+            "search": {
+                "type": "mcp",
+                "url": "${INLINE_MCP_URL}",
+                "headers": {"Authorization": "Bearer ${INLINE_MCP_TOKEN}"},
+            },
+            "local": {
+                "type": "mcp",
+                "command": "my-mcp-server",
+                "env": {"API_TOKEN": "${INLINE_STDIO_SECRET}"},
+            },
+        },
+    )
+
+    servers = _upload_and_parse(tmp_path)
+
+    assert servers["search"].url == "https://inline.example.invalid/mcp"
+    assert servers["search"].headers == {"Authorization": "Bearer tok-inline"}
+    assert servers["local"].env == {"API_TOKEN": "stdio-inline"}
+    # The shipped config.yaml itself carries the resolved values, since the
+    # runtime tool loader reads them from the raw YAML.
+    shipped = _extract_yaml_from_bundle(_bundle(tmp_path), "config.yaml")
+    assert shipped["tools"]["search"]["url"] == "https://inline.example.invalid/mcp"
+    assert shipped["tools"]["local"]["env"] == {"API_TOKEN": "stdio-inline"}
+
+
+@pytest.mark.parametrize("layout", ["directory", "inline"])
+def test_bundle_upload_missing_mcp_url_var_fails_like_parser(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    layout: str,
+) -> None:
+    """
+    A missing variable in an MCP ``url`` fails the upload with the same
+    error the parser raises, instead of shipping a literal ``${VAR}``.
+    """
+    from omnigent.spec.parser import parse
+
+    monkeypatch.delenv("MISSING_UPLOAD_MCP_URL", raising=False)
+    server = {"type": "mcp", "url": "${MISSING_UPLOAD_MCP_URL}/mcp"}
+    if layout == "inline":
+        _write_upload_agent(tmp_path, tools={"search": server})
+    else:
+        _write_upload_agent(tmp_path)
+        _write_mcp_config(
+            tmp_path,
+            "search",
+            {"name": "search", "transport": "http", "url": server["url"]},
+        )
+
+    with pytest.raises(OmnigentError) as parser_error:
+        parse(tmp_path, expand_env=True)
+    with pytest.raises(OmnigentError) as upload_error:
+        _bundle(tmp_path)
+
+    assert "Unresolved environment variable '${MISSING_UPLOAD_MCP_URL}'" in str(upload_error.value)
+    assert str(upload_error.value) == str(parser_error.value)
+
+
+def test_bundle_upload_keeps_literal_mcp_url(tmp_path: Path) -> None:
+    """
+    An MCP ``url`` without ``${}`` passes through unchanged, and a
+    directory MCP file with nothing to expand ships byte-for-byte.
+    """
+    _write_upload_agent(
+        tmp_path,
+        tools={"search": {"type": "mcp", "url": "https://inline.example.invalid/mcp"}},
+    )
+    _write_mcp_config(
+        tmp_path,
+        "plain",
+        {"name": "plain", "transport": "http", "url": "http://localhost:9000/mcp"},
+    )
+
+    servers = _upload_and_parse(tmp_path)
+
+    assert servers["search"].url == "https://inline.example.invalid/mcp"
+    assert servers["plain"].url == "http://localhost:9000/mcp"
+    assert "tools/mcp/plain.yaml" not in _resolve_bundle_env_vars(tmp_path)
+
+
+def _bundle_member_text(bundle_bytes: bytes, arcname: str) -> str:
+    """
+    Return one bundle member's raw text, without parsing it.
+
+    :param bundle_bytes: The gzipped tarball bytes.
+    :param arcname: The archive member name, e.g. ``"tools/mcp/github.yaml"``.
+    :returns: The member's contents decoded as UTF-8.
+    """
+    with tarfile.open(fileobj=io.BytesIO(bundle_bytes), mode="r:gz") as tf:
+        extracted = tf.extractfile(tf.getmember(arcname))
+        assert extracted is not None, f"Expected {arcname!r} to be a regular file in the bundle"
+        return extracted.read().decode("utf-8")
+
+
+def test_bundle_upload_rewrites_mcp_file_only_when_a_value_expands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    MCP files whose headers and env are all literal ship byte-for-byte
+    (comments and formatting kept); a ``${VAR}`` header is resolved.
+    """
+    monkeypatch.setenv("SIDECAR_MCP_TOKEN", "tok-sidecar")
+    _write_upload_agent(
+        tmp_path,
+        tools={
+            "inline": {
+                "type": "mcp",
+                "url": "https://inline.example.invalid/mcp",
+                "headers": {"Authorization": "Bearer literal-inline"},
+            },
+        },
+    )
+    mcp_dir = tmp_path / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True, exist_ok=True)
+    literal_text = (
+        "# Hand-written sidecar; keep this comment.\n"
+        "name: literal\n"
+        "transport: http\n"
+        "url: http://localhost:9000/mcp\n"
+        "headers:\n"
+        "  Authorization: Bearer literal-token  # not a secret\n"
+        "env:\n"
+        "  LOG_LEVEL: debug\n"
+    )
+    (mcp_dir / "literal.yaml").write_text(literal_text, encoding="utf-8")
+    (mcp_dir / "templated.yaml").write_text(
+        "# Token comes from the uploader's environment.\n"
+        "name: templated\n"
+        "transport: http\n"
+        "url: http://localhost:9001/mcp\n"
+        "headers:\n"
+        "  Authorization: Bearer ${SIDECAR_MCP_TOKEN}\n",
+        encoding="utf-8",
+    )
+
+    resolved = _resolve_bundle_env_vars(tmp_path)
+    bundle_bytes = _bundle(tmp_path)
+
+    assert "config.yaml" not in resolved
+    assert "tools/mcp/literal.yaml" not in resolved
+    assert _bundle_member_text(bundle_bytes, "tools/mcp/literal.yaml") == literal_text
+    assert "tools/mcp/templated.yaml" in resolved
+    templated = _extract_yaml_from_bundle(bundle_bytes, "tools/mcp/templated.yaml")
+    assert templated["headers"] == {"Authorization": "Bearer tok-sidecar"}
+
+
 def test_bundle_materializes_standalone_omnigent_yaml(tmp_path: Path) -> None:
     """
     ``_bundle`` wraps a standalone omnigent YAML file in a tarball.
@@ -3355,6 +3672,91 @@ def test_preregister_agent_accepts_directory(tmp_path: Path) -> None:
     put_location, put_bytes = artifact_store.puts[0]
     assert put_location == created["bundle_location"]
     assert len(put_bytes) > 0
+
+
+def test_preregister_agent_accepts_resolvable_policy_function(tmp_path: Path) -> None:
+    """
+    A guardrail function policy whose path IS importable from
+    sys.path registers normally — the fail-loud validation must not
+    reject valid paths.
+    """
+    agent_dir = tmp_path / "guarded-agent"
+    agent_dir.mkdir()
+    _write_config(
+        agent_dir,
+        {
+            "spec_version": 1,
+            "name": "guarded-agent",
+            "executor": {"config": {"harness": "openai-agents"}},
+            "guardrails": {
+                "policies": {
+                    "guard": {
+                        "type": "function",
+                        "on": ["request"],
+                        # A real, importable builtin — resolves from sys.path.
+                        "function": "omnigent.policies.builtins.safety.ask_on_os_tools",
+                    },
+                },
+            },
+        },
+    )
+
+    agent_store = _RecordingAgentStore()
+    artifact_store = _RecordingArtifactStore()
+    agent_cache = _RecordingAgentCache()
+
+    agent_id = _preregister_agent(agent_dir, agent_store, artifact_store, agent_cache)
+
+    assert agent_id is not None
+    assert len(agent_store.created) == 1
+
+
+def test_preregister_agent_rejects_unresolvable_policy_function(
+    tmp_path: Path,
+) -> None:
+    """
+    A guardrail function policy whose path can't be resolved from
+    sys.path fails REGISTRATION loudly, naming the agent, policy, and
+    path — instead of registering an agent whose every turn would be
+    fail-closed denied with a generic policy-evaluation error.
+    """
+    agent_dir = tmp_path / "broken-agent"
+    agent_dir.mkdir()
+    _write_config(
+        agent_dir,
+        {
+            "spec_version": 1,
+            "name": "broken-agent",
+            "executor": {"config": {"harness": "openai-agents"}},
+            "guardrails": {
+                "policies": {
+                    "pack_guard": {
+                        "type": "function",
+                        "on": ["request"],
+                        # Pack-local module the server can't import.
+                        "function": "agents.mypack.policies.missing_module.check",
+                    },
+                },
+            },
+        },
+    )
+
+    agent_store = _RecordingAgentStore()
+    artifact_store = _RecordingArtifactStore()
+    agent_cache = _RecordingAgentCache()
+
+    with pytest.raises(ClickException, match=r"cannot be resolved from sys\.path") as exc:
+        _preregister_agent(agent_dir, agent_store, artifact_store, agent_cache)
+
+    # Actionable message: names the agent, the policy, and the path.
+    message = str(exc.value)
+    assert "broken-agent" in message
+    assert "pack_guard" in message
+    assert "missing_module" in message
+
+    # Nothing half-registered.
+    assert agent_store.created == []
+    assert artifact_store.puts == []
 
 
 def test_preregister_agent_accepts_omnigent_yaml_file(tmp_path: Path) -> None:
@@ -5765,6 +6167,9 @@ def test_codex_applies_auto_open_conversation_config(
     monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
     _save_global_config({"auto_open_conversation": True})
 
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_backend", lambda server: server or "http://localhost:0"
+    )
     captured: dict[str, object] = {}
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.main.run_codex_native",
@@ -5814,6 +6219,82 @@ def test_run_bare_omnigent_with_harness_only_config(
     # harness default must be forwarded; no target was set
     assert dispatched["harness"] == "claude-sdk"
     assert dispatched["target"] is None
+
+
+class _FakeStream:
+    """A stdio stub recording ``reconfigure`` calls for the stdio-hardening test."""
+
+    def __init__(self, encoding: str, *, raises: bool = False) -> None:
+        self.encoding = encoding
+        self.raises = raises
+        self.reconfigured: dict[str, object] | None = None
+
+    def reconfigure(self, **kwargs: object) -> None:
+        if self.raises:
+            raise ValueError("stream detached")
+        self.reconfigured = kwargs
+        self.encoding = str(kwargs.get("encoding", self.encoding))
+
+
+def test_stdio_hardening_reconfigures_legacy_windows_streams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On Windows, non-UTF-8 stdio is reconfigured to utf-8/replace."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    out, err = _FakeStream("cp1252"), _FakeStream("cp1252")
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+
+    _ensure_stdio_survives_unencodable_output()
+
+    assert out.reconfigured == {"encoding": "utf-8", "errors": "replace"}
+    assert err.reconfigured == {"encoding": "utf-8", "errors": "replace"}
+
+
+def test_stdio_hardening_relaxes_errors_on_posix_legacy_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legacy-encoding stream off Windows keeps its encoding, relaxed errors.
+
+    ``PYTHONIOENCODING=cp1252`` (or a C/latin-1 locale) reproduces the same
+    mid-command ``UnicodeEncodeError`` on any OS; the stream must degrade
+    unencodable glyphs instead of aborting, without changing the encoding
+    the consumer asked for.
+    """
+    monkeypatch.setattr(sys, "platform", "linux")
+    out, err = _FakeStream("cp1252"), _FakeStream("cp1252")
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+
+    _ensure_stdio_survives_unencodable_output()
+
+    assert out.reconfigured == {"errors": "replace"}
+    assert err.reconfigured == {"errors": "replace"}
+    assert out.encoding == "cp1252"
+
+
+def test_stdio_hardening_skips_already_utf8(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A UTF-8 stream is not reconfigured again (any platform)."""
+    for platform in ("win32", "linux"):
+        monkeypatch.setattr(sys, "platform", platform)
+        out = _FakeStream("utf-8")
+        monkeypatch.setattr(sys, "stdout", out)
+        monkeypatch.setattr(sys, "stderr", _FakeStream("utf-8"))
+
+        _ensure_stdio_survives_unencodable_output()
+
+        assert out.reconfigured is None
+
+
+def test_stdio_hardening_tolerates_reconfigure_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream whose ``reconfigure`` raises does not abort startup."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "stdout", _FakeStream("cp1252", raises=True))
+    monkeypatch.setattr(sys, "stderr", _FakeStream("cp1252", raises=True))
+
+    _ensure_stdio_survives_unencodable_output()  # must not raise
 
 
 def test_bare_omnigent_harness_flag_dispatches_to_run(

@@ -32,6 +32,7 @@ from omnigent.runner.background_titles.service import (
     background_title_model,
     build_background_title_instructions,
 )
+from omnigent.runtime.harnesses.process_manager import _build_harness_spawn_env
 from tests.runner.helpers import NullServerClient
 
 
@@ -107,6 +108,7 @@ async def _runner_client(app):
 async def test_background_title_uses_isolated_codex_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("HARNESS_CODEX_SKILLS_DIR", "/ambient-parent-session-skills")
     harness_client = _FakeHarnessClient()
     process_manager = _FakeProcessManager(harness_client)
 
@@ -114,7 +116,10 @@ async def test_background_title_uses_isolated_codex_process(
         assert kwargs["agent_id"] == "agent_test"
         assert kwargs["session_id"] == "conv_test"
         assert kwargs["model_override"] == "gpt-5.4-mini"
-        return "codex", {"HARNESS_CODEX_MODEL": "gpt-5.4-mini"}
+        return "codex", {
+            "HARNESS_CODEX_MODEL": "gpt-5.4-mini",
+            "HARNESS_CODEX_SKILLS_DIR": "/parent-session-skills",
+        }
 
     monkeypatch.setattr(
         "omnigent.runner.app._resolve_harness_config",
@@ -152,7 +157,9 @@ async def test_background_title_uses_isolated_codex_process(
         "HARNESS_CODEX_MINIMAL_CONFIG": "1",
         "HARNESS_CODEX_MODEL": "gpt-5.4-mini",
         "HARNESS_CODEX_SKILLS_FILTER": '"none"',
+        "HARNESS_CODEX_SKILLS_DIR": "",
     }
+    assert _build_harness_spawn_env(env)["HARNESS_CODEX_SKILLS_DIR"] == ""
     assert process_manager.released == [process_key]
 
     [(url, body)] = harness_client.requests
@@ -457,7 +464,17 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
+    from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+
     captured: dict[str, Any] = {}
+    claude_config = ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+        api_key_helper="printf token",
+        model_overrides={
+            "claude-opus-5": "deployment-current",
+            "claude-opus-4-8": "deployment-17",
+        },
+    )
 
     class FakeProcess:
         returncode = 0
@@ -471,7 +488,7 @@ async def test_claude_native_title_uses_tool_free_print_mode(
 
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.resolve_native_claude_config",
-        lambda spec=None: None,
+        lambda spec=None: claude_config,
     )
     monkeypatch.setattr(
         "omnigent.claude_launcher.resolve_claude_launch",
@@ -497,6 +514,14 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     assert args[args.index("--tools") + 1] == ""
     assert args[args.index("--output-format") + 1] == "text"
     assert args[args.index("--model") + 1] == "claude-sonnet-4-6"
+    settings = json.loads(args[args.index("--settings") + 1])
+    assert settings == {
+        "apiKeyHelper": "printf token",
+        "modelOverrides": {
+            "claude-opus-5": "deployment-current",
+            "claude-opus-4-8": "deployment-17",
+        },
+    }
     assert "--no-session-persistence" in args
     assert captured["kwargs"]["cwd"] == str(tmp_path)
     assert "CLAUDECODE" not in captured["kwargs"]["env"]

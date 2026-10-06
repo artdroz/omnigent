@@ -45,6 +45,7 @@ import {
 import { useSession } from "@/hooks/useSession";
 import { useUserSearch } from "@/hooks/useUserSearch";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { withBasePath } from "@/lib/basePath";
 import { updateSession } from "@/lib/sessionsApi";
 import { getOmnigentTransformShareLink, getOmnigentUserSearch } from "@/lib/host";
 import { workspaceSharingBlocked } from "@/lib/permissionsApi";
@@ -333,12 +334,13 @@ export function PermissionsModal({
 
         {error && <p className="text-sm text-destructive">{error}</p>}
 
-        <DialogFooter className="flex-row justify-between sm:justify-between">
+        {/* Keep the default stacking below sm: one row of Copy link + QR +
+            Done overflows a phone-width dialog and widens the whole grid. */}
+        <DialogFooter className="sm:justify-between">
           <div className="flex items-center gap-2">
             <CopyLinkButton sessionId={sessionId} />
             <Button
               variant="ghost"
-              size="sm"
               onClick={() => setShowQr(true)}
               className="gap-1.5 text-primary"
             >
@@ -539,7 +541,10 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
 function getShareableLink(sessionId: string, rebasePath: (path: string) => string): string {
   const path = rebasePath(`/c/${sessionId}`);
   const transform = getOmnigentTransformShareLink();
-  return transform ? transform(path) : `${window.location.origin}${path}`;
+  // Standalone: `rebasePath` is identity, so apply the deployment base path
+  // (e.g. `/proxy/6767`) before prepending the origin. The embed supplies its
+  // own `transform`, which already includes the host mount path.
+  return transform ? transform(path) : `${window.location.origin}${withBasePath(path)}`;
 }
 
 /**
@@ -584,7 +589,6 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
   return (
     <Button
       variant="ghost"
-      size="sm"
       onClick={handleCopy}
       className="gap-1.5 text-primary"
       componentId="diagnostics.permissions.copy_link"

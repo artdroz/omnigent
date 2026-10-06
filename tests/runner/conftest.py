@@ -20,6 +20,7 @@ from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from omnigent.runner import create_runner_app
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig
+from omnigent.terminals import TerminalRegistry
 from tests.runner.helpers import NullServerClient
 
 # The real store-backed catalog resolver, captured before the autouse fixture
@@ -262,6 +263,9 @@ class _FakeProcessManager:
         self.marked_in_flight: list[tuple[str, str]] = []
         self.cleared_in_flight: list[str] = []
         self.activity_noted: list[str] = []
+        # Every release call with its idle-cutoff guard, including calls the
+        # guard suppressed; ``released`` records only completed releases.
+        self.release_calls: list[tuple[str, float | None]] = []
 
     async def get_client(
         self, conversation_id: str, harness: str, env: Any = None
@@ -302,8 +306,21 @@ class _FakeProcessManager:
         self.cancelled.append(conversation_id)
         return True
 
-    async def release(self, conversation_id: str) -> None:
-        """Record a release and remove the session."""
+    async def release(
+        self, conversation_id: str, *, only_if_idle_cutoff: float | None = None
+    ) -> None:
+        """Record a release and remove the session.
+
+        Mirrors the real manager's conditional release: with a cutoff, an
+        entry with a turn in flight is left alone.
+
+        :param conversation_id: Session/conversation id being released.
+        :param only_if_idle_cutoff: Idle-reap cutoff; when given, a
+            conversation with an active turn is not torn down.
+        """
+        self.release_calls.append((conversation_id, only_if_idle_cutoff))
+        if only_if_idle_cutoff is not None and conversation_id in self._active_turns:
+            return
         self.released.append(conversation_id)
         self._sessions.discard(conversation_id)
 
@@ -339,6 +356,20 @@ async def _spec_resolver_returning(spec: AgentSpec) -> Any:
         return spec
 
     return _resolve
+
+
+async def _build_app_for_spec(
+    spec: AgentSpec, *, terminal_registry: TerminalRegistry | None = None
+) -> tuple[FastAPI, _FakeProcessManager]:
+    """Build the real runner app with an idle harness and one fixed agent spec."""
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=await _spec_resolver_returning(spec),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+    return app, pm
 
 
 def _sse(event: dict[str, Any]) -> str:
@@ -794,7 +825,7 @@ def _no_wake_backoff(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     async def _record(seconds: float) -> None:
         recorded.append(seconds)
 
-    monkeypatch.setattr("omnigent.runner.app._wake_retry_sleep", _record)
+    monkeypatch.setattr("omnigent.runner.subagent_work._wake_retry_sleep", _record)
     return recorded
 
 
