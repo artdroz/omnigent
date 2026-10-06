@@ -221,6 +221,14 @@ async def open_proxy_connect_socket(
         raise OSError(f"proxy URL has no host: {redact_proxy_url(proxy_url)!r}")
     if not target.hostname:
         raise OSError(f"tunnel URL has no host: {ws_url!r}")
+    target_host = target.hostname
+    if _ip_literal(target_host) is None:
+        try:
+            # The CONNECT authority is ASCII; encode an IDN host the way the
+            # direct-dial resolver would.
+            target_host = target_host.encode("idna").decode("ascii")
+        except UnicodeError as exc:
+            raise OSError(f"tunnel host is not IDNA-encodable: {target_host!r}") from exc
     try:
         proxy_port = proxy.port or 80
         target_port = target.port or _DEFAULT_PORT_BY_WS_SCHEME.get(
@@ -238,19 +246,28 @@ async def open_proxy_connect_socket(
             _connect_sync,
             proxy.hostname,
             proxy_port,
-            target.hostname,
+            target_host,
             target_port,
             auth_header,
             timeout,
         )
     )
     try:
-        return await asyncio.shield(dial)
+        # One overall deadline covers resolution, every address attempt and
+        # the handshake; the worker's own per-operation budget is secondary.
+        return await asyncio.wait_for(asyncio.shield(dial), timeout)
     except asyncio.CancelledError:
         # The worker thread cannot be interrupted; close any socket it still
         # hands back after this cancellation instead of orphaning it.
         dial.add_done_callback(_close_dial_result)
         raise
+    except TimeoutError:
+        if dial.done():
+            raise
+        dial.add_done_callback(_close_dial_result)
+        raise TimeoutError(
+            f"proxy did not complete CONNECT to {target_host}:{target_port} within {timeout:g}s"
+        ) from None
 
 
 def _close_dial_result(dial: asyncio.Future[socket.socket]) -> None:
@@ -278,8 +295,9 @@ def _connect_sync(
     :param target_host: Origin hostname the proxy must reach.
     :param target_port: Origin port.
     :param auth_header: Optional ``Proxy-Authorization`` value.
-    :param timeout: Overall budget, in seconds, for the dial and handshake
-        (the dial applies it per resolved proxy address).
+    :param timeout: Budget, in seconds, for this worker's dial and handshake;
+        the dial applies it per resolved proxy address, and the awaiting
+        caller enforces the overall deadline.
     :returns: The connected socket with its timeout cleared.
     :raises OSError: On dial failure, a refused/garbled CONNECT, or an
         exhausted budget.

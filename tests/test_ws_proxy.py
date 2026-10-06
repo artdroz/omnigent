@@ -121,8 +121,9 @@ async def _connect_proxy(reply):
             writer.write(reply)
             await writer.drain()
             if reply == _OK:
-                writer.write(await reader.readexactly(4))
-                await writer.drain()
+                with contextlib.suppress(asyncio.IncompleteReadError):
+                    writer.write(await reader.readexactly(4))
+                    await writer.drain()
         finally:
             writer.close()
             await writer.wait_closed()
@@ -174,6 +175,18 @@ async def test_connect_error(reply, error):
             await open_proxy_connect_socket(f"http://127.0.0.1:{port}", _TUNNEL_URL, timeout=5)
 
 
+async def test_connect_tunnel_idna_host():
+    async with _connect_proxy(_OK) as (port, requests):
+        with await open_proxy_connect_socket(
+            f"http://127.0.0.1:{port}", "ws://bücher.example:8000/t", timeout=5
+        ):
+            pass
+        authority = b"xn--bcher-kva.example:8000"
+        assert requests == [
+            b"CONNECT " + authority + b" HTTP/1.1\r\nHost: " + authority + b"\r\n\r\n"
+        ]
+
+
 async def test_connect_rejects_malformed_proxy_port():
     with pytest.raises(OSError, match="invalid port"):
         await open_proxy_connect_socket("http://127.0.0.1:bad", _TUNNEL_URL, timeout=5)
@@ -197,6 +210,28 @@ async def test_connect_closes_socket_when_awaiter_is_cancelled(monkeypatch):
     dial.cancel()
     with pytest.raises(asyncio.CancelledError):
         await dial
+    for _ in range(100):
+        if sock.fileno() == -1:
+            break
+        await asyncio.sleep(0.02)
+    assert sock.fileno() == -1
+
+
+async def test_connect_timeout_bounds_a_slow_dial(monkeypatch):
+    """The budget caps the dial itself, not only the handshake after it."""
+    from omnigent.util import ws_proxy
+
+    sock = socket.socket()
+
+    def slow_dial(*_args, **_kwargs):
+        time.sleep(0.8)
+        return sock
+
+    monkeypatch.setattr(ws_proxy.socket, "create_connection", slow_dial)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match=r"within 0\.3s"):
+        await open_proxy_connect_socket("http://127.0.0.1:1", _TUNNEL_URL, timeout=0.3)
+    assert time.monotonic() - started < 0.7
     for _ in range(100):
         if sock.fileno() == -1:
             break

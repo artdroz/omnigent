@@ -64,8 +64,8 @@ def _mandatory_proxy(server_port: int) -> Iterator[tuple[str, list[tuple[str, st
             if parts.hostname != _SERVER_HOST or parts.port != server_port:
                 client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                 return
-            requests.append((method, target))
             with socket.create_connection(("127.0.0.1", server_port), timeout=5) as upstream:
+                requests.append((method, target))
                 if method == "CONNECT":
                     client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 else:
@@ -164,13 +164,15 @@ def test_host_comes_online_through_mandatory_proxy(
                 online = False
                 deadline = time.monotonic() + 90
                 while proc.poll() is None and time.monotonic() < deadline:
+                    hosts: list[dict[str, object]] = []
                     with contextlib.suppress(httpx.HTTPError):
                         response = http_client.get("/v1/hosts", timeout=5)
                         response.raise_for_status()
-                        online = any(
-                            host["host_id"] == host_id and host["status"] == "online"
-                            for host in response.json().get("hosts", [])
-                        )
+                        hosts = response.json().get("hosts", [])
+                    online = any(
+                        host.get("host_id") == host_id and host.get("status") == "online"
+                        for host in hosts
+                    )
                     if (
                         online
                         or host_log.read_text(errors="replace").count(
