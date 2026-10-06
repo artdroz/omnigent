@@ -190,7 +190,7 @@ def test_mysql_resumes_after_the_index_ddl_committed(db_uri: str, direction: str
     migrate(start, down=True)
 
     def interrupt(_conn, _cursor, statement, _params, _context, _many) -> None:
-        if statement.startswith(ddl):
+        if statement.lstrip().startswith(ddl):  # compiled DROP INDEX starts with a newline
             raise RuntimeError("injected interruption after committed DDL")
 
     try:
