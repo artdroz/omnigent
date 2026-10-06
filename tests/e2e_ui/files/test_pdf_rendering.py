@@ -198,11 +198,9 @@ def test_pdf_worker_failure_keeps_session_and_download_available(
     assert page.evaluate("window.__pdfWorkerBlocked") is True
     assert f"/c/{session_id}" in page.url
 
-    settings = file_viewer.get_by_role("button", name="View settings", exact=True)
-    if settings.is_visible():
-        settings.click()
-    else:
-        file_viewer.get_by_role("button", name="More actions", exact=True).click()
+    # The toolbar renders either inline actions or a collapsed "More actions"
+    # menu, never both; either one holds "Download file".
+    file_viewer.get_by_role("button", name=re.compile(r"^(View settings|More actions)$")).click()
     with page.expect_download() as download_info:
         page.get_by_role("menuitem", name="Download file", exact=True).click()
     download = download_info.value

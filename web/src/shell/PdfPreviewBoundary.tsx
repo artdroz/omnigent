@@ -1,10 +1,8 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
 import { isChunkLoadError } from "@/lib/chunkLoadRecovery";
 
-/**
- * Keep rejected PDF imports and rendering errors inside the file preview.
- * Stale-chunk failures are rethrown so ChunkLoadErrorBoundary can refresh the page.
- */
+// Keep rejected PDF imports and rendering errors inside the file preview.
+// Stale-chunk failures are rethrown so ChunkLoadErrorBoundary can refresh the page.
 export class PdfPreviewBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
   override state = { failed: false };
 
