@@ -1165,12 +1165,9 @@ class HostProcess:
             self._interactive_shells = ["bash"]
         self._harness_tmp_parent = resolve_harness_tmp_parent()
         self._runners: dict[str, _RunnerHandle] = {}
-        from omnigent.host.skills import HostSkillDiscovery, HostSkillSubscriptions
+        from omnigent.host.skills import HostSkillDiscovery
 
         self._skill_discovery = HostSkillDiscovery(self._fetch_skill_bundle)
-        self._skill_subscriptions = HostSkillSubscriptions(
-            self._skill_discovery, self._handle_skills
-        )
         from omnigent.host.mcp_inventory import HostMcpInventory
 
         self._mcp_inventory = HostMcpInventory()
@@ -4582,7 +4579,6 @@ class HostProcess:
                     # _runner_lifecycle_lock in _dispatch_host_frame.
                     self._start_frame_task(ws, raw)
         finally:
-            await self._skill_subscriptions.close()
             readiness_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await readiness_task
@@ -4851,13 +4847,6 @@ class HostProcess:
             fs_write_result = await asyncio.to_thread(self._handle_fs_write, frame)
             await ws.send(encode_host_frame(fs_write_result))
         elif isinstance(frame, HostSkillsFrame):
-            if frame.action != "get":
-
-                async def send_skills(result: HostSkillsResultFrame) -> None:
-                    await ws.send(encode_host_frame(result))
-
-                await self._skill_subscriptions.handle(frame, send_skills)
-                return
             skills_result = await asyncio.to_thread(self._handle_skills, frame)
             await ws.send(encode_host_frame(skills_result))
         elif isinstance(frame, HostPluginsFrame):

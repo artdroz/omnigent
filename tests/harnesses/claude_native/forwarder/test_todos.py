@@ -260,7 +260,7 @@ async def test_skill_config_change_refreshes_host(tmp_path: Path) -> None:
         async with asyncio.timeout(5):
             while True:
                 request = await _get_recorded_request(server)
-                if request["path"] == "/v1/sessions/conv_abc/skills/refresh":
+                if request["path"] == "/v1/skills?session_id=conv_abc":
                     break
     finally:
         task.cancel()

@@ -115,10 +115,11 @@ def presession_app(skills_app):
     return skills_app
 
 
+@pytest.mark.parametrize("method", ["GET", "POST"])
 @pytest.mark.parametrize("user", ["owner", "editor"])
 @pytest.mark.parametrize("acknowledged", [True, False])
 async def test_session_catalog_needs_no_runner_and_allows_shared_editors(
-    skills_app, user: str, acknowledged: bool
+    skills_app, user: str, acknowledged: bool, method: str
 ) -> None:
     app, _, conn, conv, agent, _ = skills_app
     assert conv.runner_id is None
@@ -126,10 +127,13 @@ async def test_session_catalog_needs_no_runner_and_allows_shared_editors(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         task = asyncio.create_task(
-            client.get("/v1/skills", params={"session_id": conv.id}, headers={"x-test-user": user})
+            client.request(
+                method, "/v1/skills", params={"session_id": conv.id}, headers={"x-test-user": user}
+            )
         )
         frame = decode_host_frame(await asyncio.wait_for(conn.outbound_queue.get(), 2))
         assert isinstance(frame, HostSkillsFrame)
+        assert frame.refresh == (method == "POST")
         assert (
             frame.session_id,
             frame.path,
@@ -154,15 +158,17 @@ async def test_session_catalog_needs_no_runner_and_allows_shared_editors(
     assert not conn.pending_skills
 
 
+@pytest.mark.parametrize("method", ["GET", "POST"])
 @pytest.mark.parametrize("user,status", [("reader", 403), ("stranger", 404), (None, 401)])
 async def test_unauthorized_session_does_not_send_discovery(
-    skills_app, user: str | None, status: int
+    skills_app, user: str | None, status: int, method: str
 ) -> None:
     app, _, conn, conv, _, _ = skills_app
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
-        response = await client.get(
+        response = await client.request(
+            method,
             "/v1/skills",
             params={"session_id": conv.id},
             headers={"x-test-user": user} if user else {},
@@ -378,24 +384,3 @@ async def test_managed_host_bundle_token_is_bound_to_session_host(
         assert response.headers["X-Agent-Id"] == agent.id
         assert response.headers["X-Agent-Version"] == str(agent.version)
         assert response.headers["Cache-Control"] == "no-store"
-
-
-@pytest.mark.parametrize("user,status", [("owner", 200), ("editor", 200), ("reader", 403)])
-async def test_refresh_authorizes_before_invalidating_host(skills_app, user, status):
-    from omnigent.host.frames import CAP_SKILL_SUBSCRIPTIONS
-
-    app, _, conn, conv, _, _ = skills_app
-    conn.hello.capabilities.append(CAP_SKILL_SUBSCRIPTIONS)
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
-    ) as client:
-        response = await client.post(
-            f"/v1/sessions/{conv.id}/skills/refresh", headers={"x-test-user": user}
-        )
-    assert response.status_code == status
-    if status == 200:
-        frame = decode_host_frame(conn.outbound_queue.get_nowait())
-        assert frame.action == "invalidate"
-        assert frame.session_id == conv.id
-    else:
-        assert conn.outbound_queue.empty()

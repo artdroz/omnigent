@@ -592,4 +592,4 @@ async def test_skill_change_refreshes_host_without_thread_id(tmp_path: Path, par
         elicitation_tracker=fwd._CodexElicitationTaskTracker(),
         expected_thread_id="thread_1",
     )
-    assert client.posts == [("/v1/sessions/conv_x/skills/refresh", {})]
+    assert client.posts == [("/v1/skills?session_id=conv_x", {})]

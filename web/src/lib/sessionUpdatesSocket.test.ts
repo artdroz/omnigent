@@ -3,7 +3,6 @@ import {
   HEARTBEAT_WATCHDOG_MS,
   nextPushedSession,
   sessionUpdatesSocket,
-  subscribeHostSkills,
 } from "./sessionUpdatesSocket";
 
 // Minimal stand-in for the browser WebSocket: records sends/closes and lets
@@ -30,10 +29,8 @@ class FakeWebSocket {
     FakeWebSocket.instances.push(this);
   }
 
-  sent: string[] = [];
-
-  send(message: string): void {
-    this.sent.push(message);
+  send(): void {
+    // The watch-set send is irrelevant to the watchdog; ignore it.
   }
 
   close(): void {
@@ -101,31 +98,6 @@ describe("sessionUpdatesSocket heartbeat watchdog", () => {
     const before = FakeWebSocket.instances.length;
     vi.advanceTimersByTime(RECONNECT_CEILING_MS);
     expect(FakeWebSocket.instances.length).toBe(before + 1);
-  });
-
-  it("shares a host skill socket, restores watches on reconnect, and releases the last listener", () => {
-    const target = { host_id: "skill-host", harness: "claude-native", path: "/repo" };
-    const releaseA = subscribeHostSkills("target", target, () => {});
-    const ws = latestWs();
-    const releaseB = subscribeHostSkills("target", target, () => {});
-    expect(latestWs()).toBe(ws);
-    ws.open();
-    expect(ws.sent.map((m) => JSON.parse(m))).toContainEqual({
-      type: "watch_skills",
-      targets: [{ id: "target", ...target }],
-    });
-    ws.close();
-    vi.advanceTimersByTime(RECONNECT_CEILING_MS);
-    const reconnected = latestWs();
-    reconnected.open();
-    expect(reconnected.sent.map((m) => JSON.parse(m))).toContainEqual({
-      type: "watch_skills",
-      targets: [{ id: "target", ...target }],
-    });
-    releaseA();
-    expect(reconnected.closeCount).toBe(0);
-    releaseB();
-    expect(reconnected.closeCount).toBe(1);
   });
 
   it("keeps the connection alive when a heartbeat arrives before the deadline", () => {

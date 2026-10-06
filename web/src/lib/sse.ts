@@ -1,4 +1,3 @@
-import { parseSkillCatalog } from "@/lib/skillCatalogs";
 // Mirrors sdks/python-client/omnigent_client/_sse.py.
 //
 // Parses raw `text/event-stream` bytes into typed `StreamEvent`
@@ -722,11 +721,6 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       agentId,
       agentName,
     } satisfies SessionAgentChangedEvent;
-  }
-  if (eventType === "session.skills") {
-    const catalog = parseSkillCatalog(data);
-    if (typeof data.conversation_id !== "string" || !catalog) return null;
-    return { type: "session_skills", conversationId: data.conversation_id, catalog };
   }
   if (eventType === "session.todos") {
     const conversationId = data.conversation_id;

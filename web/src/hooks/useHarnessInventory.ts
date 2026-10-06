@@ -6,7 +6,7 @@ import { skipToken, useQueries, useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { BRAND_HARNESSES, type BrandHarness } from "@/components/onboarding/harnessBrand";
 import type { Host } from "@/hooks/useHosts";
-import { fetchSkills, type SkillsTarget } from "@/hooks/useSkills";
+import { fetchSkills, skillsQueryKey, type SkillsTarget } from "@/hooks/useSkills";
 import { authenticatedFetch } from "@/lib/identity";
 import { ApiError } from "@/lib/sessionsApi";
 import type { SkillSummary } from "@/lib/types";
@@ -248,7 +248,7 @@ export function useHarnessInventory(
         path: "~",
       };
       return {
-        queryKey: ["skill-inventory", target],
+        queryKey: skillsQueryKey(target),
         queryFn: ({ signal }: { signal: AbortSignal }) => fetchSkills(target, signal),
         staleTime: 30_000,
         retry,

@@ -229,62 +229,21 @@ def test_directory_catalog_never_downloads_a_session_bundle(tmp_path: Path) -> N
     fetch.assert_not_called()
 
 
-async def test_host_pushes_additions_and_removals_after_invalidation(tmp_path: Path) -> None:
-    import asyncio
-
-    from omnigent.host.frames import HostSkillsResultFrame
-    from omnigent.host.skills import HostSkillSubscriptions
-
+def test_refresh_updates_catalog_and_invalidates_other_targets(tmp_path: Path) -> None:
     discovery = HostSkillDiscovery(Mock())
-    frame = HostSkillsFrame("watch", "claude-native", str(tmp_path), action="watch")
-
-    def discover(request):
-        return HostSkillsResultFrame(
-            request.request_id, "ok", discovery.discover(request, tmp_path)
-        )
-
-    sent = asyncio.Queue()
-    subscriptions = HostSkillSubscriptions(discovery, discover, interval=3600)
-    await subscriptions.handle(frame, sent.put)
-    try:
-        assert (await asyncio.wait_for(sent.get(), 2)).skills == []
-        directory = tmp_path / ".claude" / "skills" / "added"
-        directory.mkdir(parents=True)
-        path = directory / "SKILL.md"
-        path.write_text(_skill("added"))
-        await subscriptions.handle(replace(frame, action="invalidate"), sent.put)
-        assert [s["name"] for s in (await asyncio.wait_for(sent.get(), 2)).skills] == ["added"]
-        path.unlink()
-        await subscriptions.handle(replace(frame, action="invalidate"), sent.put)
-        assert (await asyncio.wait_for(sent.get(), 2)).skills == []
-        await subscriptions.handle(replace(frame, action="unwatch"), sent.put)
-        assert not subscriptions.tasks
-    finally:
-        await subscriptions.close()
-
-
-async def test_host_reconciles_changes_without_native_cli(tmp_path: Path) -> None:
-    import asyncio
-
-    from omnigent.host.frames import HostSkillsResultFrame
-    from omnigent.host.skills import HostSkillSubscriptions
-
-    discovery = HostSkillDiscovery(Mock())
-    frame = HostSkillsFrame("watch", "claude-native", str(tmp_path), action="watch")
-    sent = asyncio.Queue()
-    subscriptions = HostSkillSubscriptions(
-        discovery,
-        lambda request: HostSkillsResultFrame(
-            request.request_id, "ok", discovery.discover(request, tmp_path)
-        ),
-        interval=0.01,
-    )
-    await subscriptions.handle(frame, sent.put)
-    try:
-        assert (await asyncio.wait_for(sent.get(), 2)).skills == []
-        directory = tmp_path / ".claude" / "skills" / "added"
-        directory.mkdir(parents=True)
-        (directory / "SKILL.md").write_text(_skill("added"))
-        assert [s["name"] for s in (await asyncio.wait_for(sent.get(), 2)).skills] == ["added"]
-    finally:
-        await subscriptions.close()
+    frame = HostSkillsFrame("request", "claude-native", str(tmp_path))
+    other = replace(frame, agent_id="other")
+    assert discovery.discover(frame, tmp_path) == []
+    assert discovery.discover(other, tmp_path) == []
+    directory = tmp_path / ".claude" / "skills" / "added"
+    directory.mkdir(parents=True)
+    path = directory / "SKILL.md"
+    path.write_text(_skill("added"))
+    assert discovery.discover(frame, tmp_path) == []
+    expected = [{"name": "added", "description": "added description"}]
+    assert discovery.discover(replace(frame, refresh=True), tmp_path) == expected
+    assert discovery.discover(other, tmp_path) == expected
+    path.unlink()
+    assert discovery.discover(frame, tmp_path) == expected
+    assert discovery.discover(replace(frame, refresh=True), tmp_path) == []
+    assert discovery.discover(other, tmp_path) == []

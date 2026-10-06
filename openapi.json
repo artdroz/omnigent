@@ -5302,7 +5302,6 @@
             "session.resource.created": "#/components/schemas/SessionResourceCreatedEvent",
             "session.resource.deleted": "#/components/schemas/SessionResourceDeletedEvent",
             "session.sandbox_status": "#/components/schemas/SessionSandboxStatusEvent",
-            "session.skills": "#/components/schemas/SessionSkillsEvent",
             "session.status": "#/components/schemas/SessionStatusEvent",
             "session.superseded": "#/components/schemas/SessionSupersededEvent",
             "session.terminal.activity": "#/components/schemas/SessionTerminalActivityEvent",
@@ -5344,9 +5343,6 @@
           },
           {
             "$ref": "#/components/schemas/SessionAgentChangedEvent"
-          },
-          {
-            "$ref": "#/components/schemas/SessionSkillsEvent"
           },
           {
             "$ref": "#/components/schemas/SessionTodosEvent"
@@ -7633,118 +7629,6 @@
           "stage"
         ],
         "title": "SessionSandboxStatusEvent",
-        "type": "object"
-      },
-      "SessionSkillsEvent": {
-        "description": "Host-discovered catalog delivered directly to a session's viewers.",
-        "properties": {
-          "agent_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Agent Id"
-          },
-          "conversation_id": {
-            "title": "Conversation Id",
-            "type": "string"
-          },
-          "host_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Host Id"
-          },
-          "revision": {
-            "format": "int64",
-            "title": "Revision",
-            "type": "integer"
-          },
-          "sequence_number": {
-            "anyOf": [
-              {
-                "format": "int64",
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Sequence Number"
-          },
-          "skills": {
-            "anyOf": [
-              {
-                "items": {
-                  "$ref": "#/components/schemas/SkillSummary"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Skills"
-          },
-          "status": {
-            "enum": [
-              "ready",
-              "error",
-              "unavailable"
-            ],
-            "title": "Status",
-            "type": "string"
-          },
-          "sub_agent_name": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Sub Agent Name"
-          },
-          "type": {
-            "const": "session.skills",
-            "title": "Type",
-            "type": "string"
-          },
-          "workspace": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Workspace"
-          }
-        },
-        "required": [
-          "type",
-          "conversation_id",
-          "status",
-          "revision"
-        ],
-        "title": "SessionSkillsEvent",
         "type": "object"
       },
       "SessionStatusEvent": {
@@ -16031,53 +15915,6 @@
         ]
       }
     },
-    "/v1/sessions/{session_id}/skills/refresh": {
-      "post": {
-        "description": "Invalidate host catalogs; subscribed streams receive refreshed skill lists.",
-        "operationId": "refresh_skills_v1_sessions__session_id__skills_refresh_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "session_id",
-            "required": true,
-            "schema": {
-              "title": "Session Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": {
-                    "type": "boolean"
-                  },
-                  "title": "Response Refresh Skills V1 Sessions  Session Id  Skills Refresh Post",
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Refresh Skills",
-        "tags": [
-          "skills"
-        ]
-      }
-    },
     "/v1/sessions/{session_id}/stream": {
       "get": {
         "description": "Subscribe to the session's live SSE event stream.\n\nDoes NOT replay history; clients reconcile via the snapshot\nendpoint. The generator emits `[DONE]` on normal completion\nand uses `finally` only for presence cleanup \u2014 see\n`_stream_live_events`.\n\nHolding this stream open registers the caller as a session\n*viewer* (presence): co-viewers' streams receive\n`session.presence` events on join/leave/idle edges, and\nthis stream's snapshot-on-connect includes the current\nviewer list. Presence is scoped to the session tree's root\nconversation, so viewers of different agents/sub-agents in\none session see each other. See\n`omnigent/server/presence.py`.\n\n**Returns:** An SSE `StreamingResponse`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
@@ -16258,8 +16095,125 @@
     },
     "/v1/skills": {
       "get": {
-        "description": "Read the host catalog for a session or a host, harness, and workspace target.",
+        "description": "Discover skills using a session or an explicit host, harness, and directory.\n\n`session_id` requires session edit access and uses the saved host,\nworkspace, and agent bundle, including its filters and sub-agent scope.\nOtherwise, supply `host_id`, `harness`, and `path`; host ownership\nis required. Optional `agent_id` applies the selected agent's filter\nand bundled skills, with the same access check as session creation.\nThe two forms cannot be combined. POST refreshes the host cache before discovery.",
         "operationId": "get_skills_v1_skills_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "host_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Host Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "harness",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Harness"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Path"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Skills",
+        "tags": [
+          "skills"
+        ]
+      },
+      "post": {
+        "description": "Discover skills using a session or an explicit host, harness, and directory.\n\n`session_id` requires session edit access and uses the saved host,\nworkspace, and agent bundle, including its filters and sub-agent scope.\nOtherwise, supply `host_id`, `harness`, and `path`; host ownership\nis required. Optional `agent_id` applies the selected agent's filter\nand bundled skills, with the same access check as session creation.\nThe two forms cannot be combined. POST refreshes the host cache before discovery.",
+        "operationId": "get_skills_v1_skills_post",
         "parameters": [
           {
             "in": "query",

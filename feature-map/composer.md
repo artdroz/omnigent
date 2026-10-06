@@ -120,8 +120,7 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
 - **`permission-mode`:**
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_permission_mode_switch_persists`
 - **`slash-menu`:**
-  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
-  `tests/browser_ui/chat/test_slash_menu.py::test_skill_updates_reach_two_open_streams_without_gets`
+  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`
 - **`attachments`:**
   `tests/e2e_ui/chat/test_composer_attachments.py::test_attach_then_remove_file`,
   `tests/e2e_ui/chat/test_composer_attachments.py::test_file_dropped_on_the_transcript_attaches`,

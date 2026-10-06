@@ -2,18 +2,16 @@
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import tempfile
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
 
-from omnigent.host.frames import HostSkillsFrame, HostSkillsResultFrame
+from omnigent.host.frames import HostSkillsFrame
 from omnigent.spec import load
 from omnigent.spec.skill_sources import (
     resolve_harness_skills,
@@ -51,11 +49,6 @@ class HostSkillDiscovery:
             tuple[str | tuple[str, ...] | None, ...], tuple[float, list[dict[str, str]]]
         ] = OrderedDict()
 
-    def invalidate(self) -> None:
-        """Invalidate catalogs sharing user or plugin skill roots."""
-        with self._lock:
-            self._cache.clear()
-
     def discover(self, frame: HostSkillsFrame, root: Path) -> list[dict[str, str]]:
         """Return metadata for the exact launch target or effective session bundle."""
         key = (
@@ -70,8 +63,11 @@ class HostSkillDiscovery:
             else frame.skills_filter,
         )
         with self._lock:
+            if frame.refresh:
+                # User and plugin roots may be shared by several cached targets.
+                self._cache.clear()
             cached = self._cache.get(key)
-            if frame.action != "watch" and cached is not None and cached[0] > time.monotonic():
+            if cached is not None and cached[0] > time.monotonic():
                 self._cache.move_to_end(key)
                 return list(cached[1])
             if frame.session_id is None:
@@ -105,66 +101,3 @@ class HostSkillDiscovery:
             while len(self._cache) > _MAX_CACHED_CATALOGS:
                 self._cache.popitem(last=False)
             return list(result)
-
-
-class HostSkillSubscriptions:
-    """Refresh watched catalogs on signals, with reconciliation for unobserved changes."""
-
-    def __init__(
-        self,
-        discovery: HostSkillDiscovery,
-        discover: Callable[[HostSkillsFrame], HostSkillsResultFrame],
-        *,
-        interval: float = 30.0,
-    ) -> None:
-        self.discovery = discovery
-        self.discover = discover
-        self.interval = interval
-        self.tasks: dict[str, tuple[asyncio.Task[None], asyncio.Event]] = {}
-
-    async def handle(
-        self, frame: HostSkillsFrame, send: Callable[[HostSkillsResultFrame], Awaitable[None]]
-    ) -> None:
-        if frame.action == "invalidate":
-            await asyncio.to_thread(self.discovery.invalidate)
-            for _, changed in self.tasks.values():
-                changed.set()
-            return
-        previous = self.tasks.pop(frame.request_id, None)
-        if previous is not None:
-            previous[0].cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await previous[0]
-        if frame.action != "watch":
-            return
-        changed = asyncio.Event()
-        self.tasks[frame.request_id] = (
-            asyncio.create_task(self._watch(frame, changed, send)),
-            changed,
-        )
-
-    async def _watch(
-        self,
-        frame: HostSkillsFrame,
-        changed: asyncio.Event,
-        send: Callable[[HostSkillsResultFrame], Awaitable[None]],
-    ) -> None:
-        previous = None
-        while True:
-            changed.clear()
-            result = await asyncio.to_thread(self.discover, frame)
-            if result != previous:
-                await send(result)
-                previous = result
-            try:
-                await asyncio.wait_for(changed.wait(), self.interval)
-                await asyncio.sleep(0.2)
-            except TimeoutError:
-                pass
-
-    async def close(self) -> None:
-        tasks = [task for task, _ in self.tasks.values()]
-        self.tasks.clear()
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)

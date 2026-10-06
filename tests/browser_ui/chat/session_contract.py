@@ -122,7 +122,6 @@ class _ChatSseStream:
     """Tiny streaming HTTP server used as the target of the mocked SSE route."""
 
     def __init__(self) -> None:
-        self.initial_event: Callable[[], Mapping[str, Any] | None] | None = None
         self._clients: set[queue.Queue[bytes | None]] = set()
         self._lock = threading.Lock()
         self._pending: list[bytes] = []
@@ -142,10 +141,6 @@ class _ChatSseStream:
                 self.send_header("Connection", "keep-alive")
                 self.end_headers()
                 messages: queue.Queue[bytes | None] = queue.Queue()
-                initial = stream.initial_event() if stream.initial_event else None
-                if initial is not None:
-                    payload = json.dumps(initial["data"])
-                    messages.put(f"event: {initial['event']}\ndata: {payload}\n\n".encode())
                 with stream._lock:
                     for event in stream._pending:
                         messages.put(event)
@@ -306,29 +301,6 @@ class ChatSessionContract:
     def set_skills(self, skills: Sequence[Mapping[str, Any]]) -> None:
         """Replace the skills returned for this session."""
         self.skills = [dict(skill) for skill in skills]
-        if self.stream.connected and not self._hold_skill_responses:
-            event = self.skill_event()
-            if event is not None:
-                self.stream.emit(event)
-
-    def skill_event(self) -> dict[str, Any] | None:
-        session = self._session()
-        if self._hold_skill_responses or (session.get("permission_level") or 4) < 2:
-            return None
-        return {
-            "event": "session.skills",
-            "data": {
-                "type": "session.skills",
-                "conversation_id": self.session_id,
-                "status": "ready",
-                "revision": time.time_ns() // 1_000_000,
-                "skills": self.skills,
-                "host_id": session["host_id"],
-                "workspace": session["workspace"],
-                "agent_id": session["agent_id"],
-                "sub_agent_name": session.get("sub_agent_name"),
-            },
-        }
 
     def hold_skills(self) -> Callable[[], None]:
         """Hold skills responses until the returned release callable runs."""
@@ -336,9 +308,6 @@ class ChatSessionContract:
 
         def release() -> None:
             self._hold_skill_responses = False
-            event = self.skill_event()
-            if event is not None:
-                self.stream.emit(event)
             pending, self._pending_skill_routes = self._pending_skill_routes, []
             for route in pending:
                 self._fulfill_skills(route)
@@ -689,7 +658,6 @@ def chat_session_handle(
     stream = _ChatSseStream()
     try:
         handle = ChatSessionContract(page=page, contract=browser_contract, stream=stream)
-        stream.initial_event = handle.skill_event
         install_chat_session_routes(handle)
         yield handle
     finally:

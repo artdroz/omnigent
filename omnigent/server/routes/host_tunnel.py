@@ -868,12 +868,6 @@ async def _receive_loop(
                 )
             continue
         if isinstance(frame, HostSkillsResultFrame):
-            skills_queue = conn.skill_subscriptions.get(frame.request_id)
-            if skills_queue is not None:
-                if skills_queue.full():
-                    skills_queue.get_nowait()
-                skills_queue.put_nowait(frame)
-                continue
             skills_future = conn.pending_skills.pop(frame.request_id, None)
             if skills_future is not None and not skills_future.done():
                 skills_future.set_result(frame)

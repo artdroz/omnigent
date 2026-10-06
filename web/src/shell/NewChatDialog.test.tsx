@@ -1,4 +1,3 @@
-import * as skillStreams from "@/lib/sessionUpdatesSocket";
 import { testAgent } from "@/test/agentFixtures";
 import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
 
@@ -7254,16 +7253,12 @@ describe("NewChatLandingScreen skills menu", () => {
     const { useSkills: realHook } =
       await vi.importActual<typeof UseSkillsModule>("@/hooks/useSkills");
     vi.mocked(useSkills).mockImplementation(realHook);
-    let pushSkills!: Parameters<typeof skillStreams.subscribeHostSkills>[2];
-    let targetId = "";
-    const subscribe = vi
-      .spyOn(skillStreams, "subscribeHostSkills")
-      .mockImplementation((id, _target, listener) => {
-        targetId = id;
-        pushSkills = listener;
-        return () => {};
-      });
-    onTestFinished(() => subscribe.mockRestore());
+    let resolveSkills!: (response: Response) => void;
+    authenticatedFetchMock.mockReturnValue(
+      new Promise<Response>((resolve) => {
+        resolveSkills = resolve;
+      }),
+    );
     renderLanding({}, "/", undefined, true);
     typeMessage("/review");
     expect(screen.getByText("Loading skills…")).toBeInTheDocument();
@@ -7272,25 +7267,15 @@ describe("NewChatLandingScreen skills menu", () => {
     fireEvent.keyDown(input, { key: "Tab" });
     expect(input).toHaveValue("/review");
     expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
-    expect(authenticatedFetchMock).not.toHaveBeenCalled();
-    expect(subscribe).toHaveBeenLastCalledWith(
-      expect.any(String),
-      {
-        host_id: "host_1",
-        agent_id: "a1",
-        harness: "claude-native",
-        path: "/Users/corey/repo",
-      },
-      expect.any(Function),
+    expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
+    expect(authenticatedFetchMock.mock.calls[0]![0]).toContain(
+      "/v1/skills?host_id=host_1&harness=claude-native&path=%2FUsers%2Fcorey%2Frepo",
     );
     await act(async () =>
-      pushSkills({
-        type: "skills",
-        target_id: targetId,
-        status: "ready",
-        revision: 1,
-        skills: [{ name: "review-host", description: "Review from host" }],
-      }),
+      resolveSkills({
+        ok: true,
+        json: async () => ({ skills: [{ name: "review-host", description: "Review from host" }] }),
+      } as Response),
     );
     expect(await screen.findByTestId("slash-menu-item-review-host")).toBeInTheDocument();
     expect(screen.getByTestId("slash-menu-item-review-host")).toHaveAttribute(
@@ -7301,7 +7286,7 @@ describe("NewChatLandingScreen skills menu", () => {
     fireEvent.keyDown(input, { key: "Tab" });
     expect(input).toHaveValue("/review-host ");
     expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
-    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("shows bundled skills while loading, then uses the server's effective catalog", () => {
