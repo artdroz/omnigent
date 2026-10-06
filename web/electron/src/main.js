@@ -4748,7 +4748,7 @@ function registerIpc() {
     if (!features || typeof features !== "object" || Array.isArray(features)) return null;
     const enabled = features.desktop_arca_shutdown_warnings;
     if (typeof enabled !== "boolean") return null;
-    const origin = pinnedOrigin(BrowserWindow.fromWebContents(event.sender));
+    const origin = originOf(windowArcaServerUrl(BrowserWindow.fromWebContents(event.sender)));
     if (!origin) return null;
     const wasEnabled = arcaShutdownEnabled();
     arcaShutdownFeaturesByOrigin.set(origin, enabled);

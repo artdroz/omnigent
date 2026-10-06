@@ -67,7 +67,7 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         feature=Feature.DESKTOP_ARCA_SHUTDOWN_WARNINGS,
         description="Desktop warns before Arca shuts down and offers to extend it",
         owner="desktop",
-        review_by_release="0.16.0",
+        review_by_release="0.20.0",
         frontend_visible=True,
     ),
 )

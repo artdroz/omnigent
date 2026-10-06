@@ -1128,6 +1128,23 @@ describe("Arca shutdown warning wiring", () => {
     await until(() => h.calls.arcaStatusReads.length === 1, "enabled Arca status read");
   });
 
+  it("keys a workspace report to the picked Arca URL after sign-in changes hosts", async (t) => {
+    const picked = "https://accounts.cloud.databricks.com/omnigent?o=123";
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
+    t.after(h.cleanup);
+    settings(h, {
+      arca_auto_connect: true,
+      server_labels: { [new URL(workspace).origin]: picked },
+    });
+    await connect(h);
+    await until(() => h.calls.arcaConnects.length === 1, "Arca auto-connect");
+    assert.deepEqual(h.calls.arcaConnects, [picked]);
+    assert.equal(h.api.windows.get(h.win).origin, new URL(workspace).origin);
+    assert.deepEqual(h.calls.arcaStatusReads, []);
+    await reportGate(h, true);
+    await until(() => h.calls.arcaStatusReads.length === 1, "labelled Arca status read");
+  });
+
   it("rejects foreign pages and ignores unknown or non-boolean reports", async (t) => {
     const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
     t.after(h.cleanup);
