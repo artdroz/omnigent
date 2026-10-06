@@ -1875,11 +1875,8 @@ function UiFontFamilyControl() {
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-      {/* Grow into the remaining width (so the longer description wraps within
-          this column and the input stays inline on wide layouts), but keep a
-          real flex-basis: with basis 0 the column can collapse to a sliver on
-          phone widths where the shrink-0 control group still fits, instead of
-          the row wrapping the group onto its own line. */}
+      {/* Grow from a real flex-basis: with basis 0 this column collapses to a
+          sliver at phone widths instead of wrapping the control onto its own line. */}
       <div className="flex min-w-0 grow basis-48 flex-col">
         <span className="text-ui font-medium">Font family</span>
         <span className="text-sm text-muted-foreground">

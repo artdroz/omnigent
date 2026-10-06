@@ -54,6 +54,7 @@ def _row_layout(page: Page, input_test_id: str, label_text: str) -> dict:
           const input = document.querySelector(`[data-testid="${inputTestId}"]`);
           if (!input) return {error: `no input ${inputTestId}`};
           const group = input.closest('[role="group"]');
+          if (!group) return {error: `no role=group ancestor for ${inputTestId}`};
           const row = group.parentElement;
           const label = Array.from(row.querySelectorAll('span')).find(
             (s) => s.textContent.trim() === labelText,
