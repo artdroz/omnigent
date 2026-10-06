@@ -3159,11 +3159,9 @@ def create_runner_app(
                     "detail": (f"No session '{session_id}' on this runner."),
                 },
             )
-        # A native-pane turn streams through its own terminal, not _active_turns
-        # or the process manager's in-flight guard, so omitting it reports a
-        # false idle while that turn still runs. A server status probe settling a
-        # stuck row trusts this read, so it must stay running for a live native
-        # turn and only read idle once the pane itself settles.
+        # Native-pane turns stream through their own terminal, outside
+        # _active_turns and the process manager, so a server status probe
+        # settling a stuck row reads a false idle unless we count them here.
         has_turn = (
             session_id in _active_turns
             or process_manager.has_active_turn(session_id)

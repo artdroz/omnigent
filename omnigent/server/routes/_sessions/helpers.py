@@ -5033,11 +5033,11 @@ def reconcile_orphaned_running_status(
 # custom-lint: disable-next=workspace-scoped-cache -- set of unique Task objects, not tenant-keyed
 _live_runner_reconcile_tasks: set[asyncio.Task[None]] = set()
 
-# A confirmed-running or unreachable session is re-probed only after this
-# cooldown, so a genuinely running session is not probed on every hot list poll.
-# The entry self-expires after the cooldown, so the map stays bounded.
+# A session confirmed running (or unreachable) is re-probed only after this
+# cooldown, so a hot list poll does not re-probe it every time; the value is the
+# probed runner, so a session rebound to a different one re-probes at once.
 _LIVE_RUNNER_PROBE_COOLDOWN_S: Final[float] = 30.0
-_live_runner_probe_cooldown: WorkspaceScopedCache[str, float] = WorkspaceScopedCache(
+_live_runner_probe_cooldown: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
     lambda: cachetools.TTLCache(
         maxsize=math.inf, ttl=_LIVE_RUNNER_PROBE_COOLDOWN_S, timer=lambda: time.monotonic()
     )
@@ -5062,22 +5062,24 @@ def spawn_live_runner_idle_reconcile(
     blocking the list: the probe rewrites ``_session_status_cache`` (and the
     persisted relay status) from the runner's authoritative status, settling a
     lost-edge row to idle or confirming a still-running turn for the next poll.
-    A per-session cooldown keeps a genuinely running session off the probe on
-    every poll, and the task is held in a module set until it finishes so the
-    loop cannot collect it early.
+    A per-session cooldown keyed to the probed runner keeps a genuinely running
+    session off the probe on every poll while still re-probing a rebound session
+    at once, and the task is held in a module set until it finishes so the loop
+    cannot collect it early.
 
     :param session_id: Session/conversation identifier to reconcile.
-    :param runner_id: The runner bound on the list row, passed to the probe so a
-        skip window recorded against a different runner is discarded on rebind.
+    :param runner_id: The runner bound on the list row, keying the per-session
+        probe cooldown so a session rebound to a different runner is re-probed at
+        once instead of skipped as a repeat.
     :param runner_router: Router used to reach the pinned runner.
     """
-    if _live_runner_probe_cooldown.get(session_id) is not None:
+    if _live_runner_probe_cooldown.get(session_id) == runner_id:
         return
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
-    _live_runner_probe_cooldown[session_id] = time.monotonic()
+    _live_runner_probe_cooldown[session_id] = runner_id
 
     async def _run() -> None:
         try:
@@ -5090,7 +5092,7 @@ def spawn_live_runner_idle_reconcile(
                 _probe_runner_live_status,
             )
 
-            await _probe_runner_live_status(routed.client, session_id, runner_id)
+            await _probe_runner_live_status(routed.client, session_id, routed.runner_id)
         except OmnigentError:
             # Runner offline, or pinned to another replica — can't confirm here.
             return

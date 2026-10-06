@@ -367,6 +367,44 @@ async def test_spawn_reconcile_backs_off_within_cooldown(
         await client.aclose()
 
 
+async def test_spawn_reconcile_reprobes_rebound_runner(
+    db_uri: str,
+) -> None:
+    """The cooldown is keyed to the probed runner, so a session rebound to a
+    different runner is re-probed at once rather than skipped as a repeat."""
+    sid, runner_a = _seed_live_idle_suspect(db_uri)
+    runner_b = runner_a[:-1] + ("0" if runner_a[-1] != "0" else "1")
+    probes = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal probes
+        del request
+        probes += 1
+        return httpx.Response(200, json={"status": "running"})
+
+    client = httpx.AsyncClient(base_url="http://runner", transport=httpx.MockTransport(handler))
+    router = cast(
+        RunnerRouter,
+        _StubRunnerRouter(RoutedRunner(runner_id=runner_a, client=client)),
+    )
+    try:
+        spawn_live_runner_idle_reconcile(sid, runner_a, router)
+        await _drain_reconcile_tasks()
+        assert probes == 1
+
+        # The same runner within the window is skipped ...
+        spawn_live_runner_idle_reconcile(sid, runner_a, router)
+        await _drain_reconcile_tasks()
+        assert probes == 1
+
+        # ... but a rebind to a different runner re-probes at once.
+        spawn_live_runner_idle_reconcile(sid, runner_b, router)
+        await _drain_reconcile_tasks()
+        assert probes == 2
+    finally:
+        await client.aclose()
+
+
 # ── Facet 3: GET /v1/sessions hands lost-edge suspects to the probe ─────────
 
 
