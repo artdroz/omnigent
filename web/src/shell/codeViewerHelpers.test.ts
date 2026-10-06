@@ -454,17 +454,11 @@ describe("prepareHtmlPreviewDoc", () => {
     expect(out.indexOf(BASE)).toBeLessThan(out.indexOf("<base href"));
   });
 
-  it("injects exactly one base tag and one anchor script per call (no duplicates)", () => {
-    const out = prepareHtmlPreviewDoc("<head></head>");
-    expect(out.match(/<base target="_blank">/g)).toHaveLength(1);
-    expect(out.split("<script>")).toHaveLength(2);
-  });
-
-  it("is idempotent: re-preparing already-prepared content adds no second copy", () => {
+  it("injects one base tag and one anchor script, and re-preparing adds no second copy", () => {
     const once = prepareHtmlPreviewDoc("<head></head>");
-    const twice = prepareHtmlPreviewDoc(once);
-    expect(twice).toBe(once);
-    expect(twice.match(/<base target="_blank">/g)).toHaveLength(1);
+    expect(once.match(/<base target="_blank">/g)).toHaveLength(1);
+    expect(once.split("<script>")).toHaveLength(2);
+    expect(prepareHtmlPreviewDoc(once)).toBe(once);
   });
 
   it("still injects a real base when the literal base string only appears in content", () => {
@@ -564,6 +558,12 @@ describe("prepareHtmlPreviewDoc", () => {
     // where the parser's head begins.
     expect(prepareHtmlPreviewDoc('<html><head "a>b"></head></html>')).toBe(
       `<html><head "a>${HEAD}b"></head></html>`,
+    );
+    // Inside an unquoted value, `=` and quotes are plain text too: the tag ends at the first `>`,
+    // so the markup stays out of the artifact's script.
+    const unquoted = '<head data=x="y><script>window.before="foo>";window.after=1;</script>';
+    expect(prepareHtmlPreviewDoc(unquoted)).toBe(
+      `<head data=x="y>${HEAD}<script>window.before="foo>";window.after=1;</script>`,
     );
   });
 
@@ -765,14 +765,25 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
   it("leaves clicks the page handled itself and non-fragment links alone", () => {
     document.body.innerHTML =
       '<a id="own" href="#section-3">own</a><a id="ext" href="https://example.com/x">ext</a>' +
-      '<a id="rel" href="other.html#frag">rel</a><h2 id="section-3">S3</h2>';
+      '<a id="rel" href="other.html#frag">rel</a><a id="nbsp" href="&#160;#frag">nb</a>' +
+      '<h2 id="section-3">S3</h2>';
     document.getElementById("own")?.addEventListener("click", (event) => event.preventDefault());
     expect(click("#own")).toBe(true);
     expect(location.hash).toBe("");
     expect(click("#ext")).toBe(false);
     expect(click("#rel")).toBe(false);
+    // A non-breaking space survives URL parsing, so this is a relative path, not a fragment.
+    expect(click("#nbsp")).toBe(false);
     expect(location.hash).toBe("");
     expect(scrolled).toEqual([]);
+  });
+
+  it("drops only the ASCII whitespace URL parsing drops before classifying the href", () => {
+    // Tab and newline go anywhere; spaces and other C0 controls only at the ends.
+    document.body.innerHTML =
+      '<a id="spaced-link" href=" \t#spa\nced ">s</a><h2 id="spaced">S</h2>';
+    expect(click("#spaced-link")).toBe(true);
+    expect(location.hash).toBe("#spaced");
   });
 });
 

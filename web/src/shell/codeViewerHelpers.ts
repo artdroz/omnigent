@@ -414,7 +414,11 @@ const SAME_PAGE_ANCHOR_SCRIPT = `<script>(function () {
   function onActivate(event) {
     if (event.defaultPrevented || (event.type === "auxclick" && event.button !== 1)) return;
     const anchor = activatedLink(event);
-    const href = anchor ? anchor.getAttribute("href").trim() : "";
+    // Clean the href as URL parsing does: ASCII tab/newline go anywhere, other C0 controls
+    // and spaces only at the ends; a non-breaking space stays and makes a relative path.
+    const href = anchor
+      ? anchor.getAttribute("href").replace(/[\\t\\n\\r]/g, "").replace(/^[\\u0000-\\u0020]+|[\\u0000-\\u0020]+$/g, "")
+      : "";
     if (href.charAt(0) !== "#") return;
     // Modifier and middle clicks too: a new tab could only reopen the host app, never this document.
     event.preventDefault();
@@ -453,22 +457,25 @@ function hasTagAt(html: string, at: number, name: string): boolean {
 /**
  * Index just past the `>` that ends the tag whose name ends at `from`, or -1 when
  * the tag is still open at end of input (the parser then drops it and everything
- * after it). As in the tokenizer, only a quote right after `=` delimits a value.
+ * after it). Attribute states follow the tokenizer: a quote delimits a value only
+ * right after `=`, and inside an unquoted value quotes and `=` are plain text.
  */
 function tagEnd(html: string, from: number): number {
-  let valueNext = false;
+  let state: "name" | "beforeValue" | "unquoted" = "name";
   for (let i = from; i < html.length; i++) {
     const c = html.charAt(i);
     if (c === ">") return i + 1;
-    if (valueNext && (c === '"' || c === "'")) {
+    if (state === "beforeValue" && (c === '"' || c === "'")) {
       const close = html.indexOf(c, i + 1);
       if (close === -1) return -1;
       i = close;
-      valueNext = false;
-    } else if (c === "=") {
-      valueNext = true;
-    } else if (!TOKENIZER_SPACE.includes(c)) {
-      valueNext = false;
+      state = "name";
+    } else if (TOKENIZER_SPACE.includes(c)) {
+      if (state === "unquoted") state = "name";
+    } else if (state === "name") {
+      if (c === "=") state = "beforeValue";
+    } else {
+      state = "unquoted";
     }
   }
   return -1;
