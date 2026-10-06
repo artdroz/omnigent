@@ -40,9 +40,7 @@ def _request_event(elicitation_id: str) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_offline_runner_resolve_clears_orphaned_persisted_count(
-    _clean_index, monkeypatch
-):
+async def test_offline_runner_resolve_clears_orphaned_persisted_count(_clean_index, monkeypatch):
     """No reachable runner + an empty index (post-restart orphan) → the resolve
     reconciles the persisted count to 0 so the stuck badge finally clears."""
     sid = "conv_orphan_restart"
@@ -71,9 +69,7 @@ async def test_offline_runner_resolve_clears_orphaned_persisted_count(
 
 
 @pytest.mark.asyncio
-async def test_offline_runner_resolve_persists_remaining_live_count(
-    _clean_index, monkeypatch
-):
+async def test_offline_runner_resolve_persists_remaining_live_count(_clean_index, monkeypatch):
     """Reconcile writes the authoritative live count, not a blind zero: a still
     -tracked sibling prompt keeps the count at 1 after an unrelated resolve."""
     sid = "conv_orphan_two"
@@ -97,9 +93,7 @@ async def test_offline_runner_resolve_persists_remaining_live_count(
         lambda conv_id, count: persisted.append((conv_id, count)),
     )
 
-    await S._resolve_elicitation(
-        sid, {"elicitation_id": answered, "action": "accept"}, None
-    )
+    await S._resolve_elicitation(sid, {"elicitation_id": answered, "action": "accept"}, None)
 
     assert persisted[-1] == (sid, 1), (
         "reconcile must persist the authoritative live count (1, the still-live "

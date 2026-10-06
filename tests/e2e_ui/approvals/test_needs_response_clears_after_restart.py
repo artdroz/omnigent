@@ -34,6 +34,7 @@ and the count stays 1, so this assertion fails — the fail→pass target for th
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import secrets
@@ -114,7 +115,7 @@ def _wait_health(base_url: str, proc: subprocess.Popen, *, runner_id: str | None
 def _sidebar_badge_count(base_url: str, session_id: str) -> int:
     """Return the session's ``pending_elicitations_count`` — the source the SPA
     sidebar's "Needs response" badge renders from (LIST endpoint)."""
-    resp = httpx.get(f"{base_url}/v1/sessions?limit=200", timeout=10.0)
+    resp = httpx.get(f"{base_url}/v1/sessions?limit=200&visibility=all", timeout=10.0)
     resp.raise_for_status()
     for item in resp.json().get("data", []):
         if item.get("id") == session_id:
@@ -183,11 +184,15 @@ def test_subagent_needs_response_survives_restart_and_answer(tmp_path: Path) -> 
     runner_log = open(tmp_path / "runner.log", "w")  # noqa: SIM115
     server = subprocess.Popen(
         _server_command(port, db_path, artifact_dir, agent_yaml),
-        env=server_env, stdout=server_log, stderr=subprocess.STDOUT,
+        env=server_env,
+        stdout=server_log,
+        stderr=subprocess.STDOUT,
     )
     runner = subprocess.Popen(
         [sys.executable, "-m", "omnigent.runner._entry"],
-        env=runner_env, stdout=runner_log, stderr=subprocess.STDOUT,
+        env=runner_env,
+        stdout=runner_log,
+        stderr=subprocess.STDOUT,
     )
     try:
         _wait_health(base_url, server, runner_id=runner_id)
@@ -204,7 +209,8 @@ def test_subagent_needs_response_survives_restart_and_answer(tmp_path: Path) -> 
         session_id = create.json()["session_id"]
         patch = httpx.patch(
             f"{base_url}/v1/sessions/{session_id}",
-            json={"runner_id": runner_id}, timeout=10.0,
+            json={"runner_id": runner_id},
+            timeout=10.0,
         )
         patch.raise_for_status()
         assert _sidebar_badge_count(base_url, session_id) == 0
@@ -212,14 +218,13 @@ def test_subagent_needs_response_survives_restart_and_answer(tmp_path: Path) -> 
         # 2. Park a real permission-request elicitation via the claude-native
         #    hook. It long-polls (blocks), so drive it from a background thread.
         def _park() -> None:
-            try:
+            # The parked request dies when the server restarts.
+            with contextlib.suppress(httpx.HTTPError):
                 httpx.post(
                     f"{base_url}/v1/sessions/{session_id}/hooks/permission-request",
                     json={"tool_name": "Bash", "tool_input": {"command": "ls"}},
                     timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0),
                 )
-            except httpx.HTTPError:
-                pass  # the parked request dies when the server restarts
 
         park_thread = threading.Thread(target=_park, daemon=True)
         park_thread.start()
@@ -242,7 +247,9 @@ def test_subagent_needs_response_survives_restart_and_answer(tmp_path: Path) -> 
         _terminate(server)
         server = subprocess.Popen(
             _server_command(port, db_path, artifact_dir, agent_yaml),
-            env=server_env, stdout=server_log, stderr=subprocess.STDOUT,
+            env=server_env,
+            stdout=server_log,
+            stderr=subprocess.STDOUT,
         )
         _wait_health(base_url, server, runner_id=None)
 
