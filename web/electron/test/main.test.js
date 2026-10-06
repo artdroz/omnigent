@@ -1254,13 +1254,19 @@ describe("Arca shutdown warning wiring", () => {
   }
 
   it("saves the opt-out and still extends the selected mode", async (t) => {
+    const extendedAt = new Date(2026, 9, 6, 18).getTime();
+    let statusReads = 0;
     const h = loadNavigationHarness({
       serverUrl: workspace,
       databricksMode: "browser",
       arcaPath,
       notificationsSupported: true,
       arcaWatchNow: mondayNoon,
-      arcaStatus: { ok: true, state: "running", shutdownAt: soon() },
+      arcaStatus: () => ({
+        ok: true,
+        state: "running",
+        shutdownAt: statusReads++ === 0 ? soon() : extendedAt,
+      }),
       dialogResponse: { response: 0, checkboxChecked: true },
       focusedWindow: true,
     });
@@ -1278,11 +1284,11 @@ describe("Arca shutdown warning wiring", () => {
     });
     await until(() => h.calls.notifications.length === 1, "opt-out extension result");
     assert.deepEqual(h.calls.arcaExtends, [{ mode: "overnight", path: arcaPath }]);
-    assert.equal(h.calls.arcaStatusReads.length, 1);
-    assert.equal(
-      h.calls.notifications[0].options.body,
-      "Your Arca instance's shutdown time was extended.",
-    );
+    assert.equal(h.calls.arcaStatusReads.length, 2);
+    const date = new Date(extendedAt);
+    const weekday = date.toLocaleDateString([], { weekday: "short" });
+    const time = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    assert.equal(h.calls.notifications[0].options.body, `Until ${weekday} ${time}.`);
   });
 
   it("saves the opt-out without extending when Not now is selected", async (t) => {
