@@ -6103,8 +6103,9 @@ async def _ensure_user_message_posted(
 
     Best effort: when recovery is unavailable or the recovered POST is not
     accepted, the caller still delivers the reply. A rejected stable-id user
-    item is released so a later backfill can retry it, and the reservation is
-    never held across the delivery lock the recovering POST needs.
+    item is released so a later backfill can retry it. If another delivery
+    already owns the recovered user reservation, recovery returns without
+    waiting and the reply still proceeds.
 
     No-op when ``forwarder_state`` is absent (tests bypassing
     ``supervise_forwarder``), when no Codex client is wired, or when the

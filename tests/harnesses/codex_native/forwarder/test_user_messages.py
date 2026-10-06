@@ -205,6 +205,60 @@ async def test_rejected_user_claim_is_retried_on_replay() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rejected_image_only_user_claim_is_retried_on_replay() -> None:
+    """An image-only stable user item releases a rejected claim and retries the same id.
+
+    An image-only message posts empty content (the server folds the image in
+    by file_id), but it still carries content, so it reserves for replay like
+    a text message rather than keeping an eager claim.
+    """
+    client = _ScriptedEventClient([422, 202])
+    state = fwd._CodexForwarderState()
+    image_only: dict[str, Any] = {
+        "threadId": "thread_1",
+        "turnId": "turn_1",
+        "item": {
+            "type": "userMessage",
+            "id": "user_1",
+            "content": [{"type": "image", "url": "data:image/png;base64,AAAA"}],
+        },
+    }
+
+    await fwd._handle_completed_item_inner(client, "conv_x", image_only, forwarder_state=state)
+    await fwd._handle_completed_item_inner(client, "conv_x", image_only, forwarder_state=state)
+
+    key = "thread_1:turn_1:user_1"
+    assert [post["data"]["source_id"] for post in client.posts] == [key, key]
+    assert [post["data"]["item_data"]["content"] for post in client.accepted_posts] == [[]]
+    assert state.synced_item_keys == {key}
+    assert state.pending_item_claims == set()
+
+
+@pytest.mark.asyncio
+async def test_empty_stable_user_item_keeps_eager_claim_and_posts_nothing() -> None:
+    """An empty stable user item is eagerly claimed, never posted, never re-fetched.
+
+    With no text and no file block it would post nothing, so releasing it on
+    rejection would re-fetch it every replay. It keeps its eager claim, so a
+    replay is skipped without reserving the key.
+    """
+    client = _ScriptedEventClient([])
+    state = fwd._CodexForwarderState()
+    empty: dict[str, Any] = {
+        "threadId": "thread_1",
+        "turnId": "turn_1",
+        "item": {"type": "userMessage", "id": "user_1", "content": []},
+    }
+
+    await fwd._handle_completed_item_inner(client, "conv_x", empty, forwarder_state=state)
+    await fwd._handle_completed_item_inner(client, "conv_x", empty, forwarder_state=state)
+
+    assert client.posts == []
+    assert state.synced_item_keys == {"thread_1:turn_1:user_1"}
+    assert state.pending_item_claims == set()
+
+
+@pytest.mark.asyncio
 async def test_recovered_user_claim_is_retried_by_resume_backfill() -> None:
     """A rejected recovery does not hide valid assistant output or poison replay."""
     client = _ScriptedEventClient([422, 202, 202])
