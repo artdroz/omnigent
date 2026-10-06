@@ -170,6 +170,12 @@ _CODEX_HOME_SYMLINK_FILES = ("auth.json", "memories_1.sqlite")
 # through an ``O_NOFOLLOW`` open that rejects symlinks with ELOOP, so it is
 # hard-linked (same inode, refreshes still shared) or copied as a last resort.
 _CODEX_HOME_HARDLINK_FILES = (".credentials.json",)
+# ``os.link`` errnos meaning hard links are impossible on this filesystem
+# (cross-device, or no link support as on CIFS/FAT/FUSE). A copy is safe here:
+# a relink fails identically and can never clobber it; other errors surface.
+_CODEX_CREDENTIAL_COPY_FALLBACK_ERRNOS = frozenset(
+    {errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP, errno.EMLINK}
+)
 # Lock-dir companion for ``.credentials.json``, symlinked into the private
 # home; its target parent is the durable pointer to a custom source home,
 # since a hard-linked store records no path back to its source.
@@ -1083,8 +1089,8 @@ def _bridge_codex_credential_store(source_file: Path, dest_path: Path) -> None:
     Bridge a Codex credential store that Codex rewrites with ``O_NOFOLLOW``.
 
     A hard link keeps both names on one inode, so a token refresh in either
-    place is visible to both, as the former symlink was. When linking is
-    impossible (another filesystem) fall back to a private copy.
+    place is visible to both, as the former symlink was. When hard links are
+    impossible on this filesystem fall back to a private copy.
 
     :param source_file: The real store, e.g. ``~/.codex/.credentials.json``.
     :param dest_path: Its path inside the private ``CODEX_HOME``.
@@ -1099,10 +1105,10 @@ def _bridge_codex_credential_store(source_file: Path, dest_path: Path) -> None:
                 return
         raise
     except OSError as exc:
-        if exc.errno != errno.EXDEV:
-            # Non-EXDEV failures must surface: a same-filesystem copy is
-            # indistinguishable from an orphaned hard link, so a later relink
-            # would clobber its refreshed tokens.
+        if exc.errno not in _CODEX_CREDENTIAL_COPY_FALLBACK_ERRNOS:
+            # Copy only when hard links are impossible on this filesystem; a
+            # relink there fails identically and can never clobber the copy.
+            # Other (transient) failures must surface instead.
             raise
         logger.info(
             "could not hard-link %r into %s (%s); copying instead, so token "
@@ -1120,10 +1126,10 @@ def _bridge_codex_credential_store(source_file: Path, dest_path: Path) -> None:
         try:
             with os.fdopen(fd, "wb") as dest:
                 dest.write(source_file.read_bytes())
+            os.replace(staging, dest_path)
         except OSError:
             staging.unlink(missing_ok=True)
             raise
-        os.replace(staging, dest_path)
 
 
 def _relink_rotated_codex_credential_store(source_file: Path, dest_path: Path) -> None:

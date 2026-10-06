@@ -4032,21 +4032,54 @@ def test_private_codex_home_config_source_resolves_home_with_missing_pointer_fil
     assert _resolve_codex_home_config_source(private, default_home) == source
 
 
-def test_populate_codex_home_config_propagates_non_cross_device_link_failure(
+def test_populate_codex_home_config_copies_remote_mcp_oauth_store_without_hard_link_support(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A same-filesystem link failure surfaces instead of degrading to a copy.
+    """A filesystem that rejects hard links still gets a private, writable copy.
 
-    A private copy is only safe cross-filesystem, where a later relink can never
-    replace it. For a same-filesystem link failure (e.g. a hard-link hardening
-    policy) a copy would be indistinguishable from an orphaned hard link and
-    could be clobbered on repopulate, so the failure must propagate and leave no
-    partial store behind.
+    CIFS/FAT/some FUSE mounts return ``EPERM``/``EOPNOTSUPP`` from ``os.link``
+    rather than ``EXDEV`` even when source and target share the mount. The home
+    must still populate via the copy fallback instead of aborting the session,
+    and a relink there fails identically so the copy is never clobbered.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    def _unsupported_link(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.EPERM, "operation not permitted")
+
+    monkeypatch.setattr(os, "link", _unsupported_link)
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    bridged = target / ".credentials.json"
+    assert bridged.is_file()
+    assert not bridged.is_symlink()
+    assert not os.path.samefile(bridged, source / ".credentials.json")
+    assert stat.S_IMODE(bridged.stat().st_mode) == 0o600
+    os.close(os.open(bridged, os.O_WRONLY | os.O_NOFOLLOW))
+    assert bridged.read_text() == '{"linear|abc": {"access_token": "t"}}'
+    assert not (target / ".credentials.json.copy").exists()
+
+
+def test_populate_codex_home_config_propagates_unexpected_link_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A link failure that is not a filesystem-capability error surfaces.
+
+    ``ENOSPC`` is transient rather than a hard-link capability limit, so a copy
+    could later be clobbered by a relink once space frees up. Population must
+    surface it and leave no partial store behind rather than silently degrading
+    to a session-local copy.
     """
     from omnigent.inner.codex_executor import _populate_codex_home_config
 
     def _blocked_link(*args: object, **kwargs: object) -> None:
-        raise OSError(errno.EPERM, "operation not permitted")
+        raise OSError(errno.ENOSPC, "no space left on device")
 
     monkeypatch.setattr(os, "link", _blocked_link)
     source = tmp_path / "real_codex_home"
@@ -4057,7 +4090,45 @@ def test_populate_codex_home_config_propagates_non_cross_device_link_failure(
 
     with pytest.raises(OSError) as excinfo:
         _populate_codex_home_config(target, source)
-    assert excinfo.value.errno == errno.EPERM
+    assert excinfo.value.errno == errno.ENOSPC
+
+    assert not (target / ".credentials.json").exists()
+    assert not (target / ".credentials.json.copy").exists()
+
+
+def test_populate_codex_home_config_cleans_copy_staging_on_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed copy publish removes its 0600 staging file instead of leaking it.
+
+    The cross-filesystem copy writes OAuth secrets into a ``.credentials.json.copy``
+    staging file and renames it into place. If the rename fails, that
+    secret-bearing staging file must not be left behind, and the error surfaces.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    def _cross_device_link(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(os, "link", _cross_device_link)
+
+    real_replace = os.replace
+
+    def _blocked_copy_replace(src: object, dst: object, *args: object, **kwargs: object) -> None:
+        if str(src).endswith(".credentials.json.copy"):
+            raise OSError(errno.EACCES, "permission denied")
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", _blocked_copy_replace)
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    with pytest.raises(OSError) as excinfo:
+        _populate_codex_home_config(target, source)
+    assert excinfo.value.errno == errno.EACCES
 
     assert not (target / ".credentials.json").exists()
     assert not (target / ".credentials.json.copy").exists()
