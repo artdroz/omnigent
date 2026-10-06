@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { PresenceAvatars } from "@/components/PresenceAvatars";
 import {
   Dialog,
   DialogContent,
@@ -63,6 +64,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useNavigate } from "@/lib/routing";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showArchiveUndoToast } from "./archiveUndoToast";
+import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { conversationDisplayLabel } from "./sidebarNav";
@@ -110,6 +112,7 @@ export function HeaderConversationMenu({
   const rename = useRenameConversation();
   const moveToProject = useMoveToProject();
   const archive = useArchiveConversation();
+  const archiveWorktreePrompt = useArchiveWorktreePrompt();
   const deleteConversation = useStopAndDeleteConversation();
   const [menuOpen, setMenuOpen] = useState(false);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
@@ -196,18 +199,24 @@ export function HeaderConversationMenu({
       archive.mutate({ id: conversation.id, archived: false });
       return;
     }
+    archiveWorktreePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
+      archiveNow(deleteWorktreeIds.has(conversation.id)),
+    );
+  };
+
+  const archiveNow = (deleteWorktree: boolean) => {
     // The row leaves the sidebar optimistically (useArchiveConversation flips
     // the cached `archived` flag in onMutate), and we're viewing the session
     // being archived, so leave its chat surface now — synchronously, like
     // confirmDelete — rather than in an onSuccess callback that fires a
     // round-trip later with a stale active session.
     navigate("/", { replace: true });
-    archive.mutate({ id: conversation.id, archived: true });
+    archive.mutate({ id: conversation.id, archived: true, deleteWorktree });
     // Fire NOW, not in a mutate onSuccess: navigating away unmounts this menu,
     // and per-call mutate callbacks don't fire once their observer unmounts.
     // The Undo toast is driven by module state + the app-level Toaster, so it
     // survives this menu unmounting.
-    showArchiveUndoToast(queryClient, [conversation]);
+    showArchiveUndoToast(queryClient, [conversation], navigate);
   };
 
   const mainItems = (
@@ -379,7 +388,7 @@ export function HeaderConversationMenu({
             size={isMobile ? "icon" : "icon-xs"}
             aria-label="Conversation actions"
             data-testid="header-conversation-actions"
-            className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:size-11 max-md:rounded-full"
+            className="shrink-0 border-none text-muted-foreground hover:text-foreground max-md:size-11"
           >
             <EllipsisIcon className={isMobile ? "size-5" : "size-3.5"} />
           </Button>
@@ -394,8 +403,9 @@ export function HeaderConversationMenu({
         >
           {isMobile && !projectPickerOpen && (
             <>
-              <DropdownMenuLabel className="truncate px-2.5 pb-1.5 text-foreground">
-                {label}
+              <DropdownMenuLabel className="flex items-center gap-2 px-2.5 pb-1.5 text-foreground">
+                <span className="min-w-0 flex-1 truncate">{label}</span>
+                <PresenceAvatars />
               </DropdownMenuLabel>
               <DropdownMenuSeparator />
             </>
@@ -422,6 +432,7 @@ export function HeaderConversationMenu({
         </DropdownMenuContent>
       </DropdownMenu>
 
+      {archiveWorktreePrompt.dialog}
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
         <DialogContent>
           <form onSubmit={submitRename}>

@@ -2644,6 +2644,32 @@ def test_truncate_label_empty_string() -> None:
 # ── _persist_session_status_error_labels ─────────────────────────────────────
 
 
+@pytest.mark.parametrize(
+    ("response_id", "names", "expected"),
+    [
+        ("failed_turn", ["claude-native-ui"], "claude-native-ui"),
+        ("failed_turn", ["claude-native-ui", "codex-native-ui"], None),
+        ("other_turn", ["claude-native-ui"], None),
+        (None, ["claude-native-ui"], None),
+    ],
+)
+def test_status_error_identity_requires_an_unambiguous_response(
+    response_id: str | None, names: list[str], expected: str | None
+) -> None:
+    from omnigent.entities import MessageData
+    from omnigent.server.routes._sessions.helpers import _response_agent_name_from_store
+
+    items = [
+        SimpleNamespace(
+            response_id="failed_turn",
+            data=MessageData(role="assistant", agent=name, content=[]),
+        )
+        for name in names
+    ]
+    store = SimpleNamespace(list_items=lambda *args, **kwargs: SimpleNamespace(data=items))
+    assert _response_agent_name_from_store(store, "session", response_id) == expected
+
+
 @pytest.mark.asyncio
 async def test_persist_error_labels_truncates_long_message() -> None:
     """A failure message longer than 256 chars is truncated before the store
@@ -2775,12 +2801,13 @@ async def test_persist_and_project_structured_error_round_trip() -> None:
         remediation="Run the host as a non-root user (uid != 0).",
     )
     await _persist_session_status_error_labels(
-        "aa11bb22cc33dd44ee55ff6677889900", error, _MockStore()
+        "aa11bb22cc33dd44ee55ff6677889900", error, _MockStore(), agent_name="claude-native-ui"
     )  # type: ignore[arg-type]
 
     labels = captured["aa11bb22cc33dd44ee55ff6677889900"]
     projected = _last_task_error_from_labels(labels)
     assert projected == {
+        "agent_name": "claude-native-ui",
         "code": "required_terminal_exited",
         "message": "Claude Code can't run as root\n\n...diagnostics...",
         "title": "Claude Code can't run as root",
@@ -2816,6 +2843,7 @@ async def test_persist_error_labels_clears_stale_structured_fields() -> None:
     assert labels["omnigent.last_task_error_title"] == ""
     assert labels["omnigent.last_task_error_cause"] == ""
     assert labels["omnigent.last_task_error_remediation"] == ""
+    assert labels["omnigent.last_task_error_agent_name"] == ""
     assert _last_task_error_from_labels(labels) == {
         "code": "runner_error",
         "message": "turn setup failed",
@@ -2960,3 +2988,38 @@ async def test_snapshot_does_not_query_runner_skills_or_publish_skill_events(
     assert "skills_status" not in snapshot.model_dump()
     assert all(not url.endswith("/skills") for url in calls)
     assert all(event.get("type") != "session.skills" for event in published)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host_status", "online", "lost"),
+    [
+        ("dead", False, True),
+        ("unknown", False, True),
+        ("alive", False, False),
+        (None, False, False),
+        ("dead", True, False),
+    ],
+)
+async def test_side_chat_fork_lost_trusts_only_a_host_verdict(
+    monkeypatch: pytest.MonkeyPatch, host_status: str | None, online: bool, lost: bool
+) -> None:
+    """Only the launching host can prove an offline runner is gone; no reply proves nothing."""
+    from omnigent.server.routes._sessions import orchestration
+
+    async def _status(_conn: Any, _registry: Any, _runner_id: str) -> str | None:
+        return host_status
+
+    monkeypatch.setattr(orchestration, "_query_host_runner_status", _status)
+    monkeypatch.setattr("omnigent.runner.routing.routing_host_id", lambda _c, _s: "host-1")
+    registry = SimpleNamespace(get=lambda host_id: object() if host_id == "host-1" else None)
+    router = SimpleNamespace(runner_is_online=lambda _runner_id: online)
+    store = _ParentStore(SimpleNamespace(runner_id="runner-birth"))  # parent not relaunched yet
+    child = _side_chat_child(runner_id="runner-birth")
+
+    assert await orchestration._codex_side_chat_fork_lost(child, store, router, registry) is lost  # type: ignore[arg-type]
+
+    ordinary = _side_chat_child(runner_id="runner-birth", nickname="reviewer")
+    assert (
+        await orchestration._codex_side_chat_fork_lost(ordinary, store, router, registry) is False
+    )  # type: ignore[arg-type]

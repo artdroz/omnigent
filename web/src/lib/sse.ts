@@ -8,6 +8,7 @@
 // reducer never seeing certain events, which the reducer's tests can't
 // catch — please add an SSE-parser test when you touch this.
 
+import { readSubagentActivity } from "./subagentActivity";
 import type {
   BrowserActionRequestEvent,
   ClientTaskCancel,
@@ -411,7 +412,11 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     } satisfies ResponseCompleted;
   }
   if (eventType === "response.failed") {
-    return { type: "response_failed", response: parseResponse(data) } satisfies ResponseFailed;
+    return {
+      type: "response_failed",
+      response: parseResponse(data),
+      ...(typeof data.source === "string" ? { source: data.source } : {}),
+    } satisfies ResponseFailed;
   }
   if (eventType === "response.incomplete") {
     const resp = parseResponse(data);
@@ -1294,6 +1299,16 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       itemId,
       responseId,
     } satisfies TerminalCommandEvent;
+  }
+
+  if (readSubagentActivity(rec)) {
+    return {
+      type: "native_tool_call",
+      toolType: "subagent_activity",
+      data: rec,
+      itemId,
+      responseId,
+    } satisfies NativeToolCall;
   }
 
   if (NATIVE_TOOL_TYPES.has(itemType)) {

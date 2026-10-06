@@ -53,8 +53,7 @@ _MODEL_OPTIONS = [
 # Mirrors the server's terminal-less native model-change rejection
 # (``_surface_model_change_forward_failure`` -> RUNNER_UNAVAILABLE).
 _MODEL_CHANGE_FAILED = (
-    "The terminal did not apply the model change. "
-    "The previous selection has been restored."
+    "The terminal did not apply the model change. The previous selection has been restored."
 )
 
 

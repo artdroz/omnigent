@@ -56,7 +56,7 @@ import {
 } from "@/shell/sidebarNav";
 import { apiErrorFromResponse, stopSession } from "@/lib/sessionsApi";
 import { isStaleCursorError, useRestartOnStaleCursor } from "@/lib/staleCursor";
-import { setSessionHost } from "@/lib/sessionHost";
+import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import {
   createProject as apiCreateProject,
   deleteProject as apiDeleteProject,
@@ -478,6 +478,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
   // requests key their slice off this map — so record the host before returning
   // the row, or those requests fall back to the modal and can miss the replica.
   setSessionHost(wire.id, wire.host_id);
+  setSessionParent(wire.id, wire.parent_session_id);
   return {
     id: wire.id,
     object: "conversation",
@@ -527,6 +528,7 @@ export async function fetchConversationsPage({
     order: "desc",
     sort_by: "updated_at",
     limit: String(limit),
+    visibility: visibility ?? "all",
   });
   if (after) params.set("after", after);
   if (searchQuery) params.set("search_query", searchQuery);
@@ -539,10 +541,6 @@ export async function fetchConversationsPage({
   // query key (which drops `project`) and the cache-membership check. This
   // list never requests the server's "unfiled" (`project=`) slice.
   if (project) params.set("project", project);
-  // Server-side ownership filter for the sidebar's My/Shared split. Omitting
-  // the param keeps the legacy "all accessible" behaviour (no regression for
-  // callers that don't pass visibility).
-  if (visibility) params.set("visibility", visibility);
   // Bound search fetches with a client-side deadline (see
   // SEARCH_FETCH_TIMEOUT_MS): a search whose server-side index is missing can
   // hang, and the palette shows "Searching…" for the whole in-flight window.
@@ -562,7 +560,10 @@ export async function fetchConversationsPage({
   // session's own snapshot loads still keys to the right replica instead of
   // falling back to the modal. host_id is fixed for a session's life, so this
   // can't seed a stale value; a hostless row clears any prior mapping.
-  for (const row of page.data) setSessionHost(row.id, row.host_id);
+  for (const row of page.data) {
+    setSessionHost(row.id, row.host_id);
+    setSessionParent(row.id, row.parent_session_id);
+  }
   return applySessionTombstones(
     withRecentlyCreated(
       page,
@@ -736,13 +737,20 @@ export async function renameConversation(id: string, title: string): Promise<Con
  *
  * Exported for direct unit testing. `archived` is sent as the new
  * desired state, so the same helper handles both archive (`true`) and
- * unarchive (`false`).
+ * unarchive (`false`). `deleteWorktree` (archive only) asks the server to
+ * remove the session's worktree directory once its teardown runs.
  */
-export async function archiveConversation(id: string, archived: boolean): Promise<Conversation> {
+export async function archiveConversation(
+  id: string,
+  archived: boolean,
+  deleteWorktree = false,
+): Promise<Conversation> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ archived }),
+    body: JSON.stringify(
+      archived && deleteWorktree ? { archived, delete_worktree: true } : { archived },
+    ),
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as Conversation;
@@ -938,8 +946,15 @@ async function paintConversationsArchived(
 export function useArchiveConversation() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, archived }: { id: string; archived: boolean }) =>
-      archiveConversation(id, archived),
+    mutationFn: ({
+      id,
+      archived,
+      deleteWorktree = false,
+    }: {
+      id: string;
+      archived: boolean;
+      deleteWorktree?: boolean;
+    }) => archiveConversation(id, archived, deleteWorktree),
     onMutate: ({ id, archived }) => paintConversationsArchived(queryClient, [id], archived),
     onError: (_err, { id, archived }, context) => {
       if (archived && context?.marked !== undefined) {
@@ -1281,8 +1296,19 @@ export function useStopSession() {
 export function useBulkArchiveConversations() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async ({ ids, archived }: { ids: string[]; archived: boolean }) => {
-      const results = await Promise.allSettled(ids.map((id) => archiveConversation(id, archived)));
+    mutationFn: async ({
+      ids,
+      archived,
+      deleteWorktreeIds,
+    }: {
+      ids: string[];
+      archived: boolean;
+      /** Archived sessions whose worktree should also be removed. */
+      deleteWorktreeIds?: ReadonlySet<string>;
+    }) => {
+      const results = await Promise.allSettled(
+        ids.map((id) => archiveConversation(id, archived, deleteWorktreeIds?.has(id) === true)),
+      );
       const failed: string[] = [];
       for (let i = 0; i < results.length; i++) {
         if (results[i].status === "rejected") failed.push(ids[i]);
@@ -2002,6 +2028,8 @@ export async function fetchAllArchivedProjectNames(): Promise<string[]> {
       order: "desc",
       sort_by: "updated_at",
       limit: "100",
+      visibility: "archived",
+      // Preserve archive inclusion on older servers that ignore visibility.
       include_archived: "true",
     });
     if (after) params.set("after", after);
@@ -2013,8 +2041,7 @@ export async function fetchAllArchivedProjectNames(): Promise<string[]> {
     // eslint-disable-next-line no-await-in-loop
     const page = (await res.json()) as ConversationsPage;
     for (const conv of page.data) {
-      // include_archived returns archived AND active rows; only archived ones
-      // are filterable on this page, so collect labels from those.
+      // Keep active rows out even if a server ignores the visibility filter.
       if (conv.archived !== true) continue;
       const name = conv.labels?.[PROJECT_LABEL_KEY];
       if (name) names.add(name);
@@ -2301,6 +2328,7 @@ async function fetchAllProjectSessionIds(project: string): Promise<string[]> {
       order: "desc",
       sort_by: "updated_at",
       limit: "100",
+      visibility: "all",
       include_archived: "true",
       project,
     });
@@ -2332,6 +2360,7 @@ export async function fetchProjectSessionIds(project: string, limit = 2): Promis
     sort_by: "updated_at",
     limit: String(limit),
     include_archived: "true",
+    visibility: "all",
     project,
   });
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
@@ -2340,7 +2369,7 @@ export async function fetchProjectSessionIds(project: string, limit = 2): Promis
   return page.data.map((conv) => conv.id);
 }
 
-/** One page of a project's (non-archived) sessions, newest-first. */
+/** One page of the viewer's active sessions in a project, newest-first. */
 async function fetchProjectSessionsPage(
   project: string,
   after?: string,
@@ -2350,6 +2379,7 @@ async function fetchProjectSessionsPage(
     order: "desc",
     sort_by: "updated_at",
     limit: String(limit),
+    visibility: "mine",
     project,
   });
   if (after) params.set("after", after);

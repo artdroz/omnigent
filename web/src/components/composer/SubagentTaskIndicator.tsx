@@ -3,6 +3,7 @@ import { BotIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { RunningDot } from "@/components/RunningDot";
 import { useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { Link, useLocation } from "@/lib/routing";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
@@ -10,10 +11,11 @@ import { cn } from "@/lib/utils";
 import { childStatus } from "@/shell/subagentStatus";
 
 /**
- * Actionable sub-agent tally for the ComposerWorkspaceBar, sitting beside the
- * background-task tally: a bot icon + count badge toggling a popover listing
- * each active, parked, or errored sub-agent. Mirrors ``BackgroundTaskIndicator`` so the two
- * counts read as one family (background shells + delegated sub-agents).
+ * Direct-child attention tally for the ComposerWorkspaceBar, sitting beside
+ * the background-task tally: a bot icon + count badge toggling a popover
+ * listing each active, parked, disconnected, or errored child. Descendant
+ * hierarchy remains in the Agents rail. Mirrors ``BackgroundTaskIndicator``
+ * so the two counts read as one family (background shells + delegated agents).
  */
 
 type IndicatorState = "active" | "parked" | "quiet" | "error";
@@ -73,17 +75,7 @@ function SubagentStateIndicator({ state, label }: { state: IndicatorState; label
         role="status"
         className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground"
       >
-        <span
-          aria-hidden="true"
-          className="size-3.5 shrink-0 animate-spin rounded-full motion-reduce:animate-none"
-          style={{
-            animationDuration: "1.6s",
-            background: "conic-gradient(from 0deg, transparent 0deg, currentColor 360deg)",
-            WebkitMask:
-              "radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 2px))",
-            mask: "radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 2px))",
-          }}
-        />
+        <RunningDot />
         {label}
       </span>
     );
@@ -215,12 +207,12 @@ export function SubagentTaskIndicator({ conversationId }: { conversationId: stri
             data-state={triggerState}
             aria-label={countLabel}
             className={cn(
-              "shrink-0 gap-1 px-1 md:px-2",
+              "shrink-0 gap-1 px-1 font-normal tabular-nums md:px-2",
               triggerState === "error" && "text-destructive hover:text-destructive",
               triggerState === "parked" && "text-warning hover:text-warning",
             )}
           >
-            <BotIcon className="size-3.5" aria-hidden="true" />
+            <BotIcon className="size-3.5" strokeWidth={1.5} aria-hidden="true" />
             {count}
           </Button>
         </PopoverTrigger>

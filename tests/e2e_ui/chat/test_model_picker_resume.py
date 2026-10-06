@@ -213,9 +213,7 @@ def test_model_selection_resumes_without_sending_a_message(
 
     gear.click()
     model_trigger = page.get_by_test_id("composer-agent-edit")
-    effort_trigger = page.get_by_test_id("composer-agent-effort-select")
     expect(model_trigger).to_be_enabled()
-    expect(effort_trigger).to_be_enabled()
     model_trigger.click()
     model_choice = page.locator('[role="menuitemcheckbox"][data-model-id="gpt-5.6-luna"]')
     expect(model_choice).to_be_enabled()
@@ -224,11 +222,11 @@ def test_model_selection_resumes_without_sending_a_message(
     expect(page.get_by_test_id("runner-starting-indicator")).to_have_count(0)
     assert state.mutations == []
 
-    # Browsing either submenu, including closing/reopening, never launches.
+    # Browsing the configuration menu, including closing/reopening, never launches.
     page.keyboard.press("Escape")
     expect(page.get_by_test_id("composer-agent-menu")).to_have_count(0)
     gear.click()
-    effort_trigger.click()
+    model_trigger.click()
     expect(page.locator('[role="menuitemcheckbox"][data-effort-level="high"]')).to_be_enabled()
     assert state.mutations == []
     page.keyboard.press("Escape")
@@ -288,7 +286,7 @@ def test_effort_selection_resumes_and_stays_pending_until_applied(
         page.goto(f"{base_url}/c/{session_id}?view=chat")
 
     page.get_by_test_id("composer-config-gear").click()
-    page.get_by_test_id("composer-agent-effort-select").click()
+    page.get_by_test_id("composer-agent-edit").click()
     effort_choice = page.locator('[role="menuitemcheckbox"][data-effort-level="high"]')
     expect(effort_choice).to_be_enabled()
     assert state.mutations == []
