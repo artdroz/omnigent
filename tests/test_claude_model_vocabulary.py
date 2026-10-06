@@ -5,7 +5,7 @@ import pytest
 from omnigent.models.claude_model_vocabulary import (
     claude_model_alias,
     claude_model_command_arg,
-    model_id_with_1m_marker,
+    is_long_context_claude_model,
     model_vocabulary_env,
     normalized_model_id,
     picker_command_values,
@@ -165,34 +165,27 @@ def test_prefix_fold_strips_the_namespace_but_keeps_the_context_marker() -> None
     assert prefix_folded_model_id("claude-haiku-4-5") == "claude-haiku-4-5"
 
 
-def test_model_id_with_1m_marker_opts_long_context_families_into_1m() -> None:
-    """Opus/Sonnet served ids gain the ``[1m]`` marker, keeping their spelling."""
-    assert model_id_with_1m_marker("system.ai.claude-opus-5") == "system.ai.claude-opus-5[1m]"
-    assert (
-        model_id_with_1m_marker("databricks-claude-sonnet-5") == "databricks-claude-sonnet-5[1m]"
-    )
-    # A canonical id (a direct-spec pin) is marked on the spelling it is given.
-    assert model_id_with_1m_marker("claude-opus-4-8") == "claude-opus-4-8[1m]"
+def test_is_long_context_claude_model_matches_opus_and_sonnet() -> None:
+    """Opus and Sonnet served ids are the 1M-capable families."""
+    assert is_long_context_claude_model("system.ai.claude-opus-5")
+    assert is_long_context_claude_model("databricks-claude-sonnet-5")
+    # A canonical id (a direct-spec pin) is recognised by its family too.
+    assert is_long_context_claude_model("claude-opus-4-8")
+    assert is_long_context_claude_model("databricks-claude-sonnet-4-6")
 
 
-def test_model_id_with_1m_marker_leaves_other_models_bare() -> None:
-    """Only the 1M-capable families are marked; everything else passes through."""
+def test_is_long_context_claude_model_rejects_other_models() -> None:
+    """200K-only families, non-Claude ids, and bare aliases are not 1M-capable."""
     # 200K-only Claude families.
-    assert model_id_with_1m_marker("databricks-claude-haiku-4-5") == "databricks-claude-haiku-4-5"
-    assert model_id_with_1m_marker("system.ai.claude-fable-5") == "system.ai.claude-fable-5"
+    assert not is_long_context_claude_model("databricks-claude-haiku-4-5")
+    assert not is_long_context_claude_model("system.ai.claude-fable-5")
     # Non-Claude models the same gateway may serve.
-    assert model_id_with_1m_marker("databricks-gpt-5-6") == "databricks-gpt-5-6"
-    assert model_id_with_1m_marker("system.ai.glm-5-3") == "system.ai.glm-5-3"
+    assert not is_long_context_claude_model("databricks-gpt-5-6")
+    assert not is_long_context_claude_model("system.ai.glm-5-3")
     # Bare family aliases are not model ids; Claude Code resolves them itself.
-    assert model_id_with_1m_marker("opus") == "opus"
-    assert model_id_with_1m_marker("sonnet") == "sonnet"
-
-
-def test_model_id_with_1m_marker_is_idempotent() -> None:
-    """An already-marked id is never double-marked, case-insensitively."""
-    assert model_id_with_1m_marker("system.ai.claude-opus-5[1m]") == "system.ai.claude-opus-5[1m]"
-    assert model_id_with_1m_marker("claude-sonnet-5[1M]") == "claude-sonnet-5[1M]"
-    assert model_id_with_1m_marker("") == ""
+    assert not is_long_context_claude_model("opus")
+    assert not is_long_context_claude_model("sonnet")
+    assert not is_long_context_claude_model("")
 
 
 def test_catalog_prefixes_match_the_routing_defaults() -> None:

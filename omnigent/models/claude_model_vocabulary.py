@@ -121,37 +121,36 @@ def normalized_model_id(model: str) -> str:
     return prefix_folded_model_id(model).removesuffix("[1m]")
 
 
-LONG_CONTEXT_MARKER = "[1m]"
+#: Context window a 1M-capable Opus/Sonnet model serves, in tokens.
+LONG_CONTEXT_WINDOW_TOKENS = 1_000_000
+
+#: Claude Code env var that overrides its computed context window. It is
+#: honoured only for a custom gateway id — one outside Claude Code's own
+#: registry, which is every id omnigent's managed gateway serves — so a managed
+#: launch sets it instead of marking the id, keeping the served id bare so it
+#: still resolves to the family slot the launch pinned.
+CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
 
 _LONG_CONTEXT_FAMILIES: frozenset[str] = frozenset({"opus", "sonnet"})
 
 
-def model_id_with_1m_marker(model_id: str) -> str:
-    """Add the ``[1m]`` window marker to a long-context Claude family id.
+def is_long_context_claude_model(model_id: str) -> bool:
+    """Whether a served id names a 1M-context Opus or Sonnet model.
 
-    Claude Code sizes a session's context window client-side by testing the
-    effective model id for ``[1m]``; an unmarked id caps the session at the
-    CLI's 200K default even when the model and gateway serve 1M. Gateway
-    catalogs hold bare ids, so a managed launch adds the marker to the model it
-    launches. The marker is a client-side hint Claude Code strips before any
-    request, so it rides only the launched terminal's model, never the
-    probe/catalog the launch gate folds bare picks against.
+    Claude Code sizes a session's context window client-side. For a custom
+    gateway id it defaults to a 200K window even when the model and gateway
+    serve 1M, so a managed launch raises the window itself — but only for the
+    families that actually serve 1M. Opus and Sonnet do; Haiku, Fable, and
+    non-Claude models do not.
 
     :param model_id: A served model id, e.g. ``"system.ai.claude-opus-5"``.
-    :returns: The marked spelling for the long-context Opus/Sonnet families
-        (``"system.ai.claude-opus-5[1m]"``); unchanged otherwise — non-Claude
-        ids, bare family aliases, 200K-only families, and already-marked ids
-        all pass through.
+    :returns: ``True`` for the long-context Opus/Sonnet families; ``False`` for
+        non-Claude ids, bare family aliases, and 200K-only families.
     """
-    spelled = model_id.strip()
-    if not spelled or spelled.lower().endswith(LONG_CONTEXT_MARKER):
-        return model_id
-    canonical = canonical_claude_id(spelled)
+    canonical = canonical_claude_id(model_id)
     if canonical is None:
-        return model_id
-    if _LONG_CONTEXT_FAMILIES.isdisjoint(_SEGMENT_RE.split(canonical)):
-        return model_id
-    return f"{spelled}{LONG_CONTEXT_MARKER}"
+        return False
+    return not _LONG_CONTEXT_FAMILIES.isdisjoint(_SEGMENT_RE.split(canonical))
 
 
 def alias_pins(env: Mapping[str, str] | None = None) -> dict[str, str]:
