@@ -66,22 +66,37 @@ def _run_cli(
     )
 
 
-def _live_daemon_records(home: Path) -> dict[str, int]:
-    """Map daemon record target -> pid for records whose process is alive.
+def _live_daemon_records(home: Path) -> dict[str, set[int]]:
+    """Map daemon record target -> live pids.
+
+    Records are rewritten in place (not atomically), so a concurrent rewrite
+    can be read as truncated JSON; such a record is skipped. Pids are kept as a
+    set per target so two live daemons sharing a target stay distinct — a
+    duplicate must not hide behind a single entry, which is exactly the churn
+    this test catches.
 
     :param home: Isolated HOME holding ``.omnigent/daemons``.
-    :returns: ``{target: pid}`` for live daemons, e.g.
-        ``{"http://127.0.0.1:6767": 1234}``.
+    :returns: ``{target: {pid, ...}}`` for live daemons.
     """
     daemons_dir = home / ".omnigent" / "daemons"
-    live: dict[str, int] = {}
+    live: dict[str, set[int]] = {}
     if not daemons_dir.is_dir():
         return live
     for path in sorted(daemons_dir.glob("*.json")):
-        data = json.loads(path.read_text())
-        if _pid_alive(int(data["pid"])):
-            live[str(data["target"])] = int(data["pid"])
+        try:
+            data = json.loads(path.read_text())
+            pid = int(data["pid"])
+            target = str(data["target"])
+        except (OSError, ValueError, KeyError):
+            continue  # record mid-rewrite; in-place writes are not atomic
+        if _pid_alive(pid):
+            live.setdefault(target, set()).add(pid)
     return live
+
+
+def _live_daemon_pids(home: Path) -> set[int]:
+    """Return every live daemon pid across all targets."""
+    return {pid for pids in _live_daemon_records(home).values() for pid in pids}
 
 
 def test_second_loopback_spelling_reuses_daemon_and_stop_converges(
@@ -128,9 +143,11 @@ def test_second_loopback_spelling_reuses_daemon_and_stop_converges(
             f"first host spawn failed (rc={first.returncode})\n"
             f"stdout:\n{first.stdout}\nstderr:\n{first.stderr}"
         )
-        live = _live_daemon_records(home)
-        daemon_pids |= set(live.values())
-        assert len(live) == 1, f"expected exactly one daemon after the first spawn, got {live}"
+        pids = _live_daemon_pids(home)
+        daemon_pids |= pids
+        assert len(pids) == 1, (
+            f"expected exactly one daemon after the first spawn, got {_live_daemon_records(home)}"
+        )
 
         second = _run_cli(
             omnigent_python,
@@ -146,12 +163,12 @@ def test_second_loopback_spelling_reuses_daemon_and_stop_converges(
             f"second host spawn failed (rc={second.returncode})\n"
             f"stdout:\n{second.stdout}\nstderr:\n{second.stderr}"
         )
-        live = _live_daemon_records(home)
-        daemon_pids |= set(live.values())
-        assert len(live) == 1, (
+        pids = _live_daemon_pids(home)
+        daemon_pids |= pids
+        assert len(pids) == 1, (
             f"one server instance must be served by one host daemon, but the "
             f"localhost spelling spawned its own instead of reusing the live "
-            f"127.0.0.1 one: {live}\nstdout:\n{second.stdout}"
+            f"127.0.0.1 one: {_live_daemon_records(home)}\nstdout:\n{second.stdout}"
         )
 
         stop = _run_cli(
@@ -176,6 +193,10 @@ def test_second_loopback_spelling_reuses_daemon_and_stop_converges(
         leftovers = _live_daemon_records(home)
         assert not leftovers, f"live daemons left after stop: {leftovers}"
     finally:
+        # A spawn can land a daemon before its pid was captured above; an
+        # earlier failure then skips to here with an incomplete pid set.
+        # Rediscover this test's scoped records so cleanup still reaps them.
+        daemon_pids |= _live_daemon_pids(home)
         for pid in sorted(daemon_pids):
             if pid > 0 and _pid_alive(pid):
                 _force_stop_server(pid)

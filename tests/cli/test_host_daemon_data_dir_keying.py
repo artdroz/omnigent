@@ -57,6 +57,35 @@ def test_loopback_url_without_a_tracked_server_keeps_its_own_key() -> None:
     assert cli._normalize_daemon_target("http://127.0.0.1:6767") == "http://127.0.0.1:6767"
 
 
+def test_find_daemon_record_resolves_raw_url_record_as_local(tmp_path: Path) -> None:
+    """A record keyed on a raw loopback URL resolves when looked up as ``local``.
+
+    A daemon recorded under its raw ``http://127.0.0.1:<port>`` key (spawned
+    before the local server was tracked, or by a pre-upgrade build) must not
+    orphan once the pidfile appears and that URL starts collapsing to
+    ``local``: the lookup re-normalizes each stored target, so the drifted
+    record is found and reused instead of a duplicate daemon being spawned.
+    """
+    _track_local_server(tmp_path, 6767)
+    cli._write_daemon_record(
+        cli._HostDaemonRecord(
+            pid=4242,
+            target="http://127.0.0.1:6767",
+            mode="local",
+            server_url=None,
+            log_path=None,
+            started_at=100,
+            host_id="host_abc",
+        )
+    )
+
+    found = cli._find_daemon_record(cli._LOCAL_DAEMON_MARKER)
+
+    assert found is not None
+    assert found.target == "http://127.0.0.1:6767"
+    assert found.pid == 4242
+
+
 def test_collapsed_spawn_runs_the_daemon_in_local_mode(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

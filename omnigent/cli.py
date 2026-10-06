@@ -2556,11 +2556,9 @@ def _runner_loopback_host(host: str) -> str:
 _HOST_PID_PATH = data_dir() / "host.pid"
 
 
-# host.pid records the daemon PID + the "target" it serves: a normalized
-# server URL for remote/explicit targets, or the literal marker ``"local"``
-# for a daemon serving this data dir's own instance. Daemon reuse is keyed on
-# this target; loopback spellings of the tracked local server normalize to the
-# marker, so one instance never accrues per-spelling duplicate daemons.
+# host.pid records the daemon PID and the "target" it serves: a normalized URL
+# for remote targets, or the marker ``"local"`` for this data dir's own instance.
+# Reuse keys on this target, so loopback spellings collapse to one local daemon.
 _LOCAL_DAEMON_MARKER = "local"
 
 # ``--server`` values that mean "run against a local server" rather than naming a
@@ -6649,12 +6647,11 @@ def import_session_command(
     base_url = base_url.rstrip("/")
 
     # If this machine is itself a host, bind the imported session to it so it
-    # resumes where the transcript came from. Read-only: never mints an identity
-    # on a machine that isn't already a host. Read from the effective config
-    # path so an OMNIGENT_CONFIG_HOME override is honored.
+    # resumes where the transcript came from. Resolve identity exactly as the
+    # daemon (data-dir scoped), read-only so a non-host never mints one.
     from omnigent.host.identity import load_host_identity_if_present
 
-    host_identity = load_host_identity_if_present(_effective_global_config_path())
+    host_identity = load_host_identity_if_present()
 
     def _import_one(target: tuple[ImportSource, str]) -> _SessionImportResult:
         # Each target carries its own harness so an "all" batch can span them.
