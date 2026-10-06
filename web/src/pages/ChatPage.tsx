@@ -2536,24 +2536,24 @@ function ComposerImpl(
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
   const sessionConfigPhase = useChatStore((s) => s.sessionConfigPhase);
-  // Scope the shared lock to one session so an old request cannot unlock a new
-  // one, held in a ref so React cannot discard the lock while a request is in
-  // flight (useMemo may recompute and reset it).
-  const configBusyLock = useRef<{ current: boolean; conversationId: string | null }>({
-    current: false,
-    conversationId,
-  });
-  if (configBusyLock.current.conversationId !== conversationId) {
-    configBusyLock.current = { current: false, conversationId };
+  // Per-session lock guarding duplicate config changes, kept in a ref (not
+  // useMemo, which React may discard mid-request) and looked up by id so an
+  // in-flight request survives navigating away and back without affecting others.
+  const configBusyLocksRef = useRef<Map<string | null, { current: boolean }>>();
+  if (!configBusyLocksRef.current) configBusyLocksRef.current = new Map();
+  const configBusyLocks = configBusyLocksRef.current;
+  if (!configBusyLocks.has(conversationId)) {
+    configBusyLocks.set(conversationId, { current: false });
   }
-  const configBusyRef = configBusyLock.current;
-  const [configBusyOwner, setConfigBusyOwner] = useState<typeof configBusyRef | null>(null);
+  const configBusyRef = configBusyLocks.get(conversationId)!;
+  const [configBusyOwner, setConfigBusyOwner] = useState<{ current: boolean } | null>(null);
   const configBusy = configBusyOwner === configBusyRef || sessionConfigPhase !== null;
   const setConfigBusy = useCallback(
     (busy: boolean) =>
-      setConfigBusyOwner((owner) =>
-        busy ? configBusyRef : owner === configBusyRef ? null : owner,
-      ),
+      setConfigBusyOwner((owner) => {
+        if (busy) return configBusyRef;
+        return owner === configBusyRef ? null : owner;
+      }),
     [configBusyRef],
   );
 
