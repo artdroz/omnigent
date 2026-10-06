@@ -6004,4 +6004,26 @@ describe("Composer voice dictation", () => {
     expect(onSend).not.toHaveBeenCalled();
     expect(abortSpy).toHaveBeenCalledTimes(1);
   });
+
+  it("keeps the voice take active when an informational slash command is sent", () => {
+    // /context prints usage info and returns without clearing the composer, so
+    // it is not an accepted send; the mic must stay live rather than ending the
+    // take the user is still dictating into.
+    setComposerState({ conversationId: "conv_test", skills: [] });
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    const mic = screen.getByRole("button", { name: "Voice dictation" });
+    fireEvent.click(mic);
+    act(() => handlers.start?.({}));
+    expect(mic).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.change(textarea(), { target: { value: "/context" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onSendSlashCommand).not.toHaveBeenCalled();
+    expect(abortSpy).not.toHaveBeenCalled();
+    expect(mic).toHaveAttribute("aria-pressed", "true");
+  });
 });

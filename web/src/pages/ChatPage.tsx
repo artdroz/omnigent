@@ -3002,6 +3002,14 @@ function ComposerImpl(
     if (conversationId) setSessionDraft(conversationId, { text: "", files: [] });
   }, [restoredSendDraft, conversationId, settledConversationId, replaceText]);
 
+  // End a live voice take as part of an accepted send, pinning any pending
+  // dictation first so a draft kept after a failed fork isn't clobbered when
+  // the next take's partial lifts the stale region out. No-op when idle.
+  const endVoiceTake = () => {
+    dictation.commitPending();
+    micRef.current?.endTake();
+  };
+
   /**
    * Execute a slash command by name + optional argument string.
    * Clears the input and error state on success (or sets an error on
@@ -3046,6 +3054,7 @@ function ComposerImpl(
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
+        endVoiceTake();
         if (
           sessionHarness === "claude-native" ||
           sessionHarness === "claude-sdk" ||
@@ -3077,6 +3086,7 @@ function ComposerImpl(
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
+        endVoiceTake();
         void useChatStore
           .getState()
           .setEffort(level)
@@ -3111,6 +3121,7 @@ function ComposerImpl(
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
+        endVoiceTake();
         // Confirmation is a durable `[System: model changed to X]` note the
         // server appends to the transcript (see _persist_model_change_note) —
         // not a transient composer hint. Surface only failures inline here.
@@ -3316,11 +3327,6 @@ function ComposerImpl(
     // guard so guarded no-ops don't emit, matching the disabled Send button.
     trackClick("chat.composer.send", "button");
 
-    // End any live voice take here so the mic stops for every accepted send
-    // path, including the slash-command branches below that clear the composer
-    // and return before reaching the plaintext send.
-    micRef.current?.endTake();
-
     // A generic (non-Codex) side chat forks the conversation and runs it on the
     // SAME host/sandbox as the source (no new sandbox), then opens it as a rail
     // tab; the typed text seeds the new side chat's composer so it isn't fired
@@ -3330,6 +3336,7 @@ function ComposerImpl(
       const sourceId = useChatStore.getState().conversationId;
       if (sourceId === null) return;
       setCommandError(null);
+      endVoiceTake();
       createSideChat(sourceId).then(
         ({ childSessionId }) => {
           // Clear the composer only once the side chat exists, so a failed
@@ -3379,6 +3386,7 @@ function ComposerImpl(
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
+        endVoiceTake();
         setPickerOpenNonce((n) => n + 1);
         return;
       }
@@ -3416,6 +3424,7 @@ function ComposerImpl(
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
+        endVoiceTake();
         return;
       }
     }
@@ -3447,6 +3456,7 @@ function ComposerImpl(
       onSend(mentionPreamble + trimmed, sendFiles);
     }
     dirtyRef.current = true;
+    endVoiceTake();
     clearComposerAfterSend(resetNativeInputSession);
     clearAttachments();
     setMentionedItems([]);

@@ -206,15 +206,13 @@ def test_web_speech_take_ends_when_message_is_sent(
         expect(composer).to_be_enabled()
         expect(mic).to_be_enabled()
 
-        # Speech a second after the send: a take that survived keeps inserting.
-        page.wait_for_timeout(1_000)
+        # Confirm the take ended before probing. Only then can speech injected
+        # afterwards reveal a recognizer that wrongly survived the send, and the
+        # stop/abort it triggered is already recorded for the snapshot below.
+        _expect_take_ended(page)
         heard_after_send = page.evaluate(
             f"() => window.__fakeSpeechSay({json.dumps(_AFTER_SEND)})"
         )
-
-        # Confirm the take ended before snapshotting the recognizer, so the
-        # stop/abort it triggers is already recorded and the read can't race it.
-        _expect_take_ended(page, heard_after_send=heard_after_send)
         assert not heard_after_send, "recognizer was still listening after the send"
 
         recognizer = page.evaluate(
@@ -234,7 +232,9 @@ def test_server_dictation_take_ends_when_message_is_sent(
     mock_llm_server_url: str,
 ) -> None:
     base_url, session_id = seeded_session
-    info = httpx.get(f"{base_url}/v1/info", timeout=10.0).json()
+    response = httpx.get(f"{base_url}/v1/info", timeout=10.0)
+    response.raise_for_status()
+    info = response.json()
     if not info.get("dictation_available"):
         pytest.skip("server dictation is not enabled on this server (OMNIGENT_DICTATION_ENGINE)")
     configure_mock_llm(

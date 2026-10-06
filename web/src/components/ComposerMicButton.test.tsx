@@ -748,7 +748,7 @@ describe("ComposerMicButton (endTake)", () => {
     vi.stubGlobal("SpeechRecognition", undefined);
     vi.stubGlobal("webkitSpeechRecognition", undefined);
     // Hold the handshake open so the send (endTake) lands while start is still
-    // pending and no session is attached yet — the race the fix closes.
+    // pending with no session attached yet.
     let resolveStart!: (s: SessionStub) => void;
     sessionStartMock = vi.fn((events: DictationSessionEvents) => {
       sessionEvents = events;

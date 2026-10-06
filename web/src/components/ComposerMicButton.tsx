@@ -453,13 +453,17 @@ function ComposerMicButtonImpl(
       setError(null);
       setIsListening(true);
     } catch (startError) {
-      reportError(
-        startError instanceof DictationBusyError
-          ? "Voice input is busy. Please try again shortly."
-          : isPermissionError(startError)
-            ? "Microphone access denied. Allow access and try again."
-            : "Voice input isn't available on this device.",
-      );
+      // Stay silent if the user already ended this take mid-handshake (a Send
+      // tap set endPendingRef); the toast would warn about a take they dropped.
+      if (!endPendingRef.current) {
+        reportError(
+          startError instanceof DictationBusyError
+            ? "Voice input is busy. Please try again shortly."
+            : isPermissionError(startError)
+              ? "Microphone access denied. Allow access and try again."
+              : "Voice input isn't available on this device.",
+        );
+      }
       setIsListening(false);
     }
     // Reached only by the start path (the stop branch returns earlier). Clear
@@ -520,6 +524,9 @@ function ComposerMicButtonImpl(
     if (serverBusyRef.current) {
       endPendingRef.current = true;
       discardingRef.current = true;
+      // Drop the handshake spinner now; toggleServer cancels the session it
+      // opens once start resolves, which can lag the send by seconds.
+      setConnecting(false);
       return;
     }
     if (!isListening && !transitionRef.current) return;

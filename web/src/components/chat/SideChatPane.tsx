@@ -417,11 +417,19 @@ function SideChatComposer({
       .finally(() => setInterrupting(false));
   };
 
+  // End a live voice take on an accepted send, pinning any pending dictation
+  // first so a draft kept for a failed-fork retry isn't clobbered by the next
+  // take's partial. No-op when idle.
+  const endVoiceTake = () => {
+    dictation.commitPending();
+    micRef.current?.endTake();
+  };
+
   const submit = () => {
     const trimmed = text.trim();
     if (pending) {
       if (trimmed.length === 0 || starting || !onStart) return;
-      micRef.current?.endTake();
+      endVoiceTake();
       // Keep the text so a failed fork can be retried without re-typing.
       void onStart(
         quote === undefined
@@ -432,7 +440,7 @@ function SideChatComposer({
     }
     if (busy || (trimmed.length === 0 && files.length === 0) || agentId === null) return;
     const outgoing = files;
-    micRef.current?.endTake();
+    endVoiceTake();
     clearComposer(childId);
     void send(trimmed, agentId, outgoing.length > 0 ? outgoing : undefined, {
       pinnedConversationId: childId,
