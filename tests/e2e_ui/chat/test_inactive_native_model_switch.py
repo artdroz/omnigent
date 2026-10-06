@@ -1,23 +1,12 @@
-"""Model switching on an *inactive* native session (one that has stopped and has
-no running terminal) must first recover — start — the missing terminal via the
-session-recovery API, then apply the selection. Applying the model change
-directly against a runner with no live pane forwards a ``model_change`` the
-server rejects, surfacing a "Couldn't update configuration" error while the
-model stays unchanged; this test guards the recover-first ordering.
+"""Selecting a model on an *inactive* native session (stopped, with no running
+terminal) must recover the terminal via the session-recovery API before applying
+the change; applying directly to a runner with no live pane is rejected and
+surfaces a "Couldn't update configuration" error. Browsing the switcher must not
+trigger recovery.
 
-Browsing the switcher must stay usable without launching a terminal: merely
-opening the picker must NOT trigger recovery (recovering on open would
-needlessly block browsing).
-
-Harness/server-boundary route-patch idiom, matching ``test_claude_model_picker``
-and ``test_model_flows_contract``: the real SPA drives a real spawned server;
-only the session snapshot (shaped as a terminal-less claude-native session) and
-the model-change server contract (a PATCH that succeeds only once the terminal
-has been recovered) are stubbed. The seeded session's real runner pane is
-deleted server-side first, so the terminals inventory — HTTP snapshot and SSE
-replay alike — is genuinely empty, matching a session whose terminal is gone.
-The exercised surface — open the picker on an inactive native session, select a
-model — is the real user journey.
+The real SPA drives a real spawned server; only the terminal-less session
+snapshot and the recovery-gated model PATCH are stubbed, and the seeded session's
+runner pane is deleted server-side so the terminal inventory is genuinely empty.
 """
 
 from __future__ import annotations
@@ -79,10 +68,9 @@ def _install_inactive_native_session(page: Page, session_id: str) -> dict[str, l
 
     def _events(route: Route) -> None:
         request = route.request
-        body: dict[str, object] | None = None
         try:
             body = json.loads(request.post_data or "")
-        except (json.JSONDecodeError, TypeError):
+        except json.JSONDecodeError:
             body = None
         is_retry = isinstance(body, dict) and body.get("type") == "retry_session"
         if request.method == "POST" and is_retry:
@@ -203,9 +191,10 @@ def test_inactive_native_model_switch_recovers_terminal_first(
         f"but recovery was triggered on open: {recorded['recoveries']}"
     )
 
-    # Select a different model and wait for the recovery-gated PATCH to settle,
-    # so a late config error would already be on screen before asserting its
-    # absence rather than racing the in-flight response.
+    # Selecting applies the model only after recovery, so wait for the
+    # recovery-gated PATCH to settle: once its response arrives the retry_session
+    # recovery has already posted and any config error is rendered, so the checks
+    # below are not racing an in-flight request.
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
@@ -214,17 +203,13 @@ def test_inactive_native_model_switch_recovers_terminal_first(
     ):
         page.locator('[role="menuitemcheckbox"][data-model-id="opus"]').click()
 
-    # Recovery must post before the model applies; skipping it surfaces the
-    # config error instead, so settle on whichever signal appears first.
-    error_btn = page.get_by_test_id("composer-config-error")
-    for _ in range(40):
-        if recorded["recoveries"] or error_btn.count() > 0:
-            break
-        page.wait_for_timeout(200)
-
     assert recorded["recoveries"], (
         "selecting a model on an inactive native session must recover the "
         "terminal via the session-recovery API before applying the change, "
         "but no retry_session recovery was posted"
     )
-    expect(error_btn).to_have_count(0)
+    assert recorded["model_patches"] == [{"model_override": "opus"}], (
+        "recovery must be followed by the model PATCH, but the applied "
+        f"model_change was: {recorded['model_patches']}"
+    )
+    expect(page.get_by_test_id("composer-config-error")).to_have_count(0)
