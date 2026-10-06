@@ -271,6 +271,78 @@ async def test_codex_native_controls_reject_non_string_effort(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stalled", ["connect", "update"])
+async def test_codex_native_settings_update_times_out_and_releases_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stalled: str,
+) -> None:
+    """A hung app-server call returns 503 instead of blocking later settings updates."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.runner import turn_routing
+
+    conv_id = "1f2e3d4c5b6a49788796a5b4c3d2e1f0"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    codex_native_bridge.write_bridge_state(
+        codex_native_bridge.bridge_dir_for_bridge_id(conv_id),
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_codex",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+        ),
+    )
+    monkeypatch.setattr(turn_routing, "SETTINGS_UPDATE_TIMEOUT_S", 0.05)
+    stall = {"active": True}
+
+    class _StallingClient(_RecordingCodexAppServerClient):
+        async def connect(self) -> None:
+            if stalled == "connect" and stall["active"]:
+                await asyncio.Event().wait()
+            await super().connect()
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if stalled == "update" and method == "thread/settings/update" and stall["active"]:
+                await asyncio.Event().wait()
+            return await super().request(method, params)
+
+    clients: list[_StallingClient] = []
+
+    def _fake_client_for_transport(
+        transport: str, *, client_name: str = "omnigent"
+    ) -> _StallingClient:
+        clients.append(_StallingClient(transport=transport, client_name=client_name))
+        return clients[-1]
+
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", _fake_client_for_transport
+    )
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native", model="gpt-5.4"))
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        stalled_resp = await client.post(
+            f"/v1/sessions/{conv_id}/events", json={"type": "effort_change", "effort": "high"}
+        )
+        stall["active"] = False
+        next_resp = await client.post(
+            f"/v1/sessions/{conv_id}/events", json={"type": "effort_change", "effort": "low"}
+        )
+
+    assert stalled_resp.status_code == 503, stalled_resp.text
+    assert next_resp.status_code == 204, next_resp.text
+    assert all(stalled_client.closed for stalled_client in clients)
+    assert clients[-1].requests == [
+        ("thread/settings/update", {"threadId": "thread_codex", "effort": "low"})
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("initial_model", "initial_effort", "event", "expected_model", "expected_effort"),
     [

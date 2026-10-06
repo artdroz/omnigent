@@ -283,6 +283,7 @@ def build_native_controls(
             write_codex_config_effort,
             write_codex_config_model,
         )
+        from omnigent.runner.turn_routing import SETTINGS_UPDATE_TIMEOUT_S
         from omnigent.util.reasoning_effort import effort_for_model_switch
 
         state = await _codex_native_bridge_state_for_session(conv_id, action="settings update")
@@ -321,7 +322,8 @@ def build_native_controls(
             client_name="omnigent-codex-native-runner",
         )
         try:
-            await codex_client.connect()
+            # Bounded so a hung app-server cannot hold the settings lock indefinitely.
+            await asyncio.wait_for(codex_client.connect(), timeout=SETTINGS_UPDATE_TIMEOUT_S)
             if "model" in settings or "effort" in settings:
                 # Only an absent key inherits config; null selects the model's default.
                 effort = (
@@ -345,12 +347,15 @@ def build_native_controls(
                         codex_client, effort, model, transport=state.socket_path
                     )
                     settings["effort"] = resolved
-            await codex_client.request(
-                "thread/settings/update",
-                {
-                    "threadId": state.thread_id,
-                    **settings,
-                },
+            await asyncio.wait_for(
+                codex_client.request(
+                    "thread/settings/update",
+                    {
+                        "threadId": state.thread_id,
+                        **settings,
+                    },
+                ),
+                timeout=SETTINGS_UPDATE_TIMEOUT_S,
             )
         except Exception as exc:  # noqa: BLE001 - surface app-server settings failures.
             _logger.warning(

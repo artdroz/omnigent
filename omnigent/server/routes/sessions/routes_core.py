@@ -2748,7 +2748,12 @@ def register_core_routes(
         combined_model_forward = False
         _model_forward = None
         if live_forward and (effort is not None or clear_effort):
-            effort_event = {"type": "effort_change", "effort": updated.reasoning_effort}
+            # The flag tells the runner a refusal is rolled back here, not saved for later.
+            effort_event = {
+                "type": "effort_change",
+                "effort": updated.reasoning_effort,
+                "rollback_on_refusal": True,
+            }
             combined_model_forward = bool(
                 live_model_change
                 and updated.model_override

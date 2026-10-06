@@ -140,11 +140,16 @@ Cross-harness journeys:
   `tests/server/integration/test_codex_effort_forward_failure.py::test_legacy_server_split_reset_uses_the_previous_model_default`,
   `tests/server/integration/test_codex_effort_forward_failure.py::test_legacy_combined_reset_failure_preserves_the_applied_model`,
   `tests/server/integration/test_codex_effort_forward_failure.py::test_forwarder_recovers_a_failed_immediate_effort_mirror`,
-  `tests/server/integration/test_codex_effort_forward_failure.py::test_offline_or_silent_effort_change_is_saved_for_resume`.
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_offline_or_silent_effort_change_is_saved_for_resume`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_overlapping_refused_changes_restore_the_applied_effort`,
+  `tests/runner/test_app_sessions_native_workflow_messages.py::test_refused_codex_startup_effort_follows_the_server_rollback_contract`,
+  `tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_settings_update_times_out_and_releases_the_lock`.
   Run with plain `uv run pytest`. Both HTTP apps and persistence are real;
   Codex RPC failures inject missing defaults and discovery timeouts. A refused
   reset returns an error and preserves applied settings and concurrent edits;
-  offline and silent changes remain available for resume.
+  overlapping refused changes end on the last applied setting. Offline and
+  silent explicit efforts are applied on resume; a saved Default is stored, but
+  resume keeps the private config's effort.
   A combined model/effort PATCH uses the target model's capabilities. Older
   runners apply the model first and then the effort; if that second step
   fails, the error preserves the model already applied. A failed immediate
@@ -156,6 +161,8 @@ Cross-harness journeys:
   While a connected runner is still starting Codex and has no loaded bridge,
   live settings return a retryable 503 and retain the previous selection.
   Retry once the terminal is ready; fully offline and silent saves remain deferred.
+  An older server keeps such a refused change, so the updated runner applies it
+  on the next turn. A hung app-server call fails the update after five seconds.
 - **`approvals`:**
   `tests/e2e_ui/approvals/test_native_edit_tools_approval_card.py::test_native_file_edit_tools_require_approval_card`
 - **`resume`, bare picker scoped to this host:**
