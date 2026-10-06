@@ -34,6 +34,7 @@ from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     DeveloperInstructionsReadState,
     clear_active_turn_id_if_matches,
+    codex_config_revision,
     codex_home_for_bridge_dir,
     pending_mcp_servers,
     read_bridge_state,
@@ -3352,10 +3353,7 @@ def _refresh_effort_from_config(bridge_dir: Path, forwarder_state: _CodexForward
     :returns: None.
     """
     # Stat before reading, so a rewrite that races this read shows on the next pass.
-    revision: tuple[int, int] | None = None
-    with contextlib.suppress(OSError):
-        config_stat = (codex_home_for_bridge_dir(bridge_dir) / "config.toml").stat()
-        revision = (config_stat.st_ino, config_stat.st_mtime_ns)
+    revision = codex_config_revision(bridge_dir)
     config_effort = read_codex_config_effort(bridge_dir)
     if revision is not None:
         previous_revision = forwarder_state.last_config_effort_revision

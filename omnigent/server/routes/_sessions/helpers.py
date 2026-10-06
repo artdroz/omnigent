@@ -16,7 +16,7 @@ import secrets
 import time
 import urllib.parse
 import weakref
-from collections import deque
+from collections import Counter, deque
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -2571,6 +2571,41 @@ def _validate_external_reasoning_effort(body: SessionEventInput) -> str | None:
         ) from exc
 
 
+class _LiveSettingsChange:
+    """Orders one session's live effort/model changes and counts writes made meanwhile."""
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.writes: Counter[str] = Counter()
+
+    def rewritten(self, before: Counter[str]) -> set[str]:
+        """Return the settings that other requests wrote after *before* was taken."""
+        return {key for key, count in self.writes.items() if count != before[key]}
+
+
+# Live forwards run on the replica that holds the session's runner, so this
+# process-local registry orders them; weak values drop sessions with no change.
+# custom-lint: disable-next=workspace-scoped-cache -- session ids are globally unique
+_live_settings_changes: weakref.WeakValueDictionary[str, _LiveSettingsChange] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _live_settings_change(session_id: str) -> _LiveSettingsChange:
+    """Return the live settings change for *session_id*, starting one if none is active."""
+    change = _live_settings_changes.get(session_id)
+    if change is None:
+        change = _live_settings_changes[session_id] = _LiveSettingsChange()
+    return change
+
+
+def _note_settings_write(session_id: str, keys: Iterable[str]) -> None:
+    """Record a settings write that an active live change must not roll back over."""
+    change = _live_settings_changes.get(session_id)
+    if change is not None:
+        change.writes.update(keys)
+
+
 async def _persist_external_reasoning_effort_change(
     session_id: str,
     conv: Conversation,
@@ -2593,6 +2628,8 @@ async def _persist_external_reasoning_effort_change(
     :returns: None.
     """
     effort = _validate_external_reasoning_effort(body)
+    # The terminal reports what it runs, even when the saved value already matches.
+    _note_settings_write(session_id, ("reasoning_effort",))
     if conv.reasoning_effort == effort:
         return
     await asyncio.to_thread(

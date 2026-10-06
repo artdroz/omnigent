@@ -136,7 +136,8 @@ Cross-harness journeys:
   use it and retry the write until a terminal switch rewrites the config.
 - **`model-and-effort`, rejected Codex reset (server/runner integration):**
   `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_reset_returns_error_and_preserves_applied_settings`,
-  `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_reset_preserves_concurrent_selection_and_sibling_settings`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_change_preserves_concurrent_selection_and_sibling_settings`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_change_keeps_an_effort_the_terminal_reported_meanwhile`,
   `tests/server/integration/test_codex_effort_forward_failure.py::test_reset_without_current_model_rejected_before_codex_connection`,
   `tests/server/integration/test_codex_effort_forward_failure.py::test_successful_update_mirrors_unchanged_native_effort_without_notification`,
   `tests/server/integration/test_codex_effort_forward_failure.py::test_combined_model_and_effort_uses_target_model_capabilities`,
@@ -152,7 +153,8 @@ Cross-harness journeys:
   `tests/server/integration/test_codex_effort_forward_failure.py::test_lost_combined_change_restores_the_model_and_effort`.
   Run with plain `uv run pytest`. Both HTTP apps and persistence are real;
   Codex RPC failures inject missing defaults and discovery timeouts. A refused
-  reset returns an error and preserves applied settings and concurrent edits;
+  reset returns an error and preserves applied settings and concurrent edits,
+  including a same-value silent save or terminal report made meanwhile;
   overlapping refused changes end on the last applied setting. Offline and
   silent explicit efforts are applied on resume; a saved Default is stored, but
   resume keeps the private config's effort.

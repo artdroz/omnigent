@@ -495,6 +495,19 @@ def bridge_dir_for_codex_home(codex_home: Path) -> Path:
     return codex_home.parent
 
 
+def codex_config_revision(bridge_dir: Path) -> tuple[int, int] | None:
+    """Return the session ``config.toml``'s inode and mtime, or ``None`` when unreadable.
+
+    Config writers replace the file atomically, so any rewrite changes the revision
+    even when it keeps every value.
+    """
+    try:
+        config_stat = (codex_home_for_bridge_dir(bridge_dir) / "config.toml").stat()
+    except OSError:
+        return None
+    return config_stat.st_ino, config_stat.st_mtime_ns
+
+
 def read_codex_config_model(bridge_dir: Path) -> str | None:
     """
     Read the active model from this session's Codex ``config.toml``.

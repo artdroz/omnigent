@@ -72,8 +72,13 @@ class _CodexClient:
                     "nextCursor": None,
                 }
             }
-        if self.failure is None and method == "thread/settings/update":
-            return {"result": {}}
+        if method == "thread/settings/update":
+            if self.failure is None:
+                return {"result": {}}
+            if self.failure == "update_refused":
+                raise app_server.CodexAppServerResponseError(
+                    {"code": -32602, "message": "settings refused"}
+                )
         raise AssertionError(f"Rejected reset must not send {method}")
 
 
@@ -413,21 +418,27 @@ async def test_rejected_reset_returns_error_and_preserves_applied_settings(
     assert session.codex.catalog_cancelled == (failure == "timeout")
 
 
-@pytest.mark.parametrize("newer_effort", [None, "high"])
-async def test_rejected_reset_preserves_concurrent_selection_and_sibling_settings(
+@pytest.mark.parametrize(
+    ("attempted", "newer_effort"),
+    [("default", None), ("default", "high"), ("high", "high")],
+)
+async def test_rejected_change_preserves_concurrent_selection_and_sibling_settings(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
     monkeypatch: pytest.MonkeyPatch,
+    attempted: str,
     newer_effort: str | None,
 ) -> None:
-    """A delayed rejection restores only fields still holding this request's values."""
+    """A delayed rejection does not undo settings another request wrote meanwhile."""
     session = native_session
+    if attempted != "default":
+        session.codex.failure = "update_refused"
     monkeypatch.setattr(app_server, "_EFFORT_CATALOG_TIMEOUT_SECONDS", 5.0)
     session.codex.release_catalog = asyncio.Event()
     pending = asyncio.create_task(
         client.patch(
             f"/v1/sessions/{session.session_id}",
-            json={"reasoning_effort": "default", "model_override": "gpt-6-sol"},
+            json={"reasoning_effort": attempted, "model_override": "gpt-6-sol"},
         )
     )
     try:
@@ -450,10 +461,42 @@ async def test_rejected_reset_preserves_concurrent_selection_and_sibling_setting
     assert response.status_code == 503, response.text
     saved = session.store.get_conversation(session.session_id)
     assert saved is not None
-    assert saved.reasoning_effort == (newer_effort or "xhigh")
+    assert saved.reasoning_effort == newer_effort
     assert saved.model_override == "gpt-5.5"
     assert saved.cost_control_mode_override == "off"
     assert saved.title == "A newer title"
+
+
+async def test_rejected_change_keeps_an_effort_the_terminal_reported_meanwhile(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refusal must not roll back over the effort the terminal reports running."""
+    session = native_session
+    session.codex.failure = "update_refused"
+    monkeypatch.setattr(app_server, "_EFFORT_CATALOG_TIMEOUT_SECONDS", 5.0)
+    session.codex.release_catalog = asyncio.Event()
+    url = f"/v1/sessions/{session.session_id}"
+    pending = asyncio.create_task(client.patch(url, json={"reasoning_effort": "high"}))
+    try:
+        await asyncio.wait_for(session.codex.catalog_entered.wait(), timeout=5.0)
+        reported = await client.post(
+            f"{url}/events",
+            json={
+                "type": "external_reasoning_effort_change",
+                "data": {"reasoning_effort": "high"},
+            },
+        )
+        assert reported.status_code < 300, reported.text
+    finally:
+        session.codex.release_catalog.set()
+        response = await asyncio.wait_for(pending, timeout=5.0)
+
+    assert response.status_code == 503, response.text
+    saved = session.store.get_conversation(session.session_id)
+    assert saved is not None
+    assert saved.reasoning_effort == "high"
 
 
 async def test_overlapping_refused_changes_restore_the_applied_effort(

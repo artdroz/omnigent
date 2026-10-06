@@ -979,6 +979,7 @@ class ConversationStore(ABC):
         *,
         previous: Conversation,
         attempted: Conversation,
+        restore_effort: bool = True,
         restore_model: bool = False,
     ) -> None:
         """Restore a refused effort update without overwriting a newer selection.
@@ -990,6 +991,8 @@ class ConversationStore(ABC):
         :param conversation_id: Conversation whose settings were refused.
         :param previous: Snapshot before persisting the requested settings.
         :param attempted: Snapshot returned by that persistence operation.
+        :param restore_effort: Whether the refused effort needs rollback; false when
+            a newer write already replaced it.
         :param restore_model: Whether the unforwarded model change also needs rollback.
         """
         ...

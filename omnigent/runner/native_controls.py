@@ -258,8 +258,8 @@ def build_native_controls(
     _codex_settings_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
         weakref.WeakValueDictionary()
     )
-    # Applied models whose config mirror failed, with the stale model the config still names.
-    _codex_unmirrored_models: dict[str, tuple[str, str | None]] = {}
+    # Applied models whose config write failed, with the config revision after that update.
+    _codex_unmirrored_models: dict[str, tuple[str, tuple[int, int] | None]] = {}
 
     async def _handle_codex_native_settings_update(
         conv_id: str,
@@ -288,17 +288,17 @@ def build_native_controls(
             return response
 
     def _current_codex_model(conv_id: str, bridge_dir: Path) -> str | None:
-        """Return the thread's model, preferring one applied while its config mirror failed."""
+        """Return the thread's model, preferring one applied while its config write failed."""
         from omnigent.harnesses.codex_native.bridge import (
+            codex_config_revision,
             read_codex_config_model,
             write_codex_config_model,
         )
 
-        config_model = read_codex_config_model(bridge_dir)
         unmirrored = _codex_unmirrored_models.pop(conv_id, None)
-        # A later switch that rewrote the config supersedes the remembered model.
-        if unmirrored is None or unmirrored[1] != config_model:
-            return config_model
+        # Any later rewrite, such as a terminal model switch, makes the config current.
+        if unmirrored is None or unmirrored[1] != codex_config_revision(bridge_dir):
+            return read_codex_config_model(bridge_dir)
         if not write_codex_config_model(bridge_dir, unmirrored[0]):
             _codex_unmirrored_models[conv_id] = unmirrored
         return unmirrored[0]
@@ -313,8 +313,8 @@ def build_native_controls(
         )
         from omnigent.harnesses.codex_native.bridge import (
             bridge_dir_for_codex_home,
+            codex_config_revision,
             read_codex_config_effort,
-            read_codex_config_model,
             write_codex_config_effort,
             write_codex_config_model,
         )
@@ -351,6 +351,7 @@ def build_native_controls(
             _logger.warning(
                 "Codex-native effort change without a known model skips validation for session=%s",
                 conv_id,
+                extra={"session_id": conv_id},
             )
         codex_client = client_for_transport(
             state.socket_path,
@@ -430,15 +431,20 @@ def build_native_controls(
                 await codex_client.close()
         model = settings.get("model")
         if isinstance(model, str):
-            _codex_unmirrored_models.pop(conv_id, None)
-            if not write_codex_config_model(bridge_dir, model):
+            if write_codex_config_model(bridge_dir, model):
+                _codex_unmirrored_models.pop(conv_id, None)
+            else:
                 _logger.warning("Could not mirror Codex model for session=%s", conv_id)
-                _codex_unmirrored_models[conv_id] = (model, read_codex_config_model(bridge_dir))
+                _codex_unmirrored_models[conv_id] = (model, None)
         effort = settings.get("effort")
         if isinstance(effort, str):
             _session_reasoning_effort[conv_id] = effort
             if not write_codex_config_effort(bridge_dir, effort):
                 _logger.warning("Could not mirror Codex effort for session=%s", conv_id)
+        if (unmirrored := _codex_unmirrored_models.get(conv_id)) is not None:
+            # Stamp after this update's own writes, so only later rewrites supersede it.
+            _codex_unmirrored_models[conv_id] = (unmirrored[0], codex_config_revision(bridge_dir))
+        if isinstance(effort, str):
             # Codex emits no settings notification when normalization leaves
             # its effort unchanged, so confirm the applied value explicitly.
             if server_client is not None:

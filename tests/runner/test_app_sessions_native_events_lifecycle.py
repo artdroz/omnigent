@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import uuid
 from collections.abc import Mapping, Sequence
@@ -478,6 +479,7 @@ async def test_codex_native_settings_change_clamps_and_mirrors_effort(
         pytest.param(False, None, "max", "gpt-5.4", id="mirror_still_failing"),
         pytest.param(True, None, "max", "gpt-6-sol", id="mirror_retried"),
         pytest.param(True, "gpt-5.5", "high", "gpt-5.5", id="terminal_switched_model"),
+        pytest.param(True, "gpt-5.4", "xhigh", "gpt-5.4", id="terminal_switched_back"),
     ],
 )
 async def test_codex_native_effort_uses_the_applied_model_after_a_failed_mirror(
@@ -552,8 +554,10 @@ async def test_codex_native_effort_uses_the_applied_model_after_a_failed_mirror(
         assert codex_native_bridge.read_codex_config_model(bridge_dir) == "gpt-5.4"
         mirror["works"] = mirror_recovers
         if terminal_model is not None:
-            # A later in-terminal /model rewrites the config itself.
-            config.write_text(config.read_text().replace('"gpt-5.4"', f'"{terminal_model}"'))
+            # A later in-terminal /model replaces the config, even with the original model.
+            rewritten = config.with_name("config.toml.terminal")
+            rewritten.write_text(config.read_text().replace('"gpt-5.4"', f'"{terminal_model}"'))
+            os.replace(rewritten, config)
         picked = await client.post(
             f"/v1/sessions/{conv_id}/events", json={"type": "effort_change", "effort": "max"}
         )

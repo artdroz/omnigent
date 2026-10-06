@@ -3499,12 +3499,17 @@ class SqlAlchemyConversationStore(ConversationStore):
         *,
         previous: Conversation,
         attempted: Conversation,
+        restore_effort: bool = True,
         restore_model: bool = False,
     ) -> None:
         """Roll back refused settings under the row lock, retaining newer field values."""
-        settings = {"reasoning_effort": (attempted.reasoning_effort, previous.reasoning_effort)}
+        settings: dict[str, tuple[str | None, str | None]] = {}
+        if restore_effort:
+            settings["reasoning_effort"] = (attempted.reasoning_effort, previous.reasoning_effort)
         if restore_model:
             settings["model_override"] = (attempted.model_override, previous.model_override)
+        if not settings:
+            return
 
         def restore(session: Session) -> None:
             query = select(SqlConversation).where(

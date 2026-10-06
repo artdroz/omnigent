@@ -7,7 +7,7 @@ import contextlib
 import json
 import secrets
 import time
-import weakref
+from collections import Counter
 from collections.abc import Callable
 from typing import Any
 
@@ -132,8 +132,11 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _grant_default_public,
+    _live_settings_change,
+    _LiveSettingsChange,
     _multipart_missing_detail,
     _native_coding_agent_for_agent,
+    _note_settings_write,
     _notify_runner_of_bundled_child,
     _parse_session_create_metadata,
     _permission_level_from_grants,
@@ -314,14 +317,6 @@ async def _wake_runner_for_model_change(
     return conv
 
 
-# Orders changes within one server process; the store's compare-and-restore
-# keeps a rollback from overwriting a newer selection across processes.
-# custom-lint: disable-next=workspace-scoped-cache -- session ids are globally unique
-_SESSION_SETTINGS_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = (
-    weakref.WeakValueDictionary()
-)
-
-
 _CODEX_SETTINGS_RESTORED_MESSAGE = (
     "The terminal did not apply the model and reasoning effort changes. "
     "The previous selections have been restored."
@@ -340,14 +335,6 @@ def _runner_reply_field(body: str, key: str) -> object:
 def _codex_update_unconfirmed(result: _RunnerForwardResult) -> bool:
     """Return whether Codex timed out before confirming a settings update it may still apply."""
     return _runner_reply_field(result.body, "error") == "codex_native_settings_update_timeout"
-
-
-def _session_settings_lock(session_id: str) -> asyncio.Lock:
-    """Return the lock that orders live settings changes for *session_id*."""
-    lock = _SESSION_SETTINGS_LOCKS.get(session_id)
-    if lock is None:
-        lock = _SESSION_SETTINGS_LOCKS[session_id] = asyncio.Lock()
-    return lock
 
 
 def register_core_routes(
@@ -2258,8 +2245,9 @@ def register_core_routes(
         # A live effort/model change must read the settings its predecessor confirmed
         # or restored; otherwise a refusal can restore a value Codex never applied.
         if not body.silent and {"reasoning_effort", "model_override"} & body.model_fields_set:
-            async with _session_settings_lock(session_id):
-                return await _update_session(request, session_id, body, include_usage)
+            live_change = _live_settings_change(session_id)
+            async with live_change.lock:
+                return await _update_session(request, session_id, body, include_usage, live_change)
         return await _update_session(request, session_id, body, include_usage)
 
     async def _update_session(
@@ -2267,8 +2255,10 @@ def register_core_routes(
         session_id: str,
         body: UpdateSessionRequest,
         include_usage: bool,
+        live_change: _LiveSettingsChange | None = None,
     ) -> SessionResponse:
         """Apply the PATCH that :func:`update_session` documents."""
+        writes_before = Counter(live_change.writes) if live_change is not None else Counter()
         user_id = _get_user_id(request, auth_provider)
         if body.delete_worktree and body.archived is not True:
             raise OmnigentError(
@@ -2716,6 +2706,11 @@ def register_core_routes(
                 request, conv, conversation_store, runner_router
             )
 
+        if body.silent:
+            # A refusal of an active live change must not roll back over this write.
+            _note_settings_write(
+                session_id, {"reasoning_effort", "model_override"} & body.model_fields_set
+            )
         updated = await asyncio.to_thread(
             conversation_store.update_conversation,
             session_id,
@@ -2838,12 +2833,14 @@ def register_core_routes(
                 # when the runner confirms it did not, or after a lost fallback reply.
                 restore_model = live_model_change and not model_applied
                 if conv is not None:
+                    rewritten = live_change.rewritten(writes_before) if live_change else set()
                     await asyncio.to_thread(
                         conversation_store.restore_session_settings_if_matches,
                         session_id,
                         previous=conv,
                         attempted=updated,
-                        restore_model=restore_model,
+                        restore_effort="reasoning_effort" not in rewritten,
+                        restore_model=restore_model and "model_override" not in rewritten,
                     )
                 raise OmnigentError(
                     _CODEX_SETTINGS_RESTORED_MESSAGE
@@ -2885,12 +2882,14 @@ def register_core_routes(
                 ):
                     if combined_model_forward:
                         # The lost request also carried the effort, so restore both.
+                        rewritten = live_change.rewritten(writes_before) if live_change else set()
                         await asyncio.to_thread(
                             conversation_store.restore_session_settings_if_matches,
                             session_id,
                             previous=conv,
                             attempted=updated,
-                            restore_model=True,
+                            restore_effort="reasoning_effort" not in rewritten,
+                            restore_model="model_override" not in rewritten,
                         )
                         raise OmnigentError(
                             _CODEX_SETTINGS_RESTORED_MESSAGE, code=ErrorCode.RUNNER_UNAVAILABLE
