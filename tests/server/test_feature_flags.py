@@ -23,6 +23,7 @@ def test_features_default_off() -> None:
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
+        "harness_settings_ui": False,
     }
 
 

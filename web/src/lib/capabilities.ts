@@ -57,7 +57,7 @@ export interface Branding {
 }
 
 /** Release features understood by this frontend build. */
-export type FeatureKey = "usage_page" | "harness_install" | "canvas";
+export type FeatureKey = "usage_page" | "harness_install" | "canvas" | "harness_settings_ui";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -120,7 +120,10 @@ export interface ServerInfo {
    * branches on these (multi-repo list vs single). A provider absent from the
    * map, or the map absent entirely, defaults every flag off.
    */
-  sandbox_provider_capabilities?: Record<string, { multi_repo?: boolean }>;
+  sandbox_provider_capabilities?: Record<
+    string,
+    { multi_repo?: boolean; inference_models?: boolean }
+  >;
   /**
    * Connection providers this deploy has wired (config + store present),
    * e.g. ``["github"]`` or ``["github", "databricks"]``. Non-empty shows the
@@ -193,6 +196,12 @@ export interface ServerInfo {
    * backend (Electron, Firefox/Chromium).
    */
   dictation_available: boolean;
+  /**
+   * True when the archive PATCH accepts ``delete_worktree``. Older servers
+   * reject the unknown field, so the archive worktree prompt and setting are
+   * hidden there. Fails to ``false``.
+   */
+  archive_worktree_cleanup?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
 }
@@ -251,6 +260,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: false,
+  archive_worktree_cleanup: false,
   branding: null,
 };
 
@@ -330,7 +340,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             data.sandbox_provider_capabilities !== null &&
             typeof data.sandbox_provider_capabilities === "object" &&
             !Array.isArray(data.sandbox_provider_capabilities)
-              ? (data.sandbox_provider_capabilities as Record<string, { multi_repo?: boolean }>)
+              ? (data.sandbox_provider_capabilities as ServerInfo["sandbox_provider_capabilities"])
               : {},
           enabled_connections: Array.isArray(data.enabled_connections)
             ? data.enabled_connections.filter((p): p is string => typeof p === "string")
@@ -352,6 +362,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             ? data.installable_harnesses.filter((h): h is string => typeof h === "string")
             : [],
           dictation_available: data.dictation_available === true,
+          archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           branding: parseBranding(data.branding),
         };
         return cachedServerInfo;

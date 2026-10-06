@@ -25,6 +25,9 @@ import { useChatStore } from "@/store/chatStore";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { StreamBudgetBanner } from "@/components/StreamBudgetBanner";
+import { useSearchParams } from "@/lib/routing";
+import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
+import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
 import { RunnerStartingIndicator, McpStartupIndicator } from "@/pages/ChatIndicators";
@@ -39,7 +42,6 @@ import {
   KeepBottomOnViewportResize,
   LatestTurnSpacer,
   ScrollToBottomOnSend,
-  UserMessageNavConnected,
   WorkingIndicator,
   bubbleKey,
   buildPendingBubbles,
@@ -219,6 +221,8 @@ function TranscriptImpl({
     return () => window.removeEventListener("keydown", handleFind);
   }, [display.conversationId]);
   const disableVirtualization = nativeFindConversationId === display.conversationId;
+  const [searchParams] = useSearchParams();
+  const messageId = searchParams.get(MESSAGE_QUERY_PARAM);
 
   // Virtualizer-derived geometry (scroll handle, active turn, range nonce),
   // published by VirtualBubbleList. The rail reads the active turn and the
@@ -250,6 +254,11 @@ function TranscriptImpl({
     [display.bubbles],
   );
   const nav = useUserMessageNav(userMessageIds, ensureItemVisible);
+  useMessageDeepLink(conversationId ?? null, {
+    ensureMessageVisible: ensureItemVisible,
+    ready: display.conversationId === conversationId && !!scroller?.el && !!scrollToItemRef.current,
+    rangeNonce: spacerMeasureNonce,
+  });
 
   // One rail tick per real user turn, paired with a preview of the reply that
   // followed. Mirrors the transcript's loaded window and grows lazily.
@@ -311,14 +320,17 @@ function TranscriptImpl({
         ref={setConversationEl}
         className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
       >
-        <Conversation className={cn(!display.hasTasks && "chat-scroll-fade", "flex-1")}>
+        <Conversation
+          className={cn(
+            display.hasTasks ? "chat-scroll-composer-fade" : "chat-scroll-fade",
+            "flex-1",
+          )}
+        >
           <ConversationContent
             scrollClassName="transcript-hide-native-scrollbar"
             className={cn(
-              "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6",
+              "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6 md:px-[clamp(0px,calc((var(--chat-column-width)+3.5rem-100cqi)*0.5),1.75rem)]",
               display.hasTasks ? "pt-4" : "pt-20",
-              // Keep the rail inset in sync with the column's responsive width.
-              "md:pl-[clamp(1rem,(var(--chat-column-width)+6rem-100cqi)*0.5+1rem,1.5rem)]",
               CHAT_COLUMN_WIDTH,
             )}
           >
@@ -360,6 +372,7 @@ function TranscriptImpl({
                   conversationId={display.conversationId}
                   hasTasks={display.hasTasks}
                   disableVirtualization={disableVirtualization}
+                  messageId={messageId}
                   onGeometryChange={onGeometryChange}
                 />
                 {/* Pending elicitation cards, floated to the bottom of the chat
@@ -400,13 +413,6 @@ function TranscriptImpl({
             />
           </ConversationContent>
           <ConversationScrollButton />
-          <UserMessageNavConnected
-            goPrev={nav.goPrev}
-            goNext={nav.goNext}
-            canPrev={nav.canPrev}
-            canNext={nav.canNext}
-            hidden={userMessageIds.length === 0}
-          />
         </Conversation>
         {/* Constant-height scrollbar. Sibling of Conversation so it escapes the
         chat-scroll-fade mask. */}
@@ -546,6 +552,7 @@ export function VirtualBubbleList({
   conversationId,
   hasTasks,
   disableVirtualization,
+  messageId,
   onGeometryChange,
 }: {
   bubbles: Bubble[];
@@ -556,6 +563,7 @@ export function VirtualBubbleList({
   conversationId: string | null | undefined;
   hasTasks: boolean;
   disableVirtualization: boolean;
+  messageId?: string | null;
   /** Publishes virtualizer-derived geometry up to the rail/spacer. */
   onGeometryChange: (geometry: TranscriptGeometry) => void;
 }) {
@@ -806,7 +814,7 @@ export function VirtualBubbleList({
   // Mid-scroll mode resolves the saved bubble through the virtualizer on every
   // frame, so estimate-to-measure corrections preserve its viewport position.
   useLayoutEffect(() => {
-    if (!scrollEl || !conversationId) return;
+    if (!scrollEl || !conversationId || messageId) return;
     const c = ctxRef.current;
     const saved = transcriptViewCache.get(conversationId);
     restoringRef.current = conversationId;
@@ -867,11 +875,19 @@ export function VirtualBubbleList({
     pinAnchor();
     frame = requestAnimationFrame(tick);
     return finish;
-  }, [conversationId, scrollEl]);
+  }, [conversationId, scrollEl, messageId]);
 
   const scrollToItem = useCallback((itemId: string): boolean => {
-    const index = bubblesRef.current.findIndex((b) => b.kind === "user" && b.itemId === itemId);
+    const index = bubblesRef.current.findIndex(
+      (b) =>
+        (b.kind === "user" && b.itemId === itemId) ||
+        (b.kind === "assistant" && b.responseId === itemId),
+    );
     if (index < 0) return false;
+    const c = ctxRef.current;
+    c.stopScroll();
+    c.state.isAtBottom = false;
+    c.state.escapedFromLock = true;
     virtualizerRef.current.scrollToIndex(index, { align: "center" });
     return true;
   }, []);
