@@ -150,6 +150,7 @@ async def test_connect_tunnel(userinfo):
         (_OK + b"GARBAGE", "unexpected bytes"),
         (b"", "closed the connection"),
     ],
+    ids=["refused", "non-http", "oversized", "trailing-bytes", "eof"],
 )
 async def test_connect_error(reply, error):
     async with _connect_proxy(reply) as (port, _requests):
