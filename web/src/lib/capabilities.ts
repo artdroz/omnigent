@@ -378,6 +378,10 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           agent_install: data.agent_install === true,
           branding: parseBranding(data.branding),
         };
+        void reportServerFeatures({
+          desktop_arca_shutdown_warnings:
+            cachedServerInfo.features.desktop_arca_shutdown_warnings === true,
+        });
         return cachedServerInfo;
       }
     } catch {
@@ -385,12 +389,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
     }
     cachedServerInfo = FALLBACK_SERVER_INFO;
     return cachedServerInfo;
-  })().then((info) => {
-    void reportServerFeatures({
-      desktop_arca_shutdown_warnings: info.features.desktop_arca_shutdown_warnings === true,
-    });
-    return info;
-  });
+  })();
   return pendingServerInfo;
 }
 

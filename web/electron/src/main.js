@@ -492,6 +492,10 @@ async function promptArcaShutdown({ kind, shutdownAt, now, modes }) {
       settings.arca_shutdown_prompts = false;
       saveSettings(settings);
     }
+    if (!arcaShutdownServerGateEnabled()) {
+      console.log("[omnigent] arca shutdown: server gate closed before dialog choice");
+      return { mode: null };
+    }
     return { mode: modes[response] ?? null };
   } catch (error) {
     console.log(`[omnigent] arca shutdown: prompt failed: ${error}`);
@@ -537,20 +541,32 @@ async function reportArcaExtendResult(result) {
 }
 
 let arcaResumeListenerRegistered = false;
-const arcaShutdownFeaturesByOrigin = new Map();
+const arcaShutdownFeaturesByWindow = new Map();
 const arcaOnlineOrigins = new Set();
 
-/** Allow warnings only for an online Arca origin whose server enabled them. */
-function arcaShutdownEnabled() {
+/** Require a true report from a window for an online Arca origin. */
+function arcaShutdownServerGateEnabled() {
   return (
     arcaAutoConnectFeatureEnabled() &&
-    loadSettings().arca_shutdown_prompts !== false &&
-    [...arcaOnlineOrigins].some((origin) => arcaShutdownFeaturesByOrigin.get(origin) === true)
+    [...arcaShutdownFeaturesByWindow.values()].some(
+      ({ origin, enabled }) => enabled && arcaOnlineOrigins.has(origin),
+    )
   );
 }
 
+/** Apply the user's prompt preference after the server gate. */
+function arcaShutdownEnabled() {
+  return arcaShutdownServerGateEnabled() && loadSettings().arca_shutdown_prompts !== false;
+}
+
 /** Apply a gate change without reading Arca status when warnings are off. */
-function updateArcaShutdownWatchGate(wasEnabled) {
+function updateArcaShutdownWatchGate(wasEnabled, wasServerEnabled, origin) {
+  const serverEnabled = arcaShutdownServerGateEnabled();
+  if (serverEnabled !== wasServerEnabled) {
+    console.log(
+      `[omnigent] arca shutdown: server gate ${serverEnabled ? "on" : "off"} (${origin})`,
+    );
+  }
   if (arcaShutdownEnabled()) {
     if (wasEnabled) return;
     if (!arcaResumeListenerRegistered) {
@@ -562,6 +578,16 @@ function updateArcaShutdownWatchGate(wasEnabled) {
   } else if (wasEnabled) {
     arcaShutdownWatch.onResume();
   }
+}
+
+/** Forget a window's report when it loads or pins another server. */
+function clearArcaShutdownFeatureReport(win) {
+  const report = arcaShutdownFeaturesByWindow.get(win?.webContents?.id);
+  if (!report) return;
+  const wasEnabled = arcaShutdownEnabled();
+  const wasServerEnabled = arcaShutdownServerGateEnabled();
+  arcaShutdownFeaturesByWindow.delete(win.webContents.id);
+  updateArcaShutdownWatchGate(wasEnabled, wasServerEnabled, report.origin);
 }
 
 /** Launch-time Arca auto-connect, behind the feature flag above. */
@@ -583,9 +609,10 @@ const arcaAutoConnect = createArcaAutoConnect({
   },
   onStatus: (origin, status) => {
     const wasEnabled = arcaShutdownEnabled();
+    const wasServerEnabled = arcaShutdownServerGateEnabled();
     if (status.state === "online") arcaOnlineOrigins.add(origin);
     else arcaOnlineOrigins.delete(origin);
-    updateArcaShutdownWatchGate(wasEnabled);
+    updateArcaShutdownWatchGate(wasEnabled, wasServerEnabled, origin);
   },
   log: (message) => console.log(`[omnigent] ${message}`),
 });
@@ -1503,6 +1530,7 @@ function pinWindow(win, origin, attemptToKeep) {
   const state = windows.get(win);
   if (!state) return;
   if (state.origin !== origin) {
+    clearArcaShutdownFeatureReport(win);
     if (connectionAttempts.get(win) !== attemptToKeep) abortConnectionAttempt(win);
     if (origin === null && usesBrowserAuth(state.origin)) databricksAuth?.rejectConnection(win);
     else databricksAuth?.detach(win);
@@ -2220,6 +2248,12 @@ async function loadServerUrl(
   try {
     assertCurrent();
     let serverUrl = requestedServerUrl;
+    // A reconnect to the same pick keeps its last confirmed server gate.
+    const selectedArcaServerUrl =
+      (!interactive &&
+        serverLabel(parseServerLabels(loadSettings().server_labels), requestedServerUrl)) ||
+      requestedServerUrl;
+    if (windowArcaServerUrl(win) !== selectedArcaServerUrl) clearArcaShutdownFeatureReport(win);
     databricksAuth?.reset(win);
     oidcAuth?.detach(win);
     pinWindow(win, originOf(serverUrl), attempt);
@@ -2227,12 +2261,8 @@ async function loadServerUrl(
     const windowState = windows.get(win);
     if (windowState) {
       windowState.authKind = null;
-      // An explicit connect targets what was typed; a restore or switch lands on
-      // the workspace host and maps back to the URL picked for it.
-      windowState.arcaServerUrl =
-        (!interactive &&
-          serverLabel(parseServerLabels(loadSettings().server_labels), requestedServerUrl)) ||
-        requestedServerUrl;
+      // A restore or switch keeps the URL picked before workspace sign-in.
+      windowState.arcaServerUrl = selectedArcaServerUrl;
     }
     let target = loadUrl ?? (routePath ? resolveServerPath(serverUrl, routePath) : serverUrl);
     let manifest = null;
@@ -4751,8 +4781,9 @@ function registerIpc() {
     const origin = originOf(windowArcaServerUrl(BrowserWindow.fromWebContents(event.sender)));
     if (!origin) return null;
     const wasEnabled = arcaShutdownEnabled();
-    arcaShutdownFeaturesByOrigin.set(origin, enabled);
-    updateArcaShutdownWatchGate(wasEnabled);
+    const wasServerEnabled = arcaShutdownServerGateEnabled();
+    arcaShutdownFeaturesByWindow.set(event.sender.id, { origin, enabled });
+    updateArcaShutdownWatchGate(wasEnabled, wasServerEnabled, origin);
     return null;
   });
 

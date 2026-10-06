@@ -180,13 +180,18 @@ describe("resolveServerInfo desktop feature relay", () => {
     });
   });
 
-  it("reports false when the info request fails", async () => {
+  it("leaves the desktop's last report alone when the info request fails", async () => {
     fetchMock.mockRejectedValueOnce(new Error("offline"));
     const { resolveServerInfo } = await import("./capabilities");
     await resolveServerInfo();
-    expect(reportServerFeatures).toHaveBeenCalledExactlyOnceWith({
-      desktop_arca_shutdown_warnings: false,
-    });
+    expect(reportServerFeatures).not.toHaveBeenCalled();
+  });
+
+  it("does not report a non-OK info response", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false }));
+    const { resolveServerInfo } = await import("./capabilities");
+    await resolveServerInfo();
+    expect(reportServerFeatures).not.toHaveBeenCalled();
   });
 });
 

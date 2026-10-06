@@ -195,6 +195,7 @@ function loadNavigationHarness({
     focuses: 0,
   };
   const pickers = [];
+  const additionalWindows = new Map();
   const ipc = new Map();
   const webRequest = {};
   const jar = new Map();
@@ -358,7 +359,8 @@ function loadNavigationHarness({
         return win;
       },
       {
-        fromWebContents: (sender) => (sender === webContents ? win : null),
+        fromWebContents: (sender) =>
+          sender === webContents ? win : (additionalWindows.get(sender) ?? null),
         getFocusedWindow: () => (focusedWindow ? win : null),
         getAllWindows: () => [],
       },
@@ -688,6 +690,20 @@ function loadNavigationHarness({
     ipc,
     webRequest,
     webContents,
+    addWindow: (url, arcaServerUrl = url) => {
+      const contents = { id: additionalWindows.size + 2, getURL: () => url };
+      const other = { ...win, webContents: contents };
+      additionalWindows.set(contents, other);
+      api.windows.set(other, {
+        origin: new URL(url).origin,
+        serverUrl: url,
+        arcaServerUrl,
+        ephemeral: false,
+        badgeCount: 0,
+        browserRegistry: { closeAll: () => {} },
+      });
+      return other;
+    },
     settingsPath: path.join(userData, "settings.json"),
     powerEvents,
     pickers,
@@ -1081,10 +1097,10 @@ describe("Arca shutdown warning wiring", () => {
   const mondayEvening = new Date(2026, 9, 5, 20).getTime();
   const settings = (h, values) => fs.writeFileSync(h.settingsPath, JSON.stringify(values));
   const connect = (h) => h.api.loadServerUrl(h.win, workspace);
-  const reportGate = (h, enabled) => {
+  const reportGate = (h, enabled, win = h.win) => {
     h.api.registerIpc();
     return h.ipc.get("omnigent:report-server-features")(
-      { sender: h.webContents, senderFrame: { url: workspace } },
+      { sender: win.webContents, senderFrame: { url: win.webContents.getURL() } },
       { desktop_arca_shutdown_warnings: enabled },
     );
   };
@@ -1093,8 +1109,8 @@ describe("Arca shutdown warning wiring", () => {
   it("does not read status with auto-connect disabled", async (t) => {
     const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
     t.after(h.cleanup);
-    await reportGate(h, true);
     await connect(h);
+    await reportGate(h, true);
     assert.deepEqual(h.calls.arcaStatusReads, []);
     assert.deepEqual(h.calls.showMessageBox, []);
     assert.deepEqual(h.calls.notifications, []);
@@ -1119,12 +1135,23 @@ describe("Arca shutdown warning wiring", () => {
   });
 
   it("accepts a true report before Arca comes online", async (t) => {
-    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
+    let finishConnect;
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      arcaPath,
+      arcaResult: () =>
+        new Promise((resolve) => {
+          finishConnect = resolve;
+        }),
+    });
     t.after(h.cleanup);
     settings(h, { arca_auto_connect: true });
+    await connect(h);
+    await until(() => h.calls.arcaConnects.length === 1, "Arca auto-connect");
     await reportGate(h, true);
     assert.deepEqual(h.calls.arcaStatusReads, []);
-    await connect(h);
+    finishConnect({ ok: true, alreadyRunning: false });
     await until(() => h.calls.arcaStatusReads.length === 1, "enabled Arca status read");
   });
 
@@ -1143,6 +1170,109 @@ describe("Arca shutdown warning wiring", () => {
     assert.deepEqual(h.calls.arcaStatusReads, []);
     await reportGate(h, true);
     await until(() => h.calls.arcaStatusReads.length === 1, "labelled Arca status read");
+  });
+
+  for (const trueFirst of [true, false]) {
+    it(`keeps the true window's gate when another SPoG workspace reports false (${trueFirst ? "true first" : "false first"})`, async (t) => {
+      const picked = "https://accounts.cloud.databricks.com/omnigent?o=123";
+      const otherPick = "https://accounts.cloud.databricks.com/omnigent?o=456";
+      const h = loadNavigationHarness({
+        serverUrl: picked,
+        databricksMode: "browser",
+        arcaPath,
+        arcaWatchNow: mondayNoon,
+        arcaStatus: { ok: true, state: "running", shutdownAt: mondayNoon + 16 * 60 * 60 * 1000 },
+      });
+      t.after(h.cleanup);
+      settings(h, { arca_auto_connect: true });
+      await h.api.loadServerUrl(h.win, picked);
+      await until(() => h.calls.arcaConnects.length === 1, "Arca auto-connect");
+      const other = h.addWindow(otherPick);
+      assert.equal(new URL(picked).origin, new URL(otherPick).origin);
+      if (trueFirst) {
+        await reportGate(h, true);
+        await reportGate(h, false, other);
+      } else {
+        await reportGate(h, false, other);
+        await reportGate(h, true);
+      }
+      await until(() => h.calls.arcaStatusReads.length === 1, "first Arca status read");
+      h.powerEvents.get("resume")();
+      await until(() => h.calls.arcaStatusReads.length === 2, "resumed Arca status read");
+    });
+  }
+
+  it("drops a window's report when it loads another server on the same origin", async (t) => {
+    const picked = "https://accounts.cloud.databricks.com/omnigent?o=123";
+    const otherPick = "https://accounts.cloud.databricks.com/omnigent?o=456";
+    const h = loadNavigationHarness({
+      serverUrl: picked,
+      databricksMode: "browser",
+      arcaPath,
+      arcaWatchNow: mondayNoon,
+      arcaStatus: { ok: true, state: "running", shutdownAt: mondayNoon + 16 * 60 * 60 * 1000 },
+    });
+    t.after(h.cleanup);
+    settings(h, { arca_auto_connect: true });
+    await h.api.loadServerUrl(h.win, picked);
+    await reportGate(h, true);
+    await until(() => h.calls.arcaStatusReads.length === 1, "first Arca status read");
+    await h.api.loadServerUrl(h.win, otherPick);
+    h.powerEvents.get("resume")();
+    await wait(10);
+    assert.equal(h.calls.arcaStatusReads.length, 1);
+  });
+
+  it("keeps a report when the window reconnects to the same selected server", async (t) => {
+    const picked = "https://accounts.cloud.databricks.com/omnigent?o=123";
+    const h = loadNavigationHarness({
+      serverUrl: picked,
+      databricksMode: "browser",
+      arcaPath,
+      arcaWatchNow: mondayNoon,
+      arcaStatus: { ok: true, state: "running", shutdownAt: mondayNoon + 16 * 60 * 60 * 1000 },
+    });
+    t.after(h.cleanup);
+    settings(h, { arca_auto_connect: true });
+    await h.api.loadServerUrl(h.win, picked);
+    await reportGate(h, true);
+    await until(() => h.calls.arcaStatusReads.length === 1, "first Arca status read");
+    await h.api.loadServerUrl(h.win, picked);
+    h.powerEvents.get("resume")();
+    await until(() => h.calls.arcaStatusReads.length === 2, "status read after reconnect");
+  });
+
+  it("does not open the gate for a report from another origin", async (t) => {
+    const picked = "https://accounts.cloud.databricks.com/omnigent?o=123";
+    const h = loadNavigationHarness({ serverUrl: picked, databricksMode: "browser", arcaPath });
+    t.after(h.cleanup);
+    settings(h, { arca_auto_connect: true });
+    await h.api.loadServerUrl(h.win, picked);
+    await until(() => h.calls.arcaConnects.length === 1, "Arca auto-connect");
+    await reportGate(h, true, h.addWindow(workspace));
+    assert.deepEqual(h.calls.arcaStatusReads, []);
+    assert.equal(h.calls.powerRegistrations, 0);
+  });
+
+  it("keeps a report when its window closes", async (t) => {
+    const picked = "https://accounts.cloud.databricks.com/omnigent?o=123";
+    const h = loadNavigationHarness({
+      serverUrl: picked,
+      databricksMode: "browser",
+      arcaPath,
+      arcaWatchNow: mondayNoon,
+      arcaStatus: { ok: true, state: "running", shutdownAt: mondayNoon + 16 * 60 * 60 * 1000 },
+    });
+    t.after(h.cleanup);
+    settings(h, { arca_auto_connect: true, server_url: picked });
+    h.api.createWindow(picked);
+    await until(() => h.calls.arcaConnects.length === 1, "Arca auto-connect");
+    await reportGate(h, true);
+    await until(() => h.calls.arcaStatusReads.length === 1, "first Arca status read");
+    h.emitWindow("closed");
+    assert.equal(h.api.windows.has(h.win), false);
+    h.powerEvents.get("resume")();
+    await until(() => h.calls.arcaStatusReads.length === 2, "status read after close");
   });
 
   it("rejects foreign pages and ignores unknown or non-boolean reports", async (t) => {
@@ -1173,13 +1303,13 @@ describe("Arca shutdown warning wiring", () => {
     const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
     t.after(h.cleanup);
     settings(h, { arca_auto_connect: true });
-    await reportGate(h, true);
     await connect(h);
+    await reportGate(h, true);
     await until(() => h.calls.arcaStatusReads.length === 1, "Arca status read");
     assert.deepEqual(h.calls.arcaStatusReads, [arcaPath]);
     assert.equal(h.calls.powerRegistrations, 1);
-    await reportGate(h, true);
     await connect(h);
+    await reportGate(h, true);
     assert.equal(h.calls.powerRegistrations, 1);
   });
 
@@ -1187,8 +1317,8 @@ describe("Arca shutdown warning wiring", () => {
     const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser", arcaPath });
     t.after(h.cleanup);
     settings(h, { arca_auto_connect: true, arca_shutdown_prompts: false });
-    await reportGate(h, true);
     await connect(h);
+    await reportGate(h, true);
     assert.deepEqual(h.calls.arcaStatusReads, []);
     assert.deepEqual(h.calls.showMessageBox, []);
   });
@@ -1211,8 +1341,8 @@ describe("Arca shutdown warning wiring", () => {
     });
     t.after(h.cleanup);
     settings(h, { arca_auto_connect: true });
-    await reportGate(h, true);
     await connect(h);
+    await reportGate(h, true);
     await until(() => h.calls.showMessageBox.length === 1, "launch warning");
     const date = new Date(shutdownAt);
     const now = new Date(mondayEvening);
@@ -1254,8 +1384,8 @@ describe("Arca shutdown warning wiring", () => {
     });
     t.after(h.cleanup);
     settings(h, { arca_auto_connect: true });
-    await reportGate(h, true);
     await connect(h);
+    await reportGate(h, true);
     await until(() => h.calls.arcaExtends.length === 1, "overnight extension");
     await until(() => h.calls.notifications.length === 1, "extension notification");
     assert.deepEqual(h.calls.arcaExtends, [{ mode: "overnight", path: arcaPath }]);
@@ -1302,8 +1432,8 @@ describe("Arca shutdown warning wiring", () => {
       });
       t.after(h.cleanup);
       settings(h, { arca_auto_connect: true });
-      await reportGate(h, true);
       await connect(h);
+      await reportGate(h, true);
       await until(() => h.calls.showMessageBox.length === 1, `${day} warning`);
       const { options } = h.calls.showMessageBox[0];
       assert.deepEqual(
@@ -1336,8 +1466,8 @@ describe("Arca shutdown warning wiring", () => {
     });
     t.after(h.cleanup);
     settings(h, { arca_auto_connect: true, server_url: workspace });
-    await reportGate(h, true);
     await connect(h);
+    await reportGate(h, true);
     await until(
       () => JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).arca_shutdown_prompts === false,
       "saved Arca opt-out",
@@ -1368,14 +1498,39 @@ describe("Arca shutdown warning wiring", () => {
     });
     t.after(h.cleanup);
     settings(h, { arca_auto_connect: true, server_url: workspace });
-    await reportGate(h, true);
     await connect(h);
+    await reportGate(h, true);
     await until(
       () => JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).arca_shutdown_prompts === false,
       "saved Arca opt-out",
     );
     assert.deepEqual(h.calls.arcaExtends, []);
     assert.deepEqual(h.calls.notifications, []);
+  });
+
+  it("ignores a dialog choice after the server gate closes", async (t) => {
+    let finishDialog;
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      arcaPath,
+      arcaWatchNow: mondayNoon,
+      arcaStatus: { ok: true, state: "running", shutdownAt: soon() },
+      dialogResponse: () =>
+        new Promise((resolve) => {
+          finishDialog = resolve;
+        }),
+      focusedWindow: true,
+    });
+    t.after(h.cleanup);
+    settings(h, { arca_auto_connect: true });
+    await connect(h);
+    await reportGate(h, true);
+    await until(() => h.calls.showMessageBox.length === 1, "Arca warning dialog");
+    await reportGate(h, false);
+    finishDialog({ response: 0, checkboxChecked: false });
+    await wait(10);
+    assert.deepEqual(h.calls.arcaExtends, []);
   });
 
   it("shows the extension error detail", async (t) => {
@@ -1391,8 +1546,8 @@ describe("Arca shutdown warning wiring", () => {
     });
     t.after(h.cleanup);
     settings(h, { arca_auto_connect: true });
-    await reportGate(h, true);
     await connect(h);
+    await reportGate(h, true);
     await until(() => h.calls.showMessageBox.length === 2, "extension error dialog");
     assert.equal(h.calls.showMessageBox[1].win, h.win);
     assert.deepEqual(JSON.parse(JSON.stringify(h.calls.showMessageBox[1].options)), {
@@ -1473,8 +1628,8 @@ describe("Arca shutdown warning wiring", () => {
     t.after(h.cleanup);
     settings(h, { arca_auto_connect: true });
     assert.equal(h.powerEvents.has("resume"), false);
-    await reportGate(h, true);
     await connect(h);
+    await reportGate(h, true);
     await until(() => h.calls.arcaStatusReads.length === 1, "initial Arca status read");
     assert.equal(typeof h.powerEvents.get("resume"), "function");
     h.powerEvents.get("resume")();
