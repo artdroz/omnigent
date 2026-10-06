@@ -103,8 +103,7 @@ _last_kept: dict[str, float] = {}
 _inflight: set[str] = set()
 _state_lock = threading.Lock()
 
-# Set only on a worker, after it leaves the executor queue. Direct unit-test
-# calls to _keep_alive_for_runner have no queue delay, so the field is omitted.
+# Set by the worker wrapper; None when the helper is called directly.
 _queue_delay_s: contextvars.ContextVar[float | None] = contextvars.ContextVar(
     "managed_keepalive_queue_delay_s", default=None
 )
@@ -212,7 +211,7 @@ def touch(runner_id: str) -> None:
             exc=exc,
         )
         return
-    future.add_done_callback(lambda completed: _release_cancelled_job(completed, runner_id))
+    future.add_done_callback(lambda completed: _finalize_job(completed, runner_id))
 
 
 def _prune_throttle(now: float) -> None:
@@ -232,11 +231,21 @@ def _release_reservation(runner_id: str) -> None:
         _last_kept.pop(runner_id, None)
 
 
-def _release_cancelled_job(future: Future[None], runner_id: str) -> None:
-    """Release a reservation when an accepted executor job is cancelled."""
+def _finalize_job(future: Future[None], runner_id: str) -> None:
+    """Release a reservation whose job was cancelled or crashed before its own cleanup ran."""
     if future.cancelled():
         _release_reservation(runner_id)
         _emit_outcome(runner_id, _KeepAliveOutcome.CANCELLED, queue_delay_s=0.0)
+        return
+    exc = future.exception()
+    if exc is not None:
+        _release_reservation(runner_id)
+        _emit_outcome(
+            runner_id,
+            _KeepAliveOutcome.RESOLUTION_ERROR,
+            error_type=_bounded_error_type(exc),
+            exc=exc,
+        )
 
 
 def _run_keepalive_job(runner_id: str, queued_at: float) -> None:
@@ -398,12 +407,9 @@ def _keep_alive_for_runner(runner_id: str) -> None:
             provider_started = time.monotonic()
             try:
                 extended = config.launcher_factory().keep_alive(host.sandbox_id)
-                # INFO from the server layer so the keepalive is visible in the
-                # server log (onboarding-layer loggers do not surface there); the
-                # provider logs the new deadline at debug. A provider returns
-                # False when it attempted but could not confirm the extension (and
-                # logged its own warning); the structured outcome below remains
-                # explicit about the soft failure.
+                # INFO here so the keepalive shows in the server log (onboarding
+                # loggers do not surface there). False means the provider attempted
+                # but could not confirm; the structured outcome records that soft failure.
                 outcome = (
                     _KeepAliveOutcome.SOFT_FAILED
                     if extended is False
