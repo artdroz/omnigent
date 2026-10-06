@@ -43,7 +43,7 @@ def _mandatory_proxy(server_port: int) -> Iterator[tuple[str, list[tuple[str, st
     """Forward HTTP and CONNECT only for the otherwise unresolvable server."""
     # Appended from handler threads and read by the test thread; CPython's
     # list.append is atomic, so no lock is needed here.
-    requests: list[tuple[str, str]] = []
+    relayed: list[tuple[str, str]] = []
     stopped = threading.Event()
 
     class Handler(socketserver.BaseRequestHandler):
@@ -62,12 +62,17 @@ def _mandatory_proxy(server_port: int) -> Iterator[tuple[str, list[tuple[str, st
             if len(request_line) != 3:
                 return
             method, target, version = request_line
-            parts = urlsplit(f"//{target}" if method == "CONNECT" else target)
-            if parts.hostname != _SERVER_HOST or parts.port != server_port:
+            try:
+                parts = urlsplit(f"//{target}" if method == "CONNECT" else target)
+                hostname, port = parts.hostname, parts.port
+            except ValueError:
+                client.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                return
+            if hostname != _SERVER_HOST or port != server_port:
                 client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                 return
             with socket.create_connection(("127.0.0.1", server_port), timeout=5) as upstream:
-                requests.append((method, target))
+                relayed.append((method, target))
                 if method == "CONNECT":
                     client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 else:
@@ -102,7 +107,7 @@ def _mandatory_proxy(server_port: int) -> Iterator[tuple[str, list[tuple[str, st
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            yield f"http://127.0.0.1:{server.server_address[1]}", requests
+            yield f"http://127.0.0.1:{server.server_address[1]}", relayed
         finally:
             stopped.set()
             server.shutdown()
@@ -127,7 +132,7 @@ def test_host_comes_online_through_mandatory_proxy(
     host_log.touch()
     console_log = tmp_path / "host-console.log"
 
-    with _mandatory_proxy(server_port) as (proxy_url, requests):
+    with _mandatory_proxy(server_port) as (proxy_url, relayed):
         assert httpx.get(f"{server_url}/health", proxy=proxy_url, timeout=10).status_code == 200
         env = {
             **os.environ,
@@ -185,11 +190,11 @@ def test_host_comes_online_through_mandatory_proxy(
                         break
                     time.sleep(0.5)
                 assert online, (
-                    f"Host never came online: exit={proc.poll()}, proxy requests={requests}\n"
+                    f"Host never came online: exit={proc.poll()}, relayed requests={relayed}\n"
                     f"{host_log.read_text(errors='replace')[-3000:]}\n"
                     f"{console_log.read_text(errors='replace')[-3000:]}"
                 )
-                assert ("CONNECT", f"{_SERVER_HOST}:{server_port}") in requests
+                assert ("CONNECT", f"{_SERVER_HOST}:{server_port}") in relayed
             finally:
                 if proc.poll() is None:
                     proc.terminate()

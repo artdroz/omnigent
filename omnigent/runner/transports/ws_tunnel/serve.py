@@ -944,9 +944,10 @@ async def _serve_tunnel_once(
         if shutdown_event is not None
         else _RUNNER_TUNNEL_CLOSE_TIMEOUT_S
     )
+    connection_id = connection_id or uuid.uuid4().hex
     # websockets<15 has no proxy support and dials direct, which fails forever
     # behind a mandatory CONNECT proxy; establish the CONNECT tunnel ourselves,
-    # symmetric with the host tunnel (host/connect.py).
+    # symmetric with the host tunnel (host/connect.py) and last before connect().
     proxy_url = ws_env_proxy_url(tunnel_url)
     proxy_sock: socket.socket | None = None
     if proxy_url is not None:
@@ -958,7 +959,6 @@ async def _serve_tunnel_once(
         proxy_sock = await open_proxy_connect_socket(
             proxy_url, tunnel_url, timeout=_PROXY_CONNECT_TIMEOUT_S
         )
-    connection_id = connection_id or uuid.uuid4().hex
     async with contextlib.AsyncExitStack() as stack:
         try:
             ws = await stack.enter_async_context(

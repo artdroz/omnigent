@@ -10,6 +10,7 @@ import logging
 import socket
 import ssl
 import time
+import types
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -46,6 +47,8 @@ _OK = b"HTTP/1.1 200 Connection Established\r\n\r\n"
         (_TUNNEL_URL, {"http_proxy": "socks5://p:1"}, None),
         ("unix:///tmp/sock", {"all_proxy": "http://p:1"}, None),
         ("not a url", {"all_proxy": "http://p:1"}, None),
+        ("ws://[::1:8000/t", {"http_proxy": "http://p:1"}, None),
+        (_TUNNEL_URL, {"http_proxy": "http://[::1:3128"}, None),
         # A lowercase variable that is set but empty suppresses its uppercase
         # form, as it does for urllib and httpx.
         (_TUNNEL_URL, {"HTTP_PROXY": "http://p:2", "http_proxy": ""}, None),
@@ -106,7 +109,7 @@ def test_redact_proxy_url(userinfo):
 def test_unsupported_scheme_warns_once_without_credentials(monkeypatch, caplog):
     from omnigent.util import ws_proxy
 
-    monkeypatch.setattr(ws_proxy, "_warned_unsupported_schemes", set())
+    monkeypatch.setattr(ws_proxy, "_warned_proxy_env", set())
     env = {"http_proxy": "socks5://user:secret@p:1"}
     with caplog.at_level(logging.WARNING, logger="omnigent.util.ws_proxy"):
         assert ws_env_proxy_url(_TUNNEL_URL, env) is None
@@ -193,9 +196,13 @@ async def test_connect_tunnel_idna_host():
         ]
 
 
-async def test_connect_rejects_malformed_proxy_port():
-    with pytest.raises(OSError, match="invalid port"):
-        await open_proxy_connect_socket("http://127.0.0.1:bad", _TUNNEL_URL, timeout=5)
+@pytest.mark.parametrize(
+    ("proxy_url", "error"),
+    [("http://127.0.0.1:bad", "invalid port"), ("http://[::1:3128", "malformed")],
+)
+async def test_connect_rejects_malformed_proxy_url(proxy_url, error):
+    with pytest.raises(OSError, match=error):
+        await open_proxy_connect_socket(proxy_url, _TUNNEL_URL, timeout=5)
 
 
 async def test_connect_closes_socket_when_awaiter_is_cancelled(monkeypatch):
@@ -229,11 +236,11 @@ async def test_connect_timeout_bounds_a_slow_dial(monkeypatch):
 
     sock = socket.socket()
 
-    def slow_dial(*_args, **_kwargs):
+    def slow_dial(*_args):
         time.sleep(0.8)
         return sock
 
-    monkeypatch.setattr(ws_proxy.socket, "create_connection", slow_dial)
+    monkeypatch.setattr(ws_proxy, "_connect_sync", slow_dial)
     started = time.monotonic()
     with pytest.raises(TimeoutError, match=r"within 0\.3s"):
         await open_proxy_connect_socket("http://127.0.0.1:1", _TUNNEL_URL, timeout=0.3)
@@ -256,7 +263,10 @@ async def test_connect_timeout_race_closes_completed_dial(monkeypatch):
         await awaitable
         raise TimeoutError
 
-    monkeypatch.setattr(ws_proxy.asyncio, "wait_for", wait_for_after_completion)
+    # Patch the module's own asyncio reference, not the shared stdlib module.
+    patched_asyncio = types.SimpleNamespace(**vars(asyncio))
+    patched_asyncio.wait_for = wait_for_after_completion
+    monkeypatch.setattr(ws_proxy, "asyncio", patched_asyncio)
     with pytest.raises(TimeoutError):
         await open_proxy_connect_socket("http://127.0.0.1:1", _TUNNEL_URL, timeout=5)
     await asyncio.sleep(0)

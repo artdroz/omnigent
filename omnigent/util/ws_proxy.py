@@ -1,20 +1,15 @@
 """Mandatory-egress proxy support for omnigent's own WebSocket tunnels.
 
-Inside a sandbox whose only network path is a CONNECT proxy
-(``HTTP_PROXY``/``HTTPS_PROXY``/``ALL_PROXY`` set, no direct DNS or TCP
-egress), every proxy-honoring HTTP client reaches the server fine, but the
-pinned ``websockets<15`` client has no proxy support at all: ``connect()``
-dials the origin directly and loops on "Temporary failure in name
-resolution" forever, so the host and runner tunnels never come up.
+The pinned ``websockets<15`` client has no proxy support, so inside a sandbox
+whose only network path is a CONNECT proxy the host and runner tunnels would
+dial the origin directly and never come up. This module applies the proxy
+environment the way the host's HTTP client (httpx) does, including
+``NO_PROXY`` and the loopback exemption, and establishes the CONNECT tunnel
+so the connected socket can be handed to ``websockets`` via ``sock=``.
 
-This module gives those tunnels the same env-proxy semantics as the HTTP
-clients: :func:`ws_env_proxy_url` picks the proxy the standard environment
-variables configure for a ``ws(s)://`` URL (honoring ``NO_PROXY`` and never
-proxying loopback), and :func:`open_proxy_connect_socket` establishes the
-CONNECT tunnel so the connected socket can be handed to ``websockets`` via
-its ``sock=`` parameter. A pre-connected socket means WebSocket-level
-redirects are not followed; the tunnel endpoints never redirect, and HTTP(S)
-login redirects still surface as ``InvalidURI`` for the callers to classify.
+A pre-connected socket means WebSocket-level redirects are not followed; the
+tunnel endpoints never redirect, and HTTP(S) login redirects still surface as
+``InvalidURI`` for the callers to classify.
 """
 
 from __future__ import annotations
@@ -45,9 +40,22 @@ _DEFAULT_PORT_BY_WS_SCHEME = {"ws": 80, "wss": 443}
 _MAX_CONNECT_RESPONSE_BYTES = 65536
 
 # Proxy schemes the CONNECT dialer speaks. SOCKS / TLS-to-proxy URLs are
-# warned about once and ignored (direct dial preserves prior behavior).
+# warned about once per variable and ignored (direct dial preserves prior
+# behavior), as are values that do not parse.
 _SUPPORTED_PROXY_SCHEMES = frozenset({"http"})
-_warned_unsupported_schemes: set[str] = set()
+_warned_proxy_env: set[tuple[str, str]] = set()
+
+
+def _warn_once(key: tuple[str, str], message: str, *args: object) -> None:
+    """Log *message* the first time *key* (variable, reason) is seen.
+
+    :param key: The proxy variable and the reason it is being ignored.
+    :param message: Logging format string.
+    :param args: Format arguments.
+    """
+    if key not in _warned_proxy_env:
+        _warned_proxy_env.add(key)
+        _logger.warning(message, *args)
 
 
 def _env(environ: Mapping[str, str], name: str) -> str | None:
@@ -149,13 +157,13 @@ def ws_env_proxy_url(ws_url: str, environ: Mapping[str, str] | None = None) -> s
     """
     if environ is None:
         environ = os.environ
-    parts = urlsplit(ws_url)
-    scheme = (parts.scheme or "").lower()
-    proxy_env = _PROXY_ENV_BY_WS_SCHEME.get(scheme)
     try:
+        parts = urlsplit(ws_url)
         host, port = parts.hostname, parts.port
     except ValueError:
         return None
+    scheme = (parts.scheme or "").lower()
+    proxy_env = _PROXY_ENV_BY_WS_SCHEME.get(scheme)
     if proxy_env is None or not host:
         return None
     # A proxy resolves loopback against itself and can never reach this
@@ -173,16 +181,23 @@ def ws_env_proxy_url(ws_url: str, environ: Mapping[str, str] | None = None) -> s
     if "://" not in proxy:
         # Bare host:port proxy values are conventionally plain HTTP.
         proxy = f"http://{proxy}"
-    proxy_scheme = (urlsplit(proxy).scheme or "").lower()
+    try:
+        proxy_scheme = (urlsplit(proxy).scheme or "").lower()
+    except ValueError:
+        _warn_once(
+            (proxy_env, "malformed"),
+            "Ignoring malformed %s value for WebSocket tunnels; dialing direct",
+            proxy_env,
+        )
+        return None
     if proxy_scheme not in _SUPPORTED_PROXY_SCHEMES:
-        if proxy_scheme not in _warned_unsupported_schemes:
-            _warned_unsupported_schemes.add(proxy_scheme)
-            _logger.warning(
-                "Ignoring %s proxy scheme %r for WebSocket tunnels: only http:// "
-                "CONNECT proxies are supported; dialing direct",
-                proxy_env,
-                proxy_scheme,
-            )
+        _warn_once(
+            (proxy_env, proxy_scheme),
+            "Ignoring %s proxy scheme %r for WebSocket tunnels: only http:// "
+            "CONNECT proxies are supported; dialing direct",
+            proxy_env,
+            proxy_scheme,
+        )
         return None
     return proxy
 
@@ -217,8 +232,11 @@ async def open_proxy_connect_socket(
         refuses the CONNECT, answers with something other than HTTP, or
         exhausts the budget.
     """
-    proxy = urlsplit(proxy_url)
-    target = urlsplit(ws_url)
+    try:
+        proxy = urlsplit(proxy_url)
+        target = urlsplit(ws_url)
+    except ValueError as exc:
+        raise OSError(f"malformed proxy or tunnel URL: {exc}") from exc
     if not proxy.hostname:
         raise OSError(f"proxy URL has no host: {redact_proxy_url(proxy_url)!r}")
     if not target.hostname:
