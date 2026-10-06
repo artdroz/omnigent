@@ -76,13 +76,12 @@ def test_image_file_renders_as_img(
     request: pytest.FixtureRequest,
     seeded_image_session: tuple[str, str, str],
 ) -> None:
-    """An image file renders once, as a single blob-backed <img>.
+    """An image opens in one viewer as a single blob-backed <img>, with one
+    content GET.
 
-    The fix proof is the mount count: a CSS-hidden mobile viewer twin would
-    mount a second file-viewer and <img> and decode the image again. The
-    single-content-GET assertion is a separate request-count guard — the shared
-    React Query cache already dedupes the fetch across mounts — not the
-    fail-before signal.
+    One mounted viewer yields one <img> and one image decode; a hidden twin
+    would add a second mount. React Query dedupes the content fetch, so the
+    single-GET count is a separate request-fan-out guard.
     """
     base_url, session_id, _file_path = seeded_image_session
     # Created after seeding so a recording starts at the first navigation.

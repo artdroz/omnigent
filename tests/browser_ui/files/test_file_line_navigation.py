@@ -711,3 +711,52 @@ def test_markdown_diff_url_stays_stable_across_responsive_layouts(
         )
         transitions.append(None if diff_on else "1")
         assert page.evaluate("window.diffUrlTransitions") == transitions
+
+
+def test_comment_deep_link_reopens_across_responsive_layouts(
+    page: Page, seeded_session: BrowserSession
+) -> None:
+    """A ?comment= deep link keeps opening the linked comment after each resize.
+
+    Only the active layout mounts a viewer, so crossing the md breakpoint
+    remounts it. The file and comment URL params must rehydrate the linked
+    comment on the fresh instance instead of being dropped.
+    """
+    base_url, session_id = seeded_session
+    path = "src/notes.md"
+    content = "# Notes\nReview this line\n"
+    _mock_markdown_files(page, seeded_session, {path: content})
+    anchor = "Review this line"
+    start = content.index(anchor)
+    seeded_session.comments.append(
+        {
+            "id": "resize-comment",
+            "conversation_id": session_id,
+            "path": path,
+            "body": "Survives the layout swap",
+            "start_index": start,
+            "end_index": start + len(anchor),
+            "anchor_content": anchor,
+            "status": "draft",
+            "created_at": 1,
+            "updated_at": 1,
+            "created_by": None,
+        }
+    )
+    page.set_viewport_size({"width": 1600, "height": 1000})
+    page.goto(f"{base_url}/c/{session_id}?file={path}&comment=resize-comment")
+    comment_url = re.compile(r"[?&]comment=resize-comment(?:&|$)")
+
+    def expect_linked_comment() -> None:
+        # URL is the deterministic signal; the panel body proves the viewer
+        # re-applied the deep link after the remount.
+        expect(page).to_have_url(comment_url)
+        viewer = page.locator('[data-testid="file-viewer"]:visible')
+        expect(viewer.get_by_text("Survives the layout swap", exact=True)).to_be_visible(
+            timeout=30_000
+        )
+
+    expect_linked_comment()
+    for width in (600, 1600, 600):
+        page.set_viewport_size({"width": width, "height": 1000})
+        expect_linked_comment()
