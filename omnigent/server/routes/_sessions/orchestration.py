@@ -216,6 +216,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
+    _session_status_edge_seq,
     _session_terminal_pending_cache,
     get_caps,
     get_server_runner_router,
@@ -11862,9 +11863,11 @@ async def _probe_runner_live_status(
     Ask a session's bound runner for its live status, bounded, shared, and backed off.
 
     Concurrent snapshots of one session await the same in-flight probe. A 200
-    records the status in ``_session_status_cache``; a probe that timed out,
-    failed in transport, or answered slowly without a status puts the session
-    in a skip window that doubles per consecutive slow probe.
+    records the status in ``_session_status_cache`` unless doing so would
+    false-settle a live row to ``idle`` (see ``_should_settle_probe_status``);
+    a probe that timed out, failed in transport, or answered slowly without a
+    status puts the session in a skip window that doubles per consecutive slow
+    probe.
 
     :param runner_client: HTTP client pointed at the session's runner.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
@@ -11888,6 +11891,37 @@ async def _probe_runner_live_status(
     return await asyncio.shield(probe)
 
 
+def _should_settle_probe_status(
+    session_id: str, raw: str, payload: dict[str, object], start_epoch: int
+) -> bool:
+    """
+    Decide whether a runner status probe may write ``raw`` to the status cache.
+
+    Filling a cache miss or confirming ``running``/``waiting``/``failed`` always
+    proceeds. Using the probe to DOWNGRADE a live ``running``/``waiting`` row to
+    ``idle`` is only safe when the answer is both authoritative and current;
+    three ways it is not:
+
+    - the runner predates native-pane turn tracking (it omits
+      ``counts_native_turns``), so its ``idle`` can be a false idle for a live
+      native turn whose terminal the runner does not count;
+    - a newer turn opened and named a response id while the probe was in flight;
+    - any status edge landed during the probe (a bumped ``_session_status_edge_seq``),
+      so its cache value is fresher than this probe's now-stale ``idle``.
+
+    In each unsafe case the live row is left as-is; a later probe settles it once
+    the runner is native-aware or the session is genuinely idle again.
+    """
+    current = _session_status_cache.get(session_id)
+    if raw != "idle" or current not in ("running", "waiting"):
+        return True
+    if payload.get("counts_native_turns") is not True:
+        return False
+    if _session_active_response_cache.get(session_id) is not None:
+        return False
+    return _session_status_edge_seq.get(session_id, 0) == start_epoch
+
+
 async def _run_runner_status_probe(
     runner_client: httpx.AsyncClient, session_id: str, runner_id: str | None
 ) -> str | None:
@@ -11900,6 +11934,9 @@ async def _run_runner_status_probe(
     :returns: The runner's raw status on a 200, else ``None``.
     """
     started = time.monotonic()
+    # Captured before the runner round-trip so a concurrent status edge that
+    # lands while we await can be detected before a stale ``idle`` is written.
+    start_epoch = _session_status_edge_seq.get(session_id, 0)
     try:
         try:
             resp = await asyncio.wait_for(
@@ -11921,9 +11958,10 @@ async def _run_runner_status_probe(
                     payload = None
                 if isinstance(payload, dict):
                     raw = str(payload.get("status", "idle"))
-                    _session_status_cache[session_id] = raw
-                    if raw in ("idle", "running", "waiting", "failed"):
-                        session_live_state.persist_live_status(session_id, raw)
+                    if _should_settle_probe_status(session_id, raw, payload, start_epoch):
+                        _session_status_cache[session_id] = raw
+                        if raw in ("idle", "running", "waiting", "failed"):
+                            session_live_state.persist_live_status(session_id, raw)
                     _runner_status_probe_backoff.pop(session_id, None)
                     return raw
                 failure = "HTTP 200 with a malformed body"

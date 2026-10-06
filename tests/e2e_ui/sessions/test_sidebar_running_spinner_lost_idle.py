@@ -1,20 +1,14 @@
-"""Regression for OMNI-10125: the sidebar progress spinner spins forever on a
-session with no active work after a lost terminal-idle edge.
+"""A session whose runner is alive but holds no turn must not stay ``running``
+in ``GET /v1/sessions`` after its terminal-idle edge is lost.
 
-The sidebar badge renders a spinning ``running-dot`` purely from
-``conversation.status == "running"`` in ``GET /v1/sessions``, so the stuck
-spinner is exactly a stuck list status. This asserts the status, the lowest
-layer that reproduces the bug.
-
-The bug needs a *live* runner: the orphan-reconcile backstop only settles a
-stuck "running" row when the runner is confirmed gone. A fresh/live runner with
-no in-flight turn is left running, so a DB-seed with a fake runner (see
+The sidebar badge renders its spinner purely from
+``conversation.status == "running"`` in the list, so a stuck spinner is a
+stuck list status; this asserts it at that layer. The invariant needs a *live*
+runner: the orphan-reconcile backstop only settles a stuck row once the runner
+is confirmed gone, so a DB seed with a fake runner (see
 ``tests/server/routes/test_orphaned_running_session_reconcile.py``) cannot
-express it. This binds to the e2e lane's real runner instead.
-
-The observation runs past the SPA's connected list-refetch interval (60s) to
-show the stuck status does not self-clear within the window the frontend would
-re-poll in.
+express it. This binds to the e2e lane's real runner and exercises the real
+list -> tunnel -> runner -> list reconcile.
 """
 
 from __future__ import annotations
@@ -23,9 +17,10 @@ import time
 
 import httpx
 
-# Exceed the SPA's connected list refetch interval (60s) so a clear would have
-# to come from a reconcile, not a stale cached response.
-OBSERVE_SECONDS = 80.0
+# The settle is a background probe scheduled by the list read, so a healthy run
+# clears within a poll or two; the deadline only bounds a regression.
+SETTLE_DEADLINE_SECONDS = 30.0
+POLL_INTERVAL_SECONDS = 1.0
 
 
 def _list_status(base_url: str, session_id: str) -> str | None:
@@ -37,7 +32,7 @@ def _list_status(base_url: str, session_id: str) -> str | None:
 
 def _post_lost_idle_running(base_url: str, session_id: str) -> None:
     """Post a lone ``running`` status with no following ``idle`` over the real
-    external_session_status wire — a lost terminal-idle edge."""
+    external_session_status wire: a lost terminal-idle edge."""
     resp = httpx.post(
         f"{base_url}/v1/sessions/{session_id}/events",
         json={"type": "external_session_status", "data": {"status": "running"}},
@@ -62,19 +57,18 @@ def test_list_settles_lost_idle_running_session_with_live_runner(
 
     # The runner is alive and has no in-flight turn, so the list must stop
     # reporting running (the spinner must stop) rather than spin forever.
-    start = time.time()
-    deadline = start + OBSERVE_SECONDS
+    start = time.monotonic()
+    polls: list[str] = []
     status = "running"
-    while time.time() < deadline:
+    while time.monotonic() - start < SETTLE_DEADLINE_SECONDS:
         status = _list_status(base_url, session_id) or "idle"
-        elapsed = time.time() - start
-        print(f"[OMNI-10125] t={elapsed:5.1f}s GET /v1/sessions status={status!r}")
+        polls.append(f"t={time.monotonic() - start:.1f}s {status}")
         if status != "running":
             break
-        time.sleep(10.0)
+        time.sleep(POLL_INTERVAL_SECONDS)
 
     assert status != "running", (
-        f"GET /v1/sessions still reports running after {OBSERVE_SECONDS:.0f}s "
-        "(past the 60s list-refetch interval) for a live-runner session with no "
-        "active work; the sidebar spinner never stops (OMNI-10125)"
+        f"GET /v1/sessions still reports running after {SETTLE_DEADLINE_SECONDS:.0f}s "
+        "for a live-runner session with no active work; the sidebar spinner never "
+        f"stops. Polls: {polls}"
     )

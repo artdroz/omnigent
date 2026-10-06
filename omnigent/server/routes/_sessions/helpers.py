@@ -234,6 +234,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
+    _session_status_edge_seq,
     _session_terminal_pending_cache,
     build_policy_engine,
     get_agent_cache,
@@ -4868,6 +4869,10 @@ def _publish_status(
     previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
     if previous_status != status:
+        # A fresh edge invalidates any runner probe mid-flight: bump the epoch
+        # so the probe can tell its ``idle`` answer went stale (e.g. a new
+        # native ``running`` arrived) and must not overwrite this value.
+        _session_status_edge_seq[session_id] = _session_status_edge_seq.get(session_id, 0) + 1
         _publish_child_status_to_parent(session_id, status)
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
@@ -5050,27 +5055,23 @@ def spawn_live_runner_idle_reconcile(
     runner_router: RunnerRouter,
 ) -> None:
     """
-    Re-probe a session stuck ``running`` whose live runner may hold no turn.
+    Schedule a cooldown-limited runner probe for a suspected lost terminal status.
 
-    The confirmed-gone backstop (``reconcile_orphaned_running_status``)
-    deliberately leaves a fresh-runner row running so a real in-flight turn is
-    never falsely idled. But a terminal ``idle`` edge can be lost while the
-    runner stays alive — a dropped relay frame, a failed stop hook, replica lag
-    — stranding the row ``running`` with no turn behind it, so the sidebar
-    spinner never stops. ``GET /v1/sessions`` is a hot poll, so this fires the
-    shared, backed-off runner status probe in the background rather than
-    blocking the list: the probe rewrites ``_session_status_cache`` (and the
-    persisted relay status) from the runner's authoritative status, settling a
-    lost-edge row to idle or confirming a still-running turn for the next poll.
-    A per-session cooldown keyed to the probed runner keeps a genuinely running
-    session off the probe on every poll while still re-probing a rebound session
-    at once, and the task is held in a module set until it finishes so the loop
-    cannot collect it early.
+    The confirmed-gone backstop (``reconcile_orphaned_running_status``) leaves a
+    fresh-runner row running so a real in-flight turn is never falsely idled,
+    but a terminal ``idle`` edge can be lost while the runner stays alive (a
+    dropped relay frame, replica lag), stranding the row ``running`` with no
+    turn behind it. ``GET /v1/sessions`` is a hot poll, so this fires the
+    shared, backed-off runner status probe in the background; the probe
+    rewrites the cached and persisted status from the runner's answer, settling
+    a lost-edge row to idle or confirming a still-running turn for the next
+    poll. The task is held in a module set until it finishes so the loop cannot
+    collect it early.
 
     :param session_id: Session/conversation identifier to reconcile.
     :param runner_id: The runner bound on the list row, keying the per-session
-        probe cooldown so a session rebound to a different runner is re-probed at
-        once instead of skipped as a repeat.
+        cooldown so a busy session is not re-probed on every poll while a
+        session rebound to another runner is re-probed at once.
     :param runner_router: Router used to reach the pinned runner.
     """
     if _live_runner_probe_cooldown.get(session_id) == runner_id:

@@ -42,6 +42,7 @@ from omnigent.runner.routing import RoutedRunner, RunnerRouter
 from omnigent.server.routes._sessions.common import (
     _runner_status_probe_backoff,
     _runner_status_probe_inflight,
+    _session_status_edge_seq,
 )
 from omnigent.server.routes._sessions.helpers import (
     _live_runner_probe_cooldown,
@@ -88,24 +89,37 @@ def _seed_running_session(db_uri: str, *, runner_fresh: bool) -> str:
     return conv.id
 
 
+def _cancel_pending_reconcile_tasks() -> None:
+    """Cancel in-flight reconcile tasks before clearing the tracking set.
+
+    A fire-and-forget probe outliving its test would otherwise race the next
+    test's caches; cancelling first keeps the isolation clean.
+    """
+    for task in list(_live_runner_reconcile_tasks):
+        task.cancel()
+    _live_runner_reconcile_tasks.clear()
+
+
 @pytest.fixture(autouse=True)
 def _isolate_status_cache() -> Iterator[None]:
     """Keep the module-level relay status caches from leaking across tests."""
     status_snapshot = dict(_session_status_cache)
     response_snapshot = dict(_session_active_response_cache)
     _live_runner_probe_cooldown.clear()
-    _live_runner_reconcile_tasks.clear()
+    _cancel_pending_reconcile_tasks()
     _runner_status_probe_backoff.clear()
     _runner_status_probe_inflight.clear()
+    _session_status_edge_seq.clear()
     yield
     _session_status_cache.clear()
     _session_status_cache.update(status_snapshot)
     _session_active_response_cache.clear()
     _session_active_response_cache.update(response_snapshot)
     _live_runner_probe_cooldown.clear()
-    _live_runner_reconcile_tasks.clear()
+    _cancel_pending_reconcile_tasks()
     _runner_status_probe_backoff.clear()
     _runner_status_probe_inflight.clear()
+    _session_status_edge_seq.clear()
 
 
 def _seed_live_idle_suspect(db_uri: str) -> tuple[str, str]:
@@ -258,6 +272,10 @@ class _StubRunnerRouter:
     def __init__(self, routed: RoutedRunner | None | BaseException) -> None:
         self._routed = routed
 
+    def rebind(self, routed: RoutedRunner) -> None:
+        """Model the session being re-pinned to a different runner."""
+        self._routed = routed
+
     def client_for_existing_conversation(self, conversation_id: str) -> RoutedRunner | None:
         del conversation_id
         if isinstance(self._routed, BaseException):
@@ -265,12 +283,20 @@ class _StubRunnerRouter:
         return self._routed
 
 
-def _runner_client(runner_status: str) -> httpx.AsyncClient:
-    """An httpx client whose GET /v1/sessions/{id} returns a fixed status."""
+def _runner_client(runner_status: str, *, counts_native_turns: bool = True) -> httpx.AsyncClient:
+    """An httpx client whose GET /v1/sessions/{id} returns a fixed status.
+
+    :param counts_native_turns: Whether the stub advertises that its status
+        folds in native-pane turns. Omitted from the payload when ``False`` to
+        model a runner that predates that capability.
+    """
 
     def handler(request: httpx.Request) -> httpx.Response:
         del request
-        return httpx.Response(200, json={"status": runner_status})
+        payload: dict[str, object] = {"status": runner_status}
+        if counts_native_turns:
+            payload["counts_native_turns"] = True
+        return httpx.Response(200, json=payload)
 
     return httpx.AsyncClient(base_url="http://runner", transport=httpx.MockTransport(handler))
 
@@ -312,6 +338,115 @@ async def test_spawn_reconcile_relays_runner_status_to_cache(
     assert _session_status_cache.get(sid) == expected_cache
 
 
+async def test_spawn_reconcile_keeps_running_when_runner_lacks_native_capability(
+    db_uri: str,
+) -> None:
+    """A runner that predates native-pane turn tracking (no
+    ``counts_native_turns``) must not false-settle a live row: its bare
+    ``idle`` can be a false idle for a native turn whose terminal it does not
+    count. The row stays running until a native-aware runner answers."""
+    sid, runner_id = _seed_live_idle_suspect(db_uri)
+    client = _runner_client("idle", counts_native_turns=False)
+    router = cast(
+        RunnerRouter,
+        _StubRunnerRouter(RoutedRunner(runner_id=runner_id, client=client)),
+    )
+    try:
+        spawn_live_runner_idle_reconcile(sid, runner_id, router)
+        await _drain_reconcile_tasks()
+    finally:
+        await client.aclose()
+
+    assert _session_status_cache.get(sid) == "running"
+
+
+async def test_spawn_reconcile_keeps_running_when_turn_opens_during_probe(
+    db_uri: str,
+) -> None:
+    """A turn that opens and names a response id while the probe is in flight
+    is a real in-flight turn: the probe's now-stale ``idle`` must not clobber
+    it, even from a native-aware runner."""
+    sid, runner_id = _seed_live_idle_suspect(db_uri)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        # A new turn opens mid-probe, naming a response id.
+        _session_active_response_cache[sid] = "resp_new"
+        return httpx.Response(200, json={"status": "idle", "counts_native_turns": True})
+
+    client = httpx.AsyncClient(base_url="http://runner", transport=httpx.MockTransport(handler))
+    router = cast(
+        RunnerRouter,
+        _StubRunnerRouter(RoutedRunner(runner_id=runner_id, client=client)),
+    )
+    try:
+        spawn_live_runner_idle_reconcile(sid, runner_id, router)
+        await _drain_reconcile_tasks()
+    finally:
+        await client.aclose()
+
+    assert _session_status_cache.get(sid) == "running"
+
+
+async def test_spawn_reconcile_keeps_running_when_status_edge_lands_during_probe(
+    db_uri: str,
+) -> None:
+    """A status edge during the probe (e.g. a new native ``running`` that
+    carries no response id) bumps the status epoch, so the probe's now-stale
+    ``idle`` is not written over the fresher running row."""
+    sid, runner_id = _seed_live_idle_suspect(db_uri)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        # A fresh edge lands while the probe awaits the runner.
+        _session_status_edge_seq[sid] = _session_status_edge_seq.get(sid, 0) + 1
+        return httpx.Response(200, json={"status": "idle", "counts_native_turns": True})
+
+    client = httpx.AsyncClient(base_url="http://runner", transport=httpx.MockTransport(handler))
+    router = cast(
+        RunnerRouter,
+        _StubRunnerRouter(RoutedRunner(runner_id=runner_id, client=client)),
+    )
+    try:
+        spawn_live_runner_idle_reconcile(sid, runner_id, router)
+        await _drain_reconcile_tasks()
+    finally:
+        await client.aclose()
+
+    assert _session_status_cache.get(sid) == "running"
+
+
+def test_publish_status_bumps_edge_seq_on_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A status transition bumps the per-session epoch (so an in-flight probe
+    can tell a fresher edge landed); a no-op repeat of the same value does
+    not."""
+    from omnigent.server import session_live_state
+    from omnigent.server.routes._sessions import helpers
+
+    monkeypatch.setattr(
+        session_live_state, "persist_scheduled_run_completion", lambda *a, **k: None
+    )
+    monkeypatch.setattr(helpers, "_publish_child_status_to_parent", lambda *a, **k: None)
+
+    sid = "conv_edge_seq_probe"
+    _session_status_cache.pop(sid, None)
+    _session_status_edge_seq.pop(sid, None)
+
+    helpers._publish_status(sid, "running", persist_live_status=False)
+    first = _session_status_edge_seq.get(sid, 0)
+    assert first >= 1
+
+    # A repeat of the same value is not a transition: no bump.
+    helpers._publish_status(sid, "running", persist_live_status=False)
+    assert _session_status_edge_seq.get(sid, 0) == first
+
+    # A real transition bumps again.
+    helpers._publish_status(sid, "idle", persist_live_status=False)
+    assert _session_status_edge_seq.get(sid, 0) == first + 1
+
+
 async def test_spawn_reconcile_leaves_row_when_runner_unreachable(
     db_uri: str,
 ) -> None:
@@ -334,75 +469,51 @@ async def test_spawn_reconcile_leaves_row_when_runner_unreachable(
     assert _session_status_cache.get(sid) == "running"
 
 
-async def test_spawn_reconcile_backs_off_within_cooldown(
+async def test_spawn_reconcile_cooldown_is_keyed_to_probed_runner(
     db_uri: str,
 ) -> None:
-    """A probe sets a per-session cooldown, so the next hot list poll within
-    the window skips re-probing the still-busy runner."""
-    sid, runner_id = _seed_live_idle_suspect(db_uri)
-    probes = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal probes
-        del request
-        probes += 1
-        return httpx.Response(200, json={"status": "running"})
-
-    client = httpx.AsyncClient(base_url="http://runner", transport=httpx.MockTransport(handler))
-    router = cast(
-        RunnerRouter,
-        _StubRunnerRouter(RoutedRunner(runner_id=runner_id, client=client)),
-    )
-    try:
-        spawn_live_runner_idle_reconcile(sid, runner_id, router)
-        await _drain_reconcile_tasks()
-        assert probes == 1
-        assert _live_runner_probe_cooldown.get(sid) is not None
-
-        # A second poll within the cooldown must not re-probe the busy runner.
-        spawn_live_runner_idle_reconcile(sid, runner_id, router)
-        await _drain_reconcile_tasks()
-        assert probes == 1
-    finally:
-        await client.aclose()
-
-
-async def test_spawn_reconcile_reprobes_rebound_runner(
-    db_uri: str,
-) -> None:
-    """The cooldown is keyed to the probed runner, so a session rebound to a
-    different runner is re-probed at once rather than skipped as a repeat."""
+    """A probe sets a per-session cooldown keyed to the probed runner: the next
+    hot list poll within the window skips the still-busy runner, while a
+    session rebound to a different runner is re-probed at once, on that
+    replacement runner."""
     sid, runner_a = _seed_live_idle_suspect(db_uri)
     runner_b = runner_a[:-1] + ("0" if runner_a[-1] != "0" else "1")
-    probes = 0
+    probes: dict[str, int] = {runner_a: 0, runner_b: 0}
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal probes
-        del request
-        probes += 1
-        return httpx.Response(200, json={"status": "running"})
+    def _counting_client(runner_id: str) -> httpx.AsyncClient:
+        def handler(request: httpx.Request) -> httpx.Response:
+            del request
+            probes[runner_id] += 1
+            return httpx.Response(200, json={"status": "running"})
 
-    client = httpx.AsyncClient(base_url="http://runner", transport=httpx.MockTransport(handler))
-    router = cast(
-        RunnerRouter,
-        _StubRunnerRouter(RoutedRunner(runner_id=runner_a, client=client)),
-    )
+        return httpx.AsyncClient(
+            base_url=f"http://{runner_id}", transport=httpx.MockTransport(handler)
+        )
+
+    client_a = _counting_client(runner_a)
+    client_b = _counting_client(runner_b)
+    stub = _StubRunnerRouter(RoutedRunner(runner_id=runner_a, client=client_a))
+    router = cast(RunnerRouter, stub)
     try:
         spawn_live_runner_idle_reconcile(sid, runner_a, router)
         await _drain_reconcile_tasks()
-        assert probes == 1
+        assert probes == {runner_a: 1, runner_b: 0}
+        assert _live_runner_probe_cooldown.get(sid) == runner_a
 
         # The same runner within the window is skipped ...
         spawn_live_runner_idle_reconcile(sid, runner_a, router)
         await _drain_reconcile_tasks()
-        assert probes == 1
+        assert probes == {runner_a: 1, runner_b: 0}
 
-        # ... but a rebind to a different runner re-probes at once.
+        # ... but a rebind to a different runner re-probes that runner at once.
+        stub.rebind(RoutedRunner(runner_id=runner_b, client=client_b))
         spawn_live_runner_idle_reconcile(sid, runner_b, router)
         await _drain_reconcile_tasks()
-        assert probes == 2
+        assert probes == {runner_a: 1, runner_b: 1}
+        assert _live_runner_probe_cooldown.get(sid) == runner_b
     finally:
-        await client.aclose()
+        await client_a.aclose()
+        await client_b.aclose()
 
 
 # ── Facet 3: GET /v1/sessions hands lost-edge suspects to the probe ─────────

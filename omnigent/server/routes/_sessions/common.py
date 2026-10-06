@@ -586,6 +586,12 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 _session_status_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
+# Per-session epoch bumped on every status transition (``_publish_status``). A
+# runner probe captures it before awaiting and rechecks it before downgrading a
+# live row to ``idle``; a change means a fresher edge landed meanwhile.
+_session_status_edge_seq: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+
+
 @dataclass
 class _RunnerStatusProbeBackoff:
     """
@@ -1234,6 +1240,7 @@ __all__ = [
     "_session_mcp_startup_cache",
     "_session_sandbox_status_cache",
     "_session_status_cache",
+    "_session_status_edge_seq",
     "_session_terminal_pending_cache",
     "get_server_host_registry",
     "get_server_runner_router",

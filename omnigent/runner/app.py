@@ -3218,6 +3218,10 @@ def create_runner_app(
                 "reasoning_effort": None,
                 "items": [],
                 "permission_level": None,
+                # ``status`` counts native-pane turns; the server only lets an
+                # ``idle`` settle a live row when this is present, so an older
+                # runner's bare ``idle`` cannot false-settle a native turn.
+                "counts_native_turns": True,
             },
         )
 
