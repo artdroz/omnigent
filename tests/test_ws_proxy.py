@@ -133,6 +133,8 @@ def test_proxy_selection(url, env, expected):
         ("[fd00::1]:8000", "[fd00::1]:8000", True),
         ("[fd00:0:0:0:0:0:0:1]:8000", "fd00::1", False),
         ("evil.10.1.2.3:8000", "10.1.2.3", False),
+        # CIDR entries are not interpreted, as in httpx.
+        ("10.1.2.3:8000", "10.0.0.0/8", False),
         # Deliberately stricter than httpx, which suffix-matches IP entries with a port.
         ("evil.10.1.2.3:8000", "10.1.2.3:8000", False),
         ("server.sandbox.test:8000", "localhost,10.1.2.3,fd00::1", False),
@@ -149,18 +151,21 @@ def test_redact_proxy_url(userinfo):
     assert redact_proxy_url(f"http://{userinfo}proxy:3128/path?token=x#f") == "http://proxy:3128"
 
 
-@pytest.mark.parametrize("variable", ["http_proxy", "ALL_PROXY"])
-def test_unsupported_scheme_warns_once_without_credentials(monkeypatch, caplog, variable):
+@pytest.mark.parametrize(
+    ("variable", "scheme"),
+    [("http_proxy", "socks5"), ("ALL_PROXY", "socks5"), ("http_proxy", "https")],
+)
+def test_unsupported_scheme_warns_once_without_credentials(monkeypatch, caplog, variable, scheme):
     from omnigent.util import ws_proxy
 
     monkeypatch.setattr(ws_proxy, "_warned_proxy_env", set())
-    env = {variable: "socks5://user:secret@p:1"}
+    env = {variable: f"{scheme}://user:secret@p:1"}
     with caplog.at_level(logging.WARNING, logger="omnigent.util.ws_proxy"):
         assert ws_env_proxy_url(_TUNNEL_URL, env) is None
         assert ws_env_proxy_url(_TUNNEL_URL, env) is None
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
-    assert variable.lower() in warnings[0] and "socks5" in warnings[0]
+    assert variable.lower() in warnings[0] and scheme in warnings[0]
     assert "secret" not in warnings[0]
 
 
@@ -242,12 +247,17 @@ async def test_connect_tunnel_idna_host():
 
 
 @pytest.mark.parametrize(
-    ("proxy_url", "error"),
-    [("http://127.0.0.1:bad", "invalid port"), ("http://[::1:3128", "malformed")],
+    ("proxy_url", "ws_url", "error"),
+    [
+        ("http://127.0.0.1:bad", _TUNNEL_URL, "invalid port"),
+        ("http://[::1:3128", _TUNNEL_URL, "malformed"),
+        ("http://127.0.0.1:1", "ws://server.sandbox.test:bad/t", "invalid port"),
+        ("http://127.0.0.1:1", "ws://[::1:8000/t", "malformed"),
+    ],
 )
-async def test_connect_rejects_malformed_proxy_url(proxy_url, error):
+async def test_connect_rejects_malformed_proxy_url(proxy_url, ws_url, error):
     with pytest.raises(OSError, match=error):
-        await open_proxy_connect_socket(proxy_url, _TUNNEL_URL, timeout=5)
+        await open_proxy_connect_socket(proxy_url, ws_url, timeout=5)
 
 
 async def test_connect_closes_socket_when_awaiter_is_cancelled(monkeypatch):

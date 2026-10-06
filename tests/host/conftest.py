@@ -1,4 +1,4 @@
-"""Isolate tunnel tests from inherited proxy settings."""
+"""Isolate every test under tests/host from inherited proxy settings."""
 
 import os
 

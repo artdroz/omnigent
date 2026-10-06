@@ -1,4 +1,4 @@
-"""Isolate tunnel tests from inherited proxy settings."""
+"""Isolate every ws_tunnel test from inherited proxy settings."""
 
 import os
 
