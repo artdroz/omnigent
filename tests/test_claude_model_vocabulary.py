@@ -173,22 +173,37 @@ def test_model_id_with_1m_marker_opts_long_context_families_into_1m() -> None:
     )
     # A canonical id (a direct-spec pin) is marked on the spelling it is given.
     assert model_id_with_1m_marker("claude-opus-4-8") == "claude-opus-4-8[1m]"
-    # The 4 generation is the first that serves the 1M window.
+    # Capability is per-model: Sonnet opts in at 3.7 and Opus at 4.6, and every
+    # later version of each family keeps it.
+    assert (
+        model_id_with_1m_marker("databricks-claude-sonnet-3-7")
+        == "databricks-claude-sonnet-3-7[1m]"
+    )
+    assert (
+        model_id_with_1m_marker("databricks-claude-opus-4-6") == "databricks-claude-opus-4-6[1m]"
+    )
     assert (
         model_id_with_1m_marker("databricks-claude-sonnet-4") == "databricks-claude-sonnet-4[1m]"
     )
 
 
 def test_model_id_with_1m_marker_leaves_other_models_bare() -> None:
-    """Only the 1M-capable families are marked; everything else passes through."""
+    """Only the 1M-capable models are marked; everything else passes through."""
     # 200K-only Claude families.
     assert model_id_with_1m_marker("databricks-claude-haiku-4-5") == "databricks-claude-haiku-4-5"
     assert model_id_with_1m_marker("system.ai.claude-fable-5") == "system.ai.claude-fable-5"
-    # Pre-4 Opus/Sonnet generations only serve a 200K window, so they stay bare.
+    # Opus/Sonnet versions below each family's 1M threshold still serve 200K.
     assert (
         model_id_with_1m_marker("databricks-claude-3-5-sonnet") == "databricks-claude-3-5-sonnet"
     )
     assert model_id_with_1m_marker("claude-3-opus") == "claude-3-opus"
+    assert model_id_with_1m_marker("databricks-claude-opus-4-1") == "databricks-claude-opus-4-1"
+    assert model_id_with_1m_marker("databricks-claude-opus-4-5") == "databricks-claude-opus-4-5"
+    # The managed-sandbox Bedrock spelling of Opus 4.5 stays 200K-only too.
+    assert (
+        model_id_with_1m_marker("us.anthropic.claude-opus-4-5-20251101-v1:0")
+        == "us.anthropic.claude-opus-4-5-20251101-v1:0"
+    )
     # Non-Claude models the same gateway may serve.
     assert model_id_with_1m_marker("databricks-gpt-5-6") == "databricks-gpt-5-6"
     assert model_id_with_1m_marker("system.ai.glm-5-3") == "system.ai.glm-5-3"

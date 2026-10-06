@@ -1481,6 +1481,63 @@ async def test_auto_create_claude_terminal_inherits_agent_sandbox(
     await fake_client.aclose()
 
 
+async def _run_auto_create_ucode_gateway_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    session_id: str,
+    ucode: Any,
+) -> tuple[Any, dict[str, Any]]:
+    """Drive host-spawned ``_auto_create_claude_terminal`` with a stub ucode gateway.
+
+    Applies the shared managed-launch setup (trusted bridge roots, an isolated
+    ``auth:`` config home, a no-op forwarder, and ``_ucode_config_for_profile``
+    returning ``ucode``) and returns the launch spec and recorded configs.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    # The supported credential source for a host-spawned runner: the global
+    # config's ``auth:`` block, isolated to a temp config home so the
+    # developer's real config can't leak in.
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "auth:\n  type: databricks\n  profile: test-profile\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    # The runner imports ``_ucode_config_for_profile`` from
+    # ``omnigent.harnesses.claude_native.main`` per call, so patch it at the source.
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._ucode_config_for_profile",
+        lambda profile, *, refresh_models=True: ucode,
+    )
+
+    captured: dict[str, Any] = {}
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, json={"labels": {}}),
+        ),
+    )
+    recorded_configs: dict[str, Any] = {}
+    try:
+        await _auto_create_claude_terminal(
+            session_id,
+            _RecordingClaudeRegistry(captured),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+            record_launch_config=recorded_configs.__setitem__,
+        )
+    finally:
+        await fake_client.aclose()
+    return captured["spec"], recorded_configs
+
+
 @pytest.mark.asyncio
 async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     tmp_path: Path,
@@ -1504,25 +1561,6 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     """
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
 
-    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-    # The supported credential source for a host-spawned runner: the
-    # global config's ``auth:`` block (written by ``omnigent setup``),
-    # isolated to a temp config home so the developer's real config
-    # can't leak in.
-    config_home = tmp_path / "config-home"
-    config_home.mkdir()
-    (config_home / "config.yaml").write_text(
-        "auth:\n  type: databricks\n  profile: test-profile\n"
-    )
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
-
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
-        _no_op_forwarder,
-    )
-
     gateway_env = {"ANTHROPIC_BASE_URL": "https://gw.example/anthropic"}
     ucode = ClaudeNativeUcodeConfig(
         env=dict(gateway_env),
@@ -1539,32 +1577,13 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
             "claude-sonnet-5": "databricks-claude-sonnet-5",
         },
     )
-    # The runner imports ``_ucode_config_for_profile`` from
-    # ``omnigent.harnesses.claude_native.main`` per call, so patch it at the source.
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.main._ucode_config_for_profile",
-        lambda profile, *, refresh_models=True: ucode,
+
+    spec, recorded_configs = await _run_auto_create_ucode_gateway_launch(
+        tmp_path,
+        monkeypatch,
+        session_id="13efa494411f3ae60211e6be5635062a",
+        ucode=ucode,
     )
-
-    captured: dict[str, Any] = {}
-
-    fake_client = httpx.AsyncClient(
-        base_url="http://test-server",
-        transport=httpx.MockTransport(
-            lambda req: httpx.Response(200, json={"labels": {}}),
-        ),
-    )
-    recorded_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
-
-    await _auto_create_claude_terminal(
-        "13efa494411f3ae60211e6be5635062a",
-        _RecordingClaudeRegistry(captured),
-        lambda _sid, _evt: None,
-        server_client=fake_client,
-        record_launch_config=recorded_configs.__setitem__,
-    )
-
-    spec = captured["spec"]
     # The gateway env points ``claude`` at the Databricks gateway, and
     # ENABLE_TOOL_SEARCH forces Claude Code to defer MCP tool schemas
     # instead of loading all 200+ bridge tools into startup context.
@@ -1594,68 +1613,47 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     # window pin leaking into the stored env.
     assert recorded_configs == {"13efa494411f3ae60211e6be5635062a": ucode}
 
-    await fake_client.aclose()
-
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "session_id"),
+    [
+        # Haiku serves only 200K at every version.
+        ("databricks-claude-haiku-4-5", "9f8e7d6c5b4a39281706f5e4d3c2b1a0"),
+        # Opus 4.5 predates the 4.6 that first serves 1M, so it stays 200K.
+        ("databricks-claude-opus-4-5", "a1b2c3d4e5f60718293a4b5c6d7e8f90"),
+    ],
+)
 async def test_auto_create_claude_terminal_leaves_a_non_1m_launch_at_the_default_window(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    session_id: str,
 ) -> None:
-    """A Haiku (200K-only) launch is left unmarked, with an unchanged recorded config."""
+    """A 200K-only launch is left unmarked, with an unchanged recorded config."""
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
 
-    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-    config_home = tmp_path / "config-home"
-    config_home.mkdir()
-    (config_home / "config.yaml").write_text(
-        "auth:\n  type: databricks\n  profile: test-profile\n"
-    )
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
-        _no_op_forwarder,
-    )
-
-    gateway_env = {"ANTHROPIC_BASE_URL": "https://gw.example/anthropic"}
+    canonical = model.removeprefix("databricks-")
     ucode = ClaudeNativeUcodeConfig(
-        env=dict(gateway_env),
+        env={"ANTHROPIC_BASE_URL": "https://gw.example/anthropic"},
         api_key_helper="printf %s sk-sentinel-do-not-use",
-        model="databricks-claude-haiku-4-5",
-        routable_models=("databricks-claude-haiku-4-5",),
-        model_overrides={"claude-haiku-4-5": "databricks-claude-haiku-4-5"},
-    )
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.main._ucode_config_for_profile",
-        lambda profile, *, refresh_models=True: ucode,
+        model=model,
+        routable_models=(model,),
+        model_overrides={canonical: model},
     )
 
-    captured: dict[str, Any] = {}
-    fake_client = httpx.AsyncClient(
-        base_url="http://test-server",
-        transport=httpx.MockTransport(
-            lambda req: httpx.Response(200, json={"labels": {}}),
-        ),
-    )
-    recorded_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
-
-    await _auto_create_claude_terminal(
-        "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
-        _RecordingClaudeRegistry(captured),
-        lambda _sid, _evt: None,
-        server_client=fake_client,
-        record_launch_config=recorded_configs.__setitem__,
+    spec, recorded_configs = await _run_auto_create_ucode_gateway_launch(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        ucode=ucode,
     )
 
-    spec = captured["spec"]
-    # Haiku serves only 200K, so the launch model stays bare: no [1m] marker.
-    assert spec.args[spec.args.index("--model") + 1] == "databricks-claude-haiku-4-5"
-    assert "[1m]" not in spec.args[spec.args.index("--model") + 1]
-    assert recorded_configs == {"9f8e7d6c5b4a39281706f5e4d3c2b1a0": ucode}
-
-    await fake_client.aclose()
+    # A 200K-only model keeps a bare launch id: no [1m] marker.
+    launched = spec.args[spec.args.index("--model") + 1]
+    assert launched == model
+    assert "[1m]" not in launched
+    assert recorded_configs == {session_id: ucode}
 
 
 @pytest.mark.asyncio

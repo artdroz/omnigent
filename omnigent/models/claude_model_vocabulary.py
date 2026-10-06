@@ -128,33 +128,36 @@ def normalized_model_id(model: str) -> str:
 #: client-side and never reaches the gateway.
 LONG_CONTEXT_MARKER = "[1m]"
 
-_LONG_CONTEXT_FAMILIES: frozenset[str] = frozenset({"opus", "sonnet"})
-
-#: First Opus/Sonnet generation that serves the 1M context-1m-2025-08-07 beta.
-#: A 3.x or earlier Opus/Sonnet caps at 200K, so marking it [1m] would size the
-#: session past what the model accepts and overflow mid-session.
-_MIN_LONG_CONTEXT_VERSION = 4
+#: Lowest version of each long-context family that Claude Code serves at 1M,
+#: tracking its baked-in catalog: Sonnet opts in at 3.7, Opus at 4.6.
+_MIN_LONG_CONTEXT_VERSION: dict[str, tuple[int, ...]] = {
+    "sonnet": (3, 7),
+    "opus": (4, 6),
+}
 
 
 def _supports_long_context(canonical: str) -> bool:
-    """Whether a canonical Claude id names a 1M-capable Opus/Sonnet generation."""
+    """Whether a canonical Claude id names a model Claude Code serves at 1M.
+
+    1M capability is per-model, not per-generation: Sonnet 3.5 and Opus 4.5 cap
+    at 200K while a later sibling serves 1M. Marking a 200K-only id ``[1m]``
+    would size the session past the model and overflow mid-session, so each
+    family opts in only from its own minimum version.
+    """
     segments = _SEGMENT_RE.split(canonical)
-    if _LONG_CONTEXT_FAMILIES.isdisjoint(segments):
-        return False
-    for segment in segments:
-        # The first numeric segment is the generation in either naming
-        # (``claude-opus-4-8`` and ``claude-3-5-sonnet`` both lead with it).
-        if segment.isdigit():
-            return int(segment) >= _MIN_LONG_CONTEXT_VERSION
+    for family, minimum in _MIN_LONG_CONTEXT_VERSION.items():
+        if family in segments:
+            version = tuple(int(segment) for segment in segments if segment.isdigit())
+            return version >= minimum
     return False
 
 
 def model_id_with_1m_marker(model_id: str) -> str:
     """Add the ``[1m]`` window marker to a 1M-capable Opus/Sonnet id, else return it unchanged.
 
-    Non-Claude ids, bare family aliases, pre-4 Opus/Sonnet generations, the
-    200K-only families (Haiku, Fable), and already-marked ids all pass through
-    unchanged.
+    Everything else passes through unchanged: non-Claude ids, bare family
+    aliases, Haiku and other families, 200K-only Opus/Sonnet versions (Opus
+    through 4.5, Sonnet through 3.5), and already-marked ids.
     """
     spelled = model_id.strip()
     canonical = canonical_claude_id(spelled)
