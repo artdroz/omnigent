@@ -69,6 +69,17 @@ _OK = b"HTTP/1.1 200 Connection Established\r\n\r\n"
         # urllib ignores HTTP_PROXY under CGI; the lowercase spelling survives.
         (_TUNNEL_URL, {"HTTP_PROXY": "http://p:1", "REQUEST_METHOD": "GET"}, None),
         (_TUNNEL_URL, {"http_proxy": "http://p:1", "REQUEST_METHOD": "GET"}, "http://p:1"),
+        # URL-form bypass entries match by scheme like httpx mounts.
+        (
+            "wss://example.com/t",
+            {"https_proxy": "http://p:1", "no_proxy": "https://example.com"},
+            None,
+        ),
+        (
+            "wss://example.com/t",
+            {"https_proxy": "http://p:1", "no_proxy": "http://example.com"},
+            "http://p:1",
+        ),
         # Loopback never goes through a proxy, even without a no_proxy entry.
         ("ws://localhost:8000/t", {"http_proxy": "http://p:1"}, None),
         ("ws://127.0.0.1:8000/t", {"ALL_PROXY": "http://p:1"}, None),
@@ -97,6 +108,15 @@ def test_proxy_selection(url, env, expected):
         ("example.com:8000", "example.com:8443", False),
         ("example.com", "example.com:80", False),
         ("example.com:80", "example.com:80", False),
+        # URL-form entries behave like httpx mounts: scheme, host pattern and port.
+        ("example.com", "http://example.com", True),
+        ("example.com", "https://example.com", False),
+        ("example.com", "all://example.com", True),
+        ("sub.example.com", "http://example.com", False),
+        ("sub.example.com", "http://*.example.com", True),
+        ("example.com", "http://*example.com", True),
+        ("example.com:8443", "http://example.com:8443", True),
+        ("example.com", "http://example.com:80", True),
         ("10.1.2.3:8000", "localhost,10.1.2.3,fd00::1", True),
         ("[fd00::1]:8000", "localhost,10.1.2.3,fd00::1", True),
         ("[fd00::1]:8000", "[fd00::1]:8000", True),

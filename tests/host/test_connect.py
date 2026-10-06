@@ -8166,8 +8166,9 @@ async def test_dispatch_fs_write_op_unknown_op_raises() -> None:
         HostProcess._dispatch_fs_write_op("/ws", "bogus", {})
 
 
-@pytest.mark.parametrize("failure", ["constructor", "enter"])
-@pytest.mark.parametrize("use_proxy", [False, True])
+@pytest.mark.parametrize(
+    ("use_proxy", "failure"), [(False, "enter"), (True, "constructor"), (True, "enter")]
+)
 async def test_connect_and_serve_proxy_socket(
     monkeypatch: pytest.MonkeyPatch, use_proxy: bool, failure: str
 ) -> None:

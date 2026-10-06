@@ -34,6 +34,8 @@ _logger = logging.getLogger(__name__)
 _PROXY_ENV_BY_WS_SCHEME = {"ws": "http_proxy", "wss": "https_proxy"}
 
 _DEFAULT_PORT_BY_WS_SCHEME = {"ws": 80, "wss": 443}
+_HTTP_SCHEME_BY_WS_SCHEME = {"ws": "http", "wss": "https"}
+_DEFAULT_PORT_BY_HTTP_SCHEME = {"http": 80, "https": 443}
 
 # CONNECT responses are a handful of header lines; anything bigger is a
 # confused intermediary, not a proxy.
@@ -83,21 +85,25 @@ def _env(environ: Mapping[str, str], name: str) -> str | None:
     return value
 
 
-def _bypassed_by_no_proxy(host: str, port: int | None, no_proxy: str) -> bool:
-    """Whether ``no_proxy`` exempts *host*:*port* from proxying, as httpx would.
+def _bypassed_by_no_proxy(host: str, port: int | None, no_proxy: str, http_scheme: str) -> bool:
+    """Whether ``no_proxy`` exempts the target from proxying, as httpx would.
 
-    Mirrors the rules the host's own HTTP client applies, so HTTP requests and
-    the tunnel never disagree about the proxy: ``*`` disables proxying; a
-    plain name matches itself and its subdomains; a leading dot matches
-    subdomains only; a ``*``-prefixed entry matches nothing; an IP literal or
-    ``localhost`` matches that exact text (also when the entry carries a port,
-    where httpx falls back to suffix matching); ``host:port`` also requires
-    the port.
+    Mirrors the rules the host's own HTTP client applies so HTTP requests and
+    the tunnel agree about the proxy, with one deliberate exception: an IP
+    literal entry that carries a port stays exact, where httpx suffix-matches.
+    ``*`` disables proxying; a plain name matches itself and its subdomains;
+    a leading dot matches subdomains only; a ``*``-prefixed entry matches
+    nothing; an IP literal or ``localhost`` matches that exact text;
+    ``host:port`` also requires the port; a URL-form entry such as
+    ``https://example.com`` or ``all://*.example.com`` matches by scheme,
+    host pattern and port like an httpx mount.
 
     :param host: Target hostname (no brackets), lowercase or not.
     :param port: Target port when explicit and not the scheme default, else
         None (httpx drops default ports before matching).
     :param no_proxy: Raw ``no_proxy`` value.
+    :param http_scheme: ``"http"`` or ``"https"``, the HTTP scheme the tunnel
+        scheme corresponds to.
     :returns: True when the target must be dialed directly.
     """
     host = host.lower()
@@ -107,6 +113,10 @@ def _bypassed_by_no_proxy(host: str, port: int | None, no_proxy: str) -> bool:
             continue
         if entry == "*":
             return True
+        if "://" in entry:
+            if _matches_url_pattern(host, port, http_scheme, entry):
+                return True
+            continue
         entry_port: int | None = None
         if entry.startswith("["):
             # Bracketed IPv6, optionally with a port.
@@ -136,6 +146,36 @@ def _bypassed_by_no_proxy(host: str, port: int | None, no_proxy: str) -> bool:
         if host == entry_host or host.endswith("." + entry_host):
             return True
     return False
+
+
+def _matches_url_pattern(host: str, port: int | None, http_scheme: str, pattern: str) -> bool:
+    """Match a URL-form ``no_proxy`` entry the way an httpx mount pattern would.
+
+    :param host: Lowercased target hostname.
+    :param port: Explicit non-default target port, else None.
+    :param http_scheme: HTTP scheme corresponding to the tunnel scheme.
+    :param pattern: Lowercased entry containing ``://``.
+    :returns: True when the entry covers the target.
+    """
+    try:
+        parts = urlsplit(pattern)
+        pattern_port = parts.port
+    except ValueError:
+        return False
+    pattern_host = parts.hostname or ""
+    if parts.scheme not in ("all", http_scheme) or not pattern_host:
+        return False
+    if pattern_port == _DEFAULT_PORT_BY_HTTP_SCHEME.get(parts.scheme):
+        pattern_port = None
+    if pattern_port != port:
+        return False
+    if pattern_host == "*":
+        return True
+    if pattern_host.startswith("*."):
+        return host.endswith(pattern_host[1:])
+    if pattern_host.startswith("*"):
+        return host == pattern_host[1:] or host.endswith("." + pattern_host[1:])
+    return host == pattern_host
 
 
 def _ip_literal(text: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -189,7 +229,9 @@ def ws_env_proxy_url(ws_url: str, environ: Mapping[str, str] | None = None) -> s
         return None
     no_proxy = _env(environ, "no_proxy")
     explicit_port = None if port == _DEFAULT_PORT_BY_WS_SCHEME[scheme] else port
-    if no_proxy and _bypassed_by_no_proxy(host, explicit_port, no_proxy):
+    if no_proxy and _bypassed_by_no_proxy(
+        host, explicit_port, no_proxy, _HTTP_SCHEME_BY_WS_SCHEME[scheme]
+    ):
         return None
     if "://" not in proxy:
         # Bare host:port proxy values are conventionally plain HTTP.
