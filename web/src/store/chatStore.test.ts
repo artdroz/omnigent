@@ -33,6 +33,11 @@ import type {
 import type { ConversationItem, MessageItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { buildBubbles } from "@/lib/renderItems";
+import {
+  buildPendingBubbles,
+  computeIsWorking,
+  mergePendingBubbles,
+} from "@/components/chat/chatBubbleParts";
 import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
@@ -1318,6 +1323,162 @@ describe("chatStore — switchTo", () => {
     expect(kinds[0]).toBe("user_message");
     expect(state.blocks[0]!.ctx.itemId).toBe("item_bg_user");
     expect(kinds.slice(1)).not.toContain("user_message");
+
+    sink.close();
+  });
+
+  it("keeps the user message above a native reply that previews before input.consumed", async () => {
+    // A claude-native reply previews as a `live:` block before input.consumed
+    // promotes the just-sent user message; pending bubbles render after committed
+    // blocks, so the streaming reply would otherwise show above the user's input.
+    const sink = pushableStream();
+    seedSession("conv_omni5555", []);
+    sessionLabels.set("conv_omni5555", { "omnigent.wrapper": "claude-code-native-ui" });
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_omni5555/stream")
+        return mockResponse(null, { bodyStream: sink.stream });
+      return base(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_omni5555");
+    expect(useChatStore.getState().isNativeTerminalSession).toBe(true);
+
+    await useChatStore.getState().send("what is the capital of France?", "agent_xyz");
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+
+    // The reply previews before input.consumed acks the user's message.
+    sink.push(sse("response.created", { id: "resp_5555", status: "in_progress", output: [] }));
+    sink.push(
+      sse("response.output_text.delta", {
+        delta: "The capital of France is Paris.",
+        message_id: "msg_5555",
+        index: 0,
+      }),
+    );
+    await tick();
+    await tick();
+
+    const state = useChatStore.getState();
+    expect(state.blocks.map((b) => b.ctx.itemId)).toContain("live:msg_5555");
+    expect(state.pendingUserMessages).toHaveLength(1);
+
+    // Compose the transcript bubbles exactly as Transcript.tsx does.
+    const committed = buildBubbles(
+      state.blocks,
+      state.activeResponse,
+      undefined,
+      [],
+      computeIsWorking(state.sessionStatus),
+    );
+    const bubbles = mergePendingBubbles(
+      committed,
+      buildPendingBubbles(state.pendingUserMessages, getCurrentAuthorId()),
+    );
+    const roles = bubbles.map((b) => b.kind);
+    const userIdx = roles.indexOf("user");
+    const assistantIdx = roles.indexOf("assistant");
+    expect(userIdx).toBeGreaterThanOrEqual(0);
+    expect(assistantIdx).toBeGreaterThanOrEqual(0);
+    expect(userIdx).toBeLessThan(assistantIdx);
+
+    sink.close();
+  });
+
+  it("keeps the user message above a native reply through input.consumed and the committed item", async () => {
+    // Full forwarder ordering: delta preview, then input.consumed, then the
+    // committed assistant item. The reply must stay below the user's input at every
+    // step, including after input.consumed when no pending bubble remains to lift.
+    const sink = pushableStream();
+    seedSession("conv_omni5555_full", []);
+    sessionLabels.set("conv_omni5555_full", { "omnigent.wrapper": "claude-code-native-ui" });
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_omni5555_full/stream")
+        return mockResponse(null, { bodyStream: sink.stream });
+      return base(input, init);
+    });
+
+    const composeRoles = (): string[] => {
+      const state = useChatStore.getState();
+      const committed = buildBubbles(
+        state.blocks,
+        state.activeResponse,
+        undefined,
+        [],
+        computeIsWorking(state.sessionStatus),
+      );
+      const bubbles = mergePendingBubbles(
+        committed,
+        buildPendingBubbles(state.pendingUserMessages, getCurrentAuthorId()),
+      );
+      return bubbles.map((b) => b.kind);
+    };
+    const expectUserAboveReply = (label: string): void => {
+      const roles = composeRoles();
+      const userIdx = roles.indexOf("user");
+      const assistantIdx = roles.indexOf("assistant");
+      expect(userIdx, `${label}: user bubble present`).toBeGreaterThanOrEqual(0);
+      expect(assistantIdx, `${label}: assistant bubble present`).toBeGreaterThanOrEqual(0);
+      expect(userIdx, `${label}: user renders above the reply`).toBeLessThan(assistantIdx);
+    };
+
+    await useChatStore.getState().switchTo("conv_omni5555_full");
+    await useChatStore.getState().send("what is the capital of France?", "agent_xyz");
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+
+    // 1. The reply previews before input.consumed acks the user's message.
+    sink.push(sse("response.created", { id: "resp_5555f", status: "in_progress", output: [] }));
+    sink.push(
+      sse("response.output_text.delta", {
+        delta: "The capital of France is Paris.",
+        message_id: "msg_5555f",
+        index: 0,
+      }),
+    );
+    await tick();
+    await tick();
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toContain("live:msg_5555f");
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+    expectUserAboveReply("preview, user still pending");
+
+    // 2. input.consumed promotes the user message out of `pendingUserMessages`
+    //    while the preview is still the trailing committed block.
+    sink.push(
+      sse("session.input.consumed", {
+        data: {
+          item_id: "item_user_5555f",
+          type: "message",
+          data: {
+            role: "user",
+            content: [{ type: "input_text", text: "what is the capital of France?" }],
+          },
+        },
+      }),
+    );
+    await tick();
+    await tick();
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(0);
+    expectUserAboveReply("after input.consumed, preview still live");
+
+    // 3. The authoritative assistant item lands and replaces the preview.
+    sink.push(
+      sse("response.output_item.done", {
+        message_id: "msg_5555f",
+        item: {
+          type: "message",
+          role: "assistant",
+          id: "item_asst_5555f",
+          response_id: "resp_5555f",
+          content: [{ type: "output_text", text: "The capital of France is Paris." }],
+        },
+      }),
+    );
+    await tick();
+    await tick();
+    expectUserAboveReply("after the committed assistant item");
 
     sink.close();
   });

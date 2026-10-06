@@ -514,6 +514,16 @@ const assistantText = (id: string): Bubble => ({
   error: null,
   items: [{ kind: "text", itemId: id, text: "hi", final: true }],
 });
+// A streaming native reply whose text is still a provisional `live:<id>`
+// preview block, before its authoritative transcript item lands.
+const livePreviewReply = (id: string): Bubble => ({
+  kind: "assistant",
+  responseId: id,
+  stableId: id,
+  lifecycle: "streaming",
+  error: null,
+  items: [{ kind: "text", itemId: `live:${id}`, text: "Paris", final: true }],
+});
 // A card with no turn to anchor to carries the `elicit_*` response id
 // blockStream stamps for exactly that case; pass `responseId` to model a
 // card that DOES belong to a turn (an inline approval, or a question card
@@ -640,6 +650,29 @@ describe("mergePendingBubbles", () => {
       "e1",
       "pend_1",
     ]);
+  });
+
+  it("splices the pending prompt ABOVE a trailing native live-preview reply", () => {
+    // A native reply previews as a `live:` block before input.consumed promotes
+    // the just-sent user message, so appending after it would show the reply above
+    // the user's own input.
+    const committed = [livePreviewReply("a1")];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["pend_1", "a1"]);
+  });
+
+  it("does NOT lift a new prompt above a settled assistant reply", () => {
+    // Only a still-streaming preview belongs below the optimistic prompt; a
+    // settled prior turn stays above the next message being typed.
+    const committed = [userBubble("u1"), assistantText("a1")];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["u1", "a1", "pend_1"]);
+  });
+
+  it("lifts above a trailing live preview but stays below a settled earlier turn", () => {
+    const committed = [userBubble("u1"), assistantText("a1"), livePreviewReply("a2")];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["u1", "a1", "pend_1", "a2"]);
   });
 });
 

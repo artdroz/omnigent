@@ -6644,6 +6644,19 @@ function committedUserBlock(
   };
 }
 
+// On claude-native the forwarder emits delta previews before transcript items,
+// so a trailing `live:` preview can already sit at the tail when the user
+// message is promoted; insert the user block above it rather than appending.
+function blocksWithPromotedUserMessage(
+  blocks: AnyBlock[],
+  userBlock: UserMessageBlock,
+): AnyBlock[] {
+  let at = blocks.length;
+  while (at > 0 && isLiveProvisionalBlock(blocks[at - 1]!)) at -= 1;
+  if (at === blocks.length) return [...blocks, userBlock];
+  return [...blocks.slice(0, at), userBlock, ...blocks.slice(at)];
+}
+
 interface RefetchRunnerBackedSessionStateOptions {
   /** Force the AP server to re-read runner-backed caches before returning. */
   refreshState?: boolean;
@@ -7447,8 +7460,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               ],
               // stableKey = the optimistic bubble's temp id → the
               // promoted bubble keeps the same React key (no remount).
-              blocks: [
-                ...s.blocks,
+              blocks: blocksWithPromotedUserMessage(
+                s.blocks,
                 committedUserBlock(
                   event.itemId,
                   content,
@@ -7456,7 +7469,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                   event.createdBy ?? matched.author,
                   matched.createdAtS,
                 ),
-              ],
+              ),
             };
           }
         }
@@ -7482,8 +7495,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             pendingUserMessages: s.pendingUserMessages.slice(1),
             // stableKey = the popped optimistic bubble's temp id so the
             // promoted bubble keeps the same React key (no remount/flink).
-            blocks: [
-              ...s.blocks,
+            blocks: blocksWithPromotedUserMessage(
+              s.blocks,
               committedUserBlock(
                 event.itemId,
                 content,
@@ -7491,7 +7504,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 event.createdBy ?? head.author,
                 head.createdAtS,
               ),
-            ],
+            ),
           };
         }
 
@@ -7499,10 +7512,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         //    event payload fresh.
         if (eventContent === null) return {};
         return {
-          blocks: [
-            ...s.blocks,
+          blocks: blocksWithPromotedUserMessage(
+            s.blocks,
             committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
-          ],
+          ),
         };
       });
       return;

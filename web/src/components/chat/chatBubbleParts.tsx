@@ -61,6 +61,7 @@ import {
   imagePreview,
   isTextBlock,
   keyedAttachments,
+  LIVE_ITEM_PREFIX,
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
@@ -268,12 +269,29 @@ function liftAboveCreateRoutingChips(committed: Bubble[], end: number): number {
   return start === 0 ? start : end;
 }
 
+// A native reply streams in as a provisional `live:` preview (see
+// applyLiveDelta) that can commit into `blocks` before `session.input.consumed`
+// promotes the just-sent user message, so it must stay below that prompt.
+function isNativeLivePreviewBubble(bubble: Bubble): boolean {
+  return (
+    bubble.kind === "assistant" &&
+    bubble.items.some(
+      (item) => item.kind === "text" && (item.itemId?.startsWith(LIVE_ITEM_PREFIX) ?? false),
+    )
+  );
+}
+
 // Place optimistic pending user bubbles into the committed timeline, keeping
-// the prompt above a trailing REQUEST-phase card or create-time routing chip.
+// the prompt above a trailing REQUEST-phase card, a streaming native reply
+// preview, or a create-time routing chip.
 export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bubble[] {
   if (pending.length === 0) return committed;
   let insertAt = committed.length;
-  while (insertAt > 0 && isStandaloneElicitationBubble(committed[insertAt - 1]!)) {
+  while (
+    insertAt > 0 &&
+    (isStandaloneElicitationBubble(committed[insertAt - 1]!) ||
+      isNativeLivePreviewBubble(committed[insertAt - 1]!))
+  ) {
     insertAt -= 1;
   }
   insertAt = liftAboveCreateRoutingChips(committed, insertAt);
