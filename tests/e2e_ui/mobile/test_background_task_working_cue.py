@@ -1,59 +1,236 @@
-"""E2E (phone viewport): the bottom chrome must carry a working/idle cue once
-background tasks are running.
+"""E2E (phone): the background-task tally must show whether the agent is working.
 
-On a phone the end-of-thread "Working…" shimmer is the only working cue, and it
-leaves the viewport as soon as the user scrolls up to re-read earlier messages
-(or the keyboard shortens the screen). Once a background shell outlives a turn,
-the composer stack (workspace bar + composer card) is the one surface that
-stays on screen — so it must render differently while the agent's turn is
-running than while the session sits idle, both visually and in its
-accessibility tree.
+On a phone the end-of-thread "Working…" shimmer is the first thing to leave the
+viewport (scrolling up to re-read, the keyboard opening), and a typed draft keeps
+the composer's Send arrow instead of its Stop square. Once a background shell
+outlives a turn, the ``N background task`` tally in the composer workspace bar is
+the only persistent status surface at the bottom of the screen, so it must look
+and read differently while a turn runs than while the session is idle.
 
-Journey (the reporter's, on a narrow viewport):
+Journeys (the reporter's, claude-native on a phone):
 
-1. hold a short conversation until the thread overflows the phone viewport,
-2. a background shell outlives the turn (the native Stop-hook status edge,
-   published through the sessions events route the harness forwarder posts to,
-   carrying a positive ``background_task_count``),
-3. type a follow-up draft (with a draft the send arrow never morphs into the
-   Interrupt square) and scroll up — the shimmer slot leaves the viewport,
-4. a new turn starts (status ``running``, e.g. sent from another device),
-5. the bottom chrome must still show which state the session is in,
-6. the turn settles back to idle — the cue must clear again.
+1. ask Claude Code to run a shell in the background and let the turn finish ->
+   the ``1 background task`` tally appears above the composer,
+2. type a follow-up draft (not sent) and scroll up to re-read earlier messages,
+   so the shimmer is off screen -> a new turn starts on the session (sent from a
+   second client, which keeps the draft) -> the tally must carry the working
+   state visually and in its accessible name, and revert once the turn settles,
+3. the literal single-device step: send the follow-up from the phone's own
+   composer -> the tally must carry the working state while the agent works.
 
-All three signatures are captured at the same draft, focus, and scroll state;
-the only difference between them is the session status, so any signature
-difference is a working/idle cue. The working signature must differ from BOTH
-surrounding idle signatures, so an unrelated async repaint landing mid-journey
-(a workspace-bar refresh) can never satisfy the assertion by accident. The
-failure this guards: the bottom chrome renders pixel-identical with an
-identical accessibility tree in all three states, leaving a phone user (and a
-screen reader) no way to tell a working agent from an idle one.
+Harness notes:
+
+- The real ``claude`` CLI runs against the mock model. The scripted model issues
+  a ``Bash`` ``run_in_background`` call; Claude Code runs the shell and its own
+  Stop hook reports the background task, which the runner's forwarder publishes
+  as the tally. No status edge is injected.
+- ``--allowedTools Bash(sleep:*)`` pre-allows the scripted ``sleep`` so the
+  shell runs without an approval pause.
+- The phone is desktop Chromium at Playwright's "iPhone 13" profile (390x664),
+  so a recorder run with ``--device "iPhone 13"`` films pixel-exact.
+- Skips when the ``claude`` CLI is unavailable.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import json
+import shutil
+import subprocess
+import uuid
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
 
 import httpx
-from playwright.sync_api import Page, expect
+import pytest
+from playwright.sync_api import Browser, Locator, Page, expect
 
-_USER = '[data-testid="message-bubble"][data-role="user"]'
-_ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
+from tests._helpers.native_session import create_native_session
+from tests._helpers.session import bind_session_runner
+from tests.e2e_ui.conftest import (
+    _ensure_runner_online,
+    _server_state,
+    _temp_omnigent_mock_config,
+    configure_mock_llm,
+    reset_mock_llm,
+    set_fallback_mock_llm,
+)
+from tests.helpers.ui_configuration import _CLAUDE_MOCK_MODEL
+
+_PHONE = pytest.mark.browser_context_args(
+    viewport={"width": 390, "height": 664},
+    device_scale_factor=3,
+    is_mobile=True,
+    has_touch=True,
+)
+_DESKTOP_VIEWPORT = {"width": 1280, "height": 800}
+
 _WORKING = '[data-testid="working-indicator"]'
-# Queued strip, trays, workspace bar, and composer card all render inside the
-# composer form — the persistent bottom chrome of a session page.
-_BOTTOM_CHROME = "form.chat-composer-form"
+_ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
+_TALLY = '[data-testid="background-task-pill"]'
+_TASK_INDICATORS = '[data-testid="composer-task-indicators"]'
+_WORKSPACE_BAR = '[data-testid="composer-workspace-controls"]'
+_TERMINAL_VIEW = '[data-testid="terminal-view"]'
 
-# iPhone 13-class portrait viewport (matches Playwright's "iPhone 13" device
-# profile, so a recorder run with ``--device "iPhone 13"`` films pixel-exact).
-_IPHONE_VIEWPORT = {"width": 390, "height": 664}
+_BACKGROUND_COMMAND = "sleep 600"
+_BACKGROUND_DESCRIPTION = "Keep a long sleep running in the background"
+_DRAFT = "Also summarize the sleep's output once it finishes"
+_REPLY_MARKER = "background-sleep-started"
+# Long enough to overflow a 664px-tall phone viewport on its own.
+_LONG_REPLY = "\n\n".join(
+    [f"The sleep is running in the background ({_REPLY_MARKER})."]
+    + [
+        f"Paragraph {i}: while it runs I can keep answering questions; the shell "
+        "keeps going until it exits or you stop it."
+        for i in range(1, 13)
+    ]
+)
+_FOLLOW_UP_REPLY = "follow-up answered while the sleep keeps running"
 
-_DRAFT = "actually, please also update the changelog"
+# claude-native auto-launch + first-run pre-accept + WS attach.
+_TERMINAL_READY_TIMEOUT_MS = 120_000
+# A mock turn: CLI round trip through the bridge + hook + forwarder.
+_TURN_TIMEOUT_MS = 120_000
 
-# Tallest scrollable descendant of the conversation log — the StickToBottom
-# scroll container.
-_FIND_SCROLLER = """
+
+@pytest.fixture
+def native_claude_background_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound claude-native session allowed to run the scripted background shell.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param mock_llm_server_url: Session-scoped mock LLM server base URL.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    if shutil.which("claude") is None:
+        pytest.skip("claude CLI is required for the claude-native background-task journey")
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    with _temp_omnigent_mock_config(
+        mock_llm_server_url, "claude", workflow_owned=bool(_server_state.get("workflow_owned"))
+    ):
+        created = create_native_session(
+            httpx,
+            live_server,
+            harness="claude",
+            metadata={"terminal_launch_args": ["--allowedTools", "Bash(sleep:*)"]},
+        )
+        session_id = str(created["session_id"])
+        bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
+        try:
+            yield (live_server, session_id)
+        finally:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+            if respawned is not None:
+                respawned.terminate()
+                try:
+                    respawned.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    respawned.kill()
+                    respawned.wait(timeout=5)
+
+
+def _evidence_dir(request: pytest.FixtureRequest) -> Path:
+    """Per-test directory for the captured bottom-chrome states."""
+    root = Path(str(request.config.getoption("--output"))) / "background-task-working-cue"
+    path = root / request.node.name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _select_view(page: Page, option: str) -> None:
+    """Switch to the Chat or Terminal view.
+
+    A phone header folds the switch into its single "…" menu; a desktop header
+    shows the segmented ``view-mode-toggle`` instead.
+    """
+    kebab = page.get_by_test_id("header-conversation-actions").or_(
+        page.get_by_test_id("session-actions-menu")
+    )
+    segment = page.get_by_test_id(f"view-mode-{option}")
+    expect(kebab.or_(segment).first).to_be_visible(timeout=_TERMINAL_READY_TIMEOUT_MS)
+    if segment.count() > 0:
+        expect(segment).to_be_enabled(timeout=30_000)
+        segment.click()
+        return
+    kebab.click()
+    item = page.get_by_test_id(f"view-mode-menu-{option}")
+    expect(item).to_be_visible(timeout=10_000)
+    item.click()
+
+
+def _wait_for_claude_tui(page: Page) -> None:
+    """Wait for the live Claude Code TUI to attach, then return to the Chat view."""
+    _select_view(page, "terminal")
+    expect(page.locator(_TERMINAL_VIEW).last).to_have_attribute(
+        "data-state", "connected", timeout=_TERMINAL_READY_TIMEOUT_MS
+    )
+    _select_view(page, "chat")
+
+
+def _tally(page: Page) -> Locator:
+    return page.locator(_TALLY)
+
+
+def _start_background_shell(page: Page, mock_url: str) -> None:
+    """Ask Claude Code to run a shell in the background and wait for the tally."""
+    go_token = f"bg-shell-{uuid.uuid4().hex[:6]}"
+    bash_args = json.dumps(
+        {
+            "command": _BACKGROUND_COMMAND,
+            "run_in_background": True,
+            "description": _BACKGROUND_DESCRIPTION,
+        }
+    )
+    configure_mock_llm(
+        mock_url,
+        [
+            {"tool_calls": [{"name": "Bash", "arguments": bash_args}]},
+            {"text": _LONG_REPLY},
+        ],
+        key="bg-cue-shell",
+        match=go_token,
+        required_tools=["Bash"],
+    )
+    composer = page.get_by_label("Message the agent")
+    expect(composer).to_be_visible(timeout=30_000)
+    composer.fill(
+        f"Run `{_BACKGROUND_COMMAND}` in the background and tell me once it started {go_token}"
+    )
+    page.get_by_role("button", name="Send", exact=True).click()
+    expect(page.locator(_ASSISTANT).filter(has_text=_REPLY_MARKER).first).to_be_visible(
+        timeout=_TURN_TIMEOUT_MS
+    )
+    expect(_tally(page)).to_have_text("1", timeout=_TURN_TIMEOUT_MS)
+    expect(page.locator(_WORKING)).to_have_count(0, timeout=_TURN_TIMEOUT_MS)
+
+
+def _hold_follow_up(mock_url: str) -> str:
+    """Script the next turn's reply to stay open until the gate is released."""
+    follow_token = f"bg-cue-follow-{uuid.uuid4().hex[:6]}"
+    configure_mock_llm(
+        mock_url,
+        [{"text": _FOLLOW_UP_REPLY, "block": True}],
+        key="bg-cue-follow-up",
+        match=follow_token,
+        required_tools=["Bash"],
+    )
+    return follow_token
+
+
+def _release_follow_up(mock_url: str) -> None:
+    httpx.post(f"{mock_url}/gate/release", timeout=5.0)
+
+
+# The tallest scrollable descendant of the transcript (role="log") is the
+# StickToBottom viewport; tag it so later evaluations can address it.
+_TAG_SCROLLER = """
+() => {
   const log = document.querySelector('[role="log"]');
   let best = null;
   log.querySelectorAll('*').forEach((el) => {
@@ -61,187 +238,193 @@ _FIND_SCROLLER = """
       if (!best || el.scrollHeight > best.scrollHeight) best = el;
     }
   });
+  const el = best || log;
+  el.setAttribute('data-pw-scroller', '1');
+  return { scrollHeight: el.scrollHeight, clientHeight: el.clientHeight };
+}
 """
-_THREAD_OVERFLOW = (
-    "() => {" + _FIND_SCROLLER + " return best ? best.scrollHeight - best.clientHeight : 0; }"
-)
-_SCROLL_THREAD_TO_TOP = "() => {" + _FIND_SCROLLER + " if (best) best.scrollTop = 0; }"
+_SCROLL_TO_TOP = """
+() => {
+  const el = document.querySelector('[data-pw-scroller]');
+  el.scrollTop = 0;
+  return el.scrollTop;
+}
+"""
 
 
-def _publish_status(
-    base_url: str,
-    session_id: str,
-    status: str,
-    *,
-    background_task_count: int | None = None,
-) -> None:
-    """Publish a status edge through the sessions events route.
-
-    This is the same path the native harness's status forwarder posts to; an
-    omitted count preserves the sticky background-task tally.
-
-    :param base_url: Base URL of the local e2e server.
-    :param session_id: Session/conversation id.
-    :param status: Session status to publish, e.g. ``"running"``.
-    :param background_task_count: Background shells still running as of this
-        edge. ``None`` omits the field.
-    """
-    data: dict[str, object] = {"status": status}
-    if background_task_count is not None:
-        data["background_task_count"] = background_task_count
-    resp = httpx.post(
-        f"{base_url}/v1/sessions/{session_id}/events",
-        json={"type": "external_session_status", "data": data},
-        timeout=10.0,
+def _scroll_to_top(page: Page) -> None:
+    """Scroll the transcript back to its first message (re-reading earlier turns)."""
+    size = page.evaluate(_TAG_SCROLLER)
+    assert size["scrollHeight"] > size["clientHeight"] + 50, (
+        f"the thread does not overflow the phone viewport: {size}"
     )
-    resp.raise_for_status()
+    page.evaluate(_SCROLL_TO_TOP)
+    page.wait_for_function("document.querySelector('[data-pw-scroller]').scrollTop <= 2")
 
 
-def _seed_assistant_message(base_url: str, session_id: str, text: str) -> None:
-    """Append a deterministic assistant bubble through the events route.
+def _in_viewport(locator: Locator) -> bool | None:
+    if locator.count() == 0:
+        return None
+    box = locator.first.bounding_box()
+    if box is None:
+        return False
+    viewport = locator.page.viewport_size
+    assert viewport is not None
+    return box["y"] + box["height"] > 0 and box["y"] < viewport["height"]
 
-    Used to top up the thread's height when the mock LLM's replies run too
-    short for the conversation to overflow a phone viewport.
 
-    :param base_url: Base URL of the local e2e server.
-    :param session_id: Session/conversation id.
-    :param text: Assistant message body.
-    """
-    resp = httpx.post(
-        f"{base_url}/v1/sessions/{session_id}/events",
-        json={
-            "type": "external_assistant_message",
-            "data": {"agent": "hello_world", "text": text},
-        },
-        timeout=10.0,
+def _capture_bottom_chrome(page: Page, evidence_dir: Path, label: str) -> dict[str, Any]:
+    """Record what the bottom of the phone screen shows: tally, composer and pixels."""
+    page.evaluate("() => document.activeElement && document.activeElement.blur()")
+    page.wait_for_timeout(300)
+    bar = page.locator(_WORKSPACE_BAR)
+    tally = _tally(page)
+    composer = page.get_by_label("Message the agent")
+    viewport = page.viewport_size
+    assert viewport is not None
+    bar_box = bar.bounding_box()
+    tally_box = tally.bounding_box()
+    assert bar_box is not None and tally_box is not None
+    bottom_png = page.screenshot(
+        clip={
+            "x": 0,
+            "y": bar_box["y"],
+            "width": viewport["width"],
+            "height": viewport["height"] - bar_box["y"],
+        }
     )
-    resp.raise_for_status()
+    tally_png = page.screenshot(clip=tally_box)
+    (evidence_dir / f"bottom-{label}.png").write_bytes(bottom_png)
+    (evidence_dir / f"tally-{label}.png").write_bytes(tally_png)
+    state = {
+        "tally_name": tally.get_attribute("aria-label"),
+        "tally_text": tally.inner_text(),
+        "indicators_html": page.locator(_TASK_INDICATORS).inner_html(),
+        "indicators_aria": page.locator(_TASK_INDICATORS).aria_snapshot(),
+        "status_texts": [
+            text.strip()
+            for text in page.get_by_role("status").all_text_contents()
+            if "background task" in text
+        ],
+        "composer_value": composer.input_value(),
+        "composer_placeholder": composer.get_attribute("placeholder"),
+        "send_button_visible": page.get_by_role("button", name="Send", exact=True).is_visible(),
+        "interrupt_button_count": page.get_by_role("button", name="Interrupt", exact=True).count(),
+        "shimmer_attached": page.locator(_WORKING).count() > 0,
+        "shimmer_in_viewport": _in_viewport(page.locator(_WORKING)),
+        "bottom_png_sha256": hashlib.sha256(bottom_png).hexdigest(),
+        "tally_png_sha256": hashlib.sha256(tally_png).hexdigest(),
+    }
+    (evidence_dir / f"state-{label}.json").write_text(json.dumps(state, indent=2) + "\n")
+    return state
 
 
-def _send_turn(page: Page, text: str, turn: int) -> None:
-    """Send *text* and wait for the *turn*-th round trip to fully render."""
-    composer = page.get_by_label("Message the agent")
-    expect(composer).to_be_visible()
-    composer.fill(text)
-    page.get_by_role("button", name="Send", exact=True).click()
-    expect(page.locator(_USER)).to_have_count(turn, timeout=15_000)
-    expect(page.locator(_ASSISTANT)).to_have_count(turn, timeout=90_000)
-    expect(page.locator(_WORKING)).to_have_count(0, timeout=90_000)
-
-
-@dataclass
-class _BottomChromeSignature:
-    """User-perceivable state of the persistent bottom chrome."""
-
-    aria: str
-    pixels: bytes
-
-
-def _bottom_chrome_signature(page: Page) -> _BottomChromeSignature:
-    """Capture the bottom chrome once it paints two identical frames in a row,
-    so an in-flight repaint never lands in a signature."""
-    chrome = page.locator(_BOTTOM_CHROME)
-    expect(chrome).to_be_visible()
-    shot = chrome.screenshot(animations="disabled", caret="hide")
-    for _ in range(10):
-        page.wait_for_timeout(400)
-        again = chrome.screenshot(animations="disabled", caret="hide")
-        if again == shot:
-            break
-        shot = again
-    return _BottomChromeSignature(aria=chrome.aria_snapshot(), pixels=shot)
-
-
-def _signatures_with_background_task(
-    page: Page,
-    seeded_session: tuple[str, str],
-) -> tuple[_BottomChromeSignature, _BottomChromeSignature, _BottomChromeSignature]:
-    """Drive the journey; return (idle, working, idle-again) signatures."""
-    base_url, session_id = seeded_session
-    page.set_viewport_size(_IPHONE_VIEWPORT)
-    page.goto(f"{base_url}/c/{session_id}")
-    composer = page.get_by_label("Message the agent")
-    expect(composer).to_be_visible()
-
-    # Enough short turns that scrolling up puts the thread's end off screen.
-    overflow = 0
-    for turn in range(1, 4):
-        _send_turn(page, f"Say hello ({turn}).", turn)
-        overflow = page.evaluate(_THREAD_OVERFLOW)
-    # The mock's replies vary in height; top up with seeded earlier replies
-    # until the thread genuinely overflows the viewport.
-    seeded = 0
-    while overflow <= 300 and seeded < 12:
-        seeded += 1
-        _seed_assistant_message(
-            base_url,
-            session_id,
-            f"Earlier reply {seeded}.\n\nA few more lines of prior conversation so "
-            "the thread grows taller than a phone screen and the end-of-thread "
-            "area can scroll out of view.",
+def _assert_tally_carries_working_state(idle: dict[str, Any], working: dict[str, Any]) -> None:
+    """The tally must look and read differently while the agent works than while idle."""
+    failures: list[str] = []
+    if (
+        working["indicators_html"] == idle["indicators_html"]
+        and working["tally_png_sha256"] == idle["tally_png_sha256"]
+    ):
+        failures.append(
+            "the tally renders exactly its idle presentation while the agent works "
+            f"(text {working['tally_text']!r}, same markup and pixels)"
         )
-        expect(page.get_by_text(f"Earlier reply {seeded}.")).to_be_visible(timeout=15_000)
-        overflow = page.evaluate(_THREAD_OVERFLOW)
-    assert overflow > 300, f"thread did not overflow the phone viewport (overflow={overflow})"
+    if working["tally_name"] == idle["tally_name"]:
+        failures.append(
+            f"the tally's accessible name is {working['tally_name']!r} both while the agent "
+            "works and while idle"
+        )
+    assert not failures, "no working cue at the bottom of the phone screen:\n- " + "\n- ".join(
+        failures
+    )
 
-    # The edge sequence a claude-native turn ends with: `running` for the
-    # turn's activity, then the Stop-hook turn-end edge carrying the tally of
-    # shells that outlive it. The leading `running` also clears a sticky
-    # `failed` the mock lane's turn can leave, which would otherwise swallow
-    # the turn-end edge (failed is sticky against trailing idles server-side).
-    _publish_status(base_url, session_id, "running")
-    _publish_status(base_url, session_id, "idle", background_task_count=1)
-    # No UI hook to await: on the buggy build this edge renders nothing at
-    # all. Give the SSE edges time to land before snapshotting.
-    page.wait_for_timeout(1_500)
 
+@_PHONE
+@pytest.mark.nightly
+@pytest.mark.timeout(600)
+def test_tally_shows_working_state_while_shimmer_is_off_screen(
+    request: pytest.FixtureRequest,
+    native_claude_background_session: tuple[str, str],
+    mock_llm_server_url: str,
+    browser: Browser,
+) -> None:
+    """With a draft typed and the shimmer scrolled away, a new turn must show on the tally."""
+    base_url, session_id = native_claude_background_session
+    evidence_dir = _evidence_dir(request)
+    reset_mock_llm(mock_llm_server_url)
+    set_fallback_mock_llm(mock_llm_server_url, "default", "ok")
+    set_fallback_mock_llm(mock_llm_server_url, _CLAUDE_MOCK_MODEL, "ok")
+
+    page = request.getfixturevalue("page")
+    page.goto(f"{base_url}/c/{session_id}")
+    _wait_for_claude_tui(page)
+    _start_background_shell(page, mock_llm_server_url)
+
+    composer = page.get_by_label("Message the agent")
     composer.fill(_DRAFT)
-    composer.blur()
-    page.evaluate(_SCROLL_THREAD_TO_TOP)
+    _scroll_to_top(page)
+    idle = _capture_bottom_chrome(page, evidence_dir, "idle")
 
-    idle = _bottom_chrome_signature(page)
+    follow_token = _hold_follow_up(mock_llm_server_url)
+    second_client = browser.new_context(viewport=_DESKTOP_VIEWPORT)
+    try:
+        other = second_client.new_page()
+        other.goto(f"{base_url}/c/{session_id}")
+        other_composer = other.get_by_label("Message the agent")
+        expect(other_composer).to_be_visible(timeout=30_000)
+        other_composer.fill(f"How is the sleep doing? {follow_token}")
+        other.get_by_role("button", name="Send", exact=True).click()
 
-    _publish_status(base_url, session_id, "running")
-    working_indicator = page.locator(_WORKING)
-    expect(working_indicator).to_be_attached(timeout=15_000)
-    # A fresh status edge can re-stick the log to its end; the user is
-    # re-reading earlier messages, so scroll back up before the premise check.
-    page.evaluate(_SCROLL_THREAD_TO_TOP)
-    # The end-of-thread shimmer exists but is off screen, and with a draft the
-    # send arrow never morphs into Interrupt — the bottom chrome is all the
-    # status surface the screen has left.
-    expect(working_indicator).not_to_be_in_viewport()
-    expect(page.get_by_role("button", name="Interrupt")).to_have_count(0)
+        shimmer = page.locator(_WORKING)
+        expect(shimmer).to_be_attached(timeout=_TURN_TIMEOUT_MS)
+        if _in_viewport(shimmer):
+            _scroll_to_top(page)
+        expect(shimmer).not_to_be_in_viewport()
+        expect(composer).to_have_value(_DRAFT)
+        working = _capture_bottom_chrome(page, evidence_dir, "working")
+        _assert_tally_carries_working_state(idle, working)
+    finally:
+        _release_follow_up(mock_llm_server_url)
+        second_client.close()
 
-    working = _bottom_chrome_signature(page)
-
-    _publish_status(base_url, session_id, "idle")
-    expect(working_indicator).to_have_count(0, timeout=15_000)
-
-    idle_again = _bottom_chrome_signature(page)
-    return idle, working, idle_again
+    expect(page.locator(_WORKING)).to_have_count(0, timeout=_TURN_TIMEOUT_MS)
+    expect(_tally(page)).to_have_text("1")
+    settled = _capture_bottom_chrome(page, evidence_dir, "settled")
+    assert settled["tally_name"] == idle["tally_name"], "the tally did not revert once idle"
 
 
-def test_phone_bottom_chrome_distinguishes_working_from_idle(
-    page: Page,
-    seeded_session: tuple[str, str],
+@_PHONE
+@pytest.mark.nightly
+@pytest.mark.timeout(600)
+def test_tally_shows_working_state_for_follow_up_sent_from_the_phone(
+    request: pytest.FixtureRequest,
+    native_claude_background_session: tuple[str, str],
+    mock_llm_server_url: str,
 ) -> None:
-    idle, working, idle_again = _signatures_with_background_task(page, seeded_session)
-    assert working.pixels != idle.pixels and working.pixels != idle_again.pixels, (
-        "With a background task running and the shimmer scrolled off screen, the "
-        "bottom chrome (workspace bar + composer) renders pixel-identical while "
-        "the agent's turn is running vs while the session sits idle — a phone "
-        "user has no working/idle cue anywhere on screen."
-    )
+    """The report's single-device step: send the follow-up from the phone and watch the tally."""
+    base_url, session_id = native_claude_background_session
+    evidence_dir = _evidence_dir(request)
+    reset_mock_llm(mock_llm_server_url)
+    set_fallback_mock_llm(mock_llm_server_url, "default", "ok")
+    set_fallback_mock_llm(mock_llm_server_url, _CLAUDE_MOCK_MODEL, "ok")
 
+    page = request.getfixturevalue("page")
+    page.goto(f"{base_url}/c/{session_id}")
+    _wait_for_claude_tui(page)
+    _start_background_shell(page, mock_llm_server_url)
+    idle = _capture_bottom_chrome(page, evidence_dir, "idle")
 
-def test_phone_bottom_chrome_distinguishes_working_for_screen_readers(
-    page: Page,
-    seeded_session: tuple[str, str],
-) -> None:
-    idle, working, idle_again = _signatures_with_background_task(page, seeded_session)
-    assert working.aria != idle.aria and working.aria != idle_again.aria, (
-        "With a background task running, the bottom chrome exposes an identical "
-        "accessibility tree while the agent's turn is running vs while the "
-        "session sits idle — a screen-reader user has no working/idle cue either."
-    )
+    follow_token = _hold_follow_up(mock_llm_server_url)
+    composer = page.get_by_label("Message the agent")
+    composer.fill(f"How is the sleep doing? {follow_token}")
+    page.get_by_role("button", name="Send", exact=True).click()
+    try:
+        expect(page.locator(_WORKING)).to_be_attached(timeout=_TURN_TIMEOUT_MS)
+        working = _capture_bottom_chrome(page, evidence_dir, "working")
+        _assert_tally_carries_working_state(idle, working)
+    finally:
+        _release_follow_up(mock_llm_server_url)
+
+    expect(page.locator(_WORKING)).to_have_count(0, timeout=_TURN_TIMEOUT_MS)
+    expect(_tally(page)).to_have_text("1")
