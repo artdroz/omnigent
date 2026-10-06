@@ -325,9 +325,16 @@ def test_host_badge_offline_host_keeps_name_and_pill_offers_reconnect_below(
     pill = page.get_by_test_id("disconnected-indicator")
     expect(pill).to_be_visible(timeout=15_000)
     expect(pill).to_have_text("Host is offline — click to reconnect")
-    # Legible text, not a screen-reader-only sliver.
+    # Legible text directly below the composer, not a screen-reader-only sliver.
     box = pill.bounding_box()
-    assert box is not None and box["height"] >= 16 and box["width"] >= 120, box
+    composer_box = composer.bounding_box()
+    assert box is not None and composer_box is not None, (box, composer_box)
+    assert box["height"] >= 16 and box["width"] >= 120, box
+    assert box["y"] >= composer_box["y"] + composer_box["height"], (box, composer_box)
+    assert (
+        box["x"] < composer_box["x"] + composer_box["width"]
+        and box["x"] + box["width"] > composer_box["x"]
+    ), (box, composer_box)
 
     pill.click()
     dialog = page.get_by_test_id("reconnect-session-dialog")
