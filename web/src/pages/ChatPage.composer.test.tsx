@@ -6026,4 +6026,27 @@ describe("Composer voice dictation", () => {
     expect(abortSpy).not.toHaveBeenCalled();
     expect(mic).toHaveAttribute("aria-pressed", "true");
   });
+
+  it("ends the voice take when a command is run from the slash menu", () => {
+    // Selecting a no-arg built-in from the menu clears the composer via
+    // setValue(""), unlike the typed path that leaves the text in place. A
+    // cleared composer must not keep the mic recording.
+    setComposerState({ conversationId: "conv_test", skills: [] });
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    const mic = screen.getByRole("button", { name: "Voice dictation" });
+    fireEvent.click(mic);
+    act(() => handlers.start?.({}));
+    expect(mic).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.focus(textarea());
+    fireEvent.change(textarea(), { target: { value: "/con" } });
+    fireEvent.click(screen.getByTestId("slash-menu-item-context"));
+
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onSendSlashCommand).not.toHaveBeenCalled();
+    expect(textarea().value).toBe("");
+    expect(abortSpy).toHaveBeenCalledTimes(1);
+  });
 });

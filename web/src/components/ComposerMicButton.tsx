@@ -102,10 +102,8 @@ export interface ComposerMicButtonProps {
 }
 
 export interface ComposerMicButtonHandle {
-  /** End an in-progress take, keeping whatever was already dictated but never
-   *  flushing a trailing utterance into the just-cleared composer. Parents call
-   *  this when they commit the draft (e.g. a Send tap, which on touch devices
-   *  never reaches the Enter-commit handler). No-op when idle. */
+  /** End the current take, preserving dictated text without flushing a trailing
+   *  utterance into the just-cleared composer. No-op when idle. */
   endTake: () => void;
 }
 
@@ -524,9 +522,8 @@ function ComposerMicButtonImpl(
     if (serverBusyRef.current) {
       endPendingRef.current = true;
       discardingRef.current = true;
-      // Drop the handshake spinner now; toggleServer cancels the session it
-      // opens once start resolves, which can lag the send by seconds.
-      setConnecting(false);
+      // Keep the connecting indicator until toggleServer cancels the pending
+      // session, so the button isn't idle-looking while it still rejects taps.
       return;
     }
     if (!isListening && !transitionRef.current) return;

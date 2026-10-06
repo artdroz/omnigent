@@ -3188,9 +3188,13 @@ function ComposerImpl(
     if (slashCompletion.inline || slashCommandsWithArgs.has(cmd)) {
       completeMenuSelection(cmd);
     } else {
-      // Execute immediately — no argument needed.
-      // /compact clears its draft only after the busy guard accepts it.
-      if (cmd !== "/compact") setValue("");
+      // Execute immediately — no argument needed. Clearing the composer ends a
+      // live take so the mic can't keep recording into the emptied composer;
+      // /compact clears later, under its busy guard, and ends the take there.
+      if (cmd !== "/compact") {
+        endVoiceTake();
+        setValue("");
+      }
       setCommandError(null);
       executeSlashCommand(cmd, "");
     }

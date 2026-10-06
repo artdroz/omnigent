@@ -771,6 +771,10 @@ describe("ComposerMicButton (endTake)", () => {
     expect(button).toHaveAttribute("aria-busy", "true");
     act(() => ref.current?.endTake());
 
+    // The take is marked for teardown, but the handshake is still in flight, so
+    // the button keeps showing busy instead of looking idle yet rejecting taps.
+    expect(button).toHaveAttribute("aria-busy", "true");
+
     // Resolving the handshake must discard the session, not attach a live take.
     await act(async () => {
       resolveStart({ stop: sessionStopMock, cancel: sessionCancelMock });
@@ -786,7 +790,7 @@ describe("ComposerMicButton (endTake)", () => {
     vi.stubGlobal("webkitSpeechRecognition", undefined);
     const onTranscript = vi.fn();
     // Hold session.stop() open so the send (endTake) lands while the stop is
-    // still pending and no session is attached — the race the fix closes.
+    // still pending and no session is attached — its tail must not flush.
     let resolveStop!: (tail: string) => void;
     sessionStopMock = vi.fn(
       () =>

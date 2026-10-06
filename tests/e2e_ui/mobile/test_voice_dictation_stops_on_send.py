@@ -22,7 +22,6 @@ import re
 from typing import Any
 
 import httpx
-import pytest
 from playwright.sync_api import Browser, BrowserContext, Page, expect
 
 from omnigent.server.dictation import FAKE_SCRIPT as _FAKE_SCRIPT
@@ -235,8 +234,10 @@ def test_server_dictation_take_ends_when_message_is_sent(
     response = httpx.get(f"{base_url}/v1/info", timeout=10.0)
     response.raise_for_status()
     info = response.json()
-    if not info.get("dictation_available"):
-        pytest.skip("server dictation is not enabled on this server (OMNIGENT_DICTATION_ENGINE)")
+    # The shared fixture defaults OMNIGENT_DICTATION_ENGINE=fake, so dictation is
+    # always advertised here; assert it rather than skip so a setup or capability
+    # regression fails loudly instead of silently bypassing this coverage.
+    assert info.get("dictation_available"), "server dictation must be enabled for this regression"
     configure_mock_llm(
         mock_llm_server_url, [{"text": _REPLY}], key="voice-send-server", match=_FAKE_SCRIPT
     )
