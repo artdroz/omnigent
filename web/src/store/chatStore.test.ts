@@ -10168,7 +10168,9 @@ describe("chatStore — session configuration scope", () => {
     refuses: (body: Record<string, unknown>) => boolean,
     message: string,
     gate?: Promise<void>,
-  ) =>
+  ) => {
+    // Chain to the session snapshot handler so a post-refusal lookup reads the server's value.
+    const serve = fetchMock.getMockImplementation() ?? defaultFetchHandler;
     fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       const body = init?.method === "PATCH" ? JSON.parse(String(init.body)) : {};
@@ -10179,8 +10181,9 @@ describe("chatStore — session configuration scope", () => {
           { ok: false, status: 503 },
         );
       }
-      return defaultFetchHandler(input, init);
+      return serve(input, init);
     });
+  };
   const refuseEffortPatch = (sessionId: string, gate?: Promise<void>) =>
     refusePatch(
       sessionId,
@@ -10255,6 +10258,63 @@ describe("chatStore — session configuration scope", () => {
 
     expect(patchCallsFor("conv_codex_lookup_failed")).toEqual([]);
     expect(useChatStore.getState().sessionReasoningEffort).toBe("low");
+  });
+
+  it("restores the server's effort when two overlapping effort picks are refused", async () => {
+    seedSession("conv_codex_double_refusal", []);
+    withSnapshot("conv_codex_double_refusal", {
+      labels: { "omnigent.wrapper": "codex-native-ui" },
+      reasoning_effort: "low",
+    });
+    await useChatStore.getState().switchTo("conv_codex_double_refusal");
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    refusePatch(
+      "conv_codex_double_refusal",
+      (body) => body.reasoning_effort === "high" || body.reasoning_effort === "medium",
+      "The terminal did not apply the reasoning effort change. Please try again.",
+      gate,
+    );
+
+    const first = useChatStore.getState().setEffort("high");
+    const second = useChatStore.getState().setEffort("medium");
+    release();
+
+    await expect(first).rejects.toThrow("did not apply the reasoning effort change");
+    await expect(second).rejects.toThrow("did not apply the reasoning effort change");
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("low");
+  });
+
+  it("restores the server's model when two overlapping model picks are refused", async () => {
+    seedSession("conv_model_double_refusal", []);
+    withSnapshot("conv_model_double_refusal", {
+      labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      model_override: "claude-sonnet-4-6",
+    });
+    await useChatStore.getState().switchTo("conv_model_double_refusal");
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    refusePatch(
+      "conv_model_double_refusal",
+      (body) => "model_override" in body,
+      "The terminal did not apply the model change. The previous selection has been restored.",
+      gate,
+    );
+
+    const first = useChatStore.getState().setModel("claude-opus-4-7", { expectConfirmation: true });
+    const second = useChatStore
+      .getState()
+      .setModel("claude-haiku-4-5", { expectConfirmation: true });
+    release();
+
+    await expect(first).rejects.toThrow("did not apply the model change");
+    await expect(second).rejects.toThrow("did not apply the model change");
+    expect(useChatStore.getState().sessionModelOverride).toBe("claude-sonnet-4-6");
+    expect(useChatStore.getState().pendingModelChange).toBeNull();
   });
 
   it("keeps a newer effort pick when an earlier refused change settles", async () => {

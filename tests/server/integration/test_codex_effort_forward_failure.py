@@ -455,6 +455,35 @@ async def test_rejected_reset_preserves_concurrent_selection_and_sibling_setting
     assert saved.title == "A newer title"
 
 
+async def test_overlapping_refused_changes_restore_the_applied_effort(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second refused change must not restore the first change's unapplied value."""
+    session = native_session
+    monkeypatch.setattr(app_server, "_EFFORT_CATALOG_TIMEOUT_SECONDS", 5.0)
+    session.codex.release_catalog = asyncio.Event()
+    url = f"/v1/sessions/{session.session_id}"
+    first = asyncio.create_task(client.patch(url, json={"reasoning_effort": "high"}))
+    try:
+        await asyncio.wait_for(session.codex.catalog_entered.wait(), timeout=5.0)
+        second = asyncio.create_task(client.patch(url, json={"reasoning_effort": "medium"}))
+        # Without ordering, the second change would persist over the first meanwhile.
+        await asyncio.sleep(0.2)
+    finally:
+        session.codex.release_catalog.set()
+    responses = await asyncio.wait_for(asyncio.gather(first, second), timeout=10.0)
+
+    assert [response.status_code for response in responses] == [503, 503], [
+        response.text for response in responses
+    ]
+    saved = session.store.get_conversation(session.session_id)
+    assert saved is not None
+    assert saved.reasoning_effort == "xhigh"
+    assert bridge.read_codex_config_effort(session.bridge_dir) == "xhigh"
+
+
 @pytest.mark.parametrize("silent", [False, True])
 async def test_offline_or_silent_effort_change_is_saved_for_resume(
     client: httpx.AsyncClient,

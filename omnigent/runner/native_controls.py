@@ -261,7 +261,10 @@ def build_native_controls(
     ) -> Response:
         if not settings:
             return Response(status_code=204)
-        lock = _codex_settings_locks.setdefault(conv_id, asyncio.Lock())
+        lock = _codex_settings_locks.get(conv_id)
+        if lock is None:
+            lock = _codex_settings_locks[conv_id] = asyncio.Lock()
+        # The lock also covers the public mirror so the server sees efforts in apply order.
         async with lock:
             return await _apply_codex_native_settings_update(conv_id, settings)
 

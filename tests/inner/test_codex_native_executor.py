@@ -1382,16 +1382,15 @@ def test_dispatch_uses_model_supported_effort(
     model_override: str | None,
 ) -> None:
     """Explicit and inherited efforts are checked before starting the next turn."""
-    requests: list[tuple[str, dict[str, Any]]] = []
 
     class CatalogClient(_FakeCodexNativeClient):
-        requests = []
+        requests: list[tuple[str, dict[str, Any]]] = []
         created = []
         next_turn = 1
 
         async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-            requests.append((method, params))
             if method == "model/list":
+                type(self).requests.append((method, params))
                 return {
                     "result": {
                         "data": [
@@ -1423,7 +1422,9 @@ def test_dispatch_uses_model_supported_effort(
         ExecutorConfig(model=model_override, extra={"reasoning_effort": requested}),
     )
 
-    updates = [params for method, params in requests if method == "thread/settings/update"]
+    updates = [
+        params for method, params in CatalogClient.requests if method == "thread/settings/update"
+    ]
     if requested is not None or inherited != expected:
         assert len(updates) == 1
         assert updates[0]["effort"] == expected
@@ -1431,7 +1432,7 @@ def test_dispatch_uses_model_supported_effort(
         assert updates == [{"threadId": "thread_123", "model": model_override}]
     else:
         assert updates == []
-    assert requests[-1][0] == "turn/start"
+    assert CatalogClient.requests[-1][0] == "turn/start"
     assert read_codex_config_effort(tmp_path) == expected
 
     if requested == "minimal" and model_override is None:
@@ -1442,9 +1443,11 @@ def test_dispatch_uses_model_supported_effort(
             ExecutorConfig(model=model_override, extra={"reasoning_effort": requested}),
         )
         assert [
-            params["effort"] for method, params in requests if method == "thread/settings/update"
+            params["effort"]
+            for method, params in CatalogClient.requests
+            if method == "thread/settings/update"
         ] == [expected, expected]
-    assert sum(method == "model/list" for method, _params in requests) == 1
+    assert sum(method == "model/list" for method, _params in CatalogClient.requests) == 1
     assert read_codex_config_model(tmp_path) == (model_override or "gpt-5.6-sol")
 
 

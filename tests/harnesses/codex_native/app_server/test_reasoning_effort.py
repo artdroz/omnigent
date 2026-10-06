@@ -301,15 +301,24 @@ async def test_resume_applies_and_mirrors_supported_effort(
         if method == "model/list"
         else {"result": {}}
     )
-    monkeypatch.setattr(app_server, "client_for_transport", lambda *args, **kwargs: client)
+    client_calls: list[tuple[str, str]] = []
+
+    def _client_for_transport(transport: str, *, client_name: str) -> AsyncMock:
+        client_calls.append((transport, client_name))
+        return client
+
+    monkeypatch.setattr(app_server, "client_for_transport", _client_for_transport)
+    transport = str(tmp_path / "app-server.sock")
 
     await app_server.apply_codex_thread_effort(
-        str(tmp_path / "app-server.sock"),
+        transport,
         "thread_resumed",
         effort,
         model=None if model == "gpt-5.4" else model,
         bridge_dir=tmp_path,
     )
+
+    assert client_calls == [(transport, "omnigent-codex-native-effort")]
 
     client.request.assert_awaited_with(
         "thread/settings/update", {"threadId": "thread_resumed", "effort": expected}

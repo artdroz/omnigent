@@ -3085,9 +3085,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }
         await updateSession(conversationId, { reasoningEffort: effort });
       } catch (err) {
-        // A failed lookup or refused change leaves the server's effort; keep a newer pick.
+        // Adopt the server's settled effort, not an earlier unconfirmed pick; keep a newer pick.
+        const settled = await settledSessionSetting(conversationId, "reasoningEffort", previous);
         setterFor(conversationId)((s) =>
-          s.sessionReasoningEffort === effort ? { sessionReasoningEffort: previous } : {},
+          s.sessionReasoningEffort === effort ? { sessionReasoningEffort: settled } : {},
         );
         throw err;
       }
@@ -3121,12 +3122,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       try {
         session = await updateSession(conversationId, { modelOverride: model });
       } catch (err) {
-        // Nothing will confirm a refused ask; restore the prior pick unless a newer one replaced it.
+        // Nothing will confirm a refused ask; adopt the server's settled model unless
+        // a newer pick replaced it.
+        const settled = await settledSessionSetting(conversationId, "modelOverride", previous);
         setterFor(conversationId)((s) => ({
           ...(expectConfirmation && s.pendingModelChange === model
             ? { pendingModelChange: null }
             : {}),
-          ...(s.sessionModelOverride === model ? { sessionModelOverride: previous } : {}),
+          ...(s.sessionModelOverride === model ? { sessionModelOverride: settled } : {}),
         }));
         throw err;
       }
@@ -3559,6 +3562,24 @@ function abortConversationStream(entry: ConversationEntry): void {
 function setterForState(conversationId: string): ChatState | null {
   const entry = conversationRegistry.peek(conversationId);
   return entry === undefined ? null : entryGetter(entry)();
+}
+
+/**
+ * Read a session setting after a refused change.
+ *
+ * The server orders and rolls back live settings changes, so its value is the
+ * settled one; an earlier optimistic pick may never have applied.
+ */
+async function settledSessionSetting(
+  conversationId: string,
+  field: "reasoningEffort" | "modelOverride",
+  fallback: string | null,
+): Promise<string | null> {
+  try {
+    return (await getSessionSlim(conversationId))[field] ?? null;
+  } catch {
+    return fallback;
+  }
 }
 
 /**

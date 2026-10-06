@@ -7,6 +7,7 @@ import contextlib
 import json
 import secrets
 import time
+import weakref
 from collections.abc import Callable
 from typing import Any
 
@@ -310,6 +311,20 @@ async def _wake_runner_for_model_change(
         conv.id, conv.runner_id, runner_client, conversation_store, conversation=conv
     )
     return conv
+
+
+# custom-lint: disable-next=workspace-scoped-cache -- session ids are globally unique
+_SESSION_SETTINGS_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _session_settings_lock(session_id: str) -> asyncio.Lock:
+    """Return the lock that orders live settings changes for *session_id*."""
+    lock = _SESSION_SETTINGS_LOCKS.get(session_id)
+    if lock is None:
+        lock = _SESSION_SETTINGS_LOCKS[session_id] = asyncio.Lock()
+    return lock
 
 
 def register_core_routes(
@@ -2193,6 +2208,20 @@ def register_core_routes(
         session_id: str,
         body: UpdateSessionRequest,
         include_usage: bool = Query(default=True),
+    ) -> SessionResponse:
+        """Apply a session PATCH; see :func:`_update_session` for the field semantics."""
+        # A live effort/model change must read the settings its predecessor confirmed
+        # or restored; otherwise a refusal can restore a value Codex never applied.
+        if not body.silent and {"reasoning_effort", "model_override"} & body.model_fields_set:
+            async with _session_settings_lock(session_id):
+                return await _update_session(request, session_id, body, include_usage)
+        return await _update_session(request, session_id, body, include_usage)
+
+    async def _update_session(
+        request: Request,
+        session_id: str,
+        body: UpdateSessionRequest,
+        include_usage: bool,
     ) -> SessionResponse:
         """
         Update a session's mutable fields. When ``runner_id`` is
