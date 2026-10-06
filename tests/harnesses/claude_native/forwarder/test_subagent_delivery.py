@@ -1616,7 +1616,8 @@ async def test_subagent_watcher_backs_off_relocating_a_missing_transcript(
             )
         }
     )
-    backoff = forwarder._SubagentRelocationBackoff()
+    now = [1000.0]
+    memo = forwarder._SubagentScanMemo(clock=lambda: now[0])
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(lambda request: httpx.Response(202, json={})),
@@ -1634,10 +1635,38 @@ async def test_subagent_watcher_backs_off_relocating_a_missing_transcript(
                     start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
                     item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
                     status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
-                    relocation_backoff=backoff,
+                    scan_memo=memo,
                 )
 
     assert scans == ["ghost"]
+
+    async def tick_after(seconds: float) -> None:
+        now[0] += seconds
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: httpx.Response(202, json={})),
+            base_url="http://ap",
+        ) as client:
+            await forwarder._forward_available_subagents(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=state,
+                agent_name="claude-native-ui",
+                start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                scan_memo=memo,
+            )
+
+    # The first miss waits 1 s, the second 2 s: a retry is permitted only once
+    # the window has elapsed.
+    await tick_after(1.0)
+    assert scans == ["ghost", "ghost"]
+    await tick_after(1.0)
+    assert len(scans) == 2
+    await tick_after(1.0)
+    assert len(scans) == 3
     warnings = [record for record in caplog.records if "has no transcript" in record.message]
     assert len(warnings) == 1 and "ghost" in warnings[0].message
     assert state.subagents["ghost"].transcript_subdir is None

@@ -748,6 +748,14 @@ async def test_subagent_watcher_registers_workflow_nested_spawn(
         tool_use_id=None,
         transcript_subdir="workflows/wf_run_abc123",
     )
+    # Outside workflows/ a meta still needs its tool call; this one must not register.
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="flat-toolless",
+        agent_type="general-purpose",
+        description="meta without a spawn",
+        tool_use_id=None,
+    )
 
     start_paths: dict[str, str] = {}
     tool_use_ids: dict[str, str] = {}
@@ -791,6 +799,7 @@ async def test_subagent_watcher_registers_workflow_nested_spawn(
     assert "nested-worker" in state.subagents
     assert state.subagents["nested-worker"].child_conversation_id == "conv_nested-worker"
     assert state.subagents["workflow-worker"].transcript_subdir == "workflows/wf_run_abc123"
+    assert "flat-toolless" not in start_paths and "flat-toolless" not in state.subagents
 
 
 def test_subagent_state_reader_keeps_transcript_subdir_inside_subagents(
@@ -950,3 +959,62 @@ async def test_subagent_watcher_registers_workflow_child_under_its_parent_agent(
         "phase-worker": "/v1/sessions/conv_lead/events",
     }
     assert state.subagents["phase-worker"].parent_subagent_id == "lead"
+
+
+async def test_subagent_watcher_warns_once_for_a_persistently_duplicated_id(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A duplicated id whose spawn stays unresolved is warned about once, not per poll."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere.jsonl"
+    for transcript_subdir in (None, "workflows/wf_run_abc123"):
+        # The spawn record lands in a transcript the forwarder never reads, so the
+        # kept candidate is deferred on every poll.
+        _seed_subagent_on_disk(
+            transcript_path=transcript_path,
+            subagent_id="twin",
+            agent_type="general-purpose",
+            description="duplicated id",
+            tool_use_id="toolu_twin",
+            transcript_subdir=transcript_subdir,
+            spawn_transcript_path=elsewhere,
+        )
+    starts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("type") == "external_subagent_start":
+            starts.append(body["data"]["subagent_id"])
+        return httpx.Response(202, json={})
+
+    memo = forwarder._SubagentScanMemo()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        with caplog.at_level(logging.WARNING, logger=forwarder._logger.name):
+            state = forwarder.SubagentForwardState(subagents={})
+            for _ in range(3):
+                state = await forwarder._forward_available_subagents(
+                    client=client,
+                    parent_session_id="conv_root",
+                    bridge_dir=bridge_dir,
+                    transcript_path=transcript_path,
+                    state=state,
+                    agent_name="claude-native-ui",
+                    start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                    item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                    status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                    scan_memo=memo,
+                )
+
+    assert starts == [] and state.subagents == {}
+    warnings = [
+        record
+        for record in caplog.records
+        if "duplicate claude-native sub-agent" in record.message
+    ]
+    assert len(warnings) == 1

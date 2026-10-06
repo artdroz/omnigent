@@ -645,15 +645,22 @@ class _SessionEventBatchCapability:
 
 
 @dataclass
-class _SubagentRelocationBackoff:
-    """Space out ``subagents/`` scans for tracked entries whose transcript is missing."""
+class _SubagentScanMemo:
+    """Process-local memory for the sub-agent scan.
+
+    Spaces out ``subagents/`` scans for tracked entries whose transcript is
+    missing and remembers duplicate ids already warned about. The forwarder
+    loop threads one instance; a fresh instance per call disables both.
+    """
 
     next_attempt_at: dict[str, float] = field(default_factory=dict)
     attempts: dict[str, int] = field(default_factory=dict)
+    warned_duplicates: set[str] = field(default_factory=set)
+    clock: Callable[[], float] = time.monotonic
 
     def due(self, subagent_id: str) -> bool:
         """Return whether a relocation scan may run for ``subagent_id`` now."""
-        return time.monotonic() >= self.next_attempt_at.get(subagent_id, 0.0)
+        return self.clock() >= self.next_attempt_at.get(subagent_id, 0.0)
 
     def record_miss(self, subagent_id: str) -> int:
         """Schedule the next scan with exponential backoff and return the attempt count."""
@@ -663,7 +670,7 @@ class _SubagentRelocationBackoff:
             _SUBAGENT_RELOCATE_BASE_DELAY_S * 2 ** (attempts - 1),
             _SUBAGENT_RELOCATE_MAX_DELAY_S,
         )
-        self.next_attempt_at[subagent_id] = time.monotonic() + delay_s
+        self.next_attempt_at[subagent_id] = self.clock() + delay_s
         return attempts
 
     def clear(self, subagent_id: str) -> None:
@@ -1253,7 +1260,7 @@ async def forward_claude_transcript_to_session(
     session_event_batch_capability = _SessionEventBatchCapability()
     delta_batch_capability = _SessionEventBatchCapability()
     subagent_status_capability = _SubagentStatusCapability()
-    subagent_relocation_backoff = _SubagentRelocationBackoff()
+    subagent_scan_memo = _SubagentScanMemo()
     # Dedupe: Claude rewrites the same usage block every poll until
     # the next assistant entry; only POST on real change. Mutated in
     # place by ``_forward_available_items`` and carried across polls.
@@ -1534,7 +1541,7 @@ async def forward_claude_transcript_to_session(
                                         status_retry_tracker=subagent_status_retries,
                                         batch_capability=session_event_batch_capability,
                                         status_capability=subagent_status_capability,
-                                        relocation_backoff=subagent_relocation_backoff,
+                                        scan_memo=subagent_scan_memo,
                                     ),
                                     timeout=_FORWARD_LOOP_STALL_DEADLINE_S,
                                 ),
@@ -2191,7 +2198,7 @@ async def _forward_one_subagent(
     status_retry_tracker: _PostRetryTracker,
     batch_capability: _SessionEventBatchCapability,
     status_capability: _SubagentStatusCapability,
-    relocation_backoff: _SubagentRelocationBackoff | None = None,
+    scan_memo: _SubagentScanMemo | None = None,
 ) -> None:
     """Drain one child's transcript in ordered, byte-capped batches."""
     retry_prefixes = (
@@ -2204,17 +2211,17 @@ async def _forward_one_subagent(
         return
     jsonl_path = _subagent_transcript_path(subagents_dir, entry)
     if not jsonl_path.exists():
-        if relocation_backoff is None:
-            relocation_backoff = _SubagentRelocationBackoff()
-        if entry.transcript_subdir is not None or not relocation_backoff.due(entry.subagent_id):
+        if scan_memo is None:
+            scan_memo = _SubagentScanMemo()
+        if entry.transcript_subdir is not None or not scan_memo.due(entry.subagent_id):
             return
         # An older runner may have checkpointed this entry without its subdir;
         # relocate a nested transcript instead of waiting for a flat one forever.
         recovered = await asyncio.to_thread(
             _recover_subagent_transcript_subdir, subagents_dir, entry
         )
-        if not recovered:
-            if relocation_backoff.record_miss(entry.subagent_id) == 1:
+        if recovered is None:
+            if scan_memo.record_miss(entry.subagent_id) == 1:
                 _logger.warning(
                     "Tracked claude-native sub-agent has no transcript; "
                     "parent_session=%s subagent_id=%s expected=%s",
@@ -2223,7 +2230,7 @@ async def _forward_one_subagent(
                     jsonl_path,
                 )
             return
-        relocation_backoff.clear(entry.subagent_id)
+        scan_memo.clear(entry.subagent_id)
         entry = replace(entry, transcript_subdir=recovered)
         await checkpoint.put(entry)
         jsonl_path = _subagent_transcript_path(subagents_dir, entry)
@@ -2595,7 +2602,7 @@ async def _forward_available_subagents(
     status_retry_tracker: _PostRetryTracker,
     batch_capability: _SessionEventBatchCapability | None = None,
     status_capability: _SubagentStatusCapability | None = None,
-    relocation_backoff: _SubagentRelocationBackoff | None = None,
+    scan_memo: _SubagentScanMemo | None = None,
 ) -> SubagentForwardState:
     """
     Discover new Claude Task-tool sub-agents on disk, mint Omnigent child
@@ -2628,8 +2635,9 @@ async def _forward_available_subagents(
         event arrays. A new cache is created for direct callers that omit it.
     :param status_capability: Process-local cache of whether the server accepts
         idle observations. A new cache is created for direct callers that omit it.
-    :param relocation_backoff: Process-local backoff for re-scanning ``subagents/``
-        when a tracked transcript is missing. Created for direct callers that omit it.
+    :param scan_memo: Process-local relocation backoff and duplicate-warning
+        memory. Direct callers that omit it get a fresh instance per call, which
+        disables both; the forwarder loop threads one instance across polls.
     :returns: Updated state with new sub-agents registered and
         existing sub-agents' cursors advanced.
     """
@@ -2640,8 +2648,8 @@ async def _forward_available_subagents(
         batch_capability = _SessionEventBatchCapability()
     if status_capability is None:
         status_capability = _SubagentStatusCapability()
-    if relocation_backoff is None:
-        relocation_backoff = _SubagentRelocationBackoff()
+    if scan_memo is None:
+        scan_memo = _SubagentScanMemo()
 
     # ── Register newly-appeared sub-agents ──────────────
     # ``rglob`` is sync; offload to a thread so we don't stat the
@@ -2659,6 +2667,9 @@ async def _forward_available_subagents(
         ):
             continue
         if sid in candidates_by_id:
+            if sid in scan_memo.warned_duplicates:
+                continue
+            scan_memo.warned_duplicates.add(sid)
             _logger.warning(
                 "Ignoring duplicate claude-native sub-agent meta; parent_session=%s "
                 "subagent_id=%s path=%s kept=%s",
@@ -2670,16 +2681,7 @@ async def _forward_available_subagents(
             continue
         candidates_by_id[sid] = path
     candidate_meta_paths = list(candidates_by_id.values())
-    parents_by_tool_use = (
-        await asyncio.to_thread(
-            _subagent_parents_by_tool_use,
-            transcript_path,
-            subagents_dir,
-        )
-        if candidate_meta_paths
-        else {}
-    )
-    pending: list[tuple[Path, dict[str, str], str | None]] = []
+    candidates: list[tuple[Path, str, dict[str, str]]] = []
     for meta_path in candidate_meta_paths:
         transcript_subdir = _subagent_transcript_subdir(subagents_dir, meta_path)
         meta = await asyncio.to_thread(
@@ -2687,8 +2689,16 @@ async def _forward_available_subagents(
             meta_path,
             allow_missing_tool_use_id=_is_workflow_subdir(transcript_subdir),
         )
-        if meta is None:
-            continue
+        if meta is not None:
+            candidates.append((meta_path, transcript_subdir, meta))
+    # Only tool spawns need their owner looked up in the transcripts.
+    parents_by_tool_use = (
+        await asyncio.to_thread(_subagent_parents_by_tool_use, transcript_path, subagents_dir)
+        if any(meta["toolUseId"] for _, _, meta in candidates)
+        else {}
+    )
+    pending: list[tuple[Path, dict[str, str], str | None]] = []
+    for meta_path, transcript_subdir, meta in candidates:
         tool_use_id = meta["toolUseId"]
         if not tool_use_id:
             # A workflow run launches its agents without a tool call; the meta
@@ -2873,7 +2883,7 @@ async def _forward_available_subagents(
                 status_retry_tracker=status_retry_tracker,
                 batch_capability=batch_capability,
                 status_capability=status_capability,
-                relocation_backoff=relocation_backoff,
+                scan_memo=scan_memo,
             )
 
     entries = list(updated.subagents.values())
