@@ -1,15 +1,6 @@
-"""E2E: ``sys_session_list`` reports a stopped sub-agent's live status.
-
-A supervisor dispatches a sub-agent whose turn is held open on the mock LLM
-gate, so it is mid-run when its runner process is killed. A replacement
-runner reconnects under the same id inside the disconnect grace. The
-supervisor then calls ``sys_session_list``; the child's ``sub_agents`` row
-must carry a live ``status`` that does not read as running, otherwise the
-supervisor cannot tell the interrupted child apart from one still working.
-
-Drives the shared live server + runner subprocesses with the mock LLM and
-inspects the tool output the supervisor actually received.
-"""
+"""E2E: ``sys_session_list`` carries a live ``status`` for a sub-agent whose
+runner died mid-turn and was replaced inside the disconnect grace, so the
+supervisor can tell the stopped child apart from one that is still working."""
 
 from __future__ import annotations
 
