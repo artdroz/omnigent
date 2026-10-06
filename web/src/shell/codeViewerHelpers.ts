@@ -421,7 +421,28 @@ const SAME_PAGE_ANCHOR_SCRIPT = `<script>(function () {
       : "";
     if (href.charAt(0) !== "#") return;
     // Modifier and middle clicks too: a new tab could only reopen the host app, never this document.
-    event.preventDefault();
+    // Cancel the browser's navigation now, but commit the in-frame one only once dispatch has
+    // finished, so a listener the artifact registered later (on window too) can still cancel; its
+    // preventDefault() or returnValue = false is observed through own properties of this event.
+    const nativePreventDefault = event.preventDefault;
+    nativePreventDefault.call(event);
+    let cancelled = false;
+    event.preventDefault = function () {
+      cancelled = true;
+      nativePreventDefault.call(this);
+    };
+    Object.defineProperty(event, "returnValue", {
+      configurable: true,
+      get: function () { return false; },
+      set: function (value) { if (value === false) cancelled = true; },
+    });
+    setTimeout(function () {
+      delete event.preventDefault;
+      delete event.returnValue;
+      if (!cancelled) navigateTo(href);
+    }, 0);
+  }
+  function navigateTo(href) {
     const before = location.href;
     location.hash = href;
     if (location.href !== before) return;
@@ -526,15 +547,10 @@ function scriptEnd(html: string, from: number): number {
 }
 
 /**
- * End offset of the first real `<head>`/`<html>` start tag, or -1. A small
- * forward-only scanner that follows the tokenizer where it matters here:
- * comments and `<script>` elements (including their escaped and double-escaped
- * states) are skipped whole, so a look-alike tag inside them cannot attract the
- * injection, whose `</script>` would end the artifact's own script; a tag name
- * must end at whitespace, `/` or `>`, so `</script-x>` is plain text; and a tag,
- * quoted value, comment or script still open at end of input swallows the rest.
- * It runs on the host page before the sandbox applies and only ever moves
- * forward, so hostile input cannot make it slow.
+ * End offset of the first real `<head>`/`<html>` start tag, or -1: comments and
+ * `<script>` elements are skipped whole so nothing is inserted into them, and
+ * anything still open at end of input swallows the rest, as in the parser. The
+ * scan only moves forward because artifact text is processed on the host page.
  */
 function startTagEnd(html: string, tag: "head" | "html"): number {
   for (let i = html.indexOf("<"); i !== -1; i = html.indexOf("<", i)) {

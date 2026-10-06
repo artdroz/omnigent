@@ -627,18 +627,30 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
     vi.restoreAllMocks();
   });
 
+  /** Let the task in which the handler commits or abandons its in-frame navigation run. */
+  const settle = () =>
+    new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+
   /**
-   * Click `selector` and report whether the in-frame handler cancelled it. A window-level
-   * listener runs after it and cancels whatever remains, so jsdom never attempts the
-   * navigation of links the handler skipped.
+   * Click `target`, let the handler settle, and report whether the click was cancelled before
+   * the listener below ran. The handler cancels a fragment link at once (so nothing can open a
+   * window) and commits the in-frame navigation in a later task so that a window listener
+   * registered after it, like this one, can still cancel; this one only cancels links the
+   * handler skipped, so jsdom never attempts a real navigation.
    */
-  function click(target: string | Element, init: MouseEventInit = {}, type = "click"): boolean {
+  async function click(
+    target: string | Element,
+    init: MouseEventInit = {},
+    type = "click",
+  ): Promise<boolean> {
     let cancelled = false;
     window.addEventListener(
       type,
       (event) => {
         cancelled = event.defaultPrevented;
-        event.preventDefault();
+        if (!cancelled) event.preventDefault();
       },
       { once: true },
     );
@@ -647,41 +659,42 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
     element?.dispatchEvent(
       new MouseEvent(type, { bubbles: true, cancelable: true, composed: true, ...init }),
     );
+    await settle();
     return cancelled;
   }
 
-  it("keeps a fragment-only link in the frame by setting the frame's own hash", () => {
+  it("keeps a fragment-only link in the frame by setting the frame's own hash", async () => {
     document.body.innerHTML = '<a id="link" href="#section-3">Jump</a><h2 id="section-3">S3</h2>';
-    expect(click("#link")).toBe(true);
+    expect(await click("#link")).toBe(true);
     expect(location.hash).toBe("#section-3");
     expect(location.pathname).toBe("/preview");
     expect(scrolled).toEqual([]);
   });
 
-  it("keeps modifier clicks in the frame too (a new tab could only reopen the host app)", () => {
+  it("keeps modifier clicks in the frame too (a new tab could only reopen the host app)", async () => {
     document.body.innerHTML = '<a id="a" href="#one">1</a><a id="b" href="#two">2</a>';
-    expect(click("#a", { ctrlKey: true })).toBe(true);
+    expect(await click("#a", { ctrlKey: true })).toBe(true);
     expect(location.hash).toBe("#one");
-    expect(click("#b", { metaKey: true, shiftKey: true })).toBe(true);
+    expect(await click("#b", { metaKey: true, shiftKey: true })).toBe(true);
     expect(location.hash).toBe("#two");
   });
 
-  it("handles middle clicks (auxclick) the same way and leaves right clicks alone", () => {
+  it("handles middle clicks (auxclick) the same way and leaves right clicks alone", async () => {
     document.body.innerHTML = '<a id="link" href="#mid">m</a>';
-    expect(click("#link", { button: 2 }, "auxclick")).toBe(false);
+    expect(await click("#link", { button: 2 }, "auxclick")).toBe(false);
     expect(location.hash).toBe("");
-    expect(click("#link", { button: 1 }, "auxclick")).toBe(true);
+    expect(await click("#link", { button: 1 }, "auxclick")).toBe(true);
     expect(location.hash).toBe("#mid");
   });
 
-  it("finds links inside an open shadow root through composedPath", () => {
+  it("finds links inside an open shadow root through composedPath", async () => {
     const host = document.createElement("div");
     document.body.append(host);
     const root = host.attachShadow({ mode: "open" });
     root.innerHTML = '<a href="#shadow">s</a>';
     const link = root.querySelector("a");
     expect(link).not.toBeNull();
-    expect(click(link as Element)).toBe(true);
+    expect(await click(link as Element)).toBe(true);
     expect(location.hash).toBe("#shadow");
     // A light-DOM anchor wrapping a shadow host is found along the composed path too.
     document.body.innerHTML = '<a href="#wrap"><span id="wrapped"></span></a>';
@@ -689,41 +702,41 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
       mode: "open",
     });
     inner.innerHTML = "<b>inside</b>";
-    expect(click(inner.querySelector("b") as Element)).toBe(true);
+    expect(await click(inner.querySelector("b") as Element)).toBe(true);
     expect(location.hash).toBe("#wrap");
   });
 
-  it("handles clicks on elements nested in the anchor and on <area> hotspots", () => {
+  it("handles clicks on elements nested in the anchor and on <area> hotspots", async () => {
     document.body.innerHTML =
       '<a href="#a"><span id="inner">in</span></a><map><area id="hot" href="#b" shape="default"></map>';
-    expect(click("#inner")).toBe(true);
+    expect(await click("#inner")).toBe(true);
     expect(location.hash).toBe("#a");
-    expect(click("#hot")).toBe(true);
+    expect(await click("#hot")).toBe(true);
     expect(location.hash).toBe("#b");
   });
 
-  it("re-scrolls to the target when the hash is already current", () => {
+  it("re-scrolls to the target when the hash is already current", async () => {
     document.body.innerHTML = '<a id="link" href="#section-3">Jump</a><h2 id="section-3">S3</h2>';
     location.hash = "#section-3";
-    expect(click("#link")).toBe(true);
+    expect(await click("#link")).toBe(true);
     expect(scrolled).toHaveLength(1);
     expect(scrolled[0]).toBe(document.getElementById("section-3"));
   });
 
-  it("resolves <a name> anchors (not other named elements) and encoded ids for the repeat scroll", () => {
+  it("resolves <a name> anchors (not other named elements) and encoded ids for the repeat scroll", async () => {
     document.body.innerHTML =
       '<a id="named" href="#spot">n</a><input name="spot"><a name="spot"></a>' +
       '<a id="encoded" href="#caf%C3%A9">e</a><h3 id="café">Café</h3>';
     location.hash = "#spot";
-    click("#named");
+    await click("#named");
     location.hash = "#caf%C3%A9";
-    click("#encoded");
+    await click("#encoded");
     expect(scrolled).toHaveLength(2);
     expect(scrolled[0]).toBe(document.querySelector('a[name="spot"]'));
     expect(scrolled[1]).toBe(document.getElementById("café"));
   });
 
-  it("prefers the literal fragment over its decoded form, like native navigation", () => {
+  it("prefers the literal fragment over its decoded form, like native navigation", async () => {
     // The first click is native navigation, which tries the literal id first; the repeat
     // scroll must pick the same element whether or not a decoded competitor exists.
     document.body.innerHTML =
@@ -731,30 +744,30 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
       '<h3 id="caf%C3%A9">Literal</h3><h3 id="café">Decoded</h3>';
     const literal = document.getElementById("caf%C3%A9");
     location.hash = "#caf%C3%A9";
-    click("#link");
+    await click("#link");
     document.getElementById("café")?.remove();
-    click("#link");
+    await click("#link");
     expect(scrolled).toEqual([literal, literal]);
   });
 
-  it("scrolls to the top for '#' and '#top' when no element matches", () => {
+  it("scrolls to the top for '#' and '#top' when no element matches", async () => {
     document.body.innerHTML = '<a id="empty" href="#">top</a><a id="top-link" href="#top">top</a>';
-    click("#empty");
+    await click("#empty");
     // The first click changed the URL (a trailing "#"), so the browser scrolled.
     expect(window.scrollTo).not.toHaveBeenCalled();
-    click("#empty");
+    await click("#empty");
     expect(window.scrollTo).toHaveBeenCalledTimes(1);
     location.hash = "#top";
-    click("#top-link");
+    await click("#top-link");
     expect(window.scrollTo).toHaveBeenCalledTimes(2);
   });
 
-  it("lets a document-level handler the page registers later cancel the click first", () => {
+  it("lets a document-level handler the page registers later cancel the click first", async () => {
     document.body.innerHTML = '<a id="route" href="#settings">settings</a>';
     const router = (event: Event) => event.preventDefault();
     document.addEventListener("click", router);
     try {
-      expect(click("#route")).toBe(true);
+      expect(await click("#route")).toBe(true);
       expect(location.hash).toBe("");
       expect(scrolled).toEqual([]);
     } finally {
@@ -762,27 +775,47 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
     }
   });
 
-  it("leaves clicks the page handled itself and non-fragment links alone", () => {
+  it("lets a window-level handler the page registers later cancel the click too", async () => {
+    // It runs after the injected handler, which therefore commits the navigation only once
+    // dispatch has finished; the legacy `returnValue = false` counts as cancelling as well.
+    document.body.innerHTML = '<a id="route" href="#settings">settings</a>';
+    async function cancelsVia(router: EventListener): Promise<void> {
+      window.addEventListener("click", router);
+      try {
+        expect(await click("#route")).toBe(true);
+        expect(location.hash).toBe("");
+        expect(scrolled).toEqual([]);
+      } finally {
+        window.removeEventListener("click", router);
+      }
+    }
+    await cancelsVia((event) => event.preventDefault());
+    await cancelsVia((event) => {
+      event.returnValue = false;
+    });
+  });
+
+  it("leaves clicks the page handled itself and non-fragment links alone", async () => {
     document.body.innerHTML =
       '<a id="own" href="#section-3">own</a><a id="ext" href="https://example.com/x">ext</a>' +
       '<a id="rel" href="other.html#frag">rel</a><a id="nbsp" href="&#160;#frag">nb</a>' +
       '<h2 id="section-3">S3</h2>';
     document.getElementById("own")?.addEventListener("click", (event) => event.preventDefault());
-    expect(click("#own")).toBe(true);
+    expect(await click("#own")).toBe(true);
     expect(location.hash).toBe("");
-    expect(click("#ext")).toBe(false);
-    expect(click("#rel")).toBe(false);
+    expect(await click("#ext")).toBe(false);
+    expect(await click("#rel")).toBe(false);
     // A non-breaking space survives URL parsing, so this is a relative path, not a fragment.
-    expect(click("#nbsp")).toBe(false);
+    expect(await click("#nbsp")).toBe(false);
     expect(location.hash).toBe("");
     expect(scrolled).toEqual([]);
   });
 
-  it("drops only the ASCII whitespace URL parsing drops before classifying the href", () => {
+  it("drops only the ASCII whitespace URL parsing drops before classifying the href", async () => {
     // Tab and newline go anywhere; spaces and other C0 controls only at the ends.
     document.body.innerHTML =
       '<a id="spaced-link" href=" \t#spa\nced ">s</a><h2 id="spaced">S</h2>';
-    expect(click("#spaced-link")).toBe(true);
+    expect(await click("#spaced-link")).toBe(true);
     expect(location.hash).toBe("#spaced");
   });
 });
