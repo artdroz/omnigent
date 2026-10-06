@@ -14,6 +14,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MessageSquarePlusIcon } from "lucide-react";
 import type { Comment } from "@/hooks/useComments";
 import { useCanEdit } from "@/hooks/usePermissions";
+import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
 import { randomUUID } from "@/lib/randomUUID";
 import { type ActiveSelection, HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
@@ -27,6 +28,7 @@ import {
 } from "./htmlCommentBridge";
 import { TruncatedBanner } from "./TruncatedBanner";
 
+// Force a file asset: a data: URL would be blocked by the embed's script-src CSP.
 const HTML_COMMENT_BRIDGE_RUNTIME_URL = new URL(
   "./htmlCommentBridgeRuntime.js?no-inline",
   import.meta.url,
@@ -87,7 +89,7 @@ export function HtmlCommentViewer({
   onSetActiveSelection,
 }: HtmlCommentViewerProps) {
   const canEdit = useCanEdit(conversationId);
-  const useExternalBridge = getEmbedRoot() !== null;
+  const loadBridgeExternally = useIsEmbedded();
 
   // A fresh nonce + srcDoc per content load. Changing srcDoc reloads the iframe
   // document, which re-runs the bridge and (via the new nonce) re-establishes
@@ -99,10 +101,10 @@ export function HtmlCommentViewer({
       srcDoc: injectCommentBridge(
         content,
         n,
-        useExternalBridge ? HTML_COMMENT_BRIDGE_RUNTIME_URL : undefined,
+        loadBridgeExternally ? HTML_COMMENT_BRIDGE_RUNTIME_URL : undefined,
       ),
     };
-  }, [content, useExternalBridge]);
+  }, [content, loadBridgeExternally]);
 
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const portRef = useRef<MessagePort | null>(null);

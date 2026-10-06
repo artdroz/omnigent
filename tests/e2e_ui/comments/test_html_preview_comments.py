@@ -34,7 +34,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from playwright.sync_api import Page, Route, expect
+from playwright.sync_api import Page, expect
 
 # The hello_world agent spec uses ``os_env.cwd: .``, so the runner writes seeded
 # files into the server process's cwd — the repo root (this file is
@@ -183,42 +183,77 @@ def test_html_preview_add_comment(
     assert comment["end_index"] == raw_idx + len(_ANCHOR_SENTENCE)
 
 
-def test_html_preview_standalone_does_not_retry_with_inherited_csp(
+def test_html_comment_external_runtime_connects_under_strict_csp(
     page: Page,
-    seeded_html: tuple[str, str, str],
+    built_spa: None,
 ) -> None:
-    """Standalone keeps its inline-only bridge even when inherited CSP blocks it."""
-    base_url, session_id, _ = seeded_html
-    document_url = re.compile(rf"^{re.escape(base_url)}/c/{re.escape(session_id)}(?:\?|$)")
+    """The emitted external bridge connects when inherited CSP blocks inline JS."""
+    del built_spa
+    assets = list(
+        (_REPO_ROOT / "omnigent/server/static/web-ui/assets").glob("htmlCommentBridgeRuntime-*.js")
+    )
+    assert len(assets) == 1, f"expected one emitted bridge asset, found {assets}"
 
-    def add_managed_csp(route: Route) -> None:
-        response = route.fetch()
-        headers = {
-            **response.headers,
-            "content-security-policy": (
-                "default-src 'self'; script-src 'self'; "
-                "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
-                "font-src 'self' data:"
-            ),
+    probe_url = "https://app.example/probe"
+    asset_url = f"https://app.example/assets/{assets[0].name}"
+    page.route(
+        probe_url,
+        lambda route: route.fulfill(
+            body="<!doctype html><html><body></body></html>",
+            content_type="text/html",
+            headers={"content-security-policy": "default-src 'self'; script-src 'self'"},
+        ),
+    )
+    page.route(
+        asset_url,
+        lambda route: route.fulfill(path=assets[0], content_type="application/javascript"),
+    )
+    page.goto(probe_url)
+
+    nonce = "external-bridge-e2e"
+    page.evaluate(
+        r"""
+        ({ assetUrl, nonce }) => {
+          const iframe = document.createElement("iframe");
+          iframe.id = "external-bridge-probe";
+          iframe.dataset.ready = "false";
+          iframe.setAttribute("sandbox", "allow-scripts");
+          iframe.addEventListener("load", () => {
+            const channel = new MessageChannel();
+            channel.port1.onmessage = (event) => {
+              const message = event.data;
+              if (
+                message?.source === "omni-html-comment" &&
+                message?.nonce === nonce &&
+                message?.type === "omni:ready"
+              ) {
+                iframe.dataset.ready = "true";
+              }
+            };
+            iframe.contentWindow.postMessage(
+              { source: "omni-html-comment", nonce, type: "omni:init" },
+              "*",
+              [channel.port2],
+            );
+          });
+          iframe.srcdoc = `<!doctype html><html><body>
+            <script>window.__omniCspInlineCanary = true;<\/script>
+            <script src="${assetUrl}" data-omni-nonce="${nonce}"><\/script>
+          </body></html>`;
+          document.body.append(iframe);
         }
-        route.fulfill(response=response, headers=headers)
+        """,
+        {"assetUrl": asset_url, "nonce": nonce},
+    )
 
-    page.route(document_url, add_managed_csp)
-    file_viewer, preview = _open_preview(page, base_url, session_id)
-    expect(preview.locator("#anchor")).to_have_text(_ANCHOR_SENTENCE, timeout=10_000)
-    expect(preview.locator("script[src]")).to_have_count(0)
+    iframe_el = page.locator("#external-bridge-probe")
+    expect(iframe_el).to_have_attribute("data-ready", "true", timeout=10_000)
+    preview = page.frame_locator("#external-bridge-probe")
+    expect(preview.locator(f'script[src="{asset_url}"][data-omni-nonce="{nonce}"]')).to_have_count(
+        1
+    )
     canary_ran = preview.locator("body").evaluate("() => window.__omniCspInlineCanary === true")
-    assert not canary_ran, "fixture inline script ran; CSP did not reach the srcdoc frame"
-
-    # The diagnostic timeout is observational: it must not replace the iframe
-    # with an external-runtime retry after the bridge fails to become ready.
-    iframe_el = file_viewer.locator('iframe[title="HTML preview"]')
-    iframe_el.evaluate("frame => { frame.dataset.testIdentity = 'original'; }")
-    preview.locator("#anchor").select_text()
-    page.wait_for_timeout(5_100)
-    expect(iframe_el).to_have_attribute("data-test-identity", "original")
-    expect(preview.locator("script[src]")).to_have_count(0)
-    expect(page.get_by_role("button", name="Add comment")).not_to_be_visible()
+    assert not canary_ran, "inline canary ran; CSP did not reach the srcdoc frame"
 
 
 def _open_preview(page: Page, base_url: str, session_id: str):

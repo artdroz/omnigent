@@ -1,6 +1,6 @@
 import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getEmbedRoot } from "@/lib/host";
+import { EmbeddedProvider } from "@/lib/embedded";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
 
 // Permissions gate the floating "Add comment" button; default to editable.
@@ -10,11 +10,10 @@ vi.mock("@/lib/host", () => ({ getEmbedRoot: vi.fn(() => null) }));
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
-  vi.mocked(getEmbedRoot).mockReturnValue(null);
 });
 
-function renderViewer(content: string, truncated = false) {
-  return render(
+function renderViewer(content: string, truncated = false, embedded = false) {
+  const viewer = (
     <HtmlCommentViewer
       conversationId="conv_1"
       content={content}
@@ -22,8 +21,9 @@ function renderViewer(content: string, truncated = false) {
       comments={[]}
       activeSelection={null}
       onSetActiveSelection={() => {}}
-    />,
+    />
   );
+  return render(embedded ? <EmbeddedProvider>{viewer}</EmbeddedProvider> : viewer);
 }
 
 describe("HtmlCommentViewer", () => {
@@ -49,8 +49,11 @@ describe("HtmlCommentViewer", () => {
   });
 
   it("loads the static bridge runtime externally in embed mode", () => {
-    vi.mocked(getEmbedRoot).mockReturnValue(document.body);
-    const { container } = renderViewer("<html><head></head><body><p>doc</p></body></html>");
+    const { container } = renderViewer(
+      "<html><head></head><body><p>doc</p></body></html>",
+      false,
+      true,
+    );
     const iframe = container.querySelector('iframe[title="HTML preview"]') as HTMLIFrameElement;
     const srcDoc = iframe.getAttribute("srcdoc") ?? "";
     expect(srcDoc).toContain("<script src=");

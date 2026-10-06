@@ -3,7 +3,6 @@
   if (!(script instanceof HTMLScriptElement)) return;
   var NONCE = script.getAttribute("data-omni-nonce");
   if (!NONCE) return;
-  script.setAttribute("data-omni-loaded", "true");
   var SRC = "omni-html-comment";
   var T = {
     init: "omni:init",
