@@ -172,6 +172,11 @@ _CODEX_HOME_SYMLINK_FILES = ("auth.json", "memories_1.sqlite")
 # through an ``O_NOFOLLOW`` open that rejects symlinks with ELOOP, so it is
 # hard-linked (same inode, refreshes still shared) or copied as a last resort.
 _CODEX_HOME_HARDLINK_FILES = (".credentials.json",)
+# Companion lock directory for ``.credentials.json``, symlinked into the
+# private home. A hard-linked store records no path back to its source, so this
+# symlink's target parent is the durable pointer to a custom source home that
+# carries only remote-MCP OAuth state.
+_CODEX_HOME_CREDENTIAL_COMPANION_DIR = Path("mcp-oauth-locks")
 _CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md", "hooks.json")
 # Name of the hooks file inside a CODEX_HOME. Symlinked from the user's home
 # by default; generated as a merged regular file when subagent routing is on.
@@ -193,7 +198,7 @@ _CODEX_HOME_SYMLINK_DIRS = (
     Path("plugins") / "cache",
     # Cross-process lock guarding ``.credentials.json``; shared so a token
     # refresh in one session cannot race another into a stale refresh token.
-    Path("mcp-oauth-locks"),
+    _CODEX_HOME_CREDENTIAL_COMPANION_DIR,
     # Memories directory and user-defined rules: symlinked so sessions see the
     # same memories and rules as the real home without replicating them.
     Path("memories"),
@@ -991,10 +996,13 @@ def _private_codex_home_config_source(path: Path) -> Path | None:
     """
     Infer the original config source from a private Codex home.
 
-    A parent Omnigent launch bridges ``auth.json`` and ``config.toml`` into
-    its private home as symlinks. If a nested launch inherits that private
-    ``CODEX_HOME``, those symlink targets are the only durable record of a
-    custom parent source.
+    A parent Omnigent launch bridges ``auth.json`` and ``memories_1.sqlite``
+    into its private home as symlinks. If a nested launch inherits that
+    private ``CODEX_HOME``, those symlink targets are a durable record of a
+    custom parent source. The remote-MCP OAuth store is hard-linked and so
+    records no source path itself, but its companion ``mcp-oauth-locks/``
+    directory is symlinked, so a home carrying only that store is still
+    recoverable.
 
     :param path: Private ``CODEX_HOME`` path, e.g.
         ``"/home/user/.omnigent/codex-native/<hash>/codex-home"``.
@@ -1008,6 +1016,10 @@ def _private_codex_home_config_source(path: Path) -> Path | None:
             continue
         with suppress(OSError):
             source_dirs.add(config_file.resolve().parent)
+    companion = path / _CODEX_HOME_CREDENTIAL_COMPANION_DIR
+    if companion.is_symlink():
+        with suppress(OSError):
+            source_dirs.add(companion.resolve().parent)
     if len(source_dirs) == 1:
         return next(iter(source_dirs))
     return None
@@ -1207,8 +1219,17 @@ def _populate_codex_home_config(
             if not source_file.is_file():
                 continue
             dest_path = target_dir / filename
-            if dest_path.exists() or dest_path.is_symlink():
+            if dest_path.is_symlink():
                 continue
+            if dest_path.exists():
+                with suppress(OSError):
+                    if os.path.samefile(source_file, dest_path):
+                        continue
+                # A reused home can hold a link or copy of a since-rotated
+                # store (the source was deleted and recreated with a new
+                # inode); drop the stale bridge so the session reads current
+                # tokens instead of revoked ones.
+                dest_path.unlink(missing_ok=True)
             _bridge_codex_credential_store(source_file, dest_path)
 
     if not minimal_config:

@@ -3771,6 +3771,81 @@ def test_populate_codex_home_config_copies_remote_mcp_oauth_store_across_filesys
     assert bridged.read_text() == '{"linear|abc": {"access_token": "t"}}'
 
 
+def test_private_codex_home_config_source_recovers_home_from_credential_companion(
+    tmp_path: Path,
+) -> None:
+    """A credentials-only custom home is recovered via its lock-dir symlink.
+
+    A custom source home can carry remote-MCP OAuth state but neither
+    ``auth.json`` nor ``memories_1.sqlite``. The hard-linked ``.credentials.json``
+    records no source path, so a nested launch must infer the custom home from
+    the symlinked ``mcp-oauth-locks/`` companion instead of ``~/.codex``.
+    """
+    from omnigent.inner.codex_executor import (
+        _populate_codex_home_config,
+        _private_codex_home_config_source,
+        _resolve_codex_home_config_source,
+    )
+
+    source = tmp_path / "custom-codex-home"
+    source.mkdir()
+    (source / "config.toml").write_text('model_provider = "custom"')
+    (source / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    (source / "mcp-oauth-locks").mkdir()
+    (source / "mcp-oauth-locks" / "file-store.lock").write_text("")
+    private = tmp_path / ".omnigent" / "codex-native" / "abc123" / "codex-home"
+    private.mkdir(parents=True)
+
+    _populate_codex_home_config(private, source)
+
+    # The regression surface: the store is a hard link (no source path) and the
+    # home carries none of the file symlinks the resolver used before.
+    assert (private / ".credentials.json").is_file()
+    assert not (private / ".credentials.json").is_symlink()
+    assert not (private / "auth.json").exists()
+    assert not (private / "memories_1.sqlite").exists()
+    assert (private / "mcp-oauth-locks").is_symlink()
+
+    assert _private_codex_home_config_source(private) == source
+    default_home = tmp_path / "default-home" / ".codex"
+    assert _resolve_codex_home_config_source(private, default_home) == source
+
+
+def test_populate_codex_home_config_rebridges_rotated_remote_mcp_oauth_store(
+    tmp_path: Path,
+) -> None:
+    """A reused home re-bridges when the source store is rotated to a new inode.
+
+    If the real store is deleted and recreated (a fresh login after revocation),
+    the hard link in a reused private home points at the orphaned old inode.
+    Repopulating that home must drop the stale link and re-bridge the current
+    store so the session reads live tokens, not revoked ones.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    store = source / ".credentials.json"
+    store.write_text('{"linear|abc": {"access_token": "old"}}')
+    target = tmp_path / "persistent_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+    assert os.path.samefile(target / ".credentials.json", store)
+
+    # Rotate the source to a new inode, as a delete-then-recreate login would.
+    store.unlink()
+    store.write_text('{"linear|abc": {"access_token": "new"}}')
+    assert not os.path.samefile(target / ".credentials.json", store)
+
+    _populate_codex_home_config(target, source)
+
+    bridged = target / ".credentials.json"
+    assert not bridged.is_symlink()
+    assert os.path.samefile(bridged, store)
+    assert json.loads(bridged.read_text()) == {"linear|abc": {"access_token": "new"}}
+
+
 def test_populate_codex_home_config_symlinks_memories(tmp_path: Path) -> None:
     """``memories_1.sqlite``, ``memories/``, and ``rules/`` are symlinked.
 
