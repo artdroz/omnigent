@@ -14,18 +14,15 @@ from tests.harnesses.codex_native.forwarder._support import (
 )
 
 
-class _ScriptedEventClient(httpx.AsyncClient):
+class _ScriptedEventClient:
     """Return scripted event responses while recording accepted POST attempts."""
 
     def __init__(self, statuses: list[int]) -> None:
-        # MockTransport opens no connection pool: every POST is served from the
-        # overridden ``post`` below, so no real transport is created or leaked.
-        super().__init__(transport=httpx.MockTransport(lambda request: httpx.Response(204)))
         self.statuses = list(statuses)
         self.posts: list[dict[str, Any]] = []
         self.accepted_posts: list[dict[str, Any]] = []
 
-    async def post(  # type: ignore[override]
+    async def post(
         self,
         url: str,
         *,
@@ -39,6 +36,33 @@ class _ScriptedEventClient(httpx.AsyncClient):
         if status < 400:
             self.accepted_posts.append(json)
         return httpx.Response(status, request=httpx.Request("POST", url), json={})
+
+
+class _BlockingEventClient(_ScriptedEventClient):
+    """Block on the first POST until ``pending`` resolves, then accept with 202.
+
+    Models a POST left in flight so a cancellation can be delivered while the
+    item's stable claim is held, exercising claim release on cancellation.
+    """
+
+    def __init__(self, entered: asyncio.Event, pending: asyncio.Future[Any]) -> None:
+        super().__init__([])
+        self._entered = entered
+        self._pending = pending
+
+    async def post(
+        self,
+        url: str,
+        *,
+        json: dict[str, Any],
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del timeout
+        self.posts.append(json)
+        if len(self.posts) == 1:
+            self._entered.set()
+            await self._pending
+        return httpx.Response(202, request=httpx.Request("POST", url), json={})
 
 
 class _ResumeClient:
@@ -242,22 +266,7 @@ async def test_cancelled_user_post_releases_claim_for_retry() -> None:
     """Cancellation while a user POST has no response must not suppress replay."""
     entered = asyncio.Event()
     pending = asyncio.get_running_loop().create_future()
-
-    class _BlockingClient(_ScriptedEventClient):
-        async def post(
-            self,
-            url: str,
-            *,
-            json: dict[str, Any],
-            timeout: float | None = None,
-        ) -> httpx.Response:
-            self.posts.append(json)
-            if len(self.posts) == 1:
-                entered.set()
-                await pending
-            return httpx.Response(202, request=httpx.Request("POST", url), json={})
-
-    client = _BlockingClient([])
+    client = _BlockingEventClient(entered, pending)
     state = fwd._CodexForwarderState()
     task = asyncio.create_task(
         fwd._handle_completed_item_inner(client, "conv_x", _user_params(), forwarder_state=state)
@@ -374,22 +383,7 @@ async def test_cancelled_recovery_user_post_releases_claim() -> None:
     """Cancelling the recovered user POST releases its claim for a later backfill."""
     entered = asyncio.Event()
     pending = asyncio.get_running_loop().create_future()
-
-    class _BlockingClient(_ScriptedEventClient):
-        async def post(
-            self,
-            url: str,
-            *,
-            json: dict[str, Any],
-            timeout: float | None = None,
-        ) -> httpx.Response:
-            self.posts.append(json)
-            if len(self.posts) == 1:
-                entered.set()
-                await pending
-            return httpx.Response(202, request=httpx.Request("POST", url), json={})
-
-    client = _BlockingClient([])
+    client = _BlockingEventClient(entered, pending)
     state = fwd._CodexForwarderState(
         codex_client=_ResumeClient(),  # type: ignore[arg-type]
     )
