@@ -27,6 +27,11 @@ import {
 } from "./htmlCommentBridge";
 import { TruncatedBanner } from "./TruncatedBanner";
 
+const HTML_COMMENT_BRIDGE_LOADER_URL = new URL(
+  "./htmlCommentBridgeLoader.js?no-inline",
+  import.meta.url,
+).href;
+
 interface HtmlCommentViewerProps {
   conversationId: string;
   /** Raw HTML source — rendered in the iframe and searched for comment anchors. */
@@ -87,7 +92,10 @@ export function HtmlCommentViewer({
   // the channel — clearing any stale highlights from the previous content.
   const { nonce, srcDoc } = useMemo(() => {
     const n = genNonce();
-    return { nonce: n, srcDoc: injectCommentBridge(content, n) };
+    return {
+      nonce: n,
+      srcDoc: injectCommentBridge(content, n, HTML_COMMENT_BRIDGE_LOADER_URL),
+    };
   }, [content]);
 
   const iframeRef = useRef<HTMLIFrameElement>(null);

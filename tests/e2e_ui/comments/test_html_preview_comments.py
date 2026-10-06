@@ -34,7 +34,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Route, expect
 
 # The hello_world agent spec uses ``os_env.cwd: .``, so the runner writes seeded
 # files into the server process's cwd — the repo root (this file is
@@ -180,6 +180,61 @@ def test_html_preview_add_comment(
         f"source position {raw_idx} of the anchor sentence"
     )
     assert comment["end_index"] == raw_idx + len(_ANCHOR_SENTENCE)
+
+
+def test_html_preview_add_comment_with_inherited_csp(
+    page: Page,
+    seeded_html: tuple[str, str, str],
+) -> None:
+    """The external bridge starts when srcdoc inherits a strict script CSP."""
+    base_url, session_id, file_path = seeded_html
+    console_errors: list[str] = []
+    page.on(
+        "console",
+        lambda message: console_errors.append(message.text) if message.type == "error" else None,
+    )
+    document_url = re.compile(rf"^{re.escape(base_url)}/c/{re.escape(session_id)}(?:\?|$)")
+
+    def add_managed_csp(route: Route) -> None:
+        response = route.fetch()
+        headers = {
+            **response.headers,
+            "content-security-policy": (
+                "default-src 'self'; script-src 'self' 'unsafe-eval'; "
+                "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+                "font-src 'self' data:"
+            ),
+        }
+        route.fulfill(response=response, headers=headers)
+
+    def allow_opaque_frame_asset(route: Route) -> None:
+        response = route.fetch()
+        route.fulfill(
+            response=response,
+            headers={
+                **response.headers,
+                "access-control-allow-origin": "*",
+                "access-control-allow-private-network": "true",
+            },
+        )
+
+    page.route(document_url, add_managed_csp)
+    page.route(re.compile(r".*/assets/htmlCommentBridgeLoader-.*\.js$"), allow_opaque_frame_asset)
+    file_viewer, preview = _open_preview(page, base_url, session_id)
+    expect(preview.locator("#anchor")).to_have_text(_ANCHOR_SENTENCE, timeout=10_000)
+    preview.locator("#anchor").select_text()
+    add_btn = page.get_by_role("button", name="Add comment")
+    page.wait_for_timeout(1_000)
+    assert add_btn.is_visible(), "\n".join(console_errors)
+    add_btn.click()
+    textarea = file_viewer.locator("textarea[placeholder='Add a comment…']")
+    expect(textarea).to_be_visible()
+    textarea.fill("comment under inherited CSP")
+    file_viewer.get_by_role("button", name="Add Comment").click()
+
+    comments = _get_comments(base_url, session_id, file_path)
+    assert len(comments) == 1, comments
+    assert comments[0]["anchor_content"] == _ANCHOR_SENTENCE
 
 
 def _open_preview(page: Page, base_url: str, session_id: str):

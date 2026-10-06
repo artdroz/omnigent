@@ -15,11 +15,12 @@ import {
 
 describe("injectCommentBridge", () => {
   const NONCE = "test-nonce-123";
+  const LOADER_URL = "https://app.example/assets/html-comment-bridge.js";
 
   it("injects the bridge script before </body> when present", () => {
     const html = "<html><head></head><body><p>hi</p></body></html>";
-    const out = injectCommentBridge(html, NONCE);
-    const scriptAt = out.indexOf("<script>");
+    const out = injectCommentBridge(html, NONCE, LOADER_URL);
+    const scriptAt = out.indexOf("<script ");
     const bodyCloseAt = out.indexOf("</body>");
     expect(scriptAt).toBeGreaterThan(-1);
     expect(scriptAt).toBeLessThan(bodyCloseAt);
@@ -28,28 +29,41 @@ describe("injectCommentBridge", () => {
 
   it("falls back to before </html> when there is no body", () => {
     const html = "<html><head></head><p>hi</p></html>";
-    const out = injectCommentBridge(html, NONCE);
-    expect(out.indexOf("<script>")).toBeLessThan(out.indexOf("</html>"));
+    const out = injectCommentBridge(html, NONCE, LOADER_URL);
+    expect(out.indexOf("<script ")).toBeLessThan(out.indexOf("</html>"));
   });
 
   it("appends to a bare fragment with no body/html", () => {
-    const out = injectCommentBridge("<p>just a fragment</p>", NONCE);
+    const out = injectCommentBridge("<p>just a fragment</p>", NONCE, LOADER_URL);
     // prepareHtmlPreviewDoc prepends <base> for a bare fragment; the bridge is
     // then appended at the end since there's no </body>/</html> to inject before.
     expect(out).toContain("<p>just a fragment</p>");
     const fragAt = out.indexOf("<p>just a fragment</p>");
-    expect(out.indexOf("<script>")).toBeGreaterThan(fragAt);
+    expect(out.indexOf("<script ")).toBeGreaterThan(fragAt);
   });
 
   it("preserves the prepared <base target=_blank> link behavior", () => {
-    const out = injectCommentBridge("<html><head></head><body></body></html>", NONCE);
+    const out = injectCommentBridge("<html><head></head><body></body></html>", NONCE, LOADER_URL);
     expect(out).toContain('<base target="_blank">');
   });
 
   it("includes the highlight style for the Custom Highlight ranges", () => {
-    const out = injectCommentBridge("<body></body>", NONCE);
+    const out = injectCommentBridge("<body></body>", NONCE, LOADER_URL);
     expect(out).toContain("::highlight(omni-comment)");
     expect(out).toContain("::highlight(omni-comment-active)");
+  });
+
+  it("loads the bridge through an external CSP-compatible bootstrap", () => {
+    const out = injectCommentBridge("<body></body>", NONCE, LOADER_URL);
+    expect(out).toContain(`src="${LOADER_URL}"`);
+    expect(out).toContain('data-omni-bridge="');
+    expect(out).not.toContain("<script>(function");
+  });
+
+  it("escapes loader URLs and bridge source as HTML attributes", () => {
+    const out = injectCommentBridge("<body></body>", NONCE, 'https://app.example/a?x=1&y="2"');
+    expect(out).toContain('src="https://app.example/a?x=1&amp;y=&quot;2&quot;"');
+    expect(out).toContain("&quot;test-nonce-123&quot;");
   });
 
   it("substitutes the nonce, source tag, and message types into the script", () => {

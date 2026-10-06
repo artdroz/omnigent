@@ -611,6 +611,14 @@ const BRIDGE_HIGHLIGHT_STYLE =
   "::highlight(omni-comment-active){background-color:rgba(250,204,21,0.5);}" +
   "</style>";
 
+function escapeHtmlAttribute(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
 /**
  * Build the injected bridge script with the given nonce substituted in.
  * Exported for unit testing.
@@ -643,9 +651,17 @@ export function buildBridgeScript(nonce: string): string {
  * @param html  Raw artifact HTML.
  * @param nonce Per-mount nonce shared with the parent for message validation.
  */
-export function injectCommentBridge(html: string, nonce: string): string {
+export function injectCommentBridge(html: string, nonce: string, loaderUrl: string): string {
   const prepared = prepareHtmlPreviewDoc(html);
-  const inject = BRIDGE_HIGHLIGHT_STYLE + "<script>" + buildBridgeScript(nonce) + "</script>";
+  // An external bootstrap is required because srcdoc inherits the embedder's
+  // CSP, and managed deployments disallow inline scripts.
+  const inject =
+    BRIDGE_HIGHLIGHT_STYLE +
+    '<script src="' +
+    escapeHtmlAttribute(loaderUrl) +
+    '" data-omni-bridge="' +
+    escapeHtmlAttribute(buildBridgeScript(nonce)) +
+    '"></script>';
 
   const bodyClose = prepared.search(/<\/body\s*>/i);
   if (bodyClose !== -1) {
