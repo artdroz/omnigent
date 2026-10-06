@@ -157,6 +157,25 @@ def test_classify_connection_error_is_retryable(
     assert result.code == "connection_error"
 
 
+def test_classify_remote_protocol_error_is_retryable(
+    retryable_status_codes: list[int],
+) -> None:
+    """
+    ``httpx.RemoteProtocolError`` (peer closed the connection before
+    the response was complete) must be retryable.
+
+    A provider that drops a streaming response before any event has
+    arrived surfaces this way rather than as ``NetworkError``; it is
+    the same transient transport loss, so the retry loop must fire.
+    """
+    exc = httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+
+    result = classify_llm_error(exc, retryable_status_codes)
+
+    assert isinstance(result, RetryableLLMError)
+    assert result.code == "connection_error"
+
+
 # ── compute_backoff_delay ────────────────────────────────────────────
 
 

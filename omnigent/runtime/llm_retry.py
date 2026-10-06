@@ -145,10 +145,12 @@ def classify_llm_error(
 
     # Transport-level connection failures: tunnel disconnects raise
     # bare ``ConnectionError`` (an ``OSError`` subclass), httpx
-    # network errors surface as ``httpx.NetworkError``.  Both are
-    # transient — the runner reconnects with backoff and a retry
-    # will find it back online.
-    if isinstance(exc, (ConnectionError, httpx.NetworkError)):
+    # network errors surface as ``httpx.NetworkError``, and a peer
+    # that closes the connection before the response is complete
+    # raises ``httpx.RemoteProtocolError``.  All are transient — the
+    # runner reconnects with backoff and a retry will find it back
+    # online.
+    if isinstance(exc, (ConnectionError, httpx.NetworkError, httpx.RemoteProtocolError)):
         return RetryableLLMError(
             f"LLM call failed (transient): {exc}",
             code="connection_error",

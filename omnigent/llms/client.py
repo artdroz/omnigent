@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 from omnigent.llms._responses_to_chat import (
@@ -50,13 +51,28 @@ def _emit_usage_from_response(response: Response) -> None:
     )
 
 
+async def _aclose(stream: AsyncIterator[Any] | None) -> None:
+    """
+    Close ``stream`` when it supports ``aclose``, releasing the
+    provider connection an adapter generator may still hold.
+
+    :param stream: The iterator to close, or ``None``.
+    """
+    aclose = getattr(stream, "aclose", None)
+    if aclose is not None:
+        await aclose()
+
+
 async def _tee_stream_for_usage(
     stream: AsyncIterator[ResponseStreamEvent],
 ) -> AsyncIterator[ResponseStreamEvent]:
-    async for event in stream:
-        if isinstance(event, ResponseCompletedEvent):
-            _emit_usage_from_response(event.response)
-        yield event
+    try:
+        async for event in stream:
+            if isinstance(event, ResponseCompletedEvent):
+                _emit_usage_from_response(event.response)
+            yield event
+    finally:
+        await _aclose(stream)
 
 
 class _ResponsesNamespace:
@@ -112,7 +128,9 @@ class _ResponsesNamespace:
         :param retry: Retry policy for transient failures
             (timeouts, rate limits). ``None`` disables
             client-level retries. Useful for standalone calls
-            outside the workflow engine.
+            outside the workflow engine. With ``stream=True`` the
+            same budget also covers failures while opening the
+            stream, until the first event reaches the caller.
         :param kwargs: Additional provider-specific kwargs (e.g.
             ``temperature``, ``max_tokens``).
         :returns: A :class:`Response` when ``stream=False``, or
@@ -144,7 +162,10 @@ class _ResponsesNamespace:
         if retry is None:
             result = await call_fn()
         else:
-            result = await _execute_with_retry(call_fn, retry)
+            attempts = _RetryAttempts(retry)
+            result = await _execute_with_retry(call_fn, attempts)
+            if not isinstance(result, Response):
+                result = _retry_stream_open(result, call_fn, attempts)
         if isinstance(result, Response):
             _emit_usage_from_response(result)
             return result
@@ -257,9 +278,45 @@ class _ResponsesNamespace:
         return chat_response_to_response(result)
 
 
+@dataclass
+class _RetryAttempts:
+    """
+    Retry budget shared by every attempt of one ``create()`` call.
+
+    :param config: Retry policy (max_retries, backoff, etc.).
+    :param failures: Attempts that have failed so far.
+    """
+
+    config: RetryPolicy
+    failures: int = 0
+
+    async def absorb(self, exc: Exception) -> None:
+        """
+        Account for a failed attempt: re-raise it when it is not
+        retryable or the budget is spent, otherwise sleep the backoff.
+
+        :param exc: The exception the attempt raised.
+        :raises PermanentLLMError: On non-retryable errors.
+        :raises RetryableLLMError: When all retry attempts are
+            exhausted.
+        """
+        if isinstance(exc, (PermanentLLMError, RetryableLLMError)):
+            raise exc
+        classified = classify_llm_error(
+            exc,
+            self.config.retryable_status_codes,
+        )
+        if isinstance(classified, PermanentLLMError):
+            raise classified from exc
+        self.failures += 1
+        if self.failures > self.config.max_retries:
+            raise classified from exc
+        await _backoff_sleep(self.failures - 1, self.config)
+
+
 async def _execute_with_retry(
     call_fn: Callable[[], Awaitable[_T]],
-    retry_config: RetryPolicy,
+    attempts: _RetryAttempts,
 ) -> _T:
     """
     Execute ``call_fn`` with retry on transient failures.
@@ -269,34 +326,60 @@ async def _execute_with_retry(
 
     :param call_fn: Zero-argument async callable that performs
         the LLM call.
-    :param retry_config: Retry policy (max_attempts, backoff,
-        etc.).
+    :param attempts: The retry budget to charge failures to.
     :returns: The successful result from ``call_fn``.
     :raises PermanentLLMError: On non-retryable errors.
     :raises RetryableLLMError: When all retry attempts are
         exhausted.
     """
-    last_error: RetryableLLMError | None = None
-    total_tries = retry_config.max_retries + 1
-
-    for attempt in range(total_tries):
+    while True:
         try:
             return await call_fn()
-        except (PermanentLLMError, RetryableLLMError):
-            raise
         except Exception as exc:
-            classified = classify_llm_error(
-                exc,
-                retry_config.retryable_status_codes,
-            )
-            if isinstance(classified, PermanentLLMError):
-                raise classified from exc
-            last_error = classified
-            if attempt + 1 < total_tries:
-                await _backoff_sleep(attempt, retry_config)
+            await attempts.absorb(exc)
 
-    assert last_error is not None
-    raise last_error
+
+async def _retry_stream_open(
+    stream: AsyncIterator[ResponseStreamEvent],
+    call_fn: Callable[[], Awaitable[Response | AsyncIterator[ResponseStreamEvent]]],
+    attempts: _RetryAttempts,
+) -> AsyncIterator[ResponseStreamEvent]:
+    """
+    Yield ``stream``, retrying the request while no event has
+    reached the caller.
+
+    Adapters send the HTTP request on the first ``__anext__``, so a
+    failure there is charged to the same budget as iterator creation.
+    After the first event nothing is replayed; later failures
+    propagate unchanged.
+
+    :param stream: The iterator returned by the first attempt.
+    :param call_fn: Creates a fresh iterator for a retry.
+    :param attempts: The retry budget shared with creation.
+    :returns: Async iterator of streaming events.
+    """
+    current: AsyncIterator[ResponseStreamEvent] | None = stream
+    try:
+        while True:
+            if current is None:
+                reopened = await _execute_with_retry(call_fn, attempts)
+                assert not isinstance(reopened, Response)
+                current = reopened
+            try:
+                first = await anext(current)
+            except StopAsyncIteration:
+                return
+            except Exception as exc:
+                await _aclose(current)
+                current = None
+                await attempts.absorb(exc)
+            else:
+                yield first
+                async for event in current:
+                    yield event
+                return
+    finally:
+        await _aclose(current)
 
 
 async def _backoff_sleep(

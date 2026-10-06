@@ -9,14 +9,18 @@ methods are async.
 
 from __future__ import annotations
 
+import asyncio
 import json
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import MagicMock
 
 import httpx
 import pytest
 
+from omnigent.llms.adapters.base import BaseAdapter
+from omnigent.llms.adapters.openai import OpenAIAdapter, OpenAICompatibleAdapter
 from omnigent.llms.client import Client
 from omnigent.llms.errors import (
     ContextWindowExceededError,
@@ -28,6 +32,8 @@ from omnigent.llms.types import (
     MessageOutput,
     OutputText,
     Response,
+    ResponseCompletedEvent,
+    ResponseTextDeltaEvent,
 )
 from omnigent.spec.types import RetryPolicy
 
@@ -114,15 +120,15 @@ class _MockAdapter:
 
 def _patch_client_deps(
     monkeypatch: pytest.MonkeyPatch,
-    mock_adapter: _MockAdapter,
+    mock_adapter: _MockAdapter | BaseAdapter,
 ) -> _SleepTracker:
     """
     Patch all external dependencies of ``Client().responses.create()``
     so that calls route through ``mock_adapter.chat_completions``.
 
     :param monkeypatch: Pytest monkeypatch fixture.
-    :param mock_adapter: A :class:`_MockAdapter` whose
-        ``chat_completions`` controls call success/failure.
+    :param mock_adapter: A :class:`_MockAdapter` (or a real adapter)
+        whose ``chat_completions`` controls call success/failure.
     :returns: A :class:`_SleepTracker` recording backoff sleep calls.
     """
     # Route model parsing to a fake routed model
@@ -179,6 +185,152 @@ def _default_create_kwargs() -> dict[str, Any]:
         "input": [{"role": "user", "content": "hi"}],
         "model": "test/test-model",
     }
+
+
+@dataclass
+class _HttpSequence:
+    """
+    What a mocked ``httpx`` transport observed, appended to live.
+
+    :param requests: Every request the transport received.
+    :param clients: Every ``httpx.AsyncClient`` the adapter created.
+    """
+
+    requests: list[httpx.Request] = field(default_factory=list)
+    clients: list[httpx.AsyncClient] = field(default_factory=list)
+
+
+def _install_mock_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Callable[[httpx.Request], httpx.Response | Awaitable[httpx.Response]],
+) -> list[httpx.AsyncClient]:
+    """
+    Patch ``httpx.AsyncClient`` so every new client sends through
+    ``handler`` and return the list of clients created so far.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param handler: Sync or async ``httpx.MockTransport`` handler.
+    :returns: The created clients, appended to live.
+    """
+    clients: list[httpx.AsyncClient] = []
+    real_async_client = httpx.AsyncClient
+
+    def _factory(**kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = httpx.MockTransport(handler)
+        client = real_async_client(**kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(httpx, "AsyncClient", _factory)
+    return clients
+
+
+def _serve_http_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+    outcomes: list[httpx.Response | Exception],
+) -> _HttpSequence:
+    """
+    Patch ``httpx.AsyncClient`` so consecutive requests receive
+    ``outcomes`` in order (a response to return or an exception to
+    raise).
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param outcomes: One entry per expected request, consumed in order.
+    :returns: The requests and clients observed so far.
+    """
+    observed = _HttpSequence()
+    pending = list(outcomes)
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        observed.requests.append(request)
+        outcome = pending.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    observed.clients = _install_mock_transport(monkeypatch, _handler)
+    return observed
+
+
+class _InterruptedBody(httpx.AsyncByteStream):
+    """
+    Response body that delivers ``chunks`` and then raises ``error``,
+    like a connection dropped mid-stream.
+
+    :param chunks: Byte chunks delivered before the failure.
+    :param error: Exception raised once the chunks are consumed.
+    """
+
+    def __init__(self, chunks: list[bytes], error: Exception) -> None:
+        self._chunks = chunks
+        self._error = error
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in self._chunks:
+            yield chunk
+        raise self._error
+
+
+_SSE_EVENT_STREAM_HEADERS = {"content-type": "text/event-stream"}
+
+_LOOPBACK_SSE_RESPONSE_HEAD = (
+    b"HTTP/1.1 200 OK\r\n"
+    b"Content-Type: text/event-stream\r\n"
+    b"Transfer-Encoding: chunked\r\n"
+    b"Connection: close\r\n\r\n"
+)
+
+
+def _chunked(body: bytes) -> bytes:
+    """
+    Encode ``body`` as one complete HTTP/1.1 chunked message body.
+
+    :param body: The payload bytes.
+    :returns: The chunk, its terminator, and the final zero chunk.
+    """
+    return f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n\r\n"
+
+
+async def _read_http_request(reader: asyncio.StreamReader) -> bytes:
+    """
+    Read one HTTP/1.1 request (head plus ``Content-Length`` body).
+
+    :param reader: The connection's stream reader.
+    :returns: The raw request bytes.
+    """
+    head = await reader.readuntil(b"\r\n\r\n")
+    length = 0
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":", 1)[1])
+    return head + (await reader.readexactly(length) if length else b"")
+
+
+_CHAT_COMPLETIONS_SSE_HELLO_DELTA = (
+    b'data: {"choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}\n\n'
+)
+
+_CHAT_COMPLETIONS_SSE_HELLO = (
+    _CHAT_COMPLETIONS_SSE_HELLO_DELTA
+    + b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+    + b"data: [DONE]\n\n"
+)
+
+_RESPONSES_SSE_HELLO = (
+    b'event: response.output_text.delta\ndata: {"delta":"Hello"}\n\n'
+    b'event: response.completed\ndata: {"response":{"model":"test-model","output":'
+    b'[{"type":"message","content":[{"type":"output_text","text":"Hello"}]}]}}\n\n'
+)
+
+
+def _streaming_adapter() -> OpenAICompatibleAdapter:
+    """
+    Build the real Chat Completions adapter the streaming tests route
+    through, so the request is opened lazily like in production.
+
+    :returns: An adapter pointed at a fake host.
+    """
+    return OpenAICompatibleAdapter(base_url="https://fake-host/v1")
 
 
 # ── Fixtures ─────────────────────────────────────────────────
@@ -324,6 +476,285 @@ async def test_create_with_retry_http_429_then_success(
 
     # Two adapter calls: one 429, one success.
     assert mock_adapter.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "first_attempt_fault",
+    ["http_503", "connect_error"],
+)
+@pytest.mark.asyncio
+async def test_create_streaming_retries_failure_at_stream_open(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_config: RetryPolicy,
+    first_attempt_fault: str,
+) -> None:
+    """
+    A transient failure on the first streaming HTTP attempt consumes
+    the configured retry budget just like the non-streaming path.
+
+    The real adapter opens the connection only when the returned
+    iterator is first consumed, so the failure surfaces during
+    iteration rather than inside ``create()``; the retry policy must
+    still cover it when no event has reached the caller yet.
+    """
+    tracker = _patch_client_deps(monkeypatch, _streaming_adapter())
+    first_attempt: httpx.Response | Exception
+    if first_attempt_fault == "http_503":
+        first_attempt = httpx.Response(
+            503,
+            content=b'{"error": {"message": "upstream unavailable"}}',
+        )
+    else:
+        first_attempt = httpx.ConnectError("connection refused")
+    http = _serve_http_sequence(
+        monkeypatch,
+        [
+            first_attempt,
+            httpx.Response(
+                200,
+                headers=_SSE_EVENT_STREAM_HEADERS,
+                content=_CHAT_COMPLETIONS_SSE_HELLO,
+            ),
+        ],
+    )
+
+    stream = await Client().responses.create(
+        **_default_create_kwargs(),
+        stream=True,
+        retry=retry_config,
+    )
+    events = [event async for event in stream]
+
+    assert [req.url.path for req in http.requests] == ["/v1/chat/completions"] * 2
+    assert len(tracker.calls) == 1
+    assert [e.delta for e in events if isinstance(e, ResponseTextDeltaEvent)] == ["Hello"]
+    completed = events[-1]
+    assert isinstance(completed, ResponseCompletedEvent)
+    assert completed.response.output[0].content[0].text == "Hello"
+    # The failed attempt's connection must not linger behind the retry.
+    assert all(client.is_closed for client in http.clients)
+
+
+@pytest.mark.asyncio
+async def test_create_streaming_retries_body_closed_before_output_over_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_config: RetryPolicy,
+) -> None:
+    """
+    A provider that accepts the request but closes the chunked body
+    before any event is a transient transport loss and is retried.
+
+    Runs over a real loopback socket so the test pins the exception
+    httpx raises for that close (``RemoteProtocolError``), which a
+    mock transport cannot reproduce.
+    """
+    requests: list[bytes] = []
+    # ``None`` closes the connection right after the headers.
+    bodies: list[bytes | None] = [None, _chunked(_CHAT_COMPLETIONS_SSE_HELLO)]
+
+    async def _serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        requests.append(await _read_http_request(reader))
+        body = bodies.pop(0)
+        writer.write(_LOOPBACK_SSE_RESPONSE_HEAD)
+        if body is not None:
+            writer.write(body)
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(_serve, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        tracker = _patch_client_deps(
+            monkeypatch,
+            OpenAICompatibleAdapter(base_url=f"http://127.0.0.1:{port}/v1"),
+        )
+        stream = await Client().responses.create(
+            **_default_create_kwargs(),
+            stream=True,
+            retry=retry_config,
+        )
+        events = [event async for event in stream]
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert len(requests) == 2
+    assert len(tracker.calls) == 1
+    assert [e.delta for e in events if isinstance(e, ResponseTextDeltaEvent)] == ["Hello"]
+    assert isinstance(events[-1], ResponseCompletedEvent)
+
+
+@pytest.mark.asyncio
+async def test_create_streaming_retry_covers_openai_responses_path(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_config: RetryPolicy,
+) -> None:
+    """
+    The native OpenAI Responses stream is opened lazily too, so a
+    transient failure at its open shares the same retry budget.
+    """
+    tracker = _patch_client_deps(monkeypatch, OpenAIAdapter(base_url="https://fake-host/v1"))
+    http = _serve_http_sequence(
+        monkeypatch,
+        [
+            httpx.Response(503, content=b"upstream unavailable"),
+            httpx.Response(
+                200,
+                headers=_SSE_EVENT_STREAM_HEADERS,
+                content=_RESPONSES_SSE_HELLO,
+            ),
+        ],
+    )
+
+    stream = await Client().responses.create(
+        **_default_create_kwargs(),
+        stream=True,
+        retry=retry_config,
+    )
+    events = [event async for event in stream]
+
+    assert [req.url.path for req in http.requests] == ["/v1/responses"] * 2
+    assert len(tracker.calls) == 1
+    assert [e.delta for e in events if isinstance(e, ResponseTextDeltaEvent)] == ["Hello"]
+    assert isinstance(events[-1], ResponseCompletedEvent)
+
+
+@pytest.mark.asyncio
+async def test_create_streaming_exhausted_retries_raise_classified_error(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_config: RetryPolicy,
+) -> None:
+    """
+    When every streaming attempt fails at open, iteration raises the
+    classified ``RetryableLLMError`` only after the whole budget is
+    spent, and each failed connection is released.
+    """
+    tracker = _patch_client_deps(monkeypatch, _streaming_adapter())
+    total_attempts = retry_config.max_retries + 1
+    http = _serve_http_sequence(
+        monkeypatch,
+        [httpx.Response(503, content=b"upstream unavailable") for _ in range(total_attempts)],
+    )
+
+    stream = await Client().responses.create(
+        **_default_create_kwargs(),
+        stream=True,
+        retry=retry_config,
+    )
+    with pytest.raises(RetryableLLMError) as exc_info:
+        _ = [event async for event in stream]
+
+    assert exc_info.value.code == "503"
+    assert len(http.requests) == total_attempts
+    assert len(tracker.calls) == retry_config.max_retries
+    assert all(client.is_closed for client in http.clients)
+
+
+@pytest.mark.asyncio
+async def test_create_streaming_permanent_error_at_stream_open_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_config: RetryPolicy,
+) -> None:
+    """
+    A non-retryable status at stream open surfaces as
+    ``PermanentLLMError`` from iteration without a second request.
+    """
+    tracker = _patch_client_deps(monkeypatch, _streaming_adapter())
+    http = _serve_http_sequence(monkeypatch, [httpx.Response(401, content=b"bad key")])
+
+    stream = await Client().responses.create(
+        **_default_create_kwargs(),
+        stream=True,
+        retry=retry_config,
+    )
+    with pytest.raises(PermanentLLMError) as exc_info:
+        _ = [event async for event in stream]
+
+    assert exc_info.value.code == "401"
+    assert len(http.requests) == 1
+    assert tracker.calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_streaming_does_not_replay_after_first_event(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_config: RetryPolicy,
+) -> None:
+    """
+    Once an event has reached the caller, a mid-stream failure
+    propagates unchanged: the request is never replayed, so the
+    caller cannot receive duplicated output.
+    """
+    tracker = _patch_client_deps(monkeypatch, _streaming_adapter())
+    http = _serve_http_sequence(
+        monkeypatch,
+        [
+            httpx.Response(
+                200,
+                headers=_SSE_EVENT_STREAM_HEADERS,
+                stream=_InterruptedBody(
+                    [_CHAT_COMPLETIONS_SSE_HELLO_DELTA],
+                    httpx.ReadError("connection reset"),
+                ),
+            ),
+        ],
+    )
+
+    stream = await Client().responses.create(
+        **_default_create_kwargs(),
+        stream=True,
+        retry=retry_config,
+    )
+    delivered: list[Any] = []
+    with pytest.raises(httpx.ReadError):
+        async for event in stream:
+            delivered.append(event)
+
+    assert [e.delta for e in delivered if isinstance(e, ResponseTextDeltaEvent)] == ["Hello"]
+    assert len(http.requests) == 1
+    assert tracker.calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_streaming_cancellation_while_opening_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_config: RetryPolicy,
+) -> None:
+    """
+    Cancelling the consumer while the first request is in flight
+    propagates ``CancelledError`` instead of being treated as a
+    transient failure to retry.
+    """
+    tracker = _patch_client_deps(monkeypatch, _streaming_adapter())
+    requests: list[httpx.Request] = []
+    request_started = asyncio.Event()
+
+    async def _hang(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        request_started.set()
+        await asyncio.Event().wait()
+        return httpx.Response(503)
+
+    _install_mock_transport(monkeypatch, _hang)
+
+    stream = await Client().responses.create(
+        **_default_create_kwargs(),
+        stream=True,
+        retry=retry_config,
+    )
+
+    async def _first_event() -> Any:
+        return await anext(stream)
+
+    consumer = asyncio.create_task(_first_event())
+    await request_started.wait()
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+
+    assert len(requests) == 1
+    assert tracker.calls == []
 
 
 @pytest.mark.asyncio
