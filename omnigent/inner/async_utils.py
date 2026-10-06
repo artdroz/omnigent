@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import logging
 import queue as sync_queue
@@ -83,43 +84,49 @@ async def run_sync_cleanup(  # type: ignore[explicit-any]
     :returns: The callable's return value.
     :raises asyncio.CancelledError: After cleanup finishes when the caller was
         cancelled, including when cancellation was requested repeatedly.
-    :raises BaseException: The callable's exception when cleanup was not
+    :raises RuntimeError: When the callable itself raised ``CancelledError`` and
+        the caller was not cancelled, to avoid faking task cancellation.
+    :raises BaseException: Any other callable exception when cleanup was not
         cancelled.
     """
+    loop = asyncio.get_running_loop()
     context = contextvars.copy_context()
     started = time.monotonic()
-    result_queue: sync_queue.Queue[tuple[str, Any]] = sync_queue.Queue()
+    done = asyncio.Event()
+    outcome: dict[str, Any] = {}
 
     def _runner() -> None:
         try:
-            result = context.run(fn, *args, **kwargs)
+            outcome["result"] = context.run(fn, *args, **kwargs)
         except BaseException as exc:  # noqa: BLE001 - forward cleanup failures
-            result_queue.put(("error", exc))
-            return
-        result_queue.put(("result", result))
+            outcome["error"] = exc
+        finally:
+            # The awaiting coroutine does not exit before this fires, so the
+            # loop is still live; guard only the abandoned/closed-loop case.
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(done.set)
 
     # Start before the first await. A loop-wide shutdown can cancel every
     # asyncio task before it gets scheduled, but it must not prevent owned
     # cleanup from ever starting.
     thread = threading.Thread(target=_runner, name=f"sync-cleanup-{component}", daemon=True)
     thread.start()
+
     cancelled = False
-    result: Any = None
-    worker_error: BaseException | None = None
-    while True:
+    # Absorb cancellation and keep waiting: the worker owns an external resource
+    # after its registry entry is gone, so it must finish rather than be
+    # abandoned. uncancel() keeps structured-cancellation accounting balanced for
+    # asyncio.timeout()/TaskGroup callers; the final re-raise re-signals the
+    # cancellation once cleanup is done.
+    while not done.is_set():
         try:
-            kind, payload = result_queue.get_nowait()
-        except sync_queue.Empty:
-            try:
-                await asyncio.sleep(0.001)
-            except asyncio.CancelledError:
-                cancelled = True
-            continue
-        if kind == "error":
-            worker_error = payload
-        else:
-            result = payload
-        break
+            await done.wait()
+        except asyncio.CancelledError:
+            cancelled = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+    thread.join(timeout=0)
 
     duration_s = time.monotonic() - started
     if duration_s >= slow_threshold_s:
@@ -136,6 +143,7 @@ async def run_sync_cleanup(  # type: ignore[explicit-any]
             extra["session_id"] = session_id
         _logger.warning("Synchronous cleanup completed slowly", extra=extra)
 
+    worker_error = outcome.get("error")
     if worker_error is not None:
         if cancelled:
             _logger.error(
@@ -151,7 +159,13 @@ async def run_sync_cleanup(  # type: ignore[explicit-any]
                 },
             )
             raise asyncio.CancelledError
+        if isinstance(worker_error, asyncio.CancelledError):
+            # The callable raised CancelledError on its own thread; surface it as
+            # a failure instead of faking cancellation of this live task.
+            raise RuntimeError(
+                f"Synchronous cleanup for {component} raised CancelledError"
+            ) from worker_error
         raise worker_error
     if cancelled:
         raise asyncio.CancelledError
-    return result
+    return outcome.get("result")

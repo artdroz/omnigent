@@ -2766,12 +2766,6 @@ async def test_runner_os_env_cleanup_is_off_loop_and_cancellation_safe(
 
     heartbeat_task: asyncio.Task[None] | None = None
     tool_task: asyncio.Task[str] | None = None
-    watchdog = threading.Thread(
-        target=lambda: (release_close.wait(timeout=2.0), release_close.set()),
-        name="test-os-env-watchdog",
-        daemon=True,
-    )
-    watchdog.start()
     try:
         heartbeat_task = asyncio.create_task(heartbeat())
         tool_task = asyncio.create_task(_execute_os_env_tool("sys_os_read", {"path": "x"}))
@@ -2788,8 +2782,9 @@ async def test_runner_os_env_cleanup_is_off_loop_and_cancellation_safe(
             tool_task.cancel()
         if heartbeat_task is not None and not heartbeat_task.done():
             heartbeat_task.cancel()
-        await asyncio.gather(tool_task, heartbeat_task, return_exceptions=True)
-        watchdog.join(timeout=1.0)
+        pending = [t for t in (tool_task, heartbeat_task) if t is not None]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     assert close_finished.is_set()
     assert heartbeat_ran_while_blocked.is_set()

@@ -39,12 +39,6 @@ async def test_sync_cleanup_keeps_loop_live_and_finishes_before_repeat_cancel(
     token = cleanup_scope.set("session-cleanup")
     heartbeat_task: asyncio.Task[None] | None = None
     cleanup_task: asyncio.Task[object] | None = None
-    watchdog = threading.Thread(
-        target=lambda: (release.wait(timeout=2.0), release.set()),
-        name="test-cleanup-watchdog",
-        daemon=True,
-    )
-    watchdog.start()
     try:
         heartbeat_task = asyncio.create_task(heartbeat())
         cleanup_task = asyncio.create_task(
@@ -68,8 +62,9 @@ async def test_sync_cleanup_keeps_loop_live_and_finishes_before_repeat_cancel(
             cleanup_task.cancel()
         if heartbeat_task is not None and not heartbeat_task.done():
             heartbeat_task.cancel()
-        await asyncio.gather(cleanup_task, heartbeat_task, return_exceptions=True)
-        watchdog.join(timeout=1.0)
+        pending = [t for t in (cleanup_task, heartbeat_task) if t is not None]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         cleanup_scope.reset(token)
 
     assert observed_scope == ["session-cleanup"]
@@ -123,6 +118,23 @@ async def test_sync_cleanup_cancellation_wins_over_worker_error(
     assert failure.session_id == "session-failing-cleanup"
     assert failure.attributes["component"] == "failing_cleanup"
     assert failure.attributes["error_type"] == "ValueError"
+
+
+@pytest.mark.asyncio
+async def test_sync_cleanup_callable_cancellederror_surfaces_as_runtimeerror() -> None:
+    """A callable raising CancelledError must not fake caller cancellation."""
+    from omnigent.inner.async_utils import run_sync_cleanup
+
+    def cleanup_raises_cancel() -> None:
+        raise asyncio.CancelledError
+
+    with pytest.raises(RuntimeError) as caught:
+        await run_sync_cleanup(
+            cleanup_raises_cancel,
+            component="callable_cancel",
+            session_id="session-callable-cancel",
+        )
+    assert isinstance(caught.value.__cause__, asyncio.CancelledError)
 
 
 @pytest.mark.asyncio

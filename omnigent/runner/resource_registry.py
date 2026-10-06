@@ -2077,26 +2077,34 @@ class SessionResourceRegistry:
                     session_id,
                 )
 
-        if primary is not None:
-            try:
-                await run_sync_cleanup(
-                    primary.close,
-                    component="runner_primary_os_env",
-                    session_id=session_id,
-                )
-            except Exception:
-                _logger.exception(
-                    "Error closing primary env for session=%s",
-                    session_id,
-                )
-        if skills_directory is not None:
-            try:
-                await asyncio.to_thread(skills_directory.cleanup)
-            except OSError:
-                _logger.exception(
-                    "Error cleaning up Codex skills for session=%s",
-                    session_id,
-                )
+        try:
+            if primary is not None:
+                try:
+                    await run_sync_cleanup(
+                        primary.close,
+                        component="runner_primary_os_env",
+                        session_id=session_id,
+                    )
+                except Exception:
+                    _logger.exception(
+                        "Error closing primary env for session=%s",
+                        session_id,
+                    )
+        finally:
+            # The skills dir was already popped from the registry; a cancellation
+            # re-raised by the primary close must not skip its cleanup and leak it.
+            if skills_directory is not None:
+                try:
+                    await run_sync_cleanup(
+                        skills_directory.cleanup,
+                        component="runner_codex_skills_dir",
+                        session_id=session_id,
+                    )
+                except OSError:
+                    _logger.exception(
+                        "Error cleaning up Codex skills for session=%s",
+                        session_id,
+                    )
 
     def has_primary_env(self, session_id: str) -> bool:
         """Check if a primary env has been materialized.

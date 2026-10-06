@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import tempfile
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -1289,6 +1290,9 @@ async def test_cleanup_session_primary_close_is_off_loop_and_cancellation_safe()
         cwd=Path("/tmp"),
     )
     reg._primary_envs["conv_blocked_cleanup"] = environment
+    skills_dir = tempfile.TemporaryDirectory()
+    skills_path = skills_dir.name
+    reg._codex_skills_dirs["conv_blocked_cleanup"] = skills_dir
 
     async def heartbeat() -> None:
         while not finished.is_set():
@@ -1299,12 +1303,6 @@ async def test_cleanup_session_primary_close_is_off_loop_and_cancellation_safe()
 
     heartbeat_task: asyncio.Task[None] | None = None
     cleanup_task: asyncio.Task[None] | None = None
-    watchdog = threading.Thread(
-        target=lambda: (release.wait(timeout=2.0), release.set()),
-        name="test-resource-cleanup-watchdog",
-        daemon=True,
-    )
-    watchdog.start()
     try:
         heartbeat_task = asyncio.create_task(heartbeat())
         cleanup_task = asyncio.create_task(reg.cleanup_session("conv_blocked_cleanup"))
@@ -1321,13 +1319,18 @@ async def test_cleanup_session_primary_close_is_off_loop_and_cancellation_safe()
             cleanup_task.cancel()
         if heartbeat_task is not None and not heartbeat_task.done():
             heartbeat_task.cancel()
-        await asyncio.gather(cleanup_task, heartbeat_task, return_exceptions=True)
-        watchdog.join(timeout=1.0)
+        pending = [t for t in (cleanup_task, heartbeat_task) if t is not None]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     assert finished.is_set()
     assert environment._closed
     assert not reg.has_primary_env("conv_blocked_cleanup")
     assert heartbeat_ran_while_blocked.is_set()
+    # The skills dir cleanup runs even though the cancelled primary close
+    # re-raised, so the temp directory does not leak.
+    assert not os.path.exists(skills_path)
+    assert "conv_blocked_cleanup" not in reg._codex_skills_dirs
 
 
 # ── Phase 4: cleanup endpoint tests ─────────────────────────────
