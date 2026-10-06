@@ -74,6 +74,17 @@ function loadCommonJsModule(file, fakes) {
   return module.exports;
 }
 
+// The pre-install CI gate has no third-party modules. Load the real CLI helpers
+// behind an unused YAML boundary, then give auto-connect that same real module.
+const omnigentCliModule = loadCommonJsModule(path.join(__dirname, "../src/omnigent_cli.js"), {
+  "./url": urlHelpers,
+  "js-yaml": {},
+});
+const arcaAutoConnectModule = loadCommonJsModule(
+  path.join(__dirname, "../src/arca_autoconnect.js"),
+  { "./omnigent_cli": omnigentCliModule },
+);
+
 const electronCredentialBoundary = {
   shell: { openExternal: async () => {} },
   safeStorage: { isEncryptionAvailable: () => false },
@@ -433,6 +444,7 @@ function loadNavigationHarness({
   };
 
   const localRequires = {
+    "./arca_autoconnect": arcaAutoConnectModule,
     "./desktop_updater": { createDesktopUpdater },
     "./connection_loading": {
       createConnectionLoading: () => ({
@@ -598,8 +610,8 @@ function loadNavigationHarness({
     "./omnigent_cli": {
       isExecutableFile: () => false,
       resolveCliPath: () => (cliPath ? { path: cliPath } : null),
-      cliCommandParts: require("../src/omnigent_cli").cliCommandParts,
-      normalizeServerUrl: require("../src/omnigent_cli").normalizeServerUrl,
+      cliCommandParts: omnigentCliModule.cliCommandParts,
+      normalizeServerUrl: omnigentCliModule.normalizeServerUrl,
       localHostId: () => "host_test",
       getCliStatus: () => ({ installed: false }),
     },
