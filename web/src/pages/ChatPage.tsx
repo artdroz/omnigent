@@ -2536,8 +2536,17 @@ function ComposerImpl(
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
   const sessionConfigPhase = useChatStore((s) => s.sessionConfigPhase);
-  // Scope the shared lock to one session so an old request cannot unlock a new one.
-  const configBusyRef = useMemo(() => ({ current: false, conversationId }), [conversationId]);
+  // Scope the shared lock to one session so an old request cannot unlock a new
+  // one, held in a ref so React cannot discard the lock while a request is in
+  // flight (useMemo may recompute and reset it).
+  const configBusyLock = useRef<{ current: boolean; conversationId: string | null }>({
+    current: false,
+    conversationId,
+  });
+  if (configBusyLock.current.conversationId !== conversationId) {
+    configBusyLock.current = { current: false, conversationId };
+  }
+  const configBusyRef = configBusyLock.current;
   const [configBusyOwner, setConfigBusyOwner] = useState<typeof configBusyRef | null>(null);
   const configBusy = configBusyOwner === configBusyRef || sessionConfigPhase !== null;
   const setConfigBusy = useCallback(
