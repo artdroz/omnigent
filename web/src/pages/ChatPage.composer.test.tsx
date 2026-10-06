@@ -5921,6 +5921,11 @@ describe("Composer voice dictation", () => {
   let abortSpy: ReturnType<typeof vi.fn>;
   let originalMediaDevices: PropertyDescriptor | undefined;
 
+  const finalResult = (transcript: string) => ({
+    resultIndex: 0,
+    results: { length: 1, 0: { length: 1, isFinal: true, 0: { transcript } } },
+  });
+
   beforeEach(() => {
     handlers = {};
     stopSpy = vi.fn();
@@ -5963,23 +5968,21 @@ describe("Composer voice dictation", () => {
     fireEvent.click(mic);
     act(() => handlers.start?.({}));
     expect(mic).toHaveAttribute("aria-pressed", "true");
-    act(() =>
-      handlers.result?.({
-        resultIndex: 0,
-        results: {
-          length: 1,
-          0: { length: 1, isFinal: true, 0: { transcript: "voice dictated message" } },
-        },
-      }),
-    );
+    act(() => handlers.result?.(finalResult("voice dictated message")));
     expect(textarea().value).toBe("voice dictated message");
 
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
     expect(onSend).toHaveBeenCalledWith("voice dictated message", undefined);
-    // endTake aborts (not stops) the recognizer so a trailing final can't flush
-    // into the composer that was just cleared on send.
-    expect(abortSpy).toHaveBeenCalledTimes(1);
-    expect(stopSpy).not.toHaveBeenCalled();
+    expect(textarea().value).toBe("");
+    // Sending must tear the recognizer down; stop() and abort() both end the take.
+    expect(stopSpy.mock.calls.length + abortSpy.mock.calls.length).toBe(1);
+
+    // A real recognizer can still deliver a buffered result before it ends.
+    act(() => handlers.result?.(finalResult("words spoken after the send")));
+    expect(textarea().value).toBe("");
+
+    act(() => handlers.end?.({}));
+    expect(mic).toHaveAttribute("aria-pressed", "false");
   });
 
   it("ends the voice take when a known slash command is sent", () => {
@@ -6002,7 +6005,7 @@ describe("Composer voice dictation", () => {
 
     expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "fix the bug");
     expect(onSend).not.toHaveBeenCalled();
-    expect(abortSpy).toHaveBeenCalledTimes(1);
+    expect(stopSpy.mock.calls.length + abortSpy.mock.calls.length).toBe(1);
   });
 
   it("keeps the voice take active when an informational slash command is sent", () => {
@@ -6023,7 +6026,7 @@ describe("Composer voice dictation", () => {
 
     expect(onSend).not.toHaveBeenCalled();
     expect(onSendSlashCommand).not.toHaveBeenCalled();
-    expect(abortSpy).not.toHaveBeenCalled();
+    expect(stopSpy.mock.calls.length + abortSpy.mock.calls.length).toBe(0);
     expect(mic).toHaveAttribute("aria-pressed", "true");
   });
 
@@ -6047,6 +6050,6 @@ describe("Composer voice dictation", () => {
     expect(onSend).not.toHaveBeenCalled();
     expect(onSendSlashCommand).not.toHaveBeenCalled();
     expect(textarea().value).toBe("");
-    expect(abortSpy).toHaveBeenCalledTimes(1);
+    expect(stopSpy.mock.calls.length + abortSpy.mock.calls.length).toBe(1);
   });
 });
