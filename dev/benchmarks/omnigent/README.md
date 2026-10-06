@@ -369,6 +369,14 @@ reseed; Postgres and MySQL are fresh per run), runs the benchmark, and uploads
 `benchmark-results-<backend>-<run_id>.json`. The workspace notebook pulls those
 artifacts.
 
+`.github/workflows/benchmark-release.yml` gates release cuts (called from
+`release.yml`). It benchmarks the previous stable release and the candidate
+concurrently on **one** runner, because hosted VMs vary in speed by up to ~1.5x
+between runs and a cross-runner comparison reports that as a regression. Each
+side gets its own checkout, venv, `HOME`, and copy of a corpus seeded at the
+baseline's schema. Dispatch it with `baseline_ref` == `candidate_ref` for an A/A
+noise check.
+
 Schema changes need no manual step: the seed always targets the current
 migrated schema (migrations run when the store is constructed), the reuse
 marker records the head read at seed time (so old corpora auto-reseed), and
