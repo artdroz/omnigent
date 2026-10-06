@@ -111,17 +111,22 @@ def test_codex_new_rotation_notifies_superseded_conversation(
     _type_into_tui(page, "/new")
 
     new_session_id = _wait_for_rotation(old_session_id)
-    replacement = httpx.get(f"{base_url}/v1/sessions/{new_session_id}", timeout=10.0)
-    replacement.raise_for_status()
+    try:
+        replacement = httpx.get(f"{base_url}/v1/sessions/{new_session_id}", timeout=10.0)
+        replacement.raise_for_status()
 
-    # Best-effort return to the chat surface: the toggle can vanish once the
-    # terminal transfers to the replacement session.
-    chat_segment = page.get_by_test_id("view-mode-chat")
-    if chat_segment.is_visible():
-        chat_segment.click()
+        # Best-effort return to the chat surface: the toggle can vanish once the
+        # terminal transfers to the replacement session.
+        chat_segment = page.get_by_test_id("view-mode-chat")
+        if chat_segment.is_visible():
+            chat_segment.click()
 
-    expect(page).to_have_url(
-        re.compile(re.escape(f"/c/{new_session_id}")), timeout=_REDIRECT_TIMEOUT_MS
-    )
+        expect(page).to_have_url(
+            re.compile(re.escape(f"/c/{new_session_id}")), timeout=_REDIRECT_TIMEOUT_MS
+        )
 
-    _wait_for_supersession_notice(base_url, old_session_id, new_session_id)
+        _wait_for_supersession_notice(base_url, old_session_id, new_session_id)
+    finally:
+        # The fixture reclaims only the original session; the rotation's
+        # replacement owns the transferred terminal and the live Codex process.
+        httpx.delete(f"{base_url}/v1/sessions/{new_session_id}", timeout=10.0)

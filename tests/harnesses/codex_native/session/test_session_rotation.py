@@ -493,9 +493,7 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
         for event in session_events
         if event.session_id == "conv_new" and event.body["type"] == "external_session_status"
     ] == ["running"]
-    # The OLD session receives only the intentional supersession notice
-    # (spinner stop, notice message, redirect event) — never stale
-    # child-thread events leaked from the superseded thread.
+    # Guards against stale child-thread events leaking from the superseded thread.
     assert [event.body["type"] for event in session_events if event.session_id == "conv_old"] == [
         "external_session_status",
         "external_conversation_item",
