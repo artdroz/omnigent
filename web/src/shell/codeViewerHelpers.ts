@@ -437,7 +437,7 @@ export const HTML_PREVIEW_HEAD = '<base target="_blank">' + SAME_PAGE_ANCHOR_SCR
  */
 function startTagEnd(html: string, tag: "head" | "html"): number {
   const scanner =
-    /<!--[\s\S]*?(?:--!?>|$)|<script(?=[\s/>])(?:"[^"]*"|'[^']*'|[^>])*>[\s\S]*?(?:<\/script(?=[\s/>])[^>]*>|$)|<(head|html)(?=[\s/>])[^>]*>/gi;
+    /<!--[\s\S]*?(?:--!?>|$)|<script(?=[\s/>])(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?(?:<\/script(?=[\s/>])[^>]*>|$)|<(head|html)(?=[\s/>])(?:"[^"]*"|'[^']*'|[^>"'])*>/gi;
   for (let match = scanner.exec(html); match; match = scanner.exec(html)) {
     if (match[1]?.toLowerCase() === tag) return match.index + match[0].length;
   }

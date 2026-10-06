@@ -503,6 +503,17 @@ describe("prepareHtmlPreviewDoc", () => {
     expect(prepareHtmlPreviewDoc(fake)).toBe(`${HEAD}${fake}`);
     const quoted = "<script data-x=\"a>b\">var t = '<head>';</script><p>hi</p>";
     expect(prepareHtmlPreviewDoc(quoted)).toBe(`${HEAD}${quoted}`);
+    expect(prepareHtmlPreviewDoc('<html><head data-x="a>b"></head></html>')).toBe(
+      `<html><head data-x="a>b">${HEAD}</head></html>`,
+    );
+  });
+
+  it("scans an unterminated, quote-heavy script start tag in linear time", () => {
+    const hostile = `<p>ok</p><script ${'"'.repeat(36)}`;
+    const started = performance.now();
+    expect(prepareHtmlPreviewDoc(hostile)).toBe(`${HEAD}${hostile}`);
+    // Overlapping attribute alternatives took seconds on this input; disjoint ones are instant.
+    expect(performance.now() - started).toBeLessThan(500);
   });
 
   it("treats an unterminated <script> or comment as swallowing the rest of the document", () => {

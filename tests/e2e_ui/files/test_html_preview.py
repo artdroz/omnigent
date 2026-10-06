@@ -168,9 +168,9 @@ def test_html_preview_runs_scripts_and_targets_links(
     # The runtime-created link is present, confirming the script fully executed.
     expect(preview.locator("#dynamic-link")).to_have_text("dynamic link")
 
-    # A same-page ``#fragment`` link scrolls the preview in place. A srcdoc frame
-    # resolves it against the host page's URL, so with the ``_blank`` base target
-    # it used to open a new window at the session URL instead.
+    # A same-page ``#fragment`` link must scroll the preview: a srcdoc frame otherwise
+    # resolves it against the host page's URL and the ``_blank`` base target opens it
+    # externally.
     target = preview.locator("#section-3")
     expect(target).not_to_be_in_viewport()
     _click_without_popup(page, preview.get_by_role("link", name="Jump to section 3"), target)
