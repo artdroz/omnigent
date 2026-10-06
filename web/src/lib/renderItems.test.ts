@@ -31,6 +31,7 @@ function ctx(opts?: {
   itemId?: string | null;
   responseId?: string;
   agent?: string | null;
+  turn?: number;
   timestamp?: number;
   createdBy?: string;
   createdAtS?: number;
@@ -39,7 +40,7 @@ function ctx(opts?: {
   return {
     agent: opts?.agent ?? "test",
     depth: 0,
-    turn: 0,
+    turn: opts?.turn ?? 0,
     timestamp: opts?.timestamp ?? 0,
     responseId: opts?.responseId ?? "resp_1",
     itemId: opts?.itemId === undefined ? null : opts.itemId,
@@ -60,6 +61,69 @@ function mkExec(name: string, callId: string): ToolExecution {
     output: null,
   };
 }
+
+describe("sub-agent timeline events", () => {
+  const notice = (): AnyBlock => ({
+    type: "native_tool",
+    ctx: ctx({ itemId: "notice_1", responseId: "subagent_returned" }),
+    toolType: "subagent_activity",
+    label: "Sub-agent activity",
+    data: {},
+  });
+  const work: AnyBlock = {
+    type: "tool_group",
+    ctx: ctx({ itemId: "parent_tool", responseId: "parent_turn" }),
+    executions: [mkExec("Agent", "call_1")],
+    iteration: 0,
+  };
+  const answer: AnyBlock = {
+    type: "text_done",
+    ctx: ctx({ itemId: "parent_answer", responseId: "parent_turn" }),
+    fullText: "The review is complete.",
+    hasCodeBlocks: false,
+  };
+
+  it.each([true, false])("preserves parent liveness with streaming response = %s", (streaming) => {
+    const active: ActiveResponse | null = streaming
+      ? { responseId: "parent_turn", state: "streaming", error: null }
+      : null;
+    const bubbles = buildBubbles([work, notice()], active, undefined, [], true);
+    expect(bubbles[0]).toMatchObject({
+      kind: "assistant",
+      responseId: "parent_turn",
+      lifecycle: streaming ? "streaming" : "completed",
+      items: [{ kind: "tool", state: "input-available" }],
+    });
+    expect(liveCandidateAssistantIndex(bubbles)).toBe(0);
+  });
+
+  it.each([false, true])("preserves timeline and parent identity with steering = %s", (steered) => {
+    const user: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "steering", responseId: "parent_turn" }),
+      content: [{ type: "input_text", text: "Include the API change too." }],
+    };
+    const cache = createBubbleCache();
+    const blocks = [work, notice(), ...(steered ? [user] : [])];
+    buildBubbles(blocks, null, cache);
+    const bubbles = buildBubbles([...blocks, answer], null, cache);
+    expect(bubbles.map((bubble) => bubble.kind)).toEqual([
+      "assistant",
+      "subagent_activity",
+      ...(steered ? ["user"] : []),
+      "assistant",
+    ]);
+    if (!steered) expect(bubbles[0]).toMatchObject({ continued: true });
+    expect(bubbles.at(-1)).toMatchObject({
+      responseId: "parent_turn",
+      stableId: "parent_answer",
+      ...(steered ? { defaultExpanded: true } : {}),
+      items: [{ kind: "text", text: "The review is complete." }],
+    });
+    expect(lastRenderableAssistantIndex(bubbles)).toBe(bubbles.length - 1);
+    expect(liveCandidateAssistantIndex(bubbles)).toBe(bubbles.length - 1);
+  });
+});
 
 describe("buildBubbles — bubble grouping", () => {
   it("UserMessageBlock + TextDone in same response → [user, assistant{ items: [text] }]", () => {
@@ -716,6 +780,89 @@ describe("buildBubbles — bubble grouping", () => {
     const bubbles = buildBubbles(blocks, null);
     const asst = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
     expect(asst.items[0]).toMatchObject({ kind: "error", level: "info" });
+  });
+
+  it("groups consecutive errors from the same response, turn, and agent", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "u1", responseId: "resp_failed" }),
+        content: [{ type: "input_text", text: "Run it" }],
+      },
+      {
+        type: "error",
+        ctx: ctx({ itemId: "err_1", responseId: "resp_failed" }),
+        source: "execution",
+        code: "required_terminal_exited",
+        message: "Terminal exited.",
+      },
+      {
+        type: "error",
+        ctx: ctx({ itemId: "err_2", responseId: "resp_failed" }),
+        source: "execution",
+        code: "runner_disconnected",
+        message: "Runner disconnected.\n\nTerminal diagnostics:\ntunnel: closed",
+      },
+    ];
+
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((bubble) => bubble.kind)).toEqual(["user", "assistant"]);
+    const assistant = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
+    expect(assistant.items).toEqual([
+      {
+        kind: "error",
+        itemId: "err_1",
+        source: "execution",
+        code: "required_terminal_exited",
+        message: "Terminal exited.",
+        relatedErrors: [
+          {
+            itemId: "err_2",
+            source: "execution",
+            code: "runner_disconnected",
+            message: "Runner disconnected.\n\nTerminal diagnostics:\ntunnel: closed",
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("keeps errors with different causal boundaries in separate bubbles", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "error",
+        ctx: ctx({ itemId: "err_1", responseId: "resp_1" }),
+        source: "execution",
+        code: "runner_error",
+        message: "First turn failed.",
+      },
+      {
+        type: "error",
+        ctx: ctx({ itemId: "err_2", responseId: "resp_2", turn: 1 }),
+        source: "execution",
+        code: "runner_error",
+        message: "First turn failed.",
+      },
+    ];
+
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles).toHaveLength(2);
+    expect(
+      bubbles.map((bubble) =>
+        bubble.kind === "assistant"
+          ? { responseId: bubble.responseId, items: bubble.items.length }
+          : bubble.kind,
+      ),
+    ).toEqual([
+      { responseId: "resp_1", items: 1 },
+      { responseId: "resp_2", items: 1 },
+    ]);
+    for (const bubble of bubbles) {
+      if (bubble.kind !== "assistant") continue;
+      expect((bubble.items[0] as Extract<RenderItem, { kind: "error" }>).relatedErrors).toBe(
+        undefined,
+      );
+    }
   });
 
   it("compaction block becomes a standalone compaction bubble", () => {

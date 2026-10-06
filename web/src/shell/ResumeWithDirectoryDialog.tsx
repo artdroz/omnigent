@@ -17,12 +17,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import {
-  WorkspacePicker,
-  isNavigablePath,
-  resolveWorkspacePath,
-  useResolvedHostHome,
-} from "./WorkspacePicker";
+import { resolveWorkspacePath, useResolvedHostHome } from "./WorkspacePicker";
+import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { WorkspacePathField } from "./WorkspacePathField";
 import { CliCommandBlock } from "./CliCommandBlock";
 import { HostLabel } from "./HostLabel";
@@ -140,7 +136,6 @@ export function ResumeWithDirectoryDialog({
   const [branchName, setBranchName] = useState("");
   const [baseBranch, setBaseBranch] = useState("");
   const [browsing, setBrowsing] = useState(false);
-  const [browseNonce, setBrowseNonce] = useState(0);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -232,7 +227,6 @@ export function ResumeWithDirectoryDialog({
   function commitWorkspacePath(path: string): void {
     setWorkspace(path);
     setBrowsing(true);
-    setBrowseNonce((n) => n + 1);
   }
 
   async function handleBind(): Promise<void> {
@@ -357,18 +351,13 @@ export function ResumeWithDirectoryDialog({
                     recent={recent}
                     dropdownDisabled={browsing}
                   />
-                  {browsing && (
-                    <WorkspacePicker
-                      key={browseNonce}
-                      hostId={selectedHostId}
-                      initialPath={isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined}
-                      onSelect={(path) => {
-                        setWorkspace(path);
-                        setBrowsing(false);
-                      }}
-                      onClose={() => setBrowsing(false)}
-                    />
-                  )}
+                  <WorkspacePickerDialog
+                    open={browsing}
+                    onOpenChange={setBrowsing}
+                    hostId={selectedHostId}
+                    initialPath={workspaceTrimmed}
+                    onConfirm={setWorkspace}
+                  />
                   {showConflictHint && (
                     <p
                       className="flex items-start gap-1.5 text-sm text-warning"

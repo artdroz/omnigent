@@ -52,6 +52,7 @@ from typing import Final
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from omnigent.inner.terminal_clipboard import MAX_CLIPBOARD_BYTES
 from omnigent.terminals.ws_common import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_DETACHED,
@@ -126,7 +127,7 @@ _CLIPBOARD_BUFFER_CHANGED_PREFIX: Final = b"%paste-buffer-changed "
 _CLIPBOARD_BUFFER_NAME_RE: Final = re.compile(rb"[A-Za-z0-9_.:-]{1,128}\Z")
 # Browser clipboard writes should stay text-sized. Bound the raw buffer before
 # base64/JSON expansion so a huge tmux buffer cannot become a websocket DoS.
-_CLIPBOARD_MAX_BYTES: Final[int] = 1024 * 1024
+_CLIPBOARD_MAX_BYTES: Final[int] = MAX_CLIPBOARD_BYTES
 _CLIPBOARD_READ_TIMEOUT_S: Final[float] = 2.0
 # A copy-mode commit follows the initiating key or mouse release immediately.
 # Correlating the notification with this client's recent input prevents one
@@ -523,8 +524,8 @@ async def bridge_tmux_control_to_websocket(
     :param websocket: An accepted FastAPI :class:`WebSocket`.
     :param socket_path: Filesystem path to the tmux server socket.
     :param tmux_target: The ``-t`` target string identifying the session.
-    :param read_only: When ``True``, attach with ``-r`` *and* drop inbound
-        binary input frames at the application layer (defense in depth).
+    :param read_only: When ``True``, drop inbound binary input frames and
+        attach with ``ignore-size`` so the viewer can't resize the pane.
     :param on_client_interaction: Optional callback fired on every client
         interaction (connect, disconnect, each input/resize frame) so the
         idle watcher can discount client-driven repaints.
@@ -558,7 +559,11 @@ async def bridge_tmux_control_to_websocket(
 
     argv = [tmux, "-S", socket_path, "-f", "/dev/null", "-C", "attach"]
     if read_only:
-        argv.append("-r")
+        # Not ``-r``: tmux >= 3.7 rejects ``send-keys`` whose implicit target
+        # client is read-only, so a viewer would block the harness from typing
+        # into the pane. Input is already dropped below; keep only the
+        # ignore-size half of ``-r`` so a viewer can't resize the owner's pane.
+        argv += ["-f", "ignore-size"]
     argv += ["-t", tmux_target]
 
     try:
