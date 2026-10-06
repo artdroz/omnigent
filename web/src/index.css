@@ -897,10 +897,9 @@ aside[aria-label="Workspace"][data-maximized] {
 [data-electron-mac] .traffic-light-clearance {
   padding-left: 10.5rem;
 }
-/* Below md the phone layout already carries these controls (drawer Search,
- * floating Settings, chat-header toggle): hide the title-bar cluster and let the
- * chat header and the full-bleed drawer's header row clear just the lights. The
- * row keeps its phone height so its Search bubble stays level with the header's. */
+/* Below md the phone layout already carries these controls: hide the title-bar
+ * cluster and pad the chat header and the full-bleed drawer's header row past
+ * the lights (the row keeps its phone height, level with the chat header's). */
 @media (width < 48rem) {
   [data-electron-mac] .electron-sidebar-header-actions {
     display: none;

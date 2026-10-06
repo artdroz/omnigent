@@ -76,7 +76,13 @@ def _shrink_window_and_open_sidebar(page: Page) -> Locator:
     expect(aside).to_have_attribute("data-collapsed", "true")
 
     page.set_viewport_size(_NARROW_VIEWPORT)
-    page.get_by_role("button", name="Open sidebar", exact=True).click()
+    # With the drawer closed the chat header's own toggle is the way back in.
+    open_sidebar = page.get_by_role("button", name="Open sidebar", exact=True)
+    expect(open_sidebar).to_be_visible()
+    assert not _intersects(open_sidebar.bounding_box(), _WINDOW_CONTROLS_STRIP), (
+        f"Open sidebar button {open_sidebar.bounding_box()} sits under the window controls"
+    )
+    open_sidebar.click()
     expect(aside).not_to_have_attribute("data-collapsed", "true")
     page.wait_for_function(
         "() => document.querySelector('aside[aria-label=\"Conversations\"]')"
@@ -122,8 +128,8 @@ def test_narrow_window_command_palette_clears_window_controls(
     # Below md the palette is a full-screen sheet; in the 640-767px band it must
     # not fall back to the dialog's default 24rem card pinned to the left edge.
     sheet = palette.bounding_box()
-    assert sheet is not None and sheet["x"] == 0, f"palette sheet {sheet} is not flush left"
-    assert sheet["width"] == _NARROW_VIEWPORT["width"], (
+    assert sheet is not None and abs(sheet["x"]) < 1, f"palette sheet {sheet} is not flush left"
+    assert abs(sheet["width"] - _NARROW_VIEWPORT["width"]) < 1, (
         f"palette sheet {sheet} does not span the {_NARROW_VIEWPORT['width']}px window"
     )
     assert not _intersects(search_field.bounding_box(), _WINDOW_CONTROLS_STRIP), (

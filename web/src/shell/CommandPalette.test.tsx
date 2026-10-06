@@ -433,17 +433,6 @@ describe("CommandPalette — mobile full-screen sheet", () => {
     }
   });
 
-  it("stays full-width in the sm band instead of DialogContent's 24rem cap", () => {
-    setMobile(true);
-    renderPalette();
-
-    // Between 640px and the md breakpoint DialogContent's sm:max-w-sm would
-    // otherwise win over max-w-full and leave a left-anchored 384px sheet.
-    const className = dialogContent()?.className ?? "";
-    expect(className).toContain("sm:max-w-full");
-    expect(className).not.toContain("sm:max-w-sm");
-  });
-
   it("pads the sheet below the macOS shell's traffic-light strip", () => {
     setMobile(true);
     setMacElectronShell();
