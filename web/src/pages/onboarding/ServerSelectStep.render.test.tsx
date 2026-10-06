@@ -24,7 +24,46 @@ describe("ServerSelectStep", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /install omnigent/i }));
-    expect(onConnect).toHaveBeenCalledWith("https://team.example.com/", false);
+    expect(onConnect).toHaveBeenCalledWith("https://team.example.com/");
+  });
+
+  it("titles a recent with the name it gave itself, beside its host", () => {
+    render(
+      <ServerSelectStep
+        {...baseProps}
+        recentServers={["https://omni.example/", "https://plain.example/"]}
+        serverNames={{ "https://omni.example": "Acme Engineering" }}
+        onConnect={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Acme Engineering (omni.example)")).toBeInTheDocument();
+    expect(screen.getByText("plain.example")).toBeInTheDocument();
+  });
+
+  it("keeps the local install's label even when it named itself", () => {
+    render(
+      <ServerSelectStep
+        {...baseProps}
+        recentServers={["http://localhost:6767/"]}
+        serverNames={{ "http://localhost:6767": "My laptop" }}
+        onConnect={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Local installation (localhost:6767)")).toBeInTheDocument();
+  });
+
+  it("titles a managed server with the organization's name over the server's own", () => {
+    render(
+      <ServerSelectStep
+        {...baseProps}
+        managedServers={["https://omni.example/"]}
+        managedServerNames={{ "https://omni.example/": "Engineering" }}
+        serverNames={{ "https://omni.example": "Self-chosen" }}
+        onConnect={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Engineering")).toBeInTheDocument();
+    expect(screen.queryByText(/Self-chosen/)).not.toBeInTheDocument();
   });
 
   it("with recents, starts on the list (no input) and 'Add server' opens the add view", () => {
@@ -70,27 +109,6 @@ describe("ServerSelectStep", () => {
     fireEvent.click(screen.getByRole("button", { name: "Join" }));
     expect(screen.getByRole("alert")).toHaveTextContent(/valid http\(s\) server URL/i);
     expect(onCheckServer).not.toHaveBeenCalled();
-  });
-
-  it("shows the confirm warning on Join, then forces on the second click", async () => {
-    const onConnect = vi
-      .fn()
-      .mockResolvedValueOnce({ needsConfirm: true })
-      .mockResolvedValueOnce({});
-    render(
-      <ServerSelectStep
-        {...baseProps}
-        recentServers={["https://amazon.com/"]}
-        onConnect={onConnect}
-      />,
-    );
-    const join = screen.getByRole("button", { name: /install omnigent/i });
-    fireEvent.click(join);
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      /doesn't look like an Omnigent server/i,
-    );
-    fireEvent.click(join);
-    expect(onConnect).toHaveBeenNthCalledWith(2, "https://amazon.com/", true);
   });
 
   it("surfaces a rejected-connect error instead of silently doing nothing", async () => {
