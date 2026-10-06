@@ -434,25 +434,130 @@ const SAME_PAGE_ANCHOR_SCRIPT = `<script>(function () {
 /** Markup `prepareHtmlPreviewDoc` places at the start of `<head>`. */
 export const HTML_PREVIEW_HEAD = '<base target="_blank">' + SAME_PAGE_ANCHOR_SCRIPT;
 
+/** Whitespace as the HTML tokenizer defines it. */
+const TOKENIZER_SPACE = " \t\n\f\r";
+
+/** Characters that end a tag name in the tokenizer: whitespace, `/` and `>`. */
+const TAG_NAME_END = `${TOKENIZER_SPACE}/>`;
+
+/** Whether `html` has the tag opener `name` (e.g. `</script`) at `at`, delimited as the tokenizer requires. */
+function hasTagAt(html: string, at: number, name: string): boolean {
+  const next = html.charAt(at + name.length);
+  return (
+    next !== "" &&
+    TAG_NAME_END.includes(next) &&
+    html.slice(at, at + name.length).toLowerCase() === name
+  );
+}
+
 /**
- * End offset of the first real `<head>`/`<html>` start tag, or -1. Comments and
- * `<script>` blocks (to their end tag, or to end of input when unterminated) are
- * consumed whole so a look-alike tag inside them cannot attract the injection,
- * whose `</script>` would end the artifact's own script. Like the HTML parser, a
- * tag name must end at whitespace, `/` or `>`, so `</script-x>` is plain text,
- * an empty comment may close abruptly (`<!-->`, `<!--->`), and a tag or quoted
- * attribute value still open at end of input swallows the rest. This runs on
- * the host page before the sandbox applies, so every
- * alternative succeeds once its opening is found and the scan only moves
- * forward: an incomplete tag is never rescanned, keeping the time linear.
+ * Index just past the `>` that ends the tag whose name ends at `from`, or -1 when
+ * the tag is still open at end of input (the parser then drops it and everything
+ * after it). As in the tokenizer, only a quote right after `=` delimits a value.
+ */
+function tagEnd(html: string, from: number): number {
+  let valueNext = false;
+  for (let i = from; i < html.length; i++) {
+    const c = html.charAt(i);
+    if (c === ">") return i + 1;
+    if (valueNext && (c === '"' || c === "'")) {
+      const close = html.indexOf(c, i + 1);
+      if (close === -1) return -1;
+      i = close;
+      valueNext = false;
+    } else if (c === "=") {
+      valueNext = true;
+    } else if (!TOKENIZER_SPACE.includes(c)) {
+      valueNext = false;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Index just past the end tag that closes a `<script>` whose start tag ended at
+ * `from`, or -1 when the element is still open at end of input. Follows the
+ * tokenizer's script states: `<!--` enters the escaped state and a `<script`
+ * inside it the double-escaped state, where `</script>` only steps back to the
+ * escaped state instead of closing the element; `-->` returns to plain script data.
+ */
+function scriptEnd(html: string, from: number): number {
+  let state: "data" | "escaped" | "double" = "data";
+  for (let i = from; i < html.length; i++) {
+    const c = html.charAt(i);
+    if (c === "-" && state !== "data") {
+      let j = i + 1;
+      while (html.charAt(j) === "-") j++;
+      if (j - i >= 2 && html.charAt(j) === ">") {
+        state = "data";
+        i = j;
+      } else {
+        i = j - 1;
+      }
+    } else if (c !== "<") {
+      continue;
+    } else if (state === "data" && html.startsWith("<!--", i)) {
+      // `<!--` followed only by dashes and `>` is already back in plain script data.
+      let j = i + 4;
+      while (html.charAt(j) === "-") j++;
+      if (html.charAt(j) === ">") {
+        i = j;
+      } else {
+        state = "escaped";
+        i += 3;
+      }
+    } else if (hasTagAt(html, i, "</script")) {
+      if (state !== "double") return tagEnd(html, i + 8);
+      state = "escaped";
+      i += 7;
+    } else if (state === "escaped" && hasTagAt(html, i, "<script")) {
+      state = "double";
+      i += 6;
+    }
+  }
+  return -1;
+}
+
+/**
+ * End offset of the first real `<head>`/`<html>` start tag, or -1. A small
+ * forward-only scanner that follows the tokenizer where it matters here:
+ * comments and `<script>` elements (including their escaped and double-escaped
+ * states) are skipped whole, so a look-alike tag inside them cannot attract the
+ * injection, whose `</script>` would end the artifact's own script; a tag name
+ * must end at whitespace, `/` or `>`, so `</script-x>` is plain text; and a tag,
+ * quoted value, comment or script still open at end of input swallows the rest.
+ * It runs on the host page before the sandbox applies and only ever moves
+ * forward, so hostile input cannot make it slow.
  */
 function startTagEnd(html: string, tag: "head" | "html"): number {
-  const scanner =
-    /<!--(?:-?>|[\s\S]*?(?:--!?>|$))|<script(?=[\s/>])(?:"[^"]*"|'[^']*'|[^>"'])*(?:>[\s\S]*?(?:<\/script(?=[\s/>])[^>]*(?:>|$)|$)|["'][\s\S]*|$)|<(head|html)(?=[\s/>])(?:"[^"]*"|'[^']*'|[^>"'])*(>|["'][\s\S]*|$)/gi;
-  for (let match = scanner.exec(html); match; match = scanner.exec(html)) {
-    // A start tag left open at end of input is dropped by the parser: no insertion point.
-    if (match[1]?.toLowerCase() !== tag || match[2] !== ">") continue;
-    return match.index + match[0].length;
+  for (let i = html.indexOf("<"); i !== -1; i = html.indexOf("<", i)) {
+    if (html.startsWith("<!--", i)) {
+      // An empty comment may close abruptly (`<!-->`, `<!--->`); otherwise `-->` or `--!>` ends it.
+      let j = i + 4;
+      while (html.charAt(j) === "-") j++;
+      if (html.charAt(j) === ">") {
+        i = j + 1;
+        continue;
+      }
+      const terminator = /--!?>/g;
+      terminator.lastIndex = i + 4;
+      const match = terminator.exec(html);
+      if (!match) return -1;
+      i = match.index + match[0].length;
+    } else if (hasTagAt(html, i, "<script")) {
+      const open = tagEnd(html, i + 7);
+      if (open === -1) return -1;
+      const close = scriptEnd(html, open);
+      if (close === -1) return -1;
+      i = close;
+    } else if (hasTagAt(html, i, "<head") || hasTagAt(html, i, "<html")) {
+      const end = tagEnd(html, i + 5);
+      if (end === -1) return -1;
+      if (html.slice(i + 1, i + 5).toLowerCase() === tag) return end;
+      i = end;
+    } else {
+      i += 1;
+    }
   }
   return -1;
 }
@@ -470,7 +575,7 @@ function startTagEnd(html: string, tag: "head" | "html"): number {
  * existing `<head>`/`<html>` when present and only fall back to prepending for
  * bare fragments that have no doctype to displace.
  *
- * The matcher is a deliberately simple regex, NOT a full HTML parser: parsing
+ * The matcher is a small forward-only scanner, NOT a full HTML parser: parsing
  * and re-serializing untrusted artifact content could subtly alter how it
  * renders. Comments and `<script>` blocks are skipped so a look-alike tag inside
  * them is not mistaken for the real one; a literal in other text (a `<style>` or

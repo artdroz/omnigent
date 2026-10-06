@@ -541,6 +541,32 @@ describe("prepareHtmlPreviewDoc", () => {
     expect(prepareHtmlPreviewDoc("<head ")).toBe(`${HEAD}<head `);
   });
 
+  it("keeps scanning through a double-escaped </script> inside an artifact script", () => {
+    // After `<!--<script`, the tokenizer is double-escaped: `</script>` only steps back to the
+    // escaped state, so the element (and its `<head>` literal) runs on to the later `</script>`.
+    const script = "<script><!--<script></script><head>-->\nwindow.artifactRan = 1;\n</script>";
+    const rest = '\n<p id="after">ok</p>';
+    expect(prepareHtmlPreviewDoc(`${script}${rest}`)).toBe(`${HEAD}${script}${rest}`);
+    // `-->` leaves the escaped states, so the next `</script>` closes the element for real.
+    const closed = "<script><!--<script>--></script><html><head></head></html>";
+    expect(prepareHtmlPreviewDoc(closed)).toBe(
+      `<script><!--<script>--></script><html><head>${HEAD}</head></html>`,
+    );
+    // In the escaped state alone, `</script>` still closes the element.
+    const escapedOnly = "<script><!--</script><html><head></head></html>";
+    expect(prepareHtmlPreviewDoc(escapedOnly)).toBe(
+      `<script><!--</script><html><head>${HEAD}</head></html>`,
+    );
+  });
+
+  it("treats a quote as an attribute value delimiter only after =, like the tokenizer", () => {
+    // `"a` is an attribute name here, so the tag ends at the first `>` and the markup lands
+    // where the parser's head begins.
+    expect(prepareHtmlPreviewDoc('<html><head "a>b"></head></html>')).toBe(
+      `<html><head "a>${HEAD}b"></head></html>`,
+    );
+  });
+
   it("treats an unterminated <script> or comment as swallowing the rest of the document", () => {
     const script = "<script>var t = '<head>';";
     expect(prepareHtmlPreviewDoc(`${script}<html><head></head></html>`)).toBe(
