@@ -23,10 +23,11 @@ Rate-limited per runner at a provider-scoped cadence
 write that wakes a controller reconcile — so agent_sandbox refreshes fast (short
 window) while other providers stay on the cheap default.
 
-Refreshes run on a bounded worker pool. A runner has at most one queued or
-running refresh, and its throttle timestamp is recorded when a worker starts
-rather than when a job enters the queue. This keeps one stalled provider from
-starving unrelated live runners while retaining the existing active-tunnel gate.
+Refreshes run on a bounded worker pool with at most one queued or running
+refresh per runner, so one stalled provider call cannot starve unrelated live
+runners. The throttle counts from the tick that requested a refresh, matching
+the tunnel loop that sleeps one interval after each :func:`touch`; a worker
+reports how long its job queued instead of moving that stamp.
 """
 
 from __future__ import annotations
@@ -69,6 +70,7 @@ class _KeepAliveOutcome(StrEnum):
     PROVIDER_ERROR = "provider_error"
     RESOLUTION_ERROR = "resolution_error"
     SUBMISSION_FAILED = "submission_failed"
+    CANCELLED = "cancelled"
 
 
 # runner_id -> its provider's keepalive cadence (seconds), filled by
@@ -90,7 +92,7 @@ _host_store: HostStore | None = None
 _sandbox_config: ManagedSandboxDeployment | None = None
 _executor: ThreadPoolExecutor | None = None
 
-# runner_id -> monotonic seconds when its last worker actually started.
+# runner_id -> monotonic seconds of the tick that last requested its refresh.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by runner_id
 _last_kept: dict[str, float] = {}
 
@@ -100,9 +102,6 @@ _last_kept: dict[str, float] = {}
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by runner_id
 _inflight: set[str] = set()
 _state_lock = threading.Lock()
-# Kept as a named alias for tests and callers that inspect the single-flight
-# guard. All shared throttle, cadence, and reservation state uses this lock.
-_inflight_lock = _state_lock
 
 # Set only on a worker, after it leaves the executor queue. Direct unit-test
 # calls to _keep_alive_for_runner have no queue delay, so the field is omitted.
@@ -190,9 +189,13 @@ def touch(runner_id: str) -> None:
             return
         if runner_id in _inflight:
             # A reservation spans both queued and running work. Do not let a
-            # slow provider accumulate duplicate jobs for one runner.
+            # slow provider accumulate duplicate jobs for one runner; _last_kept
+            # stays untouched so the next tick retries once this one clears.
             return
         _inflight.add(runner_id)
+        # Stamp the tick, not the worker start: the tunnel loop sleeps exactly
+        # one interval after this call, so a later stamp would drop its next tick.
+        _last_kept[runner_id] = now
         should_prune = len(_last_kept) > _THROTTLE_MAX_ENTRIES
     if should_prune:
         _prune_throttle(now)
@@ -200,18 +203,16 @@ def touch(runner_id: str) -> None:
         ctx = contextvars.copy_context()
         future = executor.submit(ctx.run, _run_keepalive_job, runner_id, now)
     except Exception as exc:  # noqa: BLE001 - submission is best effort
-        with _state_lock:
-            _inflight.discard(runner_id)
+        _release_reservation(runner_id)
         _emit_outcome(
             runner_id,
             _KeepAliveOutcome.SUBMISSION_FAILED,
             error_type=_bounded_error_type(exc),
             queue_delay_s=0.0,
+            exc=exc,
         )
         return
-    future.add_done_callback(
-        lambda completed: ctx.run(_release_cancelled_job, completed, runner_id)
-    )
+    future.add_done_callback(lambda completed: _release_cancelled_job(completed, runner_id))
 
 
 def _prune_throttle(now: float) -> None:
@@ -224,29 +225,23 @@ def _prune_throttle(now: float) -> None:
             _runner_interval_s.pop(runner_id, None)
 
 
+def _release_reservation(runner_id: str) -> None:
+    """Forget a refresh that never ran so the next tick retries it."""
+    with _state_lock:
+        _inflight.discard(runner_id)
+        _last_kept.pop(runner_id, None)
+
+
 def _release_cancelled_job(future: Future[None], runner_id: str) -> None:
     """Release a reservation when an accepted executor job is cancelled."""
     if future.cancelled():
-        with _state_lock:
-            _inflight.discard(runner_id)
-        _emit_outcome(
-            runner_id,
-            _KeepAliveOutcome.SUBMISSION_FAILED,
-            error_type="cancelled",
-            queue_delay_s=0.0,
-        )
+        _release_reservation(runner_id)
+        _emit_outcome(runner_id, _KeepAliveOutcome.CANCELLED, queue_delay_s=0.0)
 
 
 def _run_keepalive_job(runner_id: str, queued_at: float) -> None:
-    """Stamp the actual worker start, then resolve the runner's sandbox."""
-    started_at = time.monotonic()
-    queue_delay_s = max(0.0, started_at - queued_at)
-    with _state_lock:
-        _last_kept[runner_id] = started_at
-        should_prune = len(_last_kept) > _THROTTLE_MAX_ENTRIES
-    if should_prune:
-        _prune_throttle(started_at)
-    token = _queue_delay_s.set(queue_delay_s)
+    """Resolve the runner's sandbox on a worker, reporting how long the job queued."""
+    token = _queue_delay_s.set(max(0.0, time.monotonic() - queued_at))
     try:
         _keep_alive_for_runner(runner_id)
     finally:
@@ -274,8 +269,9 @@ def _emit_outcome(
     queue_delay_s: float | None = None,
     error_type: str | None = None,
     message: str | None = None,
+    exc: BaseException | None = None,
 ) -> None:
-    """Emit one bounded, identifier-only record for one refresh attempt."""
+    """Emit one bounded record for one refresh attempt; *exc* attaches its traceback."""
     if outcome == _KeepAliveOutcome.EXTENDED:
         level = logging.INFO
     elif outcome in {
@@ -301,7 +297,7 @@ def _emit_outcome(
         queue_delay_s=(round(max(0.0, queue_delay_s), 3) if queue_delay_s is not None else None),
     )
     if message is not None:
-        _logger.log(level, message, extra=extra)
+        _logger.log(level, message, extra=extra, exc_info=exc)
     else:
         _logger.log(
             level,
@@ -311,6 +307,7 @@ def _emit_outcome(
             host_id or "unknown",
             provider or "unknown",
             extra=extra,
+            exc_info=exc,
         )
 
 
@@ -340,6 +337,7 @@ def _keep_alive_for_runner(runner_id: str) -> None:
                     host_id=host_id,
                     error_type=_bounded_error_type(exc),
                     queue_delay_s=queue_delay_s,
+                    exc=exc,
                 )
                 continue
             # Only a server-provisioned sandbox has one to extend; a CLI host has
@@ -378,6 +376,7 @@ def _keep_alive_for_runner(runner_id: str) -> None:
                     sandbox_id=host.sandbox_id,
                     error_type=_bounded_error_type(exc),
                     queue_delay_s=queue_delay_s,
+                    exc=exc,
                 )
                 continue
             if config is None:
@@ -452,6 +451,7 @@ def _keep_alive_for_runner(runner_id: str) -> None:
                     provider_duration_s=provider_duration_s,
                     error_type=_bounded_error_type(exc),
                     queue_delay_s=queue_delay_s,
+                    exc=exc,
                 )
     # Keepalive is best effort: it must never disrupt the runner tunnel.
     except Exception as exc:  # noqa: BLE001
@@ -460,4 +460,5 @@ def _keep_alive_for_runner(runner_id: str) -> None:
             _KeepAliveOutcome.RESOLUTION_ERROR,
             error_type=_bounded_error_type(exc),
             queue_delay_s=queue_delay_s,
+            exc=exc,
         )

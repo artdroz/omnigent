@@ -1,8 +1,9 @@
 """Tests for the managed-path sandbox keepalive.
 
 Covers the resolution chain (runner -> session -> host -> provider), the
-per-runner rate limit, and the two skip paths (provider can't extend, host has
-no sandbox). Stubs stand in for the stores/deployment: the module only reads a
+per-runner rate limit, the two skip paths (provider can't extend, host has no
+sandbox), and the worker pool: one runner's stalled provider call must not starve
+other runners. Stubs stand in for the stores/deployment: the module only reads a
 few attributes off each, so a real store would add setup without adding cover.
 """
 
@@ -11,6 +12,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import cast
@@ -116,7 +118,7 @@ def test_touch_is_rate_limited_per_runner(monkeypatch: pytest.MonkeyPatch) -> No
     submitted: list[str] = []
     monkeypatch.setattr(managed_host_keepalive, "_sandbox_config", object())
     monkeypatch.setattr(managed_host_keepalive, "_host_store", object())
-    # touch() submits a worker start timestamp after the runner id.
+    # touch() submits ctx.run(job, runner_id, tick), so the runner id is args[-2].
     monkeypatch.setattr(
         managed_host_keepalive,
         "_executor",
@@ -126,7 +128,8 @@ def test_touch_is_rate_limited_per_runner(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
 
     managed_host_keepalive.touch("r1")
-    managed_host_keepalive.touch("r1")  # inside the window: dropped
+    managed_host_keepalive._inflight.discard("r1")  # first attempt finished
+    managed_host_keepalive.touch("r1")  # inside the window: dropped by the throttle
     managed_host_keepalive.touch("r2")  # different runner: allowed
     assert submitted == ["r1", "r2"]
 
@@ -137,7 +140,7 @@ def test_touch_is_a_noop_without_a_sandbox_config(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(
         managed_host_keepalive,
         "_executor",
-        SimpleNamespace(submit=lambda *args: Future()),
+        SimpleNamespace(submit=lambda *args: _record_submission(submitted, *args)),
     )
     monkeypatch.setattr(managed_host_keepalive, "_last_kept", {})
     monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
@@ -233,13 +236,7 @@ def test_a_runner_already_in_flight_is_not_queued_twice(
 def test_helper_cannot_release_a_new_reservation_at_worker_handoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The worker owns release after the helper returns.
-
-    The old two-finalizer sequence released ``r1`` inside the helper, then
-    allowed a second touch to reserve it before the worker wrapper's finalizer
-    ran. This test pauses at exactly that boundary and proves the reservation
-    remains held until the wrapper is finished.
-    """
+    """The reservation remains held until the worker wrapper's cleanup completes."""
     helper_returned = threading.Event()
     allow_worker_return = threading.Event()
     helper_calls = 0
@@ -272,7 +269,7 @@ def test_helper_cannot_release_a_new_reservation_at_worker_handoff(
             managed_host_keepalive._last_kept.clear()
 
         # A second tick is suppressed while the first worker still owns the
-        # reservation. The old helper-side release made this submit a duplicate.
+        # reservation.
         managed_host_keepalive.touch("r1")
         assert helper_calls == 1
     finally:
@@ -318,50 +315,56 @@ def test_stalled_runner_does_not_block_an_independent_refresh(
         pool.shutdown(wait=True)
 
 
-def test_worker_pool_has_a_fixed_bound() -> None:
-    """Keepalive concurrency stays bounded independently of runner count."""
-    assert managed_host_keepalive._KEEPALIVE_MAX_WORKERS == 8
+def test_configure_builds_the_bounded_worker_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """configure() builds the production pool at the fixed bound, not a single worker."""
+    for name in ("_conversation_store", "_host_store", "_sandbox_config", "_executor"):
+        monkeypatch.setattr(managed_host_keepalive, name, None)
+    managed_host_keepalive.configure(object(), object(), object())
+    executor = managed_host_keepalive._executor
+    assert executor is not None
+    try:
+        assert executor._max_workers == managed_host_keepalive._KEEPALIVE_MAX_WORKERS == 8
+    finally:
+        executor.shutdown(wait=True)
 
 
-def test_throttle_is_stamped_when_a_queued_worker_starts(
+def test_a_tick_one_interval_after_touch_is_not_throttled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A queued job is not treated as refreshed until its provider work starts."""
-    slow_started = threading.Event()
-    release_slow = threading.Event()
-    healthy_started = threading.Event()
+    """
+    The tunnel loop sleeps one interval after touch(), so the throttle must count
+    from that tick. Stamping the worker's later start instead drops the next tick
+    and doubles the refresh gap, past the 2x-interval shutdown-window floor.
+    """
+    clock = [1000.0]
+    jobs: list[tuple[Callable[..., None], tuple[object, ...]]] = []
 
-    def _keep_alive(runner_id: str) -> None:
-        if runner_id == "slow":
-            slow_started.set()
-            assert release_slow.wait(timeout=2.0)
-        else:
-            healthy_started.set()
+    class _DeferredExecutor:
+        def submit(self, fn: Callable[..., None], *args: object) -> Future[None]:
+            jobs.append((fn, args))
+            return Future()
 
-    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-managed-keepalive")
-    monkeypatch.setattr(managed_host_keepalive, "_executor", pool)
+    monkeypatch.setattr(
+        managed_host_keepalive, "time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    monkeypatch.setattr(managed_host_keepalive, "_executor", _DeferredExecutor())
     monkeypatch.setattr(managed_host_keepalive, "_sandbox_config", object())
     monkeypatch.setattr(managed_host_keepalive, "_host_store", object())
-    monkeypatch.setattr(managed_host_keepalive, "_keep_alive_for_runner", _keep_alive)
+    monkeypatch.setattr(managed_host_keepalive, "_keep_alive_for_runner", lambda _rid: None)
     monkeypatch.setattr(managed_host_keepalive, "_last_kept", {})
-    monkeypatch.setattr(managed_host_keepalive, "_runner_interval_s", {})
+    monkeypatch.setattr(managed_host_keepalive, "_runner_interval_s", {"r1": 60.0})
     monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
-    try:
-        managed_host_keepalive.touch("slow")
-        assert slow_started.wait(timeout=1.0)
-        queued_at = time.monotonic()
-        managed_host_keepalive.touch("healthy")
-        assert not healthy_started.is_set()
-        assert "healthy" not in managed_host_keepalive._last_kept
 
-        release_slow.set()
-        assert healthy_started.wait(timeout=1.0)
-        started_at = managed_host_keepalive._last_kept["healthy"]
-        assert started_at >= queued_at
-        assert started_at - queued_at < 1.0
-    finally:
-        release_slow.set()
-        pool.shutdown(wait=True)
+    managed_host_keepalive.touch("r1")
+    assert len(jobs) == 1
+    clock[0] += 0.005  # a worker picks the job up a few ms after the tick
+    run, args = jobs[0]
+    run(*args)  # ctx.run(_run_keepalive_job, "r1", tick), inline
+    assert "r1" not in managed_host_keepalive._inflight
+
+    clock[0] = 1060.001  # the loop wakes one interval (plus overshoot) later
+    managed_host_keepalive.touch("r1")
+    assert len(jobs) == 2, "the throttle counted from the worker start and dropped a due tick"
 
 
 def test_submission_failure_releases_the_runner_reservation(
@@ -395,6 +398,7 @@ def test_submission_failure_releases_the_runner_reservation(
         if getattr(record, "attributes", {}).get("outcome") == "submission_failed"
     )
     assert submission_event.attributes["error_type"] == "RuntimeError"
+    assert submission_event.exc_info is not None
 
     monkeypatch.setattr(
         managed_host_keepalive,
@@ -405,10 +409,43 @@ def test_submission_failure_releases_the_runner_reservation(
     assert submitted == ["r1"]
 
 
+def test_cancelled_job_releases_the_runner_reservation(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Cancelling an accepted but unstarted job frees the runner for the next tick."""
+    futures: list[Future[None]] = []
+
+    def _submit(*_args: object) -> Future[None]:
+        future: Future[None] = Future()
+        futures.append(future)
+        return future
+
+    monkeypatch.setattr(managed_host_keepalive, "_executor", SimpleNamespace(submit=_submit))
+    monkeypatch.setattr(managed_host_keepalive, "_sandbox_config", object())
+    monkeypatch.setattr(managed_host_keepalive, "_host_store", object())
+    monkeypatch.setattr(managed_host_keepalive, "_last_kept", {})
+    monkeypatch.setattr(managed_host_keepalive, "_runner_interval_s", {})
+    monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
+
+    managed_host_keepalive.touch("r1")
+    assert "r1" in managed_host_keepalive._inflight
+    with caplog.at_level(logging.DEBUG, logger="omnigent.server.managed_host_keepalive"):
+        assert futures[0].cancel()
+    assert "r1" not in managed_host_keepalive._inflight
+    assert "r1" not in managed_host_keepalive._last_kept
+    assert any(
+        getattr(record, "attributes", {}).get("outcome") == "cancelled"
+        for record in caplog.records
+    )
+
+    managed_host_keepalive.touch("r1")  # retry is eligible immediately
+    assert len(futures) == 2
+
+
 def test_worker_releases_reservation_when_the_provider_raises(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The scheduling wrapper releases a failed provider reservation."""
+    """The wrapper releases a failed provider reservation and keeps the traceback."""
     launcher = _Launcher(raises=RuntimeError("boom"))
     _wire(
         monkeypatch,
@@ -427,6 +464,7 @@ def test_worker_releases_reservation_when_the_provider_raises(
     assert error_events
     assert all("boom" not in record.getMessage() for record in error_events)
     assert error_events[0].attributes["error_type"] == "RuntimeError"
+    assert error_events[0].exc_info is not None
 
 
 def test_keepalive_interval_is_provider_scoped(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -562,3 +600,70 @@ def test_keepalive_interval_caches_the_runners_provider(monkeypatch: pytest.Monk
     managed_host_keepalive._keep_alive_for_runner("r1")
     # now cached at modal's slower cadence
     assert managed_host_keepalive.keepalive_interval_s("r1") == 600.0
+
+
+class _BlockingLauncher:
+    """keep_alive stalls on *blocked* until *release* is set; others return at once."""
+
+    def __init__(self, *, blocked: str, release: threading.Event) -> None:
+        self.blocked = blocked
+        self.release = release
+        self.started: list[str] = []
+        self._lock = threading.Lock()
+
+    def keep_alive(self, sandbox_id: str) -> None:
+        with self._lock:
+            self.started.append(sandbox_id)
+        if sandbox_id == self.blocked:
+            assert self.release.wait(timeout=30), "test never released the stalled keep_alive"
+
+
+def _wait_for(predicate: Callable[[], bool], timeout_s: float) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def test_a_stalled_keepalive_does_not_block_other_runners(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Runs touch() against the worker pool configure() really builds. While r1's
+    provider call is stalled, r2 (a different runner, host and sandbox) must
+    still get its keep_alive started.
+    """
+    release = threading.Event()
+    launcher = _BlockingLauncher(blocked="sbx-r1", release=release)
+    conversations = SimpleNamespace(
+        list_conversations_by_runner_id=lambda rid: [SimpleNamespace(host_id=f"host-{rid}")]
+    )
+    hosts = SimpleNamespace(
+        get_host=lambda hid: SimpleNamespace(
+            sandbox_id=hid.replace("host-", "sbx-"), sandbox_provider="modal"
+        )
+    )
+    deployment = SimpleNamespace(
+        for_provider=lambda _provider: SimpleNamespace(launcher_factory=lambda: launcher)
+    )
+    for name in ("_conversation_store", "_host_store", "_sandbox_config", "_executor"):
+        monkeypatch.setattr(managed_host_keepalive, name, None)
+    monkeypatch.setattr(managed_host_keepalive, "_last_kept", {})
+    monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
+    monkeypatch.setattr(managed_host_keepalive, "_runner_interval_s", {})
+    managed_host_keepalive.configure(conversations, hosts, deployment)
+    executor = managed_host_keepalive._executor
+    assert executor is not None
+    try:
+        managed_host_keepalive.touch("r1")
+        assert _wait_for(lambda: "sbx-r1" in launcher.started, 5.0)
+
+        managed_host_keepalive.touch("r2")
+        assert _wait_for(lambda: "sbx-r2" in launcher.started, 1.0), (
+            "r2's keep_alive never started while r1's provider call was stalled"
+        )
+    finally:
+        release.set()
+        executor.shutdown(wait=True)
