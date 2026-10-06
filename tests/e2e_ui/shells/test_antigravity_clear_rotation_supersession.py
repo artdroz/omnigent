@@ -104,6 +104,9 @@ def _wait_for_terminal_quiescent(
             reacted, last_text, stable_since = True, current, time.monotonic()
         elif reacted and time.monotonic() - stable_since >= settle_s:
             return
+    raise AssertionError(
+        f"agy TUI did not {'settle' if reacted else 'react to /clear'} within {timeout_s:.0f}s"
+    )
 
 
 # pytest resolves the imported fixtures by parameter name, so the shadowing is intended.

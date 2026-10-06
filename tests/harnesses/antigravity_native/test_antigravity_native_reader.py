@@ -3931,6 +3931,9 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
     notice_text = notice_item["content"][0]["text"]
     assert "`/clear`" in notice_text
     assert "/c/conv_new" in notice_text
+    # Antigravity hands the bridge to the replacement, so the old conversation
+    # cannot resume here; the notice must not advertise that it can.
+    assert "resume this conversation" not in notice_text
     # No external_session_id PATCH is made anywhere (the loop-bug source): every
     # PATCH body is a runner_id bind/release, never an external_session_id write.
     assert all("external_session_id" not in body for (_m, _p, body) in calls), (

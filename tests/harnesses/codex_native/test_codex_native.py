@@ -2899,6 +2899,9 @@ def test_forwarder_rotation_posts_supersession_notice_to_old_session(
     notice_text = old_session_events[1]["data"]["item_data"]["content"][0]["text"]
     assert "`/new`" in notice_text
     assert "/c/conv_new" in notice_text
+    # Codex hands the bridge to the replacement, so the old conversation cannot
+    # resume here; the notice must not advertise that it can.
+    assert "resume this conversation" not in notice_text
     assert old_session_events[1]["data"]["item_data"]["agent"] == "codex-native-ui"
     assert old_session_events[2]["data"] == {"target_conversation_id": "conv_new"}
 

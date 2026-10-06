@@ -5181,6 +5181,7 @@ async def _post_clear_supersession(
         new_session_id=new_session_id,
         agent_name=agent_name,
         command="/clear",
+        old_session_resumable=True,
     )
 
 

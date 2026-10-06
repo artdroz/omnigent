@@ -396,6 +396,8 @@ async def test_post_clear_supersession_notifies_old_session() -> None:
     notice_text = item_data["content"][0]["text"]
     assert "/clear" in notice_text
     assert "/c/conv_new" in notice_text
+    # Claude keeps the old conversation live, so it offers to resume here.
+    assert "resume this conversation" in notice_text
 
     _, _, event_body = calls[2]
     assert event_body == {

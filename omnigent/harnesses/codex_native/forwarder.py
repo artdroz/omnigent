@@ -2403,6 +2403,7 @@ async def _maybe_rotate_session_on_thread_started(
         new_session_id=new_session_id,
         agent_name=_AGENT_NAME,
         command="/new",
+        old_session_resumable=False,
     )
     _logger.info(
         "Codex forwarder rotated Omnigent session after native thread switch: "

@@ -17,6 +17,7 @@ async def post_supersession_notice(
     new_session_id: str,
     agent_name: str,
     command: str,
+    old_session_resumable: bool,
 ) -> None:
     """
     Notify the superseded session that a new-conversation command rotated it away.
@@ -46,6 +47,10 @@ async def post_supersession_notice(
         assistant ``message`` item requires one.
     :param command: Vendor command that rotated the session, e.g.
         ``"/clear"`` or ``"/new"``. Named in the notice text.
+    :param old_session_resumable: Whether sending a message to the old
+        conversation resumes it. Claude keeps the old executor bound
+        (``True``); Codex and Antigravity transfer the bridge to the
+        replacement (``False``), so the notice omits the resume offer.
     :returns: None.
     """
     if old_session_id == new_session_id:
@@ -74,9 +79,13 @@ async def post_supersession_notice(
         )
     notice = (
         f"This conversation was ended by `{command}`. "
-        f"Continue in [the new chat](/c/{urllib.parse.quote(new_session_id, safe='')}). "
-        "You can also send a message here to resume this conversation."
+        f"Continue in [the new chat](/c/{urllib.parse.quote(new_session_id, safe='')})."
     )
+    if old_session_resumable:
+        # Claude keeps the old conversation's executor bound, so a message here
+        # resumes it; Codex and Antigravity hand the bridge to the replacement,
+        # so the old conversation can only continue in the new chat.
+        notice += " You can also send a message here to resume this conversation."
     try:
         item_resp = await client.post(
             old_events_url,

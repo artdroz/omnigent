@@ -3210,6 +3210,7 @@ async def _rotate_session_for_cascade(
         new_session_id=new_session_id,
         agent_name=_AGENT_NAME,
         command="/clear",
+        old_session_resumable=False,
     )
 
     _logger.info(
