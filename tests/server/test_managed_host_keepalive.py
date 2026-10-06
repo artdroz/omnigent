@@ -133,7 +133,9 @@ def test_provider_without_keep_alive_is_skipped(
     assert _outcomes(caplog) == ["unsupported"]
 
 
-def test_store_failure_never_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_store_failure_never_propagates(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     def _boom(_rid: str) -> list[object]:
         raise RuntimeError("db down")
 
@@ -148,7 +150,11 @@ def test_store_failure_never_propagates(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(
         managed_host_keepalive, "_sandbox_config", SimpleNamespace(for_provider=lambda _p: None)
     )
-    managed_host_keepalive._keep_alive_for_runner("r1")  # must not raise
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.managed_host_keepalive"):
+        managed_host_keepalive._keep_alive_for_runner("r1")  # must not raise
+    assert _outcomes(caplog) == ["resolution_error"]
+    assert caplog.records[0].attributes["error_type"] == "RuntimeError"
+    assert caplog.records[0].exc_info is not None
 
 
 def test_cli_host_without_a_sandbox_is_skipped(
@@ -348,6 +354,54 @@ def test_a_runner_already_in_flight_is_not_queued_twice(
     assert submitted == ["r1", "r1"]
 
 
+def test_prune_keeps_a_runner_whose_refresh_is_still_in_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long stall is not a departed runner: its tick and cadence survive the prune."""
+    monkeypatch.setattr(managed_host_keepalive, "_last_kept", {"hung": 0.0, "gone": 0.0})
+    monkeypatch.setattr(
+        managed_host_keepalive, "_runner_interval_s", {"hung": 600.0, "gone": 600.0}
+    )
+    monkeypatch.setattr(managed_host_keepalive, "_inflight", {"hung"})
+    managed_host_keepalive._prune_throttle(now=10_000.0)
+    assert managed_host_keepalive._last_kept == {"hung": 0.0}
+    assert managed_host_keepalive._runner_interval_s == {"hung": 600.0}
+
+
+def test_simultaneous_ticks_for_one_runner_submit_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Competing callers entering the reservation logic together still yield one job."""
+    submitted: list[str] = []
+    record_lock = threading.Lock()
+
+    def _submit(*args: object) -> Future[None]:
+        with record_lock:
+            submitted.append(cast(str, args[-2]))
+        return Future()
+
+    monkeypatch.setattr(managed_host_keepalive, "_executor", SimpleNamespace(submit=_submit))
+    monkeypatch.setattr(managed_host_keepalive, "_sandbox_config", object())
+    monkeypatch.setattr(managed_host_keepalive, "_host_store", object())
+    monkeypatch.setattr(managed_host_keepalive, "_last_kept", {})
+    monkeypatch.setattr(managed_host_keepalive, "_runner_interval_s", {})
+    monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
+    callers = 8
+    barrier = threading.Barrier(callers)
+
+    def _tick() -> None:
+        barrier.wait(timeout=5)
+        managed_host_keepalive.touch("r1")
+
+    threads = [threading.Thread(target=_tick) for _ in range(callers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert submitted == ["r1"]
+    assert managed_host_keepalive._inflight == {"r1"}
+
+
 def test_helper_cannot_release_a_new_reservation_at_worker_handoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -410,7 +464,7 @@ def test_configure_builds_the_bounded_worker_pool(monkeypatch: pytest.MonkeyPatc
     for name in ("_conversation_store", "_host_store", "_sandbox_config", "_executor"):
         monkeypatch.setattr(managed_host_keepalive, name, None)
     managed_host_keepalive.configure(object(), object(), object())
-    assert pool_sizes == [managed_host_keepalive._KEEPALIVE_MAX_WORKERS] == [8]
+    assert pool_sizes == [managed_host_keepalive._KEEPALIVE_MAX_WORKERS]
 
     # Switching managed sandboxes off releases the pool instead of leaving idle workers.
     managed_host_keepalive.configure(object(), object(), None)
@@ -500,7 +554,7 @@ def test_submission_failure_releases_the_runner_reservation(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A failed submit must not permanently suppress later refresh attempts."""
-    submitted: list[object] = []
+    submitted: list[str] = []
 
     class _RejectingExecutor:
         def submit(self, *_args: object) -> None:
@@ -517,10 +571,6 @@ def test_submission_failure_releases_the_runner_reservation(
         managed_host_keepalive.touch("r1")
     assert "r1" not in managed_host_keepalive._inflight
     assert "r1" not in managed_host_keepalive._last_kept
-    assert any(
-        getattr(record, "attributes", {}).get("outcome") == "submission_failed"
-        for record in caplog.records
-    )
     submission_event = next(
         record
         for record in caplog.records

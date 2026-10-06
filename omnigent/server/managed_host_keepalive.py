@@ -237,7 +237,8 @@ def _prune_throttle(now: float) -> None:
     """Drop throttle entries older than two slow intervals (their runners are gone)."""
     cutoff = now - 2 * resolve_managed_keepalive_interval_s()
     with _state_lock:
-        stale = [rid for rid, seen in _last_kept.items() if seen < cutoff]
+        # A runner whose refresh is still in flight is not gone, however old its tick.
+        stale = [rid for rid, seen in _last_kept.items() if seen < cutoff and rid not in _inflight]
         for runner_id in stale:
             _last_kept.pop(runner_id, None)
             _runner_interval_s.pop(runner_id, None)
