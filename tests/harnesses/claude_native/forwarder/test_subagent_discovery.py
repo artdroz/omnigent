@@ -166,10 +166,18 @@ async def test_subagent_watcher_posts_external_subagent_start_for_new_meta(
         server.server_close()
 
 
+@pytest.mark.parametrize(
+    "transcript_subdir", [None, "workflows/wf_run_abc123"], ids=["flat", "workflow"]
+)
 async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
     tmp_path: Path,
+    transcript_subdir: str | None,
 ) -> None:
-    """Nested Claude agents register under their immediate Omnigent parent."""
+    """Nested Claude agents register under their immediate Omnigent parent.
+
+    Spawn records live in the parent agents' own transcripts, so the owner
+    scan must also read transcripts nested under a workflow run.
+    """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
@@ -177,6 +185,7 @@ async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
     parent_transcript = _seed_subagent_on_disk(
         transcript_path=transcript_path,
         subagent_id="z-parent",
+        transcript_subdir=transcript_subdir,
         agent_type="general-purpose",
         description="parent worker",
         tool_use_id="toolu_parent",
@@ -184,6 +193,7 @@ async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
     child_transcript = _seed_subagent_on_disk(
         transcript_path=transcript_path,
         subagent_id="a-child",
+        transcript_subdir=transcript_subdir,
         agent_type="general-purpose",
         description="nested child",
         tool_use_id="toolu_child",
@@ -261,6 +271,7 @@ async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
         _seed_subagent_on_disk(
             transcript_path=transcript_path,
             subagent_id="b-grandchild",
+            transcript_subdir=transcript_subdir,
             agent_type="Explore",
             description="second nested level",
             tool_use_id="toolu_grandchild",
@@ -764,3 +775,42 @@ async def test_subagent_watcher_registers_workflow_nested_spawn(
     }
     assert "nested-worker" in state.subagents
     assert state.subagents["nested-worker"].child_conversation_id == "conv_nested-worker"
+
+
+def test_subagent_state_reader_keeps_transcript_subdir_inside_subagents(
+    tmp_path: Path,
+) -> None:
+    """A persisted ``transcript_subdir`` can only point inside ``subagents/``."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    rows = {
+        "nested": {
+            "child_conversation_id": "conv_nested",
+            "transcript_subdir": "workflows/wf_run_abc123",
+        },
+        "flat": {"child_conversation_id": "conv_flat"},
+        "absolute": {"child_conversation_id": "conv_abs", "transcript_subdir": "/etc"},
+        "escaping": {"child_conversation_id": "conv_esc", "transcript_subdir": "../../outside"},
+        "malformed": {"child_conversation_id": "conv_bad", "transcript_subdir": 5},
+    }
+    (bridge_dir / "subagent_forwarder.json").write_text(
+        json.dumps({"subagents": rows}), encoding="utf-8"
+    )
+
+    state = forwarder._read_subagent_forward_state(bridge_dir)
+
+    assert {sid: entry.transcript_subdir for sid, entry in state.subagents.items()} == {
+        "nested": "workflows/wf_run_abc123",
+        "flat": "",
+        "absolute": "",
+        "escaping": "",
+        "malformed": "",
+    }
+    subagents_dir = tmp_path / "session" / "subagents"
+    assert forwarder._subagent_transcript_path(subagents_dir, state.subagents["nested"]) == (
+        subagents_dir / "workflows" / "wf_run_abc123" / "agent-nested.jsonl"
+    )
+    for entry in state.subagents.values():
+        path = forwarder._subagent_transcript_path(subagents_dir, entry)
+        assert path.resolve().is_relative_to(subagents_dir.resolve()), path
+        assert path.name == f"agent-{entry.subagent_id}.jsonl"

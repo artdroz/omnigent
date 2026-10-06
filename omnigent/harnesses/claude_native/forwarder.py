@@ -1596,7 +1596,8 @@ def _subagent_transcript_subdir(subagents_dir: Path, agent_file: Path) -> str:
 
 def _subagent_transcript_path(subagents_dir: Path, entry: SubagentEntry) -> Path:
     """Locate a tracked sub-agent's ``agent-<id>.jsonl`` under ``subagents/``."""
-    return subagents_dir / entry.transcript_subdir / f"agent-{entry.subagent_id}.jsonl"
+    base = subagents_dir / entry.transcript_subdir if entry.transcript_subdir else subagents_dir
+    return base / f"agent-{entry.subagent_id}.jsonl"
 
 
 def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
@@ -1649,7 +1650,12 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             last_activity_ts = None
         if last_status is not None and not isinstance(last_status, str):
             last_status = None
-        if not isinstance(transcript_subdir, str):
+        # A hand-edited state file must not point the tail outside ``subagents/``.
+        if (
+            not isinstance(transcript_subdir, str)
+            or Path(transcript_subdir).is_absolute()
+            or ".." in Path(transcript_subdir).parts
+        ):
             transcript_subdir = ""
         entries[subagent_id] = SubagentEntry(
             subagent_id=subagent_id,
