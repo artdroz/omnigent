@@ -57,6 +57,7 @@ CAP_MCP_INVENTORY = "mcp_inventory"
 CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
+CAP_SKILL_SUBSCRIPTIONS = "skill_subscriptions"
 CAP_MCP_TOOLS = "mcp_tools"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
@@ -65,6 +66,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_FILESYSTEM_ATTACHMENTS,
     CAP_PLUGINS,
     CAP_SKILL_CONTENT,
+    CAP_SKILL_SUBSCRIPTIONS,
     CAP_MCP_TOOLS,
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
@@ -1017,6 +1019,7 @@ class HostSkillsFrame:
     agent_version: str | None = None
     sub_agent_name: str | None = None
     skills_filter: str | list[str] = "all"
+    action: str = "get"
 
 
 @dataclass
@@ -1690,6 +1693,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "agent_version": frame.agent_version,
                 "sub_agent_name": frame.sub_agent_name,
                 "skills_filter": frame.skills_filter,
+                "action": frame.action,
             }
         )
     if isinstance(frame, HostSkillsResultFrame):
@@ -2144,6 +2148,14 @@ def _decode_known_host_frame(
         case HostFrameKind.MODEL_OPTIONS_RESULT:
             return _decode_model_options_result(msg)
         case HostFrameKind.SKILLS:
+            action = msg.get("action", "get")
+            if not isinstance(action, str) or action not in {
+                "get",
+                "watch",
+                "unwatch",
+                "invalidate",
+            }:
+                raise ValueError("unknown skill discovery action")
             raw_filter = msg.get("skills_filter", "all")
             skills_filter: str | list[str]
             if isinstance(raw_filter, list):
@@ -2161,6 +2173,7 @@ def _decode_known_host_frame(
                 agent_version=_optional_nullable_str(msg, "agent_version"),
                 sub_agent_name=_optional_nullable_str(msg, "sub_agent_name"),
                 skills_filter=skills_filter,
+                action=_required_str(msg, "action") if "action" in msg else "get",
             )
         case HostFrameKind.SKILLS_RESULT:
             return _decode_skills_result(msg)

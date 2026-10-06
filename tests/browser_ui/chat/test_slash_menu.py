@@ -105,7 +105,7 @@ def test_open_menu_accepts_an_async_skill_catalog(
     ).not_to_be_visible()
     composer.fill("/review")
     expect(composer).to_have_value("/review")
-    assert len(chat_session_contract.skill_requests) == 1
+    assert chat_session_contract.skill_requests == []
 
     release_skills()
     expect(page.get_by_text("Loading skills…", exact=True)).not_to_be_visible()
@@ -184,3 +184,29 @@ def test_native_file_paste_closes_the_slash_menu(page: Page, chat_session_contra
     expect(page.get_by_text("notes.txt")).to_be_visible()
     expect(page.locator(_ROWS)).to_have_count(0)
     expect(composer).to_have_value("/")
+
+
+def test_skill_updates_reach_two_open_streams_without_gets(
+    page: Page, chat_session_contract
+) -> None:
+    page.goto(chat_session_contract.url)
+    chat_session_contract.wait_for_stream()
+    other = page.context.new_page()
+    try:
+        other.goto(chat_session_contract.url)
+        chat_session_contract.wait_for_stream()
+        for tab in (page, other):
+            composer = _composer(tab)
+            expect(composer).to_be_visible()
+            composer.fill("/live")
+        chat_session_contract.set_skills(
+            [{"name": "live-skill", "description": "Added during the session"}]
+        )
+        for tab in (page, other):
+            expect(tab.get_by_test_id("slash-menu-item-live-skill")).to_be_visible()
+        chat_session_contract.set_skills([])
+        for tab in (page, other):
+            expect(tab.get_by_test_id("slash-menu-item-live-skill")).to_have_count(0)
+        assert chat_session_contract.skill_requests == []
+    finally:
+        other.close()

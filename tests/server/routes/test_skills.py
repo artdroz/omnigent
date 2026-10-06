@@ -378,3 +378,24 @@ async def test_managed_host_bundle_token_is_bound_to_session_host(
         assert response.headers["X-Agent-Id"] == agent.id
         assert response.headers["X-Agent-Version"] == str(agent.version)
         assert response.headers["Cache-Control"] == "no-store"
+
+
+@pytest.mark.parametrize("user,status", [("owner", 200), ("editor", 200), ("reader", 403)])
+async def test_refresh_authorizes_before_invalidating_host(skills_app, user, status):
+    from omnigent.host.frames import CAP_SKILL_SUBSCRIPTIONS
+
+    app, _, conn, conv, _, _ = skills_app
+    conn.hello.capabilities.append(CAP_SKILL_SUBSCRIPTIONS)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/v1/sessions/{conv.id}/skills/refresh", headers={"x-test-user": user}
+        )
+    assert response.status_code == status
+    if status == 200:
+        frame = decode_host_frame(conn.outbound_queue.get_nowait())
+        assert frame.action == "invalidate"
+        assert frame.session_id == conv.id
+    else:
+        assert conn.outbound_queue.empty()

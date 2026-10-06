@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+from dataclasses import dataclass
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from omnigent.harness_aliases import canonicalize_harness
@@ -31,11 +32,44 @@ class SkillsResponse(BaseModel):
     skills: list[SkillSummary]
 
 
+@dataclass
+class ResolvedSkillsTarget:
+    connection: HostConnection
+    frame: HostSkillsFrame
+    spec: AgentSpec | None
+
+    def response(self, result: HostSkillsResultFrame) -> SkillsResponse:
+        if result.status != "ok":
+            raise HTTPException(
+                status_code={"invalid_path": 400, "not_directory": 404}.get(
+                    result.error_code or "", 502
+                ),
+                detail=result.error or "host skill discovery failed",
+            )
+        if self.frame.session_id is not None and result.session_id != self.frame.session_id:
+            raise HTTPException(
+                status_code=502, detail="update the host to discover session skills"
+            )
+        if self.spec is not None and result.agent_id != self.frame.agent_id:
+            raise HTTPException(status_code=502, detail="update the host to discover agent skills")
+        skills = [SkillSummary.model_validate(skill) for skill in result.skills]
+        if self.spec is not None:
+            # Hidden bundled skills also reserve their names against host collisions.
+            reserved = {skill.name for skill in self.spec.skills}
+            skills = [
+                SkillSummary(name=skill.name, description=skill.description)
+                for skill in self.spec.skills
+                if skill.user_invocable
+            ] + [skill for skill in skills if skill.name not in reserved]
+        return SkillsResponse(skills=skills)
+
+
 def create_skills_router(
     host_registry: HostRegistry,
     host_store: HostStore,
     conversation_store: ConversationStore,
     *,
+    app: FastAPI | None = None,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     auth_provider: AuthProvider | None = None,
@@ -44,15 +78,14 @@ def create_skills_router(
     """Build the discovery route, mounted under ``/v1``."""
     router = APIRouter()
 
-    @router.get("/skills")
-    async def get_skills(
+    async def resolve_target(
         request: Request,
-        session_id: str | None = Query(None, min_length=1),
-        host_id: str | None = Query(None, min_length=1),
-        harness: str | None = Query(None, min_length=1),
-        path: str | None = Query(None, min_length=1),
-        agent_id: str | None = Query(None, min_length=1),
-    ) -> SkillsResponse:
+        session_id: str | None = None,
+        host_id: str | None = None,
+        harness: str | None = None,
+        path: str | None = None,
+        agent_id: str | None = None,
+    ) -> ResolvedSkillsTarget:
         """Discover skills using a session or an explicit host, harness, and directory.
 
         ``session_id`` requires session edit access and uses the saved host,
@@ -131,40 +164,48 @@ def create_skills_router(
             if host is not None:
                 raise host_absent_error(host)
             raise HTTPException(status_code=503, detail="session host is offline")
-        result = await request_host_skills(
-            host_registry=host_registry,
-            host_conn=conn,
-            harness=harness,
-            path=path,
-            session_id=session_id,
-            agent_id=agent_id,
-            agent_version=agent_version,
-            sub_agent_name=sub_agent_name,
-            skills_filter=spec.skills_filter if spec is not None else "all",
+        return ResolvedSkillsTarget(
+            conn,
+            HostSkillsFrame(
+                request_id="",
+                harness=harness,
+                path=path,
+                session_id=session_id,
+                agent_id=agent_id,
+                agent_version=agent_version,
+                sub_agent_name=sub_agent_name,
+                skills_filter=spec.skills_filter if spec is not None else "all",
+            ),
+            spec,
         )
-        if result.status != "ok":
-            raise HTTPException(
-                status_code={"invalid_path": 400, "not_directory": 404}.get(
-                    result.error_code or "", 502
-                ),
-                detail=result.error or "host skill discovery failed",
-            )
-        if session_id is not None and result.session_id != session_id:
-            raise HTTPException(
-                status_code=502, detail="update the host to discover session skills"
-            )
-        if spec is not None and result.agent_id != agent_id:
-            raise HTTPException(status_code=502, detail="update the host to discover agent skills")
-        skills = [SkillSummary.model_validate(skill) for skill in result.skills]
-        if spec is not None:
-            # Hidden bundled skills also reserve their names against host collisions.
-            reserved = {skill.name for skill in spec.skills}
-            skills = [
-                SkillSummary(name=skill.name, description=skill.description)
-                for skill in spec.skills
-                if skill.user_invocable
-            ] + [skill for skill in skills if skill.name not in reserved]
-        return SkillsResponse(skills=skills)
+
+    from omnigent.server.skill_catalogs import SkillCatalogs
+
+    catalogs = SkillCatalogs(host_registry, resolve_target)
+
+    @router.get("/skills")
+    async def get_skills(
+        request: Request,
+        session_id: str | None = Query(None, min_length=1),
+        host_id: str | None = Query(None, min_length=1),
+        harness: str | None = Query(None, min_length=1),
+        path: str | None = Query(None, min_length=1),
+        agent_id: str | None = Query(None, min_length=1),
+    ) -> SkillsResponse:
+        """Read the host catalog for a session or a host, harness, and workspace target."""
+        target = await resolve_target(request, session_id, host_id, harness, path, agent_id)
+        return await catalogs.read(target)
+
+    @router.post("/sessions/{session_id}/skills/refresh")
+    async def refresh_skills(request: Request, session_id: str) -> dict[str, bool]:
+        """Invalidate host catalogs; subscribed streams receive refreshed skill lists."""
+        target = await resolve_target(request, session_id=session_id)
+        catalogs.invalidate(target)
+        return {"refreshing": True}
+
+    # Both stream surfaces share this resolver and catalog subscription manager.
+    if app is not None:
+        app.state.skill_catalogs = catalogs
 
     return router
 

@@ -1818,6 +1818,10 @@ def register_core_routes(
             await websocket.send_text(json.dumps(frame))
             last_send_monotonic = time.monotonic()
 
+        from omnigent.server.skill_catalogs import SkillSocketSubscriptions
+
+        skill_subscriptions = SkillSocketSubscriptions(websocket, _send)
+
         async def _emit_snapshot() -> None:
             """Send a full snapshot for the current watch-set and reset the
             diff baseline to it."""
@@ -1859,6 +1863,9 @@ def register_core_routes(
                 try:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
+                    continue
+                if isinstance(msg, dict) and msg.get("type") in {"watch_skills", "refresh_skills"}:
+                    await skill_subscriptions.handle(msg)
                     continue
                 if not isinstance(msg, dict) or msg.get("type") != "watch":
                     # Forward-compatible: ignore frames we don't understand.
@@ -2024,6 +2031,7 @@ def register_core_routes(
                         extra=debug_event("session_updates", phase="error"),
                     )
         finally:
+            await skill_subscriptions.close()
             _logger.info(
                 "session-updates stream disconnected",
                 extra=debug_event("session_updates", phase="disconnected"),

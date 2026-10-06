@@ -1,3 +1,4 @@
+import type { SkillCatalog } from "@/lib/skillCatalogs";
 // Persistent WebSocket client for `WS /v1/sessions/updates`.
 //
 // Replaces the sidebar's 4 s HTTP poll of `GET /v1/sessions` with a single
@@ -27,7 +28,8 @@ export type SessionUpdatesFrame =
   | { type: "removed"; ids: string[] }
   | { type: "hosts_changed" }
   | { type: "projects_changed" }
-  | { type: "heartbeat" };
+  | { type: "heartbeat" }
+  | ({ type: "skills"; target_id: string } & SkillCatalog);
 
 type FrameListener = (frame: SessionUpdatesFrame) => void;
 
@@ -82,10 +84,10 @@ function nextReconnectDelay(failedAttempts: number): number {
  *
  * @returns The fully-qualified WebSocket URL.
  */
-function buildUpdatesUrl(): string {
+function buildUpdatesUrl(hostId?: string): string {
   const path = "/v1/sessions/updates";
   if (!getOmnigentHostConfig().fetcher) return resolveWebSocketUrl(path);
-  const sliceKey = modalHostId();
+  const sliceKey = hostId ?? modalHostId();
   return resolveWebSocketUrl(
     sliceKey ? `${path}?omnigent_slice_key=${encodeURIComponent(sliceKey)}` : path,
   );
@@ -98,6 +100,7 @@ function buildUpdatesUrl(): string {
 class SessionUpdatesSocket {
   private ws: WebSocket | null = null;
   private watched: string[] = [];
+  private skillTargets = new Map<string, { target: Record<string, string>; references: number }>();
   private watchedKey = "";
   private readonly listeners = new Set<FrameListener>();
   private readonly statusListeners = new Set<() => void>();
@@ -106,6 +109,12 @@ class SessionUpdatesSocket {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private watchdogTimer: ReturnType<typeof setTimeout> | null = null;
   private started = false;
+
+  private readonly hostId?: string;
+
+  constructor(hostId?: string) {
+    this.hostId = hostId;
+  }
 
   /** Open the connection (idempotent). */
   start(): void {
@@ -189,10 +198,38 @@ class SessionUpdatesSocket {
     return () => this.listeners.delete(listener);
   }
 
+  watchSkills(id: string, target: Record<string, string>): () => void {
+    const existing = this.skillTargets.get(id);
+    this.skillTargets.set(id, { target, references: (existing?.references ?? 0) + 1 });
+    this.sendSkillsWatch();
+    return () => {
+      const current = this.skillTargets.get(id);
+      if (!current) return;
+      if (--current.references === 0) this.skillTargets.delete(id);
+      this.sendSkillsWatch();
+    };
+  }
+
+  refreshSkills(id: string): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "refresh_skills", target_id: id }));
+    }
+  }
+
+  private sendSkillsWatch(): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.ws.send(
+      JSON.stringify({
+        type: "watch_skills",
+        targets: [...this.skillTargets].map(([id, { target }]) => ({ id, ...target })),
+      }),
+    );
+  }
+
   private connect(): void {
     let ws: WebSocket;
     try {
-      ws = new WebSocket(buildUpdatesUrl());
+      ws = new WebSocket(buildUpdatesUrl(this.hostId));
     } catch (err) {
       // Construction can throw on a malformed URL / blocked context; treat
       // it as a failed open and retry with backoff.
@@ -208,6 +245,7 @@ class SessionUpdatesSocket {
       // heartbeat within the window or we treat the link as dead.
       this.armWatchdog();
       this.sendWatch();
+      this.sendSkillsWatch();
     };
     ws.onmessage = (event) => this.handleMessage(event);
     ws.onerror = () => {
@@ -330,4 +368,35 @@ export function nextPushedSession(
     });
     signal.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+const skillSockets = new Map<string, { socket: SessionUpdatesSocket; references: number }>();
+
+/** Pre-session catalogs must route to their host, independently of the sidebar's socket. */
+export function subscribeHostSkills(
+  id: string,
+  target: Record<string, string>,
+  listener: FrameListener,
+): () => void {
+  let entry = skillSockets.get(target.host_id);
+  if (!entry) {
+    entry = { socket: new SessionUpdatesSocket(target.host_id), references: 0 };
+    skillSockets.set(target.host_id, entry);
+  }
+  entry.references++;
+  const unsubscribe = entry.socket.subscribe(listener);
+  const unwatch = entry.socket.watchSkills(id, target);
+  entry.socket.start();
+  return () => {
+    unsubscribe();
+    unwatch();
+    if (--entry.references === 0) {
+      entry.socket.stop();
+      skillSockets.delete(target.host_id);
+    }
+  };
+}
+
+export function refreshHostSkills(hostId: string, targetId: string): void {
+  skillSockets.get(hostId)?.socket.refreshSkills(targetId);
 }

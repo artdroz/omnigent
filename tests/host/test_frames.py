@@ -2405,3 +2405,9 @@ def test_mcp_tools_allow_list_and_correlated_malformed_result():
     frame = decode_host_frame(json.dumps(payload))
     assert isinstance(frame, HostMcpToolsResultFrame)
     assert (frame.request_id, frame.status, frame.tools) == ("m", "failed", [])
+
+
+@pytest.mark.parametrize("action", ["watch", "unwatch", "invalidate"])
+def test_skill_subscription_actions_round_trip(action: str) -> None:
+    frame = HostSkillsFrame("subscription", "claude-native", "/repo", action=action)
+    assert decode_host_frame(encode_host_frame(frame)) == frame

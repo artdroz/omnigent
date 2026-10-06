@@ -3339,6 +3339,20 @@ class SessionAgentChangedEvent(_SSEEventBase):
     agent_name: str
 
 
+class SessionSkillsEvent(_SSEEventBase):
+    """Host-discovered catalog delivered directly to a session's viewers."""
+
+    type: Literal["session.skills"]
+    conversation_id: str
+    status: Literal["ready", "error", "unavailable"]
+    revision: int
+    skills: list[SkillSummary] | None = None
+    host_id: str | None = None
+    workspace: str | None = None
+    agent_id: str | None = None
+    sub_agent_name: str | None = None
+
+
 class SessionTodosEvent(_SSEEventBase):
     """
     Plan/TODO update from a native terminal-backed session.
@@ -4733,6 +4747,7 @@ ServerStreamEvent = Annotated[
     | SessionPermissionModeEvent
     | SessionCodexApprovalModeEvent
     | SessionAgentChangedEvent
+    | SessionSkillsEvent
     | SessionTodosEvent
     | SessionTerminalPendingEvent
     | SessionSandboxStatusEvent

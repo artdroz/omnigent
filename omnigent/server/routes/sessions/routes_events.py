@@ -2931,20 +2931,26 @@ def register_events_routes(
             events.append(presence.snapshot(conv.root_conversation_id, session_id))
             return events
 
+        from omnigent.server.skill_catalogs import with_session_skills
+
         return StreamingResponse(
-            _stream_live_events(
+            with_session_skills(
+                _stream_live_events(
+                    request,
+                    session_id,
+                    _resource_snapshot,
+                    # Presence tracks distinct human actors only — the reserved
+                    # single-user "local" sentinel maps to None (no tracking),
+                    # same as message attribution.
+                    viewer_user_id=_attribution_user(user_id),
+                    viewer_idle=idle,
+                    # Scope presence to the tree's root: sub-agent pages open
+                    # the CHILD conversation's stream, and per-conversation
+                    # scoping would hide co-viewers on other agents.
+                    presence_root_id=conv.root_conversation_id,
+                ),
                 request,
                 session_id,
-                _resource_snapshot,
-                # Presence tracks distinct human actors only — the reserved
-                # single-user "local" sentinel maps to None (no tracking),
-                # same as message attribution.
-                viewer_user_id=_attribution_user(user_id),
-                viewer_idle=idle,
-                # Scope presence to the tree's root: sub-agent pages open
-                # the CHILD conversation's stream, and per-conversation
-                # scoping would hide co-viewers on other agents.
-                presence_root_id=conv.root_conversation_id,
             ),
             media_type="text/event-stream",
             headers={

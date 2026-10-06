@@ -1,3 +1,4 @@
+import { applySessionSkillCatalog } from "@/lib/skillCatalogs";
 // Module-scope Zustand store for the active chat session.
 //
 // The streaming state lives outside the React tree so it survives
@@ -6880,6 +6881,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           applyToConversation({ tokensUsed: ringTokens });
         }
       }
+      return;
+    case "session_skills":
+      if (queryClient) applySessionSkillCatalog(queryClient, event.conversationId, event.catalog);
       return;
     case "session_todos":
       // Replace the todo list entirely — each event carries the full

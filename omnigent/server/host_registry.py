@@ -450,6 +450,9 @@ class HostConnection:
     pending_model_options: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    skill_subscriptions: dict[str, asyncio.Queue[HostSkillsResultFrame]] = field(
+        default_factory=dict
+    )
     pending_skills: dict[str, asyncio.Future[HostSkillsResultFrame]] = field(
         default_factory=dict,
     )

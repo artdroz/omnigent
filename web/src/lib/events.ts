@@ -1,3 +1,4 @@
+import type { SkillCatalog } from "@/lib/skillCatalogs";
 // Mirrors sdks/python-client/omnigent_client/_events.py.
 //
 // Hand-ported. When _events.py changes, update this file and the
@@ -677,6 +678,12 @@ export interface SessionAgentChangedEvent {
  * - `activeForm`: present-continuous form of the task (e.g. `"Running tests"`),
  *   the present-continuous label for an in-progress item when distinct from `content`.
  */
+export interface SessionSkillsEvent {
+  type: "session_skills";
+  conversationId: string;
+  catalog: SkillCatalog;
+}
+
 export interface SessionTodosEvent {
   type: "session_todos";
   conversationId: string;
@@ -1016,6 +1023,7 @@ export type StreamEvent =
   | SessionPermissionModeEvent
   | SessionCodexApprovalModeEvent
   | SessionAgentChangedEvent
+  | SessionSkillsEvent
   | SessionTodosEvent
   | SessionTerminalPendingEvent
   | SessionSandboxStatusEvent

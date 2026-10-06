@@ -3804,6 +3804,7 @@ def create_app(
                 host_registry,
                 host_store,
                 conversation_store,
+                app=app,
                 agent_store=agent_store,
                 agent_cache=agent_cache,
                 auth_provider=auth_provider,

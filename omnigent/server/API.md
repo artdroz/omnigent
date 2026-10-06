@@ -4,6 +4,35 @@ Four namespaces: agent management (`/api/agents`), conversations
 (`/v1/conversations`), sessions (`/v1/sessions`), and session
 resources (`/v1/sessions/{session_id}/resources`).
 
+## Skill catalogs
+
+`GET /v1/skills` remains available for explicit discovery. Session composers receive
+host-owned catalogs through their existing `GET /v1/sessions/{id}/stream` connection:
+
+```text
+event: session.skills
+data: {"type":"session.skills","conversation_id":"conv_123","status":"ready","revision":123,"host_id":"host_123","workspace":"/repo","agent_id":"agent_123","sub_agent_name":null,"skills":[{"name":"review","description":"Review changes"}]}
+```
+
+The host produces the initial catalog and subsequent changes. The server shares a
+host watch across streams for the same discovery target and checks edit access before
+sending skill metadata. Catalog status is `ready`, `error`, or `unavailable`; clients
+retain the previous catalog on refresh errors and clear it when access is unavailable.
+Revisions order updates within the service; reconnects resubscribe to current host state.
+
+Before session creation, clients use a host-routed `/v1/sessions/updates` WebSocket.
+`{"type":"watch_skills","targets":[{"id":"selection","host_id":"host_123","harness":"claude-native","path":"/repo"}]}`
+replaces the connection's skill targets (up to eight). An optional `agent_id` applies
+that agent's bundled skills and filters. Responses have `type: "skills"`, `target_id`,
+and the same catalog fields. An empty target list releases the watches.
+
+`POST /v1/sessions/{id}/skills/refresh` requires session edit access and asks the host
+to invalidate catalogs sharing local skill sources. Pre-session clients can send
+`{"type":"refresh_skills","target_id":"selection"}` on their updates socket.
+Claude's skill `ConfigChange` and Codex's `skills/changed` signals trigger refreshes;
+the host also reconciles watched catalogs every 30 seconds for changes without a
+running native CLI. Older hosts retain server-side request/response fallback.
+
 ## Compatibility Reference
 
 | Namespace | Compatible with | Reference implementation |
