@@ -73,7 +73,11 @@ function successfulSpawner({
       forwardIndex += 1;
       queueMicrotask(() => {
         if (forwardIndex === failForwardIndex) {
-          proc.stderr.emit("data", "bind [::1]:5173: Address already in use\n");
+          proc.stderr.emit(
+            "data",
+            "mux_client_forward: forwarding request failed: Port forwarding failed\n" +
+              "muxclient: master forward request failed\n",
+          );
           proc.emit("exit", 255);
         } else proc.emit("exit", 0);
       });
@@ -383,8 +387,10 @@ describe("Arca preview manager", () => {
   });
 
   it("fails an occupied desktop port without treating that listener as readiness", async () => {
+    let master = null;
     const spawn = (_file, args) => {
       const proc = child();
+      if (args.includes("-M")) master = proc;
       queueMicrotask(() => {
         if (args.includes("status")) {
           proc.stdout.emit(
@@ -401,9 +407,16 @@ describe("Arca preview manager", () => {
             }),
           );
           proc.emit("exit", 0);
-        } else if (args.includes("-O")) {
-          proc.stderr.emit("data", "bind [127.0.0.1]:5173: Address already in use\n");
+        } else if (args.includes("forward")) {
+          master?.stderr.emit("data", "bind [127.0.0.1]:5173: Address already in use\n");
+          proc.stderr.emit(
+            "data",
+            "mux_client_forward: forwarding request failed: Port forwarding failed\n" +
+              "muxclient: master forward request failed\n",
+          );
           proc.emit("exit", 255);
+        } else if (args.includes("-O")) {
+          proc.emit("exit", 0);
         }
       });
       return proc;
@@ -421,7 +434,7 @@ describe("Arca preview manager", () => {
         hostId: "host_arca",
         serverUrl: "https://srv.example.com",
       }),
-      /port 5173 is already in use on IPv4 \(127\.0\.0\.1\)/,
+      /could not open localhost preview port 5173 on IPv4 \(127\.0\.0\.1\)/,
     );
   });
 
@@ -440,7 +453,7 @@ describe("Arca preview manager", () => {
         hostId: "host_arca",
         serverUrl: "https://srv.example.com",
       }),
-      /port 5173 is already in use on IPv6 \(\[::1\]\)/,
+      /could not open localhost preview port 5173 on IPv6 \(\[::1\]\)/,
     );
     const masterIndex = fake.calls.findIndex((call) => call.args.includes("-M"));
     assert.equal(fake.children[masterIndex].killed, true);

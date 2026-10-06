@@ -428,13 +428,8 @@ function createArcaPreviewManager({
           const detail = safeCommandDetail(acknowledged.stderr);
           if (detail) logError(`[arca preview] ${bindHost} forward failed:`, detail);
           const family = bindHost.includes(":") ? "IPv6" : "IPv4";
-          if (/address already in use/i.test(detail)) {
-            throw new Error(
-              `localhost preview port ${preview.port} is already in use on ${family} (${bindHost})`,
-            );
-          }
           throw new Error(
-            `could not bind localhost preview port ${preview.port} on ${family} (${bindHost})`,
+            `could not open localhost preview port ${preview.port} on ${family} (${bindHost})`,
           );
         }
         if (owned.get(conversationId)?.token !== token) {
