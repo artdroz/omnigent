@@ -26,7 +26,7 @@ def _clean_index():
     it does not touch the persist hook. A hook leaked from another test would
     bypass the per-test ``persist_pending_count`` patch, so save and restore it.
     """
-    prior_hook = pending_elicitations._count_persist_hook
+    prior_hook = pending_elicitations.get_count_persist_hook()
     pending_elicitations.set_count_persist_hook(None)
     yield
     pending_elicitations.set_count_persist_hook(prior_hook)

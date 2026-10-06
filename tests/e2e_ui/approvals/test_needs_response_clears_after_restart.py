@@ -9,7 +9,6 @@ runner processes and asserts that answering the restarted session returns
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import secrets
@@ -184,14 +183,20 @@ def test_subagent_needs_response_survives_restart_and_answer(tmp_path: Path) -> 
 
         # 2. Park a real permission-request elicitation via the claude-native
         #    hook. It long-polls (blocks), so drive it from a background thread.
+        park_outcome: dict[str, str] = {}
+
         def _park() -> None:
-            # The parked request dies when the server restarts.
-            with contextlib.suppress(httpx.HTTPError):
-                httpx.post(
+            # The parked request dies when the server restarts; record the
+            # outcome so a parking failure is diagnosable rather than opaque.
+            try:
+                resp = httpx.post(
                     f"{base_url}/v1/sessions/{session_id}/hooks/permission-request",
                     json={"tool_name": "Bash", "tool_input": {"command": "ls"}},
                     timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0),
                 )
+                park_outcome["result"] = f"HTTP {resp.status_code}: {resp.text[:120]}"
+            except httpx.HTTPError as exc:
+                park_outcome["result"] = f"{type(exc).__name__}: {exc}"
 
         park_thread = threading.Thread(target=_park, daemon=True)
         park_thread.start()
@@ -200,7 +205,10 @@ def test_subagent_needs_response_survives_restart_and_answer(tmp_path: Path) -> 
         deadline = time.monotonic() + 15.0
         while time.monotonic() < deadline and _sidebar_badge_count(base_url, session_id) != 1:
             time.sleep(0.25)
-        assert _sidebar_badge_count(base_url, session_id) == 1, "elicitation did not park"
+        parked = park_outcome.get("result", "pending")
+        assert _sidebar_badge_count(base_url, session_id) == 1, (
+            f"elicitation did not park (park request outcome: {parked})"
+        )
         elicitation_id = _pending_elicitation_id(base_url, session_id)
         assert elicitation_id is not None, "no parked elicitation id"
 
@@ -234,7 +242,9 @@ def test_subagent_needs_response_survives_restart_and_answer(tmp_path: Path) -> 
             headers={"Content-Type": "application/json"},
             timeout=15.0,
         )
-        assert resolve.status_code in (200, 202), f"resolve rejected: {resolve.status_code}"
+        assert resolve.status_code in (200, 202), (
+            f"resolve rejected: {resolve.status_code} body={resolve.text[:200]}"
+        )
 
         # Give the resolve a moment to propagate to the sidebar count source.
         final_count = _sidebar_badge_count(base_url, session_id)
