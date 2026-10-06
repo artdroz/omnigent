@@ -629,14 +629,21 @@ def create_runner_tunnel_router(
                             ),
                         )
                     raise task_error
-                # Every finished helper ended cleanly: a server-side close (ping
-                # timeout, replaced generation) with no peer close yet, so no
-                # ``disconnected`` row follows. Record it.
+                # Server-initiated closes may end a helper without a peer reply.
+                # Emit the same event shape as the WebSocketDisconnect path.
                 _logger.info(
-                    "Runner %s tunnel closed (%s ended)",
+                    "Runner %s tunnel closed (%s ended; code=%s, reason=%r)",
                     runner_id,
                     ended_by,
-                    extra=debug_event("runner_tunnel", phase="closed", **_connection_attrs()),
+                    session.close_code,
+                    session.close_reason,
+                    extra=debug_event(
+                        "runner_tunnel",
+                        phase="disconnected",
+                        code=session.close_code,
+                        reason=session.close_reason,
+                        **_connection_attrs(),
+                    ),
                 )
             finally:
                 for task in (sender_task, ping_task, receive_task, keepalive_task):
@@ -814,8 +821,22 @@ async def _receive_loop(
                     runner_id=runner_id,
                     batch=batch,
                 )
-        except Exception:
-            _logger.exception("Runner %s event ingestion failed", runner_id)
+        except Exception as exc:
+            _logger.exception(
+                "Runner %s event ingestion failed",
+                runner_id,
+                extra=debug_event(
+                    "runner_event_ingest_failed",
+                    session_id=batch.session_id,
+                    runner_id=runner_id,
+                    connection_id=session.hello.connection_id,
+                    batch_id=batch.id,
+                    batch_size=len(batch.events),
+                    failure_stage="dispatch",
+                    error_type=type(exc).__name__,
+                    retryable=True,
+                ),
+            )
             ack = EventAckFrame(batch.id, 0, "ingest failed", retryable=True)
         if registry.get(runner_id) is session:
             # A replacement tunnel can register between the check and enqueue.
@@ -954,6 +975,7 @@ async def _ping_loop(
                     error_phase=ErrorPhase.UNKNOWN.value,
                 ),
             )
+            registry.record_close(session, code=4003, reason="ping timeout")
             try:
                 await ws.close(code=4003, reason="ping timeout")
             except RuntimeError:

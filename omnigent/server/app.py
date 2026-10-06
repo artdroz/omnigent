@@ -76,7 +76,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
-from omnigent.server.auth import AuthProvider, SharingMode
+from omnigent.server.auth import AuthProvider, SharingMode, auth_mode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
@@ -183,6 +183,8 @@ class ServerInfoResponse(BaseModel):
     harness_install_enabled: bool
     installable_harnesses: list[str]
     dictation_available: bool
+    # The archive PATCH accepts ``delete_worktree``; older servers reject it.
+    archive_worktree_cleanup: bool = True
     branding: BrandingInfo
 
 
@@ -2781,6 +2783,19 @@ def create_app(
            version number: ``server_picker`` is ``"sidebar"`` on builds that
            dock the picker at the sidebar's bottom (it was ``"titlebar"``,
            centered in the macOS title-bar strip, before this).
+        5. ``auth`` tells a native client how this server signs users in,
+           before it loads anything. ``mode`` is ``"oidc"``, ``"accounts"``,
+           ``"header"``, ``"custom"`` (an embedding app's own provider), or
+           ``"none"``. ``"oidc"`` also promises the native loopback sign-in
+           (``/auth/login`` native parameters + ``POST /auth/native-token``).
+           ``session_cookie`` names the session cookie for ``oidc`` and
+           ``accounts`` and is ``null`` otherwise. A missing ``auth`` (older
+           servers) means "sign in as before".
+        6. ``server_name`` (str | null) is the operator's display name for
+           this deployment (``branding.server_name``), for clients that list
+           several servers. Self-asserted by the server, so clients show it
+           for display only and keep the host in any trust decision. Null
+           when unset; it never falls back to ``branding.app_name``.
 
         Unknown fields MUST be ignored, and a missing manifest (404 — every
         server older than this route) MUST be treated as the pre-manifest
@@ -2791,8 +2806,10 @@ def create_app(
         Authentication: intentionally UNAUTHED, like ``/v1/info``. A client
         must be able to read this before it holds a session cookie — the whole
         point is to consult it before loading the app. It exposes only the
-        version already public via ``/api/version`` plus coarse UI-shape
-        strings, so there is nothing here to leak.
+        version already public via ``/api/version``, coarse UI-shape
+        strings, and the sign-in mode and cookie name any visitor already
+        learns from ``/v1/info`` and the login redirect, so there is
+        nothing here to leak.
 
         Served under ``/.well-known/`` (RFC 8615) so it sits at a fixed,
         guessable path that never collides with an SPA client route.
@@ -2807,6 +2824,11 @@ def create_app(
             # key existing and exercise the "no floor" path from day one.
             "min_desktop_version": None,
             "ui": {"server_picker": "sidebar"},
+            "auth": {
+                "mode": auth_mode(auth_provider),
+                "session_cookie": getattr(auth_provider, "session_cookie_name", None),
+            },
+            "server_name": branding_snapshot.server_name,
         }
 
     @app.get("/v1/info", response_model=ServerInfoResponse)
@@ -2835,11 +2857,10 @@ def create_app(
         sandbox option with, and the installed
         ``server_version`` (already public via ``/api/version``).
         """
-        from omnigent.server.auth import UnifiedAuthProvider, local_single_user_enabled
+        from omnigent.server.auth import local_single_user_enabled
 
-        accounts_enabled = (
-            isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "accounts"
-        )
+        # Same helper as the manifest's auth.mode, so the two never disagree.
+        accounts_enabled = auth_mode(auth_provider) == "accounts"
         login_url = getattr(auth_provider, "login_url", None)
         # single_user marks the explicit single-user local runtime
         # (OMNIGENT_LOCAL_SINGLE_USER=1, set by the managed local spawn paths).
@@ -2976,6 +2997,7 @@ def create_app(
                 "harness_install_enabled": harness_install_enabled,
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
+                "archive_worktree_cleanup": True,
                 "branding": branding_snapshot.config(),
             }
         )
@@ -3365,6 +3387,13 @@ def create_app(
         affected = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
+        # The runner may reconnect while the store returns an older snapshot.
+        if tunnel_registry.get(runner_id) is not None:
+            _logger.info(
+                "Runner %s reconnected during offline lookup; skipping offline-marking",
+                runner_id,
+            )
+            return
         if _runner_live_on_another_replica_from_conversations(
             affected, runner_id, reference_stamp
         ):
@@ -3461,7 +3490,7 @@ def create_app(
 
         task.add_done_callback(_clear_grace_slot)
 
-    async def _on_runner_exited(runner_id: str, error: str) -> None:
+    async def _on_runner_exited(host_id: str, runner_id: str, error: str) -> None:
         """Mark a crashed runner's session(s) failed and push the cause.
 
         Fired by the host tunnel when a daemon reports
@@ -3475,10 +3504,12 @@ def create_app(
         sub-agent is not, since its work finished on a runner that was
         already live.
 
+        :param host_id: The reporting host's id.
         :param runner_id: The crashed runner's id.
         :param error: Human-readable cause from the daemon (exit code +
             log tail), e.g. ``"runner process exited with code 1 ..."``.
         """
+        from omnigent.server.routes.host_tunnel import log_runner_exited
         from omnigent.server.routes.sessions import _mark_runner_sessions_offline
         from omnigent.server.schemas import ErrorDetail
 
@@ -3486,15 +3517,18 @@ def create_app(
         # cancel any pending disconnect-grace timer so it can't re-run the
         # disconnect reconciliation on top of it.
         _cancel_disconnect_grace(runner_id)
-        affected = await asyncio.to_thread(
-            conversation_store.list_conversations_by_runner_id, runner_id
-        )
-        _logger.warning(
-            "Runner %s reported crashed; reconciling %d bound session(s): %s",
-            runner_id,
-            len(affected),
-            error,
-        )
+        try:
+            affected = await asyncio.to_thread(
+                conversation_store.list_conversations_by_runner_id, runner_id
+            )
+        except Exception:
+            # Never lose the crash event to a failed session lookup.
+            log_runner_exited(host_id, runner_id, error)
+            raise
+        # One row per bound session so every crash is attributable; a runner
+        # with no bound session still gets a session-less row.
+        for session_id in [conv.id for conv in affected] or [None]:
+            log_runner_exited(host_id, runner_id, error, session_id=session_id)
         await _mark_runner_sessions_offline(
             affected,
             ErrorDetail(code="runner_failed_to_start", message=error),
@@ -3605,6 +3639,7 @@ def create_app(
                     runner_id,
                     routed.client,
                     conversation_store,
+                    conversation=conv,
                 )
                 # The session's terminal exists as of the handshake above, so its
                 # model catalogs are answerable now. Warming them here is what
@@ -3699,9 +3734,13 @@ def create_app(
     # except (a hidden failure). No host_store = host support is simply
     # not enabled (host connects get 404), rather than silently broken.
     if host_store is not None:
+        from omnigent.server.routes.harness_startup import create_harness_startup_router
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
         from omnigent.server.routes.hosts import create_hosts_router
         from omnigent.server.routes.mcp_servers import create_mcp_servers_router
+        from omnigent.server.routes.mcp_tools import create_mcp_tools_router
+        from omnigent.server.routes.plugins import create_plugins_router
+        from omnigent.server.routes.skill_content import create_skill_content_router
         from omnigent.server.routes.skills import create_skills_router
 
         async def _on_hosts_changed(_host_id: str, owner: str | None) -> None:
@@ -3747,6 +3786,26 @@ def create_app(
             ),
             prefix="/v1",
             tags=["skills"],
+        )
+        app.include_router(
+            create_harness_startup_router(host_registry, host_store, auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+        app.include_router(
+            create_plugins_router(host_registry, host_store, auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+        app.include_router(
+            create_skill_content_router(host_registry, host_store, auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+        app.include_router(
+            create_mcp_tools_router(host_registry, host_store, auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["hosts"],
         )
         app.include_router(
             create_mcp_servers_router(host_registry, host_store, auth_provider=auth_provider),
