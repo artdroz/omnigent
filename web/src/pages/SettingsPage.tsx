@@ -11,7 +11,8 @@
  *
  * - **General** — app-wide behavior preferences.
  * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
- *   default transcript view, Workspace panel default, and UI/code font controls.
+ *   default transcript view, Workspace panel and tab defaults, and UI/code font
+ *   controls.
  * - **Git** — Git behavior: the global "always use a random worktree" default
  *   and the default base branch pre-filled when naming a new worktree branch.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
@@ -41,10 +42,15 @@ import {
   useRef,
   useState,
 } from "react";
+import GithubMono from "@lobehub/icons/es/Github/components/Mono";
+import { useViewerId } from "@/hooks/useViewerId";
 import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
+  BotIcon,
   DownloadIcon,
+  FileDiffIcon,
+  FilesIcon,
   KeyRoundIcon,
   Loader2Icon,
   LaptopMinimalIcon,
@@ -98,13 +104,20 @@ import {
 import { MOD_KEY } from "@/components/KeyboardShortcut";
 import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, logout } from "@/lib/accountsApi";
+import { withBasePath } from "@/lib/basePath";
 import {
   beginGithubConnect,
   disconnectGithub,
   fetchGithubStatus,
   type GithubConnectionStatus,
 } from "@/lib/githubIntegration";
-import { getCurrentIsAdmin, getCurrentUserId, resolveIdentity } from "@/lib/identity";
+import {
+  beginDatabricksConnect,
+  disconnectDatabricks,
+  fetchDatabricksStatus,
+  type DatabricksConnectionStatus,
+} from "@/lib/databricksIntegration";
+import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
@@ -161,6 +174,13 @@ import {
   type TerminalThemeMode,
 } from "@/lib/terminalThemePreferences";
 import {
+  canRememberTerminalClipboardPreference,
+  readTerminalClipboardPreference,
+  subscribeTerminalClipboardPreference,
+  writeTerminalClipboardPreference,
+  type TerminalClipboardPreference,
+} from "@/lib/terminalClipboardPreferences";
+import {
   readWorkspacePanelDefault,
   WORKSPACE_PANEL_DEFAULT,
   writeWorkspacePanelDefault,
@@ -172,6 +192,12 @@ import {
   writeTranscriptViewDefault,
   type TranscriptViewDefault,
 } from "@/lib/transcriptViewPreferences";
+import {
+  DEFAULT_WORKSPACE_TAB,
+  readDefaultWorkspaceTab,
+  writeDefaultWorkspaceTab,
+  type DefaultWorkspaceTab,
+} from "@/lib/workspaceTabPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import {
@@ -179,6 +205,10 @@ import {
   writeSubmitWithModEnter,
 } from "@/lib/composerSendShortcutPreferences";
 import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
+import {
+  readDeleteWorktreesOnArchive,
+  writeDeleteWorktreesOnArchive,
+} from "@/lib/archiveWorktreePreferences";
 import {
   archivedAtSeconds,
   readRetentionDays,
@@ -220,11 +250,19 @@ import {
   getCliStatus,
   isElectronShell,
   resetCliPath,
+  supportsBrowser,
   type UpdateConfig,
   type UpdateMode,
   updateBridge,
 } from "@/lib/nativeBridge";
+import { readOpenLinksInApp, writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { cn } from "@/lib/utils";
+import {
+  readBackgroundSessionTitlesEnabled,
+  writeBackgroundSessionTitlesEnabled,
+} from "@/lib/backgroundSessionTitlesPreferences";
+import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
+import { ReviewImportsPanel } from "@/components/onboarding/HostImportReview";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -238,34 +276,6 @@ const PoliciesPage = lazy(() =>
 const SharingPage = lazy(() =>
   import("@/pages/SharingPage").then((m) => ({ default: m.SharingPage })),
 );
-
-/**
- * The current viewer's user id, resolved reactively. Uses `getCurrentUserId`
- * (NOT `getCurrentAuthorId`): ownership compares against the session's `owner`
- * grant, which in single-user mode is the reserved `"local"` id — and
- * `getCurrentAuthorId` nulls `"local"` out (it's for author labels), which
- * would make the viewer's own sessions read as shared and vanish from the
- * default "My sessions" tab. `getCurrentUserId` keeps `"local"` and is the
- * identical real email in multi-user mode. It is synchronous (populated once
- * `resolveIdentity` has run — which `main.tsx` kicks off at boot), but on a
- * cold mount it can still be null for a tick, so we also await
- * `resolveIdentity()` and re-render when it lands. Keeping this reactive
- * (rather than a bare module read) means the My/Shared split settles correctly
- * the moment identity is known, without a manual refresh.
- */
-function useViewerId(): string | null {
-  const [viewerId, setViewerId] = useState<string | null>(() => getCurrentUserId());
-  useEffect(() => {
-    let cancelled = false;
-    void resolveIdentity().then(() => {
-      if (!cancelled) setViewerId(getCurrentUserId());
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-  return viewerId;
-}
 
 /**
  * Settings content panel. The section nav lives in the sidebar card
@@ -284,6 +294,16 @@ export function SettingsPage() {
   // hook re-keys on pathname, so switching sections re-fires under the new id.
   // `section` is a closed SettingsSectionId union (no PII / unbounded values).
   useOmnigentPageView(`settings.${section}`);
+
+  const pageWrapperSettings = useMemo(() => {
+    if (section === "harnesses") {
+      return {
+        maxWidthClassName: "max-w-4xl",
+        contentClassName: "px-8",
+      };
+    }
+    return undefined;
+  }, [section]);
 
   // Members / Policies are admin-only management surfaces that own their full
   // layout (their own PageScroll + admin gating), so they render directly —
@@ -307,9 +327,10 @@ export function SettingsPage() {
   }
 
   return (
-    <PageScroll contentClassName="px-8" extraBottom="2.5rem">
+    <PageScroll contentClassName="px-8" extraBottom="2.5rem" {...pageWrapperSettings}>
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
+      {section === "harnesses" && <SettingsHarnessesSection />}
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}
       {section === "shortcuts" && <ShortcutsSection />}
@@ -377,11 +398,22 @@ const workspacePanelCards: {
   { value: "collapsed", label: "Collapsed", icon: PanelRightCloseIcon },
 ];
 
+const workspaceTabCards: {
+  value: DefaultWorkspaceTab;
+  label: string;
+  icon: ComponentType<{ className?: string }>;
+}[] = [
+  { value: "files", label: "Files", icon: FilesIcon },
+  { value: "changes", label: "Changes", icon: FileDiffIcon },
+  { value: "github", label: "GitHub", icon: GithubMono },
+  { value: "subagents", label: "Agents", icon: BotIcon },
+];
+
 /** Centered icon + label body shared by the Mode and Terminal theme cards. */
-function iconCardBody(Icon: typeof SunIcon, label: string) {
+function iconCardBody(Icon: ComponentType<{ className?: string }>, label: string) {
   return (
     <>
-      <Icon className="size-6 text-muted-foreground" />
+      <Icon aria-hidden="true" className="size-6 text-muted-foreground" />
       <span className="text-ui font-medium">{label}</span>
     </>
   );
@@ -542,6 +574,36 @@ function WorkspacePanelDefaultControl() {
   );
 }
 
+/** Fallback tab for sessions without a remembered Workspace tab. */
+function WorkspaceTabDefaultControl() {
+  const [value, setValue] = useState(() => readDefaultWorkspaceTab());
+  const labelId = useId();
+  const choose = useCallback((next: DefaultWorkspaceTab) => {
+    setValue(next);
+    writeDefaultWorkspaceTab(next);
+  }, []);
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Default Workspace tab"
+      helper="Shown first in Workspace. Changing this also updates existing chats when reopened or refreshed. Later tab choices are remembered. File links still open the linked file."
+    >
+      <CardRadioGroup<DefaultWorkspaceTab>
+        labelledBy={labelId}
+        value={value}
+        onSelect={choose}
+        className="grid grid-cols-2 gap-3 sm:grid-cols-4"
+        cardClassName="items-center gap-2 p-4"
+        items={workspaceTabCards.map((card) => ({
+          value: card.value,
+          testId: `workspace-tab-default-${card.value}`,
+          body: iconCardBody(card.icon, card.label),
+        }))}
+      />
+    </ThemeSubsection>
+  );
+}
+
 function ColorThemeControl() {
   // Render each chip in the currently-resolved mode so it matches the app now
   // (honoring the embed's forced theme, not just next-themes' resolvedTheme).
@@ -603,7 +665,7 @@ function ColorThemeControl() {
       title="Color theme"
       helper="Choose a preset, then tune it across light and dark mode."
     >
-      <div className="overflow-hidden rounded-xl border bg-card/55 shadow-xs">
+      <div className="overflow-hidden rounded-xl border bg-card/55">
         <div className="flex flex-col gap-3 border-b bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex min-w-0 items-center gap-3">
             <div className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm">
@@ -783,6 +845,8 @@ function AppearanceSection() {
 
     writeWorkspacePanelDefault(WORKSPACE_PANEL_DEFAULT);
 
+    writeDefaultWorkspaceTab(DEFAULT_WORKSPACE_TAB);
+
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
     applyDesktopUiFontSize(UI_FONT_SIZE_DEFAULT);
@@ -809,6 +873,7 @@ function AppearanceSection() {
           "omnigent:custom-theme",
           "omnigent:default-transcript-view",
           "omnigent:default-workspace-panel",
+          "omnigent:default-workspace-tab",
           "omnigent:hide-unconfigured-harnesses",
         ]) {
           window.localStorage.removeItem(key);
@@ -893,6 +958,8 @@ function AppearanceSection() {
 
         <WorkspacePanelDefaultControl />
 
+        <WorkspaceTabDefaultControl />
+
         <HideUnconfiguredHarnessesControl />
 
         <UiFontSizeControl />
@@ -952,13 +1019,10 @@ function AppearanceSection() {
             </DialogHeader>
             <DialogFooter>
               <DialogClose asChild>
-                <Button variant="outline" size="sm">
-                  Cancel
-                </Button>
+                <Button variant="outline">Cancel</Button>
               </DialogClose>
               <Button
                 variant="default"
-                size="sm"
                 onClick={confirmResetAppearance}
                 data-testid="reset-appearance-confirm"
                 componentId="settings.appearance.reset"
@@ -1001,13 +1065,10 @@ function AppearanceSection() {
           )}
           <DialogFooter>
             <DialogClose asChild>
-              <Button variant="outline" size="sm">
-                Cancel
-              </Button>
+              <Button variant="outline">Cancel</Button>
             </DialogClose>
             <Button
               variant="default"
-              size="sm"
               data-testid="import-settings-choose-file"
               onClick={() => fileInputRef.current?.click()}
             >
@@ -1022,11 +1083,23 @@ function AppearanceSection() {
 
 /** Git behavior settings. */
 function GitSection() {
+  const info = useServerInfo();
+  const archiveWorktreeCleanup = info !== "loading" && info.archive_worktree_cleanup === true;
   return (
     <Section title="Git" description="Configure how Omnigent works with Git.">
-      <div className="flex flex-col gap-8">
-        <AlwaysUseWorktreeControl />
-        <DefaultBaseBranchControl />
+      <div className="flex flex-col gap-3">
+        <h2 className="text-ui font-medium">Worktrees</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <AlwaysUseWorktreeControl />
+          <div className="mt-4 border-t border-border pt-4">
+            <DefaultBaseBranchControl />
+          </div>
+          {archiveWorktreeCleanup && (
+            <div className="mt-4 border-t border-border pt-4">
+              <DeleteWorktreesOnArchiveControl />
+            </div>
+          )}
+        </div>
       </div>
     </Section>
   );
@@ -1049,6 +1122,7 @@ function GithubMark({ className }: { className?: string }) {
  */
 const CONNECTION_PANELS: Record<string, ComponentType> = {
   github: GithubIntegrationControl,
+  databricks: DatabricksIntegrationControl,
 };
 
 /**
@@ -1235,6 +1309,165 @@ function AlwaysUseWorktreeControl() {
 }
 
 /**
+ * Remove a session's git worktree when it's archived. Off until chosen; while
+ * unset, the first archive of a worktree session asks instead.
+ */
+function DeleteWorktreesOnArchiveControl() {
+  const [value, setValue] = useState(() => readDeleteWorktreesOnArchive() === true);
+  const labelId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setValue(next);
+    writeDeleteWorktreesOnArchive(next);
+  }, []);
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Delete worktrees for archived sessions
+        </span>
+        <span className="text-ui text-muted-foreground">
+          Remove a session's git worktree directory, including uncommitted changes, when you archive
+          it. The branch is kept.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        checked={value}
+        onCheckedChange={toggle}
+        data-testid="settings-delete-worktrees-on-archive-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.git.delete_worktrees_on_archive"
+      />
+    </div>
+  );
+}
+
+/**
+ * Connect / disconnect a Databricks workspace. Once connected, a managed
+ * sandbox launched by this user reaches the Databricks AI Gateway (MCP + model
+ * serving) as them, using their per-user OAuth token. Databricks is
+ * multi-workspace, so the user supplies their workspace URL. The connect action
+ * is a full-page redirect to the workspace OAuth consent; on return the callback
+ * lands here with ``?databricks=connected|error``.
+ */
+function DatabricksIntegrationControl() {
+  const [status, setStatus] = useState<DatabricksConnectionStatus | null | "loading">("loading");
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<"connected" | "error" | null>(null);
+  const [workspace, setWorkspace] = useState("");
+
+  const refresh = useCallback(async () => {
+    try {
+      setStatus(await fetchDatabricksStatus());
+    } catch {
+      setStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const params = new URLSearchParams(window.location.search);
+    const outcome = params.get("databricks");
+    if (outcome === "connected" || outcome === "error") {
+      setNotice(outcome);
+      params.delete("databricks");
+      const qs = params.toString();
+      window.history.replaceState({}, "", `${window.location.pathname}${qs ? `?${qs}` : ""}`);
+    }
+  }, [refresh]);
+
+  const onDisconnect = useCallback(async () => {
+    setBusy(true);
+    try {
+      await disconnectDatabricks();
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
+
+  const returnTo = `${window.location.pathname}${window.location.search}`;
+
+  // Feature not configured on this server: render nothing (like a build without it).
+  if (status !== "loading" && status !== null && !status.enabled) {
+    return null;
+  }
+  if (status === "loading") {
+    return <p className="text-sm text-muted-foreground">Checking…</p>;
+  }
+  if (status === null) {
+    return <p className="text-sm text-muted-foreground">Databricks status is unavailable.</p>;
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      {notice === "connected" && (
+        <div
+          role="status"
+          className="rounded-md border border-success/40 bg-success/10 px-3 py-2 text-sm"
+        >
+          Databricks workspace connected.
+        </div>
+      )}
+      {notice === "error" && (
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
+          Couldn't connect your Databricks workspace. Please try again.
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="text-sm font-medium">Databricks</span>
+          <span className="text-sm text-muted-foreground">
+            {status.connected && status.workspace_host
+              ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes reach the Databricks AI Gateway (MCP + model serving) as you.`
+              : "Connect your Databricks workspace so new sandboxes reach its AI Gateway (MCP + model serving) as you."}
+          </span>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {status.connected ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-9"
+              disabled={busy}
+              data-testid="databricks-disconnect"
+              onClick={() => void onDisconnect()}
+            >
+              Disconnect
+            </Button>
+          ) : (
+            <>
+              <Input
+                type="text"
+                inputMode="url"
+                placeholder="workspace-host.cloud.databricks.com"
+                className="h-9 w-64"
+                value={workspace}
+                onChange={(e) => setWorkspace(e.target.value)}
+                data-testid="databricks-workspace"
+              />
+              <Button
+                size="sm"
+                className="h-9"
+                disabled={busy || workspace.trim() === ""}
+                data-testid="databricks-connect"
+                onClick={() => beginDatabricksConnect(workspace.trim(), returnTo)}
+              >
+                Connect Databricks
+              </Button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
  * Opt-in dispatch for messages sent while the agent is working.
  */
 function AlwaysSteerControl() {
@@ -1300,6 +1533,148 @@ function ComposerSendShortcutControl() {
   );
 }
 
+/**
+ * Where a plain click on a web link in chat content opens — desktop shells
+ * with the embedded browser only. Off keeps the current behavior (the
+ * default external browser); on routes the link into the conversation's
+ * in-app Browser tab. Modified clicks always stay external.
+ */
+function OpenLinksInAppControl() {
+  const [enabled, setEnabled] = useState(readOpenLinksInApp);
+  const labelId = useId();
+  const descriptionId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setEnabled(next);
+    writeOpenLinksInApp(next);
+  }, []);
+
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Open links in the in-app browser
+        </span>
+        <span id={descriptionId} className="text-ui text-muted-foreground">
+          Open web links from chat in this conversation&apos;s Browser tab instead of your default
+          browser. {MOD_KEY}+click always opens the external browser.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        aria-describedby={descriptionId}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="open-links-in-app-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.open_links_in_app"
+      />
+    </div>
+  );
+}
+
+function BackgroundSessionTitlesControl() {
+  const [enabled, setEnabled] = useState(readBackgroundSessionTitlesEnabled);
+  const labelId = useId();
+  const descriptionId = useId();
+
+  const toggle = useCallback((next: boolean) => {
+    setEnabled(next);
+    writeBackgroundSessionTitlesEnabled(next);
+  }, []);
+
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Automatically name new sessions
+        </span>
+        <span id={descriptionId} className="text-ui text-muted-foreground">
+          Generate a concise title in the background after the first message. Turn this off to keep
+          the default session name.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        aria-describedby={descriptionId}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="background-session-titles-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.background_session_titles"
+      />
+    </div>
+  );
+}
+
+function TerminalClipboardControl() {
+  const labelId = useId();
+  const descriptionId = useId();
+  const canRemember = canRememberTerminalClipboardPreference();
+  const [preference, setPreference] = useState<TerminalClipboardPreference>(
+    readTerminalClipboardPreference,
+  );
+  const [saveFailed, setSaveFailed] = useState(false);
+
+  useEffect(
+    () =>
+      subscribeTerminalClipboardPreference((value) => {
+        setPreference(value);
+        setSaveFailed(false);
+      }),
+    [],
+  );
+
+  const update = (value: string) => {
+    if (!canRemember) return;
+    if (value !== "ask" && value !== "allow" && value !== "block") return;
+    const saved = writeTerminalClipboardPreference(value);
+    if (saved) setPreference(value);
+    setSaveFailed(!saved);
+  };
+
+  return (
+    <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <span id={labelId} className="text-ui font-medium">
+          Copying from terminals
+        </span>
+        <span id={descriptionId} className="text-sm text-muted-foreground">
+          {canRemember
+            ? "Controls copying text from all sessions and terminals on this server in this browser or app. Allowing copying also lets terminal programs silently replace your clipboard with text or commands you didn’t intend to paste."
+            : "This connection can’t remember clipboard permissions. You can still allow or block copying for each open terminal."}
+        </span>
+        {saveFailed && (
+          <span role="alert" className="text-sm text-destructive">
+            Couldn&apos;t save this preference in this browser or app. Your previous setting is
+            unchanged.
+          </span>
+        )}
+      </div>
+      <Select
+        value={preference}
+        disabled={!canRemember}
+        onValueChange={update}
+        componentId="settings.general.terminal_clipboard"
+        valueHasNoPii
+      >
+        <SelectTrigger
+          aria-labelledby={labelId}
+          aria-describedby={descriptionId}
+          data-testid="terminal-clipboard-preference-select"
+          className="w-48 shrink-0"
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="ask">Ask before copying</SelectItem>
+          <SelectItem value="allow">Allow copying</SelectItem>
+          <SelectItem value="block">Block copying</SelectItem>
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
 /** App-wide behavior settings. */
 function GeneralSection() {
   return (
@@ -1312,6 +1687,22 @@ function GeneralSection() {
             <AlwaysSteerControl />
           </div>
         </div>
+        <h2 className="mt-3 text-ui font-medium">Sessions</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <BackgroundSessionTitlesControl />
+        </div>
+        <h2 className="mt-3 text-ui font-medium">Terminal</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <TerminalClipboardControl />
+        </div>
+        {supportsBrowser() && (
+          <>
+            <h2 className="mt-3 text-ui font-medium">Links</h2>
+            <div className="rounded-xl border border-border bg-card p-4">
+              <OpenLinksInAppControl />
+            </div>
+          </>
+        )}
       </div>
     </Section>
   );
@@ -1761,7 +2152,7 @@ function StepperButton({
 function ShortcutsSection() {
   return (
     <Section title="Keyboard shortcuts" description="Speed up common actions with the keyboard.">
-      <KeyboardShortcutsList />
+      <KeyboardShortcutsList variant="settings" />
     </Section>
   );
 }
@@ -2056,14 +2447,14 @@ function AccountSection() {
       // the SPA login form.
       await logout();
       // Hard navigation so the chat store / react-query cache reset.
-      window.location.href = "/login";
+      window.location.href = withBasePath("/login");
       return;
     }
     // OIDC: logout is a server-side GET redirect at /auth/logout that clears
     // the session cookie (and honors the IdP end-session endpoint when
     // configured). A hard navigation lets the browser follow it and resets
     // client caches.
-    window.location.href = "/auth/logout";
+    window.location.href = withBasePath("/auth/logout");
   }, [accountsEnabled]);
 
   const resetPwForm = useCallback(() => {
@@ -2294,7 +2685,21 @@ function ImportSection() {
       title="Import sessions"
       description="Pull local chats from a machine you're running into Omnigent. Sessions already imported are skipped."
     >
-      <ImportSessionsPanel />
+      <div className="flex flex-col gap-3">
+        <h2 className="text-ui font-medium">Import from a machine</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <ImportSessionsPanel />
+        </div>
+      </div>
+      <div className="mt-8 flex flex-col gap-3">
+        <h2 className="text-ui font-medium">Harness imports</h2>
+        <p className="-mt-2 text-ui text-muted-foreground">
+          See the logins, MCP servers, skills, and plugins each machine's harnesses carry over.
+        </p>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <ReviewImportsPanel />
+        </div>
+      </div>
     </Section>
   );
 }
@@ -2330,8 +2735,16 @@ function ArchivedSection() {
     }
   }, [project, projectNames, namesQuery.isSuccess, namesQuery.isFetching]);
 
-  // The visible list, filtered server-side via ?project= when one is picked.
-  const listQuery = useConversations("", true, undefined, project);
+  // Named projects need the owner-scoped "all" query, including archived rows.
+  // The unfiltered view can request only archives across all accessible sessions.
+  // Keep includeArchived for older servers that ignore visibility.
+  const listQuery = useConversations(
+    "",
+    true,
+    undefined,
+    project,
+    project === undefined ? "archived" : undefined,
+  );
   const archived = useMemo(
     () => (listQuery.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
     [listQuery.data],
