@@ -154,12 +154,12 @@ def test_html_preview_runs_scripts_and_targets_links(
     opened: list[Page] = []
     page.context.on("page", lambda popup: opened.append(popup))
     preview.get_by_role("link", name="Jump to section 3").click()
-    # A popup would surface within this window; a correct build never opens one.
-    page.wait_for_timeout(2_000)
+    expect(target).to_be_in_viewport()
+    # The click itself would have created a popup; a brief settle catches a late event.
+    page.wait_for_timeout(500)
     assert not opened, "same-page anchor opened a new window at " + ", ".join(
         p.url for p in opened
     )
-    expect(target).to_be_in_viewport()
     expect(page).to_have_url(f"{base_url}/c/{session_id}?file={_HTML_PATH}")
 
 
@@ -229,11 +229,14 @@ def test_html_preview_open_in_new_tab_button(
     # ``about:blank``, so the fragment would otherwise resolve there).
     target = preview.locator("#section-3")
     expect(target).not_to_be_in_viewport()
-    open_pages = len(page.context.pages)
+    opened: list[Page] = []
+    page.context.on("page", lambda stray: opened.append(stray))
     preview.get_by_role("link", name="Jump to section 3").click()
     expect(target).to_be_in_viewport()
-    page.wait_for_timeout(1_000)
-    assert len(page.context.pages) == open_pages
+    page.wait_for_timeout(500)
+    assert not opened, "same-page anchor in the pop-out opened a new window at " + ", ".join(
+        p.url for p in opened
+    )
     assert popped.url == "about:blank"
 
     popped.close()

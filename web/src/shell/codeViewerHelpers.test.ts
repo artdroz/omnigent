@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   HTML_PREVIEW_HEAD,
   HTML_PREVIEW_SANDBOX,
@@ -457,7 +457,7 @@ describe("prepareHtmlPreviewDoc", () => {
   it("injects exactly one base tag and one anchor script per call (no duplicates)", () => {
     const out = prepareHtmlPreviewDoc("<head></head>");
     expect(out.match(/<base target="_blank">/g)).toHaveLength(1);
-    expect(out.match(/<script>/g)).toHaveLength(1);
+    expect(out.split("<script>")).toHaveLength(2);
   });
 
   it("is idempotent: re-preparing already-prepared content adds no second copy", () => {
@@ -491,14 +491,28 @@ describe("prepareHtmlPreviewDoc", () => {
 // ---------------------------------------------------------------------------
 
 describe("prepareHtmlPreviewDoc same-page anchor script", () => {
-  const SCRIPT_BODY = /<script>([\s\S]*)<\/script>/.exec(HTML_PREVIEW_HEAD)?.[1] ?? "";
+  const SCRIPT_BODY = HTML_PREVIEW_HEAD.slice(
+    HTML_PREVIEW_HEAD.indexOf("<script>") + "<script>".length,
+    HTML_PREVIEW_HEAD.lastIndexOf("</script>"),
+  );
   /** Elements the handler scrolled into view by hand (`this` of each call). */
   let scrolled: Element[];
 
+  /** The window-level click listener the script registers; removed again in afterAll. */
+  let handler: EventListener | undefined;
+
   beforeAll(() => {
     expect(SCRIPT_BODY).not.toBe("");
-    // Registers the document-level click listener on this file's jsdom document.
+    const register = vi.spyOn(window, "addEventListener");
     new Function(SCRIPT_BODY)();
+    const call = register.mock.calls.find(([type]) => type === "click");
+    register.mockRestore();
+    handler = call?.[1] as EventListener | undefined;
+    expect(handler).toBeDefined();
+  });
+
+  afterAll(() => {
+    if (handler) window.removeEventListener("click", handler);
   });
 
   beforeEach(() => {
@@ -516,9 +530,9 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
   });
 
   /**
-   * Click `selector` and report whether the in-frame handler cancelled the
-   * click. The window-level listener runs after it and cancels whatever is
-   * left, so jsdom never attempts the navigation of links the handler skipped.
+   * Click `selector` and report whether the in-frame handler cancelled it. A window-level
+   * listener runs after it and cancels whatever remains, so jsdom never attempts the
+   * navigation of links the handler skipped.
    */
   function click(selector: string): boolean {
     let cancelled = false;
@@ -561,9 +575,9 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
     expect(scrolled[0]).toBe(document.getElementById("section-3"));
   });
 
-  it("resolves named anchors and percent-encoded ids for the repeat scroll", () => {
+  it("resolves <a name> anchors (not other named elements) and encoded ids for the repeat scroll", () => {
     document.body.innerHTML =
-      '<a id="named" href="#spot">n</a><a name="spot"></a>' +
+      '<a id="named" href="#spot">n</a><input name="spot"><a name="spot"></a>' +
       '<a id="encoded" href="#caf%C3%A9">e</a><h3 id="café">Café</h3>';
     location.hash = "#spot";
     click("#named");
@@ -584,6 +598,19 @@ describe("prepareHtmlPreviewDoc same-page anchor script", () => {
     location.hash = "#top";
     click("#top-link");
     expect(window.scrollTo).toHaveBeenCalledTimes(2);
+  });
+
+  it("lets a document-level handler the page registers later cancel the click first", () => {
+    document.body.innerHTML = '<a id="route" href="#settings">settings</a>';
+    const router = (event: Event) => event.preventDefault();
+    document.addEventListener("click", router);
+    try {
+      expect(click("#route")).toBe(true);
+      expect(location.hash).toBe("");
+      expect(scrolled).toEqual([]);
+    } finally {
+      document.removeEventListener("click", router);
+    }
   });
 
   it("leaves clicks the page handled itself and non-fragment links alone", () => {

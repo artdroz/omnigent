@@ -382,35 +382,34 @@ export const HTML_PREVIEW_SANDBOX =
   "allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals";
 
 /**
- * Inline script for the preview document that keeps same-page `#fragment`
- * links inside the frame.
- *
- * A `srcdoc` document resolves relative URLs against its embedder, so under
- * `<base target="_blank">` a fragment-only link would open the host page's own
- * URL in a new window (the desktop shell then hands it to the OS browser).
- * Setting the frame's hash instead scrolls to the target, styles `:target`, and
- * fires `hashchange` like a native anchor; when that hash is already current
- * (assigning it again is a no-op) the scroll is repeated by hand. Clicks the
- * page handled itself (`preventDefault`) and every other link are left alone.
+ * In-frame handler for same-page links: a srcdoc document resolves `#x` against its
+ * embedder, so with `<base target="_blank">` the host page would open in a new window.
+ * Setting the frame's own hash scrolls like a native anchor (by hand if it is unchanged).
  */
 const SAME_PAGE_ANCHOR_SCRIPT = `<script>(function () {
   function indicatedElement(fragment) {
-    var raw = fragment.slice(1);
-    var id = raw;
+    const raw = fragment.slice(1);
+    let id = raw;
     try { id = decodeURIComponent(raw); } catch (e) { /* malformed escape: match the raw id */ }
-    return document.getElementById(id) || document.getElementsByName(id)[0] || null;
+    const byId = document.getElementById(id);
+    if (byId) return byId;
+    const named = document.getElementsByName(id);
+    for (let i = 0; i < named.length; i++) if (named[i].localName === "a") return named[i];
+    return null;
   }
-  document.addEventListener("click", function (event) {
+  // On window, so handlers the artifact delegates to document run first and can cancel.
+  window.addEventListener("click", function (event) {
     if (event.defaultPrevented) return;
-    var target = event.target;
-    var anchor = target && target.closest ? target.closest("a[href],area[href]") : null;
-    var href = anchor ? anchor.getAttribute("href").trim() : "";
+    const target = event.target;
+    const anchor = target && target.closest ? target.closest("a[href],area[href]") : null;
+    const href = anchor ? anchor.getAttribute("href").trim() : "";
     if (href.charAt(0) !== "#") return;
+    // Modifier clicks too: a new tab could only reopen the host app, never this document.
     event.preventDefault();
-    var before = location.href;
+    const before = location.href;
     location.hash = href;
     if (location.href !== before) return;
-    var element = indicatedElement(href);
+    const element = indicatedElement(href);
     if (element) element.scrollIntoView();
     else if (href === "#" || href.toLowerCase() === "#top") window.scrollTo(0, 0);
   });
@@ -444,13 +443,9 @@ export function prepareHtmlPreviewDoc(html: string): string {
   const headMatch = html.match(/<head[^>]*>/i);
   if (headMatch?.index !== undefined) {
     const insertAt = headMatch.index + headMatch[0].length;
-    // Idempotency guard, scoped to the actual injection point: only skip if our
-    // markup is ALREADY right after <head> (i.e. content was prepared twice).
-    // We must NOT use a loose `html.includes(...)` — the literal string can
-    // legitimately appear elsewhere in artifact content (a comment, a code
-    // sample), and skipping injection there would leave the document with no
-    // real <base>, so links navigate the preview in place instead of opening a
-    // new tab.
+    // Skip only if our markup is already right after <head> (prepared twice). A loose
+    // `includes` check would false-positive on the literal appearing in artifact content
+    // and leave the document without a real <base>.
     if (html.startsWith(HTML_PREVIEW_HEAD, insertAt)) return html;
     return html.slice(0, insertAt) + HTML_PREVIEW_HEAD + html.slice(insertAt);
   }
