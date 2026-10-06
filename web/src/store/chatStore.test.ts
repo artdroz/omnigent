@@ -13586,16 +13586,17 @@ describe("pending initial prompt transport", () => {
 
   it("returns the stashed prompt exactly once within one page load", () => {
     setPendingInitialPrompt("conv_abc", { text: "read the README", skill: null });
-    // First consume yields the stashed prompt verbatim.
-    expect(consumePendingInitialPrompt("conv_abc")).toEqual({
-      text: "read the README",
-      skill: null,
-    });
+    // First consume yields the stashed prompt, now stamped with a submission
+    // id so a landed-then-reloaded POST dedupes server-side.
+    const first = consumePendingInitialPrompt("conv_abc");
+    expect(first).toMatchObject({ text: "read the README", skill: null });
+    expect(typeof first!.stableId).toBe("string");
+    expect(first!.stableId!.length).toBeGreaterThan(0);
     // The storage copy must not dispatch again within this heap.
     expect(consumePendingInitialPrompt("conv_abc")).toBeNull();
   });
 
-  it("persists text + skill only, so a hard navigation can recover them", () => {
+  it("persists text + skill + submission id only, so a hard navigation can recover them", () => {
     // A unit test cannot reset the module map; inspect the stored payload.
     setPendingInitialPrompt("conv_hard", {
       text: "survive the reload",
@@ -13604,9 +13605,13 @@ describe("pending initial prompt transport", () => {
     });
     const raw = window.sessionStorage.getItem("omnigent.pendingInitialPrompts");
     expect(raw).not.toBeNull();
-    expect(JSON.parse(raw!)).toEqual({
-      conv_hard: { text: "survive the reload", skill: null },
-    });
+    const stored = JSON.parse(raw!).conv_hard;
+    // Files never persist; text, skill, and the submission id the recovery
+    // dispatch reuses to dedupe server-side do.
+    expect(stored).toMatchObject({ text: "survive the reload", skill: null });
+    expect(Object.keys(stored).sort()).toEqual(["skill", "stableId", "text"]);
+    expect(typeof stored.stableId).toBe("string");
+    expect(stored.stableId.length).toBeGreaterThan(0);
   });
 
   it("recovers a persisted prompt from a previous page load, once", () => {
@@ -13622,6 +13627,24 @@ describe("pending initial prompt transport", () => {
     expect(consumePendingInitialPrompt("conv_recovered")).toBeNull();
   });
 
+  it("recovers a persisted submission id so the reused POST dedupes server-side", () => {
+    // A plain first message persists its submission id; a fresh page after a
+    // sleep/relogin must recover that exact id so re-dispatching it dedupes a
+    // POST that already reached the server instead of double-delivering it.
+    window.sessionStorage.setItem(
+      "omnigent.pendingInitialPrompts",
+      JSON.stringify({
+        conv_resumed: { text: "sent before sleep", skill: null, stableId: "fixedid000111" },
+      }),
+    );
+    expect(consumePendingInitialPrompt("conv_resumed")).toEqual({
+      text: "sent before sleep",
+      skill: null,
+      stableId: "fixedid000111",
+    });
+    expect(consumePendingInitialPrompt("conv_resumed")).toBeNull();
+  });
+
   it("clearPersistedInitialPrompt drops the recovery copy", () => {
     setPendingInitialPrompt("conv_clear", { text: "already delivered", skill: null });
     consumePendingInitialPrompt("conv_clear");
@@ -13634,7 +13657,7 @@ describe("pending initial prompt transport", () => {
     window.sessionStorage.setItem("omnigent.pendingInitialPrompts", "{not json");
     expect(consumePendingInitialPrompt("conv_corrupt")).toBeNull();
     setPendingInitialPrompt("conv_corrupt", { text: "after corruption", skill: null });
-    expect(consumePendingInitialPrompt("conv_corrupt")).toEqual({
+    expect(consumePendingInitialPrompt("conv_corrupt")).toMatchObject({
       text: "after corruption",
       skill: null,
     });
@@ -13643,7 +13666,7 @@ describe("pending initial prompt transport", () => {
   it("a settled send clears the persisted copy so a reload can't replay it", async () => {
     // An acknowledged POST must remove its recovery copy.
     setPendingInitialPrompt("conv_settle", { text: "hello there", skill: null });
-    expect(consumePendingInitialPrompt("conv_settle")).toEqual({
+    expect(consumePendingInitialPrompt("conv_settle")).toMatchObject({
       text: "hello there",
       skill: null,
     });
@@ -13656,13 +13679,15 @@ describe("pending initial prompt transport", () => {
     expect(window.sessionStorage.getItem("omnigent.pendingInitialPrompts")).toBeNull();
   });
 
-  it("a send severed mid-flight keeps the persisted copy for recovery", async () => {
-    // A network failure leaves the copy available for a later reload.
+  it("a send severed mid-flight keeps the persisted copy, submission id intact, for recovery", async () => {
+    // A network failure leaves the copy available for a later reload. The
+    // submission id must survive unchanged so the recovery dispatch reuses it
+    // and the server dedupes a POST that actually landed before the break.
     setPendingInitialPrompt("conv_severed", { text: "must survive sleep", skill: null });
-    expect(consumePendingInitialPrompt("conv_severed")).toEqual({
-      text: "must survive sleep",
-      skill: null,
-    });
+    const consumed = consumePendingInitialPrompt("conv_severed");
+    expect(consumed).toMatchObject({ text: "must survive sleep", skill: null });
+    const submissionId = consumed!.stableId;
+    expect(typeof submissionId).toBe("string");
     useChatStore.setState({
       conversationId: "conv_severed",
       abortController: new AbortController(),
@@ -13674,14 +13699,14 @@ describe("pending initial prompt transport", () => {
     });
     await useChatStore.getState().send("must survive sleep", "agent_xyz");
     expect(JSON.parse(window.sessionStorage.getItem("omnigent.pendingInitialPrompts")!)).toEqual({
-      conv_severed: { text: "must survive sleep", skill: null },
+      conv_severed: { text: "must survive sleep", skill: null, stableId: submissionId },
     });
   });
 
   it("an unrelated settled send does not clear a pending recovery copy", async () => {
     // A different settled message must not erase the first prompt.
     setPendingInitialPrompt("conv_unrelated", { text: "still pending", skill: null });
-    consumePendingInitialPrompt("conv_unrelated");
+    const pendingId = consumePendingInitialPrompt("conv_unrelated")!.stableId;
     useChatStore.setState({
       conversationId: "conv_unrelated",
       abortController: new AbortController(),
@@ -13689,7 +13714,7 @@ describe("pending initial prompt transport", () => {
     });
     await useChatStore.getState().send("a different message", "agent_xyz");
     expect(JSON.parse(window.sessionStorage.getItem("omnigent.pendingInitialPrompts")!)).toEqual({
-      conv_unrelated: { text: "still pending", skill: null },
+      conv_unrelated: { text: "still pending", skill: null, stableId: pendingId },
     });
   });
 
@@ -13734,8 +13759,14 @@ describe("pending initial prompt transport", () => {
     setPendingInitialPrompt("conv_a", { text: "prompt for A", skill: null });
     setPendingInitialPrompt("conv_b", { text: "prompt for B", skill: null });
     // Each conversation consumes only its own prompt.
-    expect(consumePendingInitialPrompt("conv_b")).toEqual({ text: "prompt for B", skill: null });
-    expect(consumePendingInitialPrompt("conv_a")).toEqual({ text: "prompt for A", skill: null });
+    expect(consumePendingInitialPrompt("conv_b")).toMatchObject({
+      text: "prompt for B",
+      skill: null,
+    });
+    expect(consumePendingInitialPrompt("conv_a")).toMatchObject({
+      text: "prompt for A",
+      skill: null,
+    });
   });
 
   it("carries a matched skill invocation through intact", () => {

@@ -72,11 +72,13 @@ async def _drive_sleep_wake(base_url: str, session_a: str, session_b: str) -> No
 
             async def handle_events(route: Route) -> None:
                 request = route.request
+                if request.method != "POST":
+                    await route.continue_()
+                    return
                 match = _EVENTS_RE.search(request.url)
                 assert match is not None, f"unexpected /events url: {request.url}"
-                body = request.post_data_json
-                text = body["data"]["content"][0]["text"]
                 sid = match.group(1)
+                text = _PROMPT if _PROMPT in (request.post_data or "") else ""
                 if not woke["v"]:
                     events_before.append((sid, text))
                     await route.abort("connectionaborted")
@@ -162,15 +164,10 @@ async def _drive_sleep_wake(base_url: str, session_a: str, session_b: str) -> No
             )
 
             # Reload removes the in-memory handoff while preserving sessionStorage.
+            # The _wait_until above already proved the prompt reached session A.
             woke["v"] = True
             await page.reload()
             await page.wait_for_url(re.compile(rf"/c/{re.escape(session_a)}"))
-
-            assert any(sid == session_a and text == _PROMPT for sid, text in events_before), (
-                "the initial prompt never auto-sent to session A before the reload; "
-                f"pre-wake /events posts were {events_before} — the test did not exercise "
-                "the first-message handoff at all"
-            )
 
             # A composer draft is not delivery; require a transcript bubble.
             await expect(

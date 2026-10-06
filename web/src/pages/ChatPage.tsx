@@ -604,12 +604,25 @@ export function ChatPage() {
     }
     // An interrupted POST may have landed before reload. The hydrated
     // transcript is authoritative, so skip replay when it contains the prompt.
-    if (isInitialPromptDelivered(useChatStore.getState().blocks, initialPrompt.prompt)) {
+    // `blocks` is the ACTIVE projection; only trust it once the store projects
+    // this conversation, or a mid-switch stale mirror could drop the prompt on
+    // another session's transcript. A redundant replay then dedupes via the
+    // reused submission id.
+    const store = useChatStore.getState();
+    if (
+      store.conversationId === urlConvId &&
+      isInitialPromptDelivered(store.blocks, initialPrompt.prompt)
+    ) {
       clearPersistedInitialPrompt(urlConvId);
       return;
     }
-    const { send, sendSlashCommand } = useChatStore.getState();
-    dispatchInitialPrompt(initialPrompt.prompt, agentId, send, sendSlashCommand);
+    dispatchInitialPrompt(
+      initialPrompt.prompt,
+      agentId,
+      urlConvId,
+      store.send,
+      store.sendSlashCommand,
+    );
   }, [initialPrompt, urlConvId, loadingConversation, agentId]);
 
   // Open state owned here (not inside MainAgentSurface) so the dialog
@@ -4251,23 +4264,44 @@ export function isInitialPromptDelivered(
  * @param prompt The consumed pending prompt, e.g.
  *   ``{ text: "/review-pr 123", skill: { name: "review-pr", args: "123" } }``.
  * @param agentId Resolved agent id, e.g. ``"ag_abc123"``.
+ * @param conversationId The conversation the prompt was consumed for; both
+ *   wire shapes pin to it so a stale active mirror can't deliver the first
+ *   message to a different session.
  * @param send ``chatStore.send`` — posts a plain user message with the
  *   prompt's landing attachments (an empty array when none). For an
  *   image-only draft the text is ``""`` and send() omits the
  *   ``input_text`` block, so the message is ``input_image`` blocks alone.
+ *   A recovered plain message reuses its persisted ``stableId`` so a POST
+ *   that already landed dedupes server-side instead of double-delivering.
  * @param sendSlashCommand ``chatStore.sendSlashCommand`` — posts a
  *   ``slash_command`` event.
  */
 export function dispatchInitialPrompt(
   prompt: PendingInitialPrompt,
   agentId: string,
-  send: (text: string, agentId: string, files: File[]) => Promise<void>,
-  sendSlashCommand: (name: string, args: string, agentId: string) => Promise<void>,
+  conversationId: string,
+  send: (
+    text: string,
+    agentId: string,
+    files: File[],
+    opts?: { stableId?: string; pinnedConversationId?: string },
+  ) => Promise<void>,
+  sendSlashCommand: (
+    name: string,
+    args: string,
+    agentId: string,
+    opts?: { pinnedConversationId?: string },
+  ) => Promise<void>,
 ): void {
   if (prompt.skill) {
-    void sendSlashCommand(prompt.skill.name, prompt.skill.args, agentId);
+    void sendSlashCommand(prompt.skill.name, prompt.skill.args, agentId, {
+      pinnedConversationId: conversationId,
+    });
   } else {
-    void send(prompt.text, agentId, prompt.files ?? []);
+    void send(prompt.text, agentId, prompt.files ?? [], {
+      pinnedConversationId: conversationId,
+      ...(prompt.stableId !== undefined ? { stableId: prompt.stableId } : {}),
+    });
   }
 }
 

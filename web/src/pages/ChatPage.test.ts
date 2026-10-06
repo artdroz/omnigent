@@ -1505,13 +1505,16 @@ describe("dispatchInitialPrompt", () => {
         skill: { name: "review-pr", args: "123 focus on auth" },
       },
       "ag_abc123",
+      "conv_1",
       send,
       sendSlashCommand,
     );
     // Name (no leading slash) + raw args reach the slash_command path —
     // the exact values the server's skill lookup and the runner's
     // SKILL.md resolution key off.
-    expect(sendSlashCommand).toHaveBeenCalledWith("review-pr", "123 focus on auth", "ag_abc123");
+    expect(sendSlashCommand).toHaveBeenCalledWith("review-pr", "123 focus on auth", "ag_abc123", {
+      pinnedConversationId: "conv_1",
+    });
     // The plain path must NOT also fire — a double-send would deliver the
     // literal "/name" text alongside the skill invocation.
     expect(send).not.toHaveBeenCalled();
@@ -1523,12 +1526,35 @@ describe("dispatchInitialPrompt", () => {
     dispatchInitialPrompt(
       { text: "read the README", skill: null },
       "ag_abc123",
+      "conv_1",
       send,
       sendSlashCommand,
     );
     // Full text verbatim, no files. This is also the path for native
     // terminal sessions and unknown "/typo" commands (skill stays null).
-    expect(send).toHaveBeenCalledWith("read the README", "ag_abc123", []);
+    expect(send).toHaveBeenCalledWith("read the README", "ag_abc123", [], {
+      pinnedConversationId: "conv_1",
+    });
+    expect(sendSlashCommand).not.toHaveBeenCalled();
+  });
+
+  it("reuses a recovered submission id so a landed POST dedupes server-side", () => {
+    // The recovery dispatch of a plain message forwards its persisted id, so a
+    // POST that already reached the server before the reload dedupes under it
+    // instead of delivering the first message twice (the native-terminal path).
+    const send = vi.fn().mockResolvedValue(undefined);
+    const sendSlashCommand = vi.fn().mockResolvedValue(undefined);
+    dispatchInitialPrompt(
+      { text: "read the README", skill: null, stableId: "abc123def456" },
+      "ag_abc123",
+      "conv_1",
+      send,
+      sendSlashCommand,
+    );
+    expect(send).toHaveBeenCalledWith("read the README", "ag_abc123", [], {
+      pinnedConversationId: "conv_1",
+      stableId: "abc123def456",
+    });
     expect(sendSlashCommand).not.toHaveBeenCalled();
   });
 
@@ -1539,12 +1565,15 @@ describe("dispatchInitialPrompt", () => {
     dispatchInitialPrompt(
       { text: "what is this?", skill: null, files: [file] },
       "ag_abc123",
+      "conv_1",
       send,
       sendSlashCommand,
     );
     // The exact File objects picked on the landing screen reach send() —
     // an empty array here means first-message attachments silently vanish.
-    expect(send).toHaveBeenCalledWith("what is this?", "ag_abc123", [file]);
+    expect(send).toHaveBeenCalledWith("what is this?", "ag_abc123", [file], {
+      pinnedConversationId: "conv_1",
+    });
   });
 
   it("dispatches an image-only draft (blank text) through the plain path with its files", () => {
@@ -1558,10 +1587,13 @@ describe("dispatchInitialPrompt", () => {
     dispatchInitialPrompt(
       { text: "", skill: null, files: [file] },
       "ag_abc123",
+      "conv_1",
       send,
       sendSlashCommand,
     );
-    expect(send).toHaveBeenCalledWith("", "ag_abc123", [file]);
+    expect(send).toHaveBeenCalledWith("", "ag_abc123", [file], {
+      pinnedConversationId: "conv_1",
+    });
     expect(sendSlashCommand).not.toHaveBeenCalled();
   });
 });

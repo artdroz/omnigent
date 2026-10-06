@@ -459,7 +459,15 @@ export function hydrateLocalConversation(
   // Preserve an interrupted first send across a hard reload, but do not
   // replay its storage copy in this heap while the send below is in flight.
   // A blank-text (image-only) draft has no recoverable storage copy, so skip it.
-  if (text) persistInitialPrompt(realId, { text, skill });
+  // A plain message reuses one submission id so a landed-but-reloaded POST
+  // dedupes server-side on replay; the slash path carries no dedup key.
+  const initialSubmissionId = skill === null && text ? newInitialSubmissionId() : undefined;
+  if (text)
+    persistInitialPrompt(realId, {
+      text,
+      skill,
+      ...(initialSubmissionId ? { stableId: initialSubmissionId } : {}),
+    });
   dispatchedInitialPrompts.add(realId);
   if (skill !== null) {
     // Slash command: the server resolves the skill and emits its own receipt +
@@ -482,6 +490,7 @@ export function hydrateLocalConversation(
   void store.send(text, agentId, files, {
     pinnedConversationId: realId,
     reusePendingTempId: pendingMsgTempId,
+    ...(initialSubmissionId ? { stableId: initialSubmissionId } : {}),
   });
 }
 
@@ -1792,6 +1801,14 @@ export interface PendingInitialPrompt {
    *  first message. Skill invocations don't carry files (same as the
    *  in-session composer's slash-command path). */
   files?: File[];
+  /**
+   * Idempotent submission id for a plain first message, reused across the
+   * recovery dispatch so a POST that landed before a hard reload dedupes
+   * server-side instead of double-delivering. Unset for skill invocations
+   * (the slash path carries no dedup key) and image-only drafts (not
+   * recoverable from storage).
+   */
+  stableId?: string;
 }
 
 // First-message handoff from NewChatDialog to ChatPage, keyed by the
@@ -1816,6 +1833,15 @@ const dispatchedInitialPrompts = new Set<string>();
 interface PersistedInitialPrompt {
   text: string;
   skill: { name: string; args: string } | null;
+  stableId?: string;
+}
+
+// A plain first message reuses one submission id across its recovery dispatch;
+// the server then dedupes a landed-but-reloaded POST under that id (see
+// tests/server/integration/test_sessions_web_send_stable_id.py) rather than
+// double-delivering. Matches the hex shape `send` posts for ordinary turns.
+function newInitialSubmissionId(): string {
+  return randomUUID().replace(/-/g, "");
 }
 
 function loadPersistedInitialPrompts(): Record<string, PersistedInitialPrompt> {
@@ -1828,7 +1854,11 @@ function loadPersistedInitialPrompts(): Record<string, PersistedInitialPrompt> {
     const entries: Record<string, PersistedInitialPrompt> = Object.create(null);
     for (const [id, value] of Object.entries(parsed)) {
       if (value === null || typeof value !== "object") continue;
-      const { text, skill } = value as { text?: unknown; skill?: unknown };
+      const { text, skill, stableId } = value as {
+        text?: unknown;
+        skill?: unknown;
+        stableId?: unknown;
+      };
       if (typeof text !== "string" || text === "") continue;
       const candidate = skill as { name?: unknown; args?: unknown } | null | undefined;
       const validSkill =
@@ -1838,7 +1868,11 @@ function loadPersistedInitialPrompts(): Record<string, PersistedInitialPrompt> {
         typeof candidate.args === "string"
           ? { name: candidate.name, args: candidate.args }
           : null;
-      entries[id] = { text, skill: validSkill };
+      entries[id] = {
+        text,
+        skill: validSkill,
+        ...(typeof stableId === "string" && stableId !== "" ? { stableId } : {}),
+      };
     }
     return entries;
   } catch {
@@ -1861,7 +1895,11 @@ function savePersistedInitialPrompts(entries: Record<string, PersistedInitialPro
 
 function persistInitialPrompt(conversationId: string, prompt: PendingInitialPrompt): void {
   const entries = loadPersistedInitialPrompts();
-  entries[conversationId] = { text: prompt.text, skill: prompt.skill };
+  entries[conversationId] = {
+    text: prompt.text,
+    skill: prompt.skill,
+    ...(prompt.stableId !== undefined ? { stableId: prompt.stableId } : {}),
+  };
   savePersistedInitialPrompts(entries);
 }
 
@@ -1913,10 +1951,17 @@ export function setPendingInitialPrompt(
   prompt: PendingInitialPrompt,
 ): void {
   if (!prompt.text && !prompt.files?.length) return;
-  pendingInitialPrompts.set(conversationId, prompt);
+  // Stamp a reusable submission id on a recoverable plain message so its replay
+  // after a hard reload dedupes server-side. Image-only drafts aren't
+  // recoverable, and the slash path has no dedup key, so leave both unset.
+  const stamped =
+    prompt.skill === null && prompt.text && prompt.stableId === undefined
+      ? { ...prompt, stableId: newInitialSubmissionId() }
+      : prompt;
+  pendingInitialPrompts.set(conversationId, stamped);
   // Blank-text drafts can't be recovered from storage (load drops empty text),
   // so only the in-memory handoff carries an image-only first message.
-  if (prompt.text) persistInitialPrompt(conversationId, prompt);
+  if (stamped.text) persistInitialPrompt(conversationId, stamped);
 }
 
 /**
@@ -1936,7 +1981,11 @@ export function consumePendingInitialPrompt(conversationId: string): PendingInit
   const persisted = loadPersistedInitialPrompts()[conversationId];
   if (persisted === undefined) return null;
   dispatchedInitialPrompts.add(conversationId);
-  return { text: persisted.text, skill: persisted.skill };
+  return {
+    text: persisted.text,
+    skill: persisted.skill,
+    ...(persisted.stableId !== undefined ? { stableId: persisted.stableId } : {}),
+  };
 }
 
 export const useChatStore = create<ChatState>((_rootSet, get) => ({
