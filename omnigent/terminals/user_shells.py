@@ -17,11 +17,9 @@ DEFAULT_USER_SHELL = "bash"
 def user_shell_terminals(spec: AgentSpec | AgentDef | None) -> dict[str, TerminalEnvSpec]:
     """Return the terminals a user may launch for *spec*, keyed by name.
 
-    A declared ``terminals:`` block is the whole set (it also registers the
-    agent's ``sys_terminal_*`` tools). An agent that declares none still gets
-    a default ``bash`` shell for the user: it carries no ``os_env`` of its own,
-    so the launch inherits the agent's ``os_env`` and sandbox, and it is never
-    offered to the agent as a tool.
+    Declared ``terminals:`` are offered as-is. An agent declaring none gets a
+    default ``bash`` shell that inherits the agent's ``os_env`` (it has none of
+    its own) and is never offered to the agent as a tool.
 
     :param spec: The session agent's spec, or ``None`` when none resolves.
     :returns: Terminal specs in offer order; empty when *spec* is ``None``.

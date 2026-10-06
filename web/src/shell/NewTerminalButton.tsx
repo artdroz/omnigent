@@ -3,10 +3,9 @@
 // strip on native-wrapper sessions).
 //
 // Gated on the terminals the server offers this session's user
-// (`useSessionAgent().terminals`): the names the agent's spec declares
-// in `terminals:`, or the server's default shell when it declares none
-// — the same set the server enforces on POST /resources/terminals. The
-// button renders ONLY when that list is non-empty.
+// (`useSessionAgent().terminals`: declared `terminals:`, or the server's
+// default shell when the agent declares none — the same set the server
+// enforces on POST /resources/terminals). Renders ONLY when non-empty.
 //
 // Behavior by declared-terminal shape:
 //   - One declared name → creates it directly on click.

@@ -3880,11 +3880,8 @@ async def test_session_agent_terminals_follow_selected_host(
 async def test_session_agent_offers_default_shell_when_agent_declares_none(
     client: httpx.AsyncClient,
 ) -> None:
-    """A custom agent without ``terminals:`` still reports the default user shell.
-
-    The Web UI's rail "+" menu and new-shell hotkey key off this list, so an
-    empty list would leave such sessions with no way to open a shell.
-    """
+    """A custom agent without ``terminals:`` reports the default user shell that
+    the Web UI's "+" menu and new-shell hotkey key off."""
     agent = await create_test_agent(client, name="plain-agent")
     session = await _create_session(client, agent["id"])
 

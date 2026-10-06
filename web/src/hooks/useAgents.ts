@@ -51,11 +51,9 @@ export interface Agent {
   /** Guardrails policies declared on the agent. Empty when none configured. */
   policies?: PolicySummary[];
   /** Terminal names the user may open, in offer order: the spec's declared
-   * `terminals:` (e.g. ["shell"], or ["zsh", "bash"] for a native session
-   * offering the host's installed shells, default first), or the server's
-   * default shell (["bash"]) when the agent declares none. Gates the "new
-   * terminal" affordance: empty means the UI must not offer creation. Only
-   * populated by `useSessionAgent`. */
+   * `terminals:` (["zsh", "bash"] for a native session, default first), or
+   * the server's default shell (["bash"]) when the agent declares none. Empty
+   * means the UI must not offer creation. Only populated by `useSessionAgent`. */
   terminals?: string[];
 }
 

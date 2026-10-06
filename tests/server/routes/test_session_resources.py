@@ -1588,12 +1588,8 @@ async def test_create_terminal_default_shell_allowed_when_agent_declares_none(
     client: httpx.AsyncClient,
     no_terminals_spec: None,
 ) -> None:
-    """The default user shell passes the gate for an agent without ``terminals:``.
-
-    The Web UI offers ``bash`` for such agents (``GET /agent`` reports it),
-    so the create must reach the runner, which launches it with its own
-    spec inheriting the agent's os_env.
-    """
+    """The default user shell passes the gate for an agent without ``terminals:``
+    and reaches the runner."""
     terminal_resource = {
         "id": "terminal_bash_u-1",
         "object": "session.resource",
@@ -1622,11 +1618,8 @@ async def test_create_terminal_rejects_other_names_when_agent_declares_none(
     client: httpx.AsyncClient,
     no_terminals_spec: None,
 ) -> None:
-    """Only the default shell is offered to an agent without ``terminals:``.
-
-    Any other name would reach the runner's synthesize-from-body path,
-    so the gate must still refuse it and name what the agent offers.
-    """
+    """Only the default shell is offered to an agent without ``terminals:``; any
+    other name is refused before reaching the runner."""
     fake_runner = _FakeRunnerClient(payload={})
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 

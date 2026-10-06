@@ -1259,11 +1259,8 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
 async def test_create_terminal_default_user_shell_inherits_agent_os_env(
     tmp_path: Path,
 ) -> None:
-    """An agent without ``terminals:`` launches the default user shell from
-    the runner-owned spec: it inherits the agent's os_env (sandbox included)
-    and ignores the body's command/args/env, so the server gate admitting the
-    default name cannot become an arbitrary launch.
-    """
+    """The default user shell launches from the runner-owned spec, inheriting
+    the agent's os_env and ignoring the body's command/args/env."""
     from omnigent.inner.datamodel import AgentDef
 
     workspace = tmp_path / "workspace"
@@ -1327,10 +1324,8 @@ async def test_create_terminal_default_user_shell_inherits_agent_os_env(
 async def test_create_terminal_default_user_shell_without_agent_os_env_uses_workspace(
     tmp_path: Path,
 ) -> None:
-    """With no agent os_env to inherit, the default user shell gets a
-    caller-process parent rooted at the session workspace, like a declared
-    terminal with a placeholder cwd would.
-    """
+    """Without an agent os_env, the default shell gets a caller-process parent
+    rooted at the session workspace."""
     from omnigent.inner.datamodel import AgentDef
 
     workspace = tmp_path / "workspace"

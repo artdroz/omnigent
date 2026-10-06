@@ -1,12 +1,9 @@
 """E2E: a custom agent that declares no ``terminals:`` still offers a user shell.
 
-A vanilla Claude session gets ``Shell (<shell>)`` in the Workspace rail's "+"
-("Open new") menu because the native wrapper declares the host's installed
-shells. A custom SDK agent without a ``terminals:`` block used to get no Shell
-entry at all, leaving the user no way to open a shell from the rail. The server
-now offers such agents a default ``bash`` shell. This test drives the rail on
-the suite's ``hello_world`` agent (no ``terminals:``), picks Shell, and checks
-the shell opens as a connected rail tab without disturbing the chat.
+The Workspace rail's "+" menu used to offer Shell only when the agent declared
+``terminals:`` (native wrappers always do), so custom-agent sessions had no way
+to open a shell. The server now offers such agents a default ``bash`` shell;
+this drives the rail on the suite's ``hello_world`` agent and opens it.
 """
 
 from __future__ import annotations
