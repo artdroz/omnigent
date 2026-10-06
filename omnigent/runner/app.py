@@ -1168,12 +1168,12 @@ def create_runner_app(
 
     _version_cache: dict[str, int] = {}  # conversation_id → last seen agent_version
     _spec_cache: dict[str, _SpecEntry] = {}  # agent_id → cached AgentSpec for terminal tools
-    _session_terminal_epochs: dict[str, int] = {}  # session_id → terminal generation
 
     def _terminal_registration_fence(session_id: str) -> Callable[[], bool]:
-        """Check whether a launch still has this session's terminal generation."""
-        epoch = _session_terminal_epochs.get(session_id, 0)
-        return lambda: _session_terminal_epochs.get(session_id, 0) == epoch
+        """Fence a launch so a reset-state during its start retires what it built."""
+        if terminal_registry is None:
+            return lambda: True
+        return terminal_registry.launch_fence(session_id)
 
     _resp_to_conv: dict[str, str] = {}  # harness response_id → conversation_id
     _live_response_id: dict[str, str] = {}
@@ -3302,7 +3302,6 @@ def create_runner_app(
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
-        _session_terminal_epochs.pop(session_id, None)
         if resource_registry.terminal_registry is not None:
             resource_registry.terminal_registry.drop_launch_generation(session_id)
         _interrupted_sessions.discard(session_id)
@@ -7288,8 +7287,6 @@ def create_runner_app(
     @app.post("/v1/sessions/{session_id}/reset-state")
     async def reset_session_state(session_id: str) -> JSONResponse:
         # Invalidate in-flight launches before tearing down registered terminals.
-        _session_terminal_epochs[session_id] = _session_terminal_epochs.get(session_id, 0) + 1
-        # Direct registry callers need the same fence.
         if resource_registry.terminal_registry is not None:
             resource_registry.terminal_registry.supersede_inflight_launches(session_id)
         _required_terminal_exit_errors.pop(session_id, None)

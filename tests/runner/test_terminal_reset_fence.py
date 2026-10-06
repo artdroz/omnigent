@@ -79,6 +79,7 @@ async def test_reset_during_terminal_launch_refuses_the_stale_terminal(
         process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
         spec_resolver=_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
     )
 
     async with _runner_client(app) as client:

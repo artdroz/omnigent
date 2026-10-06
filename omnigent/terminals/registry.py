@@ -340,6 +340,20 @@ class TerminalRegistry:
                 self._launch_generations.get(conversation_id, 0) + 1
             )
 
+    def launch_fence(self, conversation_id: str) -> Callable[[], bool]:
+        """Return a check that is true until a reset supersedes this conversation's launches.
+
+        Capture it before resolving the agent spec so a reset in that window is seen too.
+        """
+        with self._lock:
+            generation = self._launch_generations.get(conversation_id, 0)
+
+        def is_current() -> bool:
+            with self._lock:
+                return self._launch_generations.get(conversation_id, 0) == generation
+
+        return is_current
+
     def drop_launch_generation(self, conversation_id: str) -> None:
         """Forget the generation of a deleted conversation."""
         with self._lock:
