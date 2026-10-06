@@ -1359,29 +1359,8 @@ def test_model_settings_update_mirrors_model_into_config_toml(
     assert read_codex_config_model(tmp_path) == "gpt-5.6-luna"
 
 
-@pytest.mark.parametrize(
-    ("requested", "inherited", "supported", "expected", "model_override"),
-    [
-        ("minimal", "medium", ["low", "medium", "high", "xhigh"], "low", None),
-        ("max", "medium", ["low", "medium", "high", "xhigh"], "xhigh", None),
-        (None, "max", ["low", "medium", "high", "xhigh"], "xhigh", None),
-        (None, "high", ["low", "medium", "high", "xhigh"], "high", None),
-        ("max", "medium", ["low", "medium", "high", "xhigh", "max", "ultra"], "max", None),
-        ("ultra", "medium", ["low", "medium", "high", "xhigh", "max", "ultra"], "ultra", None),
-        ("minimal", "medium", ["low", "medium", "high", "xhigh"], "low", "databricks-gpt-5-6-sol"),
-        (None, "high", ["low", "medium", "high", "xhigh"], "high", "databricks-gpt-5-6-sol"),
-    ],
-)
-def test_dispatch_uses_model_supported_effort(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    requested: str | None,
-    inherited: str,
-    supported: list[str],
-    expected: str,
-    model_override: str | None,
-) -> None:
-    """Explicit and inherited efforts are checked before starting the next turn."""
+def _catalog_client(supported: list[str]) -> type[_FakeCodexNativeClient]:
+    """Return a fresh fake whose catalog lists ``gpt-5.6-sol`` with *supported* efforts."""
 
     class CatalogClient(_FakeCodexNativeClient):
         requests: list[tuple[str, dict[str, Any]]] = []
@@ -1406,6 +1385,33 @@ def test_dispatch_uses_model_supported_effort(
                 }
             return await super().request(method, params)
 
+    return CatalogClient
+
+
+@pytest.mark.parametrize(
+    ("requested", "inherited", "supported", "expected", "model_override"),
+    [
+        ("minimal", "medium", ["low", "medium", "high", "xhigh"], "low", None),
+        ("max", "medium", ["low", "medium", "high", "xhigh"], "xhigh", None),
+        (None, "max", ["low", "medium", "high", "xhigh"], "xhigh", None),
+        (None, "high", ["low", "medium", "high", "xhigh"], "high", None),
+        ("max", "medium", ["low", "medium", "high", "xhigh", "max", "ultra"], "max", None),
+        ("ultra", "medium", ["low", "medium", "high", "xhigh", "max", "ultra"], "ultra", None),
+        ("minimal", "medium", ["low", "medium", "high", "xhigh"], "low", "databricks-gpt-5-6-sol"),
+        (None, "high", ["low", "medium", "high", "xhigh"], "high", "databricks-gpt-5-6-sol"),
+    ],
+)
+def test_dispatch_uses_model_supported_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    requested: str | None,
+    inherited: str,
+    supported: list[str],
+    expected: str,
+    model_override: str | None,
+) -> None:
+    """Explicit and inherited efforts are checked before starting the next turn."""
+    CatalogClient = _catalog_client(supported)
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", CatalogClient
     )
@@ -1461,30 +1467,7 @@ def test_dispatch_validates_an_effort_whose_config_write_failed(
         write_unmirrored_codex_settings,
     )
 
-    class CatalogClient(_FakeCodexNativeClient):
-        requests: list[tuple[str, dict[str, Any]]] = []
-        created = []
-        next_turn = 1
-
-        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-            if method == "model/list":
-                type(self).requests.append((method, params))
-                return {
-                    "result": {
-                        "data": [
-                            {
-                                "id": "gpt-5.6-sol",
-                                "supportedReasoningEfforts": [
-                                    {"reasoningEffort": value}
-                                    for value in ("low", "medium", "high", "xhigh")
-                                ],
-                            }
-                        ],
-                        "nextCursor": None,
-                    }
-                }
-            return await super().request(method, params)
-
+    CatalogClient = _catalog_client(["low", "medium", "high", "xhigh"])
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", CatalogClient
     )

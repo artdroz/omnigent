@@ -183,16 +183,16 @@ async def _start_codex_turn(
     """Apply optional settings and start one Codex turn on an idle thread."""
     settings_overrides = dict(settings_overrides)
     # Settings applied while their config write failed are recorded beside the config.
-    unmirrored = read_unmirrored_codex_settings(bridge_dir)
+    unmirrored = await asyncio.to_thread(read_unmirrored_codex_settings, bridge_dir)
     model = (
         settings_overrides.get("model")
         or unmirrored.get("model")
-        or read_codex_config_model(bridge_dir)
+        or await asyncio.to_thread(read_codex_config_model, bridge_dir)
     )
     effort = (
         settings_overrides.get("effort")
         or unmirrored.get("effort")
-        or read_codex_config_effort(bridge_dir)
+        or await asyncio.to_thread(read_codex_config_effort, bridge_dir)
     )
     if isinstance(model, str) and isinstance(effort, str):
         resolved_effort = await resolve_codex_effort_for_model(

@@ -3070,6 +3070,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (queryClient === null) {
         throw new Error("chatStore.setEffort: queryClient not initialized");
       }
+      const pick = trackLiveSettingPick(conversationId, "reasoningEffort", previous);
       try {
         const session = await queryClient.fetchQuery({
           queryKey: ["session", conversationId],
@@ -3084,13 +3085,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           return;
         }
         await updateSession(conversationId, { reasoningEffort: effort });
+        pick.confirm(effort);
       } catch (err) {
         // Adopt the server's settled effort, not an earlier unconfirmed pick; keep a newer pick.
-        const settled = await settledSessionSetting(conversationId, "reasoningEffort", previous);
+        const settled = await settledSessionSetting(conversationId, "reasoningEffort", pick);
         setterFor(conversationId)((s) =>
           s.sessionReasoningEffort === effort ? { sessionReasoningEffort: settled } : {},
         );
         throw err;
+      } finally {
+        pick.done();
       }
     }
   },
@@ -3118,13 +3122,15 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           );
         }, 30_000);
       }
+      const pick = trackLiveSettingPick(conversationId, "modelOverride", previous);
       let session;
       try {
         session = await updateSession(conversationId, { modelOverride: model });
+        pick.confirm(session.modelOverride ?? null);
       } catch (err) {
         // Nothing will confirm a refused ask; adopt the server's settled model unless
         // a newer pick replaced it.
-        const settled = await settledSessionSetting(conversationId, "modelOverride", previous);
+        const settled = await settledSessionSetting(conversationId, "modelOverride", pick);
         setterFor(conversationId)((s) => ({
           ...(expectConfirmation && s.pendingModelChange === model
             ? { pendingModelChange: null }
@@ -3132,6 +3138,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...(s.sessionModelOverride === model ? { sessionModelOverride: settled } : {}),
         }));
         throw err;
+      } finally {
+        pick.done();
       }
       // Server-canonical may differ from the optimistic write (e.g.
       // when a clear alias was sent) — refresh local state to match.
@@ -3564,21 +3572,66 @@ function setterForState(conversationId: string): ChatState | null {
   return entry === undefined ? null : entryGetter(entry)();
 }
 
+type LiveSettingField = "reasoningEffort" | "modelOverride";
+
+/** One live pick of a session setting, sharing the confirmed value with overlapping picks. */
+interface LiveSettingPick {
+  confirm: (value: string | null) => void;
+  confirmed: () => string | null;
+  done: () => void;
+}
+
+/** Last server-confirmed value of each session setting that has picks in flight. */
+const confirmedLiveSettings = new Map<string, { value: string | null; picks: number }>();
+
+/**
+ * Track a live pick of *field*, starting from *current* when no other pick is in flight.
+ *
+ * An overlapping pick's optimistic value may never apply, so it is not a fallback.
+ */
+function trackLiveSettingPick(
+  conversationId: string,
+  field: LiveSettingField,
+  current: string | null,
+): LiveSettingPick {
+  const key = `${conversationId}:${field}`;
+  let entry = confirmedLiveSettings.get(key);
+  if (entry === undefined) {
+    entry = { value: current, picks: 0 };
+    confirmedLiveSettings.set(key, entry);
+  }
+  entry.picks += 1;
+  const tracked = entry;
+  return {
+    confirm: (value) => {
+      tracked.value = value;
+    },
+    confirmed: () => tracked.value,
+    done: () => {
+      tracked.picks -= 1;
+      if (tracked.picks === 0) confirmedLiveSettings.delete(key);
+    },
+  };
+}
+
 /**
  * Read a session setting after a refused change.
  *
  * The server orders and rolls back live settings changes, so its value is the
- * settled one; an earlier optimistic pick may never have applied.
+ * settled one; an earlier optimistic pick may never have applied. If the lookup
+ * fails, fall back to the last value the server confirmed.
  */
 async function settledSessionSetting(
   conversationId: string,
-  field: "reasoningEffort" | "modelOverride",
-  fallback: string | null,
+  field: LiveSettingField,
+  pick: LiveSettingPick,
 ): Promise<string | null> {
   try {
-    return (await getSessionSlim(conversationId))[field] ?? null;
+    const value = (await getSessionSlim(conversationId))[field] ?? null;
+    pick.confirm(value);
+    return value;
   } catch {
-    return fallback;
+    return pick.confirmed();
   }
 }
 

@@ -541,7 +541,9 @@ def write_unmirrored_codex_settings(
             if os.path.exists(tmp_name):
                 os.unlink(tmp_name)
     except OSError:
-        _logger.warning("Could not record unmirrored Codex settings in %s", bridge_dir)
+        _logger.warning(
+            "Could not record unmirrored Codex settings in %s", bridge_dir, exc_info=True
+        )
 
 
 def read_unmirrored_codex_settings(bridge_dir: Path) -> dict[str, str]:
