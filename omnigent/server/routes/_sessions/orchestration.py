@@ -7404,6 +7404,9 @@ async def _dispatch_session_event_to_runner_impl(
 RUNNER_DISCONNECT_GRACE_S: float = float(RUNNER_LIVENESS_TTL_S)
 # Delay between relay stream reconnect attempts inside the grace window.
 _RELAY_RETRY_INTERVAL_S: float = 0.5
+# Version marker for the bounded relay recovery event contract. Keep this on
+# every connected/ready row so rollout queries can separate old and new shapes.
+_RELAY_TELEMETRY_SCHEMA = "runner_stream_recovery.v1"
 # A tunnel that drops mid-ensure usually belongs to a runner that is alive but
 # stalled and re-registers once it can (observed: 24 s). Hold the message that
 # long before failing it instead of discarding it on a drop the runner outlives.
@@ -7656,8 +7659,46 @@ async def _relay_runner_stream(
     """
     loop = asyncio.get_running_loop()
     deadline: float | None = None
-    outage_started = 0.0
+    outage_started: float | None = None
+    outage_id: str | None = None
+    outage_runner_id: str | None = None
+    outage_turn_id: str | None = None
     retries = 0
+
+    def _on_stream_ready() -> None:
+        """Record one ready-confirmed recovery for the active outage."""
+        nonlocal outage_id, outage_started, outage_runner_id, outage_turn_id
+        if outage_id is None or outage_started is None:
+            # The first ready heartbeat is ordinary relay startup, not recovery.
+            return
+        recovered_id = outage_id
+        recovered_started = outage_started
+        recovered_runner_id = outage_runner_id
+        recovered_turn_id = outage_turn_id
+        outage_id = None
+        outage_started = None
+        outage_runner_id = None
+        outage_turn_id = None
+        attributes = {
+            "outage_id": recovered_id,
+            "runner_id": recovered_runner_id,
+            "recovery_attempt": max(1, retries),
+            "outage_s": round(loop.time() - recovered_started, 3),
+            "recovery_evidence": "stream_heartbeat",
+            "telemetry_schema": _RELAY_TELEMETRY_SCHEMA,
+        }
+        _logger.info(
+            "Relay: runner stream recovered for session=%s after %.1fs",
+            session_id,
+            attributes["outage_s"],
+            extra=debug_event(
+                "runner_stream_recovered",
+                session_id=session_id,
+                turn_id=recovered_turn_id,
+                **attributes,
+            ),
+        )
+
     while True:
         started = loop.time()
         try:
@@ -7667,6 +7708,7 @@ async def _relay_runner_stream(
                 conversation_store,
                 ready,
                 runner_id=runner_id,
+                on_stream_ready=_on_stream_ready,
             )
             return
         except _RelayTransportLost as lost:
@@ -7677,6 +7719,9 @@ async def _relay_runner_stream(
                 deadline = now + RUNNER_DISCONNECT_GRACE_S
                 outage_started = now
                 retries = 0
+                outage_id = uuid.uuid4().hex
+                outage_runner_id = runner_id
+                outage_turn_id = _session_active_response_cache.get(session_id)
                 _logger.info(
                     "Relay: runner transport lost for session=%s (intentional=%s, grace=%.1fs)",
                     session_id,
@@ -7685,9 +7730,14 @@ async def _relay_runner_stream(
                     extra=debug_event(
                         "runner_stream_transport_lost",
                         session_id=session_id,
+                        turn_id=outage_turn_id,
+                        outage_id=outage_id,
+                        runner_id=outage_runner_id,
                         intentional_stop=lost.intentional,
+                        stream_ready=lost.stream_ready,
                         cached_session_status=_session_status_cache.get(session_id),
                         grace_s=RUNNER_DISCONNECT_GRACE_S,
+                        telemetry_schema=_RELAY_TELEMETRY_SCHEMA,
                     ),
                 )
             if not lost.intentional and now + _RELAY_RETRY_INTERVAL_S < deadline:
@@ -7732,12 +7782,18 @@ async def _relay_runner_stream(
                 extra=debug_event(
                     "runner_stream_disconnected",
                     session_id=session_id,
+                    turn_id=outage_turn_id,
+                    outage_id=outage_id,
+                    runner_id=outage_runner_id,
                     intentional_stop=lost.intentional,
                     cached_session_status=_session_status_cache.get(session_id),
                     decision=decision,
                     grace_s=RUNNER_DISCONNECT_GRACE_S,
-                    outage_s=round(now - outage_started, 3),
+                    outage_s=(
+                        round(now - outage_started, 3) if outage_started is not None else None
+                    ),
                     retries=retries,
+                    telemetry_schema=_RELAY_TELEMETRY_SCHEMA,
                 ),
             )
             if decision == "intentional_stop":
@@ -7825,6 +7881,7 @@ async def _relay_runner_stream_once(
     ready: asyncio.Event | None = None,
     *,
     runner_id: str | None = None,
+    on_stream_ready: Callable[[], None] | None = None,
 ) -> None:
     """
     Subscribe to the runner's SSE stream and relay events locally.
@@ -7853,6 +7910,9 @@ async def _relay_runner_stream_once(
         that exercise relay parsing/persistence without asserting on
         startup readiness.
     :param runner_id: The runner this attempt owns, used to match stop intent.
+    :param on_stream_ready: Optional callback after this attempt's first
+        ``session.heartbeat``. The supervisor uses it for one recovery row;
+        it is synchronous and does not create a helper task.
     """
     text_acc: list[str] = []
     current_response_id: str | None = None
@@ -7896,7 +7956,12 @@ async def _relay_runner_stream_once(
             _logger.info(
                 "Relay: connected to runner GET /stream for session=%s",
                 session_id,
-                extra=debug_event("runner_stream_connected", session_id=session_id),
+                extra=debug_event(
+                    "runner_stream_connected",
+                    session_id=session_id,
+                    runner_id=runner_id,
+                    telemetry_schema=_RELAY_TELEMETRY_SCHEMA,
+                ),
             )
             buffer = ""
             async for chunk in resp.aiter_text():
@@ -7932,8 +7997,15 @@ async def _relay_runner_stream_once(
                             _logger.info(
                                 "Relay: runner stream ready for session=%s",
                                 session_id,
-                                extra=debug_event("runner_stream_ready", session_id=session_id),
+                                extra=debug_event(
+                                    "runner_stream_ready",
+                                    session_id=session_id,
+                                    runner_id=runner_id,
+                                    telemetry_schema=_RELAY_TELEMETRY_SCHEMA,
+                                ),
                             )
+                            if on_stream_ready is not None:
+                                on_stream_ready()
                         if ready is not None:
                             ready.set()
                         continue
