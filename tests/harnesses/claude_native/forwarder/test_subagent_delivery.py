@@ -238,11 +238,8 @@ async def test_subagent_watcher_tails_workflow_nested_transcript_across_restart(
     tmp_path: Path,
 ) -> None:
     """
-    A workflow-run sub-agent's nested transcript is tailed to its child.
-
-    Claude Code writes a workflow spawn under ``subagents/workflows/<runId>/``.
-    The forwarder must read that transcript once the sub-agent registers and
-    keep finding it after a restart reloads the persisted cursor map.
+    A workflow-run sub-agent's nested transcript is tailed to its child, and the
+    persisted cursor map still locates it after a restart.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"

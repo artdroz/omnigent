@@ -410,11 +410,8 @@ async def test_session_cost_estimate_prices_workflow_nested_subagent_transcript(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """
-    ``C`` includes a sub-agent whose files sit under ``subagents/workflows/<runId>/``.
-
-    A workflow-run spawn is discovered in that nested directory, and its
-    transcript must be priced from the same location so the parent budget
-    sees the spend mid-run.
+    ``C`` prices a workflow-run sub-agent's transcript from its nested
+    ``subagents/workflows/<runId>/`` directory, so the parent budget sees it mid-run.
     """
     bridge_dir = tmp_path / "bridge"
     parent = tmp_path / "sess.jsonl"

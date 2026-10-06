@@ -704,13 +704,8 @@ async def test_subagent_watcher_registers_workflow_nested_spawn(
     tmp_path: Path,
 ) -> None:
     """
-    A workflow-run sub-agent nested under ``subagents/workflows/<runId>/``
-    registers alongside a flat sibling.
-
-    Claude Code writes a background workflow sub-agent's files to
-    ``subagents/workflows/<runId>/agent-<id>.{jsonl,meta.json}`` (its per-agent
-    ``transcriptSubdir``) and enumerates ``subagents/`` recursively, so its own
-    TUI shows the sub-agent; the Agents rail must list it too.
+    A workflow-run sub-agent under ``subagents/workflows/<runId>/`` registers
+    alongside a flat sibling, as Claude's own recursive enumeration shows it.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"

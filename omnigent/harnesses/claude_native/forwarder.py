@@ -107,10 +107,9 @@ _MAX_SEEN_DELTA_KEYS = 5000
 # This heuristic does not establish that the sub-agent has completed.
 _SUBAGENT_IDLE_THRESHOLD_S = 5.0
 
-# Sub-agent file globs inside ``~/.claude/projects/<encoded>/<session>/subagents/``,
-# matched recursively: one ``.meta.json`` per Claude Task-tool subagent beside its
-# ``agent-<id>.jsonl`` transcript, flat for an ordinary spawn or nested under
-# ``workflows/<runId>/`` (Claude's per-agent ``transcriptSubdir``) for a workflow run.
+# Sub-agent file globs under ``<session>/subagents/``, matched recursively: each
+# ``agent-<id>.meta.json`` sits beside its ``agent-<id>.jsonl``, flat for a Task spawn
+# or under ``workflows/<runId>/`` (Claude's ``transcriptSubdir``) for a workflow run.
 _SUBAGENT_META_GLOB = "agent-*.meta.json"
 _SUBAGENT_TRANSCRIPT_GLOB = "agent-*.jsonl"
 # Claude's built-in sub-agent spawn tool; its tool-use id is the ``toolUseId``
