@@ -47,8 +47,10 @@ import {
   bubbleKey,
   buildPendingBubbles,
   collectPendingElicitations,
+  computeIsTurnActive,
   computeIsWorking,
   extractUserText,
+  isBackgroundTasksOnly,
   isSystemBubble,
   mergePendingBubbles,
   reorderCommittedRequestElicitations,
@@ -122,6 +124,9 @@ function TranscriptImpl({
   const activeResponse = useChatStore((s) => s.activeResponse);
   const interruptedResponseIds = useChatStore((s) => s.interruptedResponseIds);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
+  const status = useChatStore((s) => s.status);
+  const backgroundTaskCount = useChatStore((s) => s.backgroundTaskCount);
+  const blockedOn = useChatStore((s) => s.blockedOn);
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
   const hasTasks = useChatStore((s) => s.todos.length > 0);
@@ -290,12 +295,23 @@ function TranscriptImpl({
   }, [display.bubbles]);
 
   const showWorkingIndicator = shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
+  // Repositioning the marker is worth it only when the indicator actually
+  // paints. In the background-tasks-only state it renders nothing, so splicing
+  // a marker row would reserve blank space in the virtualized list.
+  const workingIndicatorRenders =
+    showWorkingIndicator &&
+    !isBackgroundTasksOnly(
+      backgroundTaskCount,
+      blockedOn,
+      computeIsTurnActive(sessionStatus, status === "streaming"),
+    );
   // A message steered in behind the still-active turn is POSTed and promoted to
   // a bubble below that turn; carry the live Working… indicator on a marker row
   // beside the active turn so it is not read as the follow-up being processed.
   const workingInsert = useMemo(
-    () => workingIndicatorInsertIndex(display.streamBubbles, activeResponse, showWorkingIndicator),
-    [display.streamBubbles, activeResponse, showWorkingIndicator],
+    () =>
+      workingIndicatorInsertIndex(display.streamBubbles, activeResponse, workingIndicatorRenders),
+    [display.streamBubbles, activeResponse, workingIndicatorRenders],
   );
   const streamBubblesWithWorking = useMemo<Bubble[]>(() => {
     if (workingInsert === -1) return display.streamBubbles;
@@ -404,8 +420,15 @@ function TranscriptImpl({
                     </MessageContent>
                   </Message>
                 ))}
-                {/* Working… shimmer, lit for the whole busy turn. */}
-                {showWorkingIndicator && workingInsert === -1 && <WorkingIndicator />}
+                {/* Working… shimmer, lit for the whole busy turn. When a steered
+                follow-up pushes the shimmer onto a marker row inside the list,
+                only the stable aria-live announcement stays at the tail. */}
+                {showWorkingIndicator &&
+                  (workingInsert === -1 ? (
+                    <WorkingIndicator />
+                  ) : (
+                    <WorkingIndicator mode="announce" />
+                  ))}
                 {/* Managed-sandbox stage cue; only when Working is absent. */}
                 {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
                 {/* MCP-server startup band (codex-native); clears once the

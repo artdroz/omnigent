@@ -581,12 +581,13 @@ export function workingIndicatorInsertIndex(
 ): number {
   if (!showWorking) return -1;
   const isFollowUp = (b: Bubble): boolean => b.kind === "user" && !isSystemUserContent(b.content);
-  // End of the active turn's content: its own streaming reply bubble when it
-  // has rendered one, else the prompt that opened it (the first unanswered user
-  // turn after the last rendered assistant turn — FIFO, so the earliest wins).
+  // End of the active turn's content: the LAST bubble of its streaming reply
+  // when it has rendered one (a single turn can split across bubbles), else the
+  // prompt that opened it (the first unanswered user turn after the last
+  // rendered assistant turn — FIFO, so the earliest wins).
   const streamingIndex =
     activeResponse?.state === "streaming"
-      ? bubbles.findIndex(
+      ? bubbles.findLastIndex(
           (b) =>
             b.kind === "assistant" &&
             b.responseId === activeResponse.responseId &&

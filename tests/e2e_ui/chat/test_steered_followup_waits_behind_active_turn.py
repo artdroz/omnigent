@@ -38,7 +38,9 @@ def _wait_for(page: Page, predicate: Callable[[], bool], *, timeout_s: float = 3
 
 
 def _gate_pending(mock_url: str) -> bool:
-    return bool(httpx.get(f"{mock_url}/gate/pending", timeout=5.0).json()["pending"])
+    resp = httpx.get(f"{mock_url}/gate/pending", timeout=5.0)
+    resp.raise_for_status()
+    return bool(resp.json()["pending"])
 
 
 def _send(page: Page, text: str) -> None:
@@ -70,27 +72,6 @@ def _follow_up_presented_as_active(page: Page) -> bool:
               return follows && !stillQueued && !marked;
             }""",
             [_USER_BUBBLE, _WORKING, _QUEUED_STRIP, _FOLLOW_UP, _QUEUE_STATE_RE],
-        )
-    )
-
-
-def _first_reply_lands_below_follow_up(page: Page) -> bool:
-    return bool(
-        page.evaluate(
-            """([bubbleSel, assistantSel, followUp, reply]) => {
-              const followUpBubble = [...document.querySelectorAll(bubbleSel)].find((b) =>
-                b.innerText.includes(followUp),
-              );
-              const replyBubble = [...document.querySelectorAll(assistantSel)].find((b) =>
-                b.innerText.includes(reply),
-              );
-              if (!followUpBubble || !replyBubble) return false;
-              return Boolean(
-                followUpBubble.compareDocumentPosition(replyBubble) &
-                  Node.DOCUMENT_POSITION_FOLLOWING,
-              );
-            }""",
-            [_USER_BUBBLE, _ASSISTANT_BUBBLE, _FOLLOW_UP, _FINAL_REPLY],
         )
     )
 
@@ -129,14 +110,10 @@ def test_steered_followup_is_not_presented_as_active_while_first_turn_runs(
     first_reply = page.locator(_ASSISTANT_BUBBLE).filter(has_text=_FINAL_REPLY)
     expect(first_reply.first).to_be_visible(timeout=60_000)
     page.wait_for_timeout(2_000)
-    reply_below_follow_up = _first_reply_lands_below_follow_up(page)
     page.screenshot(path=os.path.join(output_path, "first-reply-after-release.png"))
     expect(page.locator(_WORKING)).to_be_hidden(timeout=60_000)
     page.wait_for_timeout(1_500)
-    print(
-        f"follow_up_item_id={follow_up_item_id} presented_as_active={presented_as_active} "
-        f"first_reply_below_follow_up={reply_below_follow_up}"
-    )
+    print(f"follow_up_item_id={follow_up_item_id} presented_as_active={presented_as_active}")
 
     assert not presented_as_active, (
         "the follow-up was shown as the request being processed (committed bubble "

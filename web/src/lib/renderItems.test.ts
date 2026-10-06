@@ -4104,6 +4104,71 @@ describe("workingIndicatorInsertIndex", () => {
     expect(workingIndicatorInsertIndex(bubbles, streaming("r1"), true)).toBe(2);
   });
 
+  it("anchors below the LAST fragment when the streaming turn splits across bubbles", () => {
+    // One streaming turn can render as several assistant bubbles sharing a
+    // responseId — here an answered AskUserQuestion card splits r1 into
+    // work / card / work. The marker must land after the turn's LAST fragment,
+    // above the steered follow-up, not between the turn's own fragments.
+    const blocks: AnyBlock[] = [
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "u1", responseId: "r1" }),
+        content: [{ type: "input_text", text: "q" }],
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ responseId: "r1" }),
+        executions: [mkExec("ls", "c1")],
+        iteration: 0,
+      },
+      {
+        type: "elicitation",
+        ctx: ctx({ itemId: null, responseId: "r1" }),
+        elicitationId: "elic_ask",
+        message: "Claude wants to call **AskUserQuestion**",
+        phase: "pre_tool_use",
+        policyName: "claude_native_permission",
+        contentPreview: "AskUserQuestion({})",
+        requestedSchema: {},
+        status: "responded",
+        response: { action: "accept", content: { Framework: "React" } },
+        askUserQuestion: {
+          questions: [
+            {
+              question: "Which framework?",
+              options: [{ label: "React" }, { label: "Vue" }],
+              multiSelect: false,
+            },
+          ],
+        },
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "a1", responseId: "r1" }),
+        fullText: "working…",
+        hasCodeBlocks: false,
+      },
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "u2", responseId: "" }),
+        content: [{ type: "input_text", text: "follow-up" }],
+      },
+    ];
+    const bubbles = buildBubbles(blocks, streaming("r1"));
+    // [user, assistant r1 (tool), assistant r1 (card), assistant r1 (text), user u2]:
+    // findLastIndex anchors to the last r1 fragment (index 3), so the marker
+    // splices at 4 — the old findIndex would wrongly splice at 2, between the
+    // turn's own fragments.
+    expect(bubbles.map((b) => b.kind)).toEqual([
+      "user",
+      "assistant",
+      "assistant",
+      "assistant",
+      "user",
+    ]);
+    expect(workingIndicatorInsertIndex(bubbles, streaming("r1"), true)).toBe(4);
+  });
+
   it("anchors to the active prompt when its reply has not streamed yet", () => {
     const bubbles = buildBubbles(
       [userMsg("u1", "q"), userMsg("u2", "follow-up")],
